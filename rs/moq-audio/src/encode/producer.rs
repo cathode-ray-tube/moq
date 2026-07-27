@@ -35,9 +35,15 @@ pub struct Options {
 	/// Channel count the codec runs at. `None` matches the input; anything else
 	/// is rejected, since remapping isn't implemented.
 	pub channels: Option<u32>,
-	/// Bitrate in bits per second. `None` lets the codec pick.
+	/// Bitrate in bits per second. `None` lets Opus pick. PCM requires `None`
+	/// because its bitrate is fixed by the sample rate and channel count.
 	pub bitrate: Option<u32>,
+	/// Enable Opus in-band forward error correction.
+	pub fec: bool,
+	/// Enable Opus discontinuous transmission during silence.
+	pub dtx: bool,
 	/// Encoded frame duration. Opus accepts 2.5 / 5 / 10 / 20 / 40 / 60 ms.
+	/// PCM accepts any duration containing a whole number of samples.
 	pub frame_duration: Duration,
 }
 
@@ -49,6 +55,8 @@ impl Default for Options {
 			sample_rate: None,
 			channels: None,
 			bitrate: None,
+			fec: false,
+			dtx: false,
 			frame_duration: Duration::from_millis(20),
 		}
 	}
@@ -63,6 +71,8 @@ impl Options {
 			sample_rate: self.sample_rate,
 			channels: self.channels,
 			bitrate: self.bitrate,
+			fec: self.fec,
+			dtx: self.dtx,
 			frame_duration: self.frame_duration,
 		}
 	}
@@ -81,8 +91,8 @@ pub struct Producer<E: CatalogExt = ()> {
 	encoder: Encoder,
 	resampler: Option<Resampler>,
 	track: moq_mux::container::Producer<moq_mux::container::legacy::Wire>,
-	track_name: String,
-	catalog: moq_mux::catalog::Producer<E>,
+	/// Owns the catalog rendition, retiring it when this producer goes away.
+	rendition: Rendition<E>,
 	pending: Vec<f32>,
 	/// Samples emitted since the current epoch (reset by [`reset_epoch`](Self::reset_epoch)).
 	frames_produced: u64,
@@ -129,19 +139,18 @@ impl<E: CatalogExt> Producer<E> {
 			None => moq_mux::import::unique_track(broadcast, &format!(".{}", options.codec))?,
 		};
 		let name = track.name().to_string();
-		let track = catalog.media_producer(track, moq_mux::container::legacy::Wire);
+		let track = catalog.media_producer(track, moq_mux::container::legacy::Wire)?;
 
 		let mut catalog_mut = catalog.clone();
 		let mut config = encoder.catalog();
-		config.timeline = Some(catalog.timeline(&name).section());
+		config.timeline = Some(catalog.timeline(&name)?.section());
 		catalog_mut.lock().audio.insert(&name, config)?;
 
 		Ok(Self {
 			encoder,
 			resampler,
 			track,
-			track_name: name,
-			catalog,
+			rendition: Rendition { catalog, name },
 			pending: Vec::new(),
 			frames_produced: 0,
 			epoch_us: None,
@@ -150,13 +159,23 @@ impl<E: CatalogExt> Producer<E> {
 
 	/// The name of the published track, which is [`Options::track`] resolved.
 	pub fn track_name(&self) -> &str {
-		&self.track_name
+		&self.rendition.name
 	}
 
 	/// The underlying track producer, e.g. to watch subscriber state via
 	/// [`used`](moq_net::track::Producer::used) / [`unused`](moq_net::track::Producer::unused).
 	pub fn track(&self) -> &moq_net::track::Producer {
 		self.track.track()
+	}
+
+	/// Current encoder target bitrate in bits per second.
+	pub fn bitrate(&self) -> u64 {
+		self.encoder.bitrate()
+	}
+
+	/// Retune the live encoder to `bitrate` bits per second.
+	pub fn set_bitrate(&mut self, bitrate: u64) -> Result<(), Error> {
+		self.encoder.set_bitrate(bitrate)
 	}
 
 	/// Re-anchor the timeline to the next frame's timestamp, dropping any
@@ -217,8 +236,9 @@ impl<E: CatalogExt> Producer<E> {
 	}
 
 	fn publish(&mut self, payload: Bytes, timestamp: Timestamp) -> Result<(), Error> {
-		// Each audio packet is its own moq-lite group, matching
-		// moq_mux::codec::opus::Import. Opus PLC handles dropped groups.
+		// Publish each audio packet as its own moq-lite group: write it as a keyframe, then cut
+		// (below) so the relay forwards it without waiting for the next. Codecs can recover
+		// independently after a dropped group.
 		let mux_frame = MuxFrame {
 			timestamp,
 			payload,
@@ -229,6 +249,18 @@ impl<E: CatalogExt> Producer<E> {
 		// No boundary to give: the next packet bounds this one, and Opus frames have a
 		// deterministic duration anyway.
 		self.track.cut(None)?;
+		Ok(())
+	}
+
+	/// Mark a break in the published timeline: whatever is published next does not continue
+	/// what came before.
+	///
+	/// Call this when capture stops rather than merely gapping between packets -- going idle,
+	/// switching source, anything that resumes on a re-anchored epoch (see
+	/// [`reset_epoch`](Self::reset_epoch)). See
+	/// [`Producer::discontinuity`](moq_mux::container::Producer::discontinuity).
+	pub fn discontinuity(&mut self) -> Result<(), Error> {
+		self.track.discontinuity()?;
 		Ok(())
 	}
 
@@ -249,14 +281,23 @@ impl<E: CatalogExt> Producer<E> {
 
 	/// Abort the track with `err` instead of finishing it, so subscribers see the
 	/// real cause rather than [`moq_net::Error::Dropped`]. Pending samples are dropped.
-	pub fn abort(mut self, err: moq_net::Error) {
+	pub fn abort(self, err: moq_net::Error) {
 		self.track.abort(err);
 	}
 }
 
-impl<E: CatalogExt> Drop for Producer<E> {
+/// The producer's catalog entry, removed however the producer ends.
+///
+/// A separate value rather than a `Drop` on [`Producer`] itself, so the terminal
+/// [`finish`](Producer::finish) / [`abort`](Producer::abort) can consume the track.
+struct Rendition<E: CatalogExt> {
+	catalog: moq_mux::catalog::Producer<E>,
+	name: String,
+}
+
+impl<E: CatalogExt> Drop for Rendition<E> {
 	fn drop(&mut self) {
-		self.catalog.lock().audio.remove(&self.track_name);
+		self.catalog.lock().audio.remove(&self.name);
 	}
 }
 

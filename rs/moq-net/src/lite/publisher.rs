@@ -1,4 +1,4 @@
-use crate::{announce, frame, group, origin, stats, track};
+use crate::{announce, frame, group, origin, track};
 use std::{sync::Arc, task::Poll, time::Duration};
 
 use bytes::Buf;
@@ -45,22 +45,15 @@ struct SentRoute {
 
 pub(super) struct PublisherConfig<S: web_transport_trait::Session> {
 	pub session: S,
-	/// The origin we read local broadcasts from.
+	/// The origin we read local broadcasts from. Traffic stats are attributed
+	/// through this handle: tag it with [`origin::Consumer::with_stats`] first.
 	pub origin: origin::Consumer,
-	/// Stats aggregator for this session's egress. Use [`stats::Handle::default`]
-	/// to opt out.
-	pub stats: stats::Handle,
 	pub version: Version,
 }
 
 pub(super) struct Publisher<S: web_transport_trait::Session> {
 	session: S,
 	origin: origin::Consumer,
-	stats: stats::Handle,
-	/// Per-session egress broadcast-subscription tracker. Each downstream
-	/// subscription holds a guard so `broadcasts - broadcasts_closed` counts
-	/// the distinct sessions (viewers) watching each broadcast.
-	broadcasts: stats::SessionBroadcasts,
 	self_origin: Origin,
 	priority: PriorityQueue,
 	version: Version,
@@ -72,12 +65,9 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		// origin we're consuming so it matches the local relay identity
 		// across every session, required for cross-session loop detection.
 		let self_origin = *config.origin;
-		let broadcasts = config.stats.publisher_broadcasts();
 		Self {
 			session: config.session,
 			origin: config.origin,
-			stats: config.stats,
-			broadcasts,
 			self_origin,
 			priority: Default::default(),
 			version: config.version,
@@ -206,7 +196,6 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 			&prefix,
 			self.self_origin,
 			exclude_hop,
-			self.stats.clone(),
 			self.version,
 		)
 		.await
@@ -238,16 +227,9 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		// reflected announces (cluster loops) never hit the wire. Zero means
 		// the peer didn't set it (Lite03 or earlier), pass through.
 		exclude_hop: u64,
-		stats: stats::Handle,
 		version: Version,
 	) -> Result<(), Error> {
 		let prefix = prefix.as_path();
-
-		// Per-path stats guards: dropping the guard records `broadcasts_closed`.
-		// The origin contract guarantees announce/unannounce toggles per path, so a
-		// new active announcement must always be for a path with no live guard.
-		let mut stats_guards: std::collections::HashMap<crate::PathOwned, stats::Publisher> =
-			std::collections::HashMap::new();
 
 		// Lite06+: announce ids. Every `active` we send implicitly assigns the next
 		// per-stream ordinal, and `ended` references the id instead of repeating the
@@ -277,29 +259,18 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 
 					if broadcast.is_some() {
 						tracing::debug!(broadcast = %absolute, "announce");
-						let guard = stats.broadcast(&absolute).publisher();
-						stats_guards.entry(absolute).or_insert(guard);
 						if !init.contains(&suffix) {
 							init.push(suffix);
 						}
 					} else {
 						// A potential race.
 						tracing::debug!(broadcast = %absolute, "unannounce");
-						stats_guards.remove(&absolute);
 						init.retain(|p| p != &suffix);
 					}
 				}
 
 				let announce_init = lite::AnnounceInit { suffixes: init };
 				stream.writer.encode(&announce_init).await?;
-
-				// AnnounceInit batches the initial active set into one message; attribute
-				// it per broadcast by name length so Lite01/02 isn't undercounted.
-				for absolute in stats_guards.keys() {
-					stats
-						.broadcast(absolute)
-						.publisher_announced_bytes(absolute.as_str().len() as u64);
-				}
 			}
 			_ if version.has_announce_ok() => {
 				// Drain the current active set synchronously (like the Lite01/02 path),
@@ -341,15 +312,12 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 								continue;
 							}
 							tracing::debug!(broadcast = %absolute, "announce");
-							let guard = stats.broadcast(&absolute).publisher();
-							stats_guards.entry(absolute.clone()).or_insert(guard);
 							initial.retain(|(s, _)| s != &suffix);
 							initial.push((suffix, SentRoute { hops, cost }));
 						}
 						None => {
 							// A potential race: a just-announced path already unannounced.
 							tracing::debug!(broadcast = %absolute, "unannounce");
-							stats_guards.remove(&absolute);
 							watched.remove(&suffix);
 							initial.retain(|(s, _)| s != &suffix);
 						}
@@ -381,14 +349,6 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 				}
 				let mut buf = buf.freeze();
 				stream.writer.write_all(&mut buf).await?;
-
-				// Count each initial announce by broadcast name length, mirroring the
-				// live loop below (the name, not the encoded message size).
-				for absolute in stats_guards.keys() {
-					stats
-						.broadcast(absolute)
-						.publisher_announced_bytes(absolute.as_str().len() as u64);
-				}
 			}
 			_ => {
 				// Lite03/Lite04: no announce init, no AnnounceOk.
@@ -537,12 +497,6 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 							};
 							let cost = Self::outgoing_cost(version, &demand, &route);
 							tracing::debug!(broadcast = %absolute, "announce");
-							let bs = stats.broadcast(&absolute);
-							// Count the broadcast name length, not the encoded message size, so
-							// stats don't penalize the broadcast for hop/framing overhead.
-							bs.publisher_announced_bytes(absolute.as_str().len() as u64);
-							let prev = stats_guards.insert(absolute.clone(), bs.publisher());
-							debug_assert!(prev.is_none(), "origin announced a path that was already active");
 							if version.has_announce_id() {
 								let prev = announce_ids.insert(suffix.clone(), next_announce_id);
 								debug_assert!(prev.is_none(), "announce id still assigned for a new announce");
@@ -567,20 +521,13 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 							// versions never populate `watched`, so they keep sending the
 							// Ended even for announces filtered above.
 							let retracted = watched.remove(&suffix).is_some_and(|entry| entry.sent.is_none());
-							stats_guards.remove(&absolute);
 							if version.has_announce_id() {
 								// Retract by id; nothing to send if the announce was filtered and
 								// the peer never saw it (an unknown id is a protocol violation).
 								if let Some(id) = announce_ids.remove(&suffix) {
-									stats
-										.broadcast(&absolute)
-										.publisher_announced_bytes(absolute.as_str().len() as u64);
 									stream.writer.encode(&lite::AnnounceBroadcast::EndedId { id }).await?;
 								}
 							} else if !retracted {
-								stats
-									.broadcast(&absolute)
-									.publisher_announced_bytes(absolute.as_str().len() as u64);
 								// An ended announce doesn't need hops; the receiver matches on path only.
 								stream
 									.writer
@@ -627,9 +574,6 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 									tracing::warn!(broadcast = %absolute, "restart without an announce id; skipping");
 									continue;
 								};
-								stats
-									.broadcast(&absolute)
-									.publisher_announced_bytes(absolute.as_str().len() as u64);
 								entry.sent = Some(route.clone());
 								stream
 									.writer
@@ -641,9 +585,6 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 									.await?;
 							} else {
 								// Lite05: a duplicate ANNOUNCE for a live path is the restart.
-								stats
-									.broadcast(&absolute)
-									.publisher_announced_bytes(absolute.as_str().len() as u64);
 								entry.sent = Some(route.clone());
 								stream
 									.writer
@@ -658,9 +599,6 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 						// Previously filtered, now forwardable: a fresh announce.
 						(Some(route), None) => {
 							tracing::debug!(broadcast = %absolute, "announce");
-							let bs = stats.broadcast(&absolute);
-							bs.publisher_announced_bytes(absolute.as_str().len() as u64);
-							stats_guards.insert(absolute.clone(), bs.publisher());
 							if version.has_announce_id() {
 								announce_ids.insert(suffix.clone(), next_announce_id);
 								next_announce_id += 1;
@@ -680,10 +618,6 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 						(None, Some(_)) => {
 							tracing::debug!(broadcast = %absolute, "unannounce (filtered route)");
 							entry.sent = None;
-							stats_guards.remove(&absolute);
-							stats
-								.broadcast(&absolute)
-								.publisher_announced_bytes(absolute.as_str().len() as u64);
 							if version.has_announce_id() {
 								if let Some(id) = announce_ids.remove(&suffix) {
 									stream.writer.encode(&lite::AnnounceBroadcast::EndedId { id }).await?;
@@ -837,19 +771,15 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		// handler (or resolves to an error when there is none).
 		let broadcast = self.origin.request_broadcast(&subscribe.broadcast);
 
-		// Per-track subscription guard (bumps `subscriptions`). The per-(session,
-		// broadcast) `broadcasts` sentinel that counts viewers is taken inside
-		// `run_subscribe`, only once the subscription is validated and active, so
-		// a stale/invalid SUBSCRIBE isn't counted as a viewer.
-		let track_stats = self.stats.broadcast(&absolute).publisher_track(&track);
-
+		// Stats (subscriptions, viewer refcount, groups/frames/bytes) are counted in
+		// the model, through the tagged `origin::Consumer` this broadcast is resolved
+		// from; the wire loop carries no counters.
 		if let Err(err) = Self::run_subscribe(
 			self.session.clone(),
 			&mut stream,
 			&subscribe,
 			broadcast,
 			self.priority.clone(),
-			(track_stats, self.broadcasts.clone(), absolute.clone()),
 			self.version,
 		)
 		.await
@@ -877,13 +807,8 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		subscribe: &lite::Subscribe<'_>,
 		broadcast: kio::Pending<origin::Requesting>,
 		priority: PriorityQueue,
-		// The track guard (bumps `subscriptions`), the per-session broadcast
-		// tracker, and the broadcast path. The `broadcasts` sentinel is taken
-		// below, after the subscription is validated, and held for its lifetime.
-		stats: (stats::PublisherTrack, stats::SessionBroadcasts, crate::PathOwned),
 		version: Version,
 	) -> Result<(), Error> {
-		let (track_stats, broadcasts, absolute) = stats;
 		let subscription = crate::track::Subscription {
 			priority: subscribe.priority,
 			ordered: subscribe.ordered,
@@ -911,10 +836,6 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 			None
 		};
 
-		// Subscription is now active: count this session as a viewer of the
-		// broadcast. Dropping this guard (subscription end) releases it.
-		let _broadcast_sub = broadcasts.subscribe(&absolute);
-
 		// Lite05+ accepts implicitly: no SUBSCRIBE_OK, the immutable properties live
 		// in TRACK_INFO, and the resolved range arrives as SUBSCRIBE_START/END emitted
 		// from run_track. Older drafts still acknowledge with SUBSCRIBE_OK here.
@@ -940,7 +861,6 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 			session,
 			id: subscribe.id,
 			track_name: Arc::from(track.name()),
-			track_stats: Arc::new(track_stats),
 			priority,
 			track_priority: track_priority_tx.consume(),
 			track_priority_seen: subscribe.priority,
@@ -987,9 +907,8 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		// `request_broadcast` resolves it immediately, or falls back to an `origin::Dynamic`
 		// handler (as in recv_subscribe).
 		let broadcast = self.origin.request_broadcast(&fetch.broadcast);
-		let track_stats = self.stats.broadcast(&absolute).publisher_track(&track);
 
-		if let Err(err) = Self::run_fetch(&mut stream, &fetch, broadcast, track_stats, self.version).await {
+		if let Err(err) = Self::run_fetch(&mut stream, &fetch, broadcast, self.version).await {
 			match &err {
 				Error::Cancel | Error::Transport(_) => {
 					tracing::info!(broadcast = %absolute, %track, %group, "fetch cancelled")
@@ -1008,7 +927,6 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		stream: &mut Stream<S, Version>,
 		fetch: &lite::Fetch<'_>,
 		broadcast: kio::Pending<origin::Requesting>,
-		track_stats: stats::PublisherTrack,
 		version: Version,
 	) -> Result<(), Error> {
 		let broadcast = broadcast.await?;
@@ -1030,16 +948,12 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 			None
 		};
 
-		// Lite05+ FETCH responds with bare FRAME messages; the subscriber already has
-		// the timescale from TRACK_INFO and the group sequence from its request.
-		track_stats.group();
-
 		// Stream every frame in order. The delta-timestamp baseline resets to 0, so the
 		// first served frame's delta is its absolute timestamp (the subscriber decodes
 		// against the same baseline).
 		let mut prev_ts: u64 = 0;
 		while let Some(mut frame) = group.next_frame().await? {
-			write_fetch_frame(&mut stream.writer, &mut frame, timescale, &mut prev_ts, &track_stats).await?;
+			write_fetch_frame(&mut stream.writer, &mut frame, timescale, &mut prev_ts).await?;
 		}
 
 		stream.writer.finish()?;
@@ -1113,6 +1027,345 @@ mod test {
 	}
 }
 
+/// The announce loop's demand/linger state machine: a drained broadcast keeps
+/// advertising zero for `COST_LINGER` before the restart that restores its cold
+/// cost, demand returning in the window cancels the restore, and a route change
+/// supersedes it. Time is paused, so the 5s linger is deterministic.
+#[cfg(test)]
+mod announce_test {
+	use super::*;
+	use crate::coding::{Decode, Reader};
+	use crate::lite::test_transport::*;
+	use std::sync::Mutex;
+
+	const VERSION: Version = Version::Lite06Wip;
+
+	/// The broadcast's cold cost: what the route advertises without demand.
+	const COLD: u64 = 7;
+
+	/// A cursor over the captured announce-stream bytes, decoding messages
+	/// incrementally so each test step asserts exactly what it caused.
+	struct Wire {
+		writes: Arc<Mutex<Vec<u8>>>,
+		cursor: usize,
+	}
+
+	impl Wire {
+		fn pending(&self) -> Vec<u8> {
+			self.writes.lock().unwrap()[self.cursor..].to_vec()
+		}
+
+		/// Decode the AnnounceOk that opens the stream.
+		fn take_ok(&mut self) -> lite::AnnounceOk {
+			let buf = self.pending();
+			let mut slice = &buf[..];
+			let ok = lite::AnnounceOk::decode(&mut slice, VERSION).expect("announce ok");
+			self.cursor += buf.len() - slice.len();
+			ok
+		}
+
+		/// Decode every announce message written since the last call.
+		fn take_announces(&mut self) -> Vec<lite::AnnounceBroadcast<'static>> {
+			let buf = self.pending();
+			let mut slice = &buf[..];
+			let mut msgs = Vec::new();
+			while !slice.is_empty() {
+				msgs.push(own(
+					lite::AnnounceBroadcast::decode(&mut slice, VERSION).expect("announce message")
+				));
+			}
+			self.cursor += buf.len();
+			msgs
+		}
+
+		/// Assert nothing hit the wire since the last decode.
+		fn assert_quiet(&self) {
+			let pending = self.pending();
+			assert!(pending.is_empty(), "unexpected wire bytes: {pending:?}");
+		}
+	}
+
+	/// Re-own a decoded message so it can outlive the decode buffer.
+	fn own(msg: lite::AnnounceBroadcast<'_>) -> lite::AnnounceBroadcast<'static> {
+		match msg {
+			lite::AnnounceBroadcast::Active { suffix, hops, cost } => lite::AnnounceBroadcast::Active {
+				suffix: suffix.to_owned(),
+				hops,
+				cost,
+			},
+			lite::AnnounceBroadcast::Ended { suffix, hops } => lite::AnnounceBroadcast::Ended {
+				suffix: suffix.to_owned(),
+				hops,
+			},
+			lite::AnnounceBroadcast::EndedId { id } => lite::AnnounceBroadcast::EndedId { id },
+			lite::AnnounceBroadcast::Restart { id, hops, cost } => lite::AnnounceBroadcast::Restart { id, hops, cost },
+		}
+	}
+
+	struct Harness {
+		/// Held for the whole test: dropping the origin producer unannounces
+		/// every broadcast under it, which would end the announce loop.
+		origin: origin::Producer,
+		/// The publishing side: route changes go in here.
+		source: crate::broadcast::Producer,
+		/// A downstream viewer: its `track()` handles are the broadcast's demand.
+		downstream: crate::broadcast::Consumer,
+		wire: Wire,
+		task: tokio::task::JoinHandle<Result<(), Error>>,
+	}
+
+	impl Harness {
+		/// Assert the loop is quiet *and* still alive. A panicked announce task
+		/// also writes nothing, so silence alone would pass for the wrong reason
+		/// (`tokio::spawn` parks the panic in the handle until it's joined).
+		fn assert_idle(&self) {
+			self.wire.assert_quiet();
+			assert!(!self.task.is_finished(), "the announce loop ended unexpectedly");
+		}
+
+		/// Announce a second broadcast once the loop is already running, with a
+		/// viewer attached so it advertises warm. Returns the producer (kept
+		/// alive by the caller) and the viewer handle whose drop drains demand.
+		async fn announce(&mut self, name: &str) -> (crate::broadcast::Producer, track::Consumer) {
+			let source = self
+				.origin
+				.create_broadcast(name, crate::broadcast::Route::new().with_cost(COLD).with_announce(true))
+				.unwrap();
+			let downstream = self.origin.consume().announced_broadcast(name).await.unwrap();
+			let track = downstream.track("video").unwrap();
+			settle().await;
+
+			// It announces cold, then immediately re-prices warm for the viewer.
+			match self.wire.take_announces().as_slice() {
+				[
+					lite::AnnounceBroadcast::Active { cost: first, .. },
+					lite::AnnounceBroadcast::Restart { cost: second, .. },
+				] => {
+					assert_eq!(*first, lite::RouteCost(COLD));
+					assert_eq!(*second, lite::RouteCost(0));
+				}
+				// The viewer may already be attached when the announce is built.
+				[lite::AnnounceBroadcast::Active { cost, .. }] => assert_eq!(*cost, lite::RouteCost(0)),
+				other => panic!("expected {name} to announce, got {other:?}"),
+			}
+
+			(source, track)
+		}
+	}
+
+	async fn settle() {
+		tokio::time::sleep(Duration::from_millis(1)).await;
+	}
+
+	/// Announce one broadcast with cold cost [`COLD`] and run the announce loop
+	/// against it, optionally with a viewer already attached (so the initial
+	/// announce goes out warm, at cost zero).
+	async fn harness(demand: bool) -> (Harness, Option<track::Consumer>) {
+		let origin = Origin::new(1).unwrap().produce();
+		let source = origin
+			.create_broadcast(
+				"cam",
+				crate::broadcast::Route::new().with_cost(COLD).with_announce(true),
+			)
+			.unwrap();
+		let downstream = origin.consume().announced_broadcast("cam").await.unwrap();
+		let track = demand.then(|| downstream.track("video").unwrap());
+
+		let log = Log::default();
+		let writes = log.writes.clone();
+		let consumer = origin.consume();
+		let mut stream = Stream::<SinkSession, Version> {
+			writer: Writer::new(SinkSend::new(log), VERSION),
+			reader: Reader::new(PendingRecv, VERSION),
+		};
+		let task = tokio::spawn(async move {
+			let mut announced = consumer.announced();
+			let self_origin = *consumer;
+			Publisher::<SinkSession>::run_announce(&mut stream, &consumer, &mut announced, "", self_origin, 0, VERSION)
+				.await
+		});
+		settle().await;
+
+		let mut wire = Wire { writes, cursor: 0 };
+		assert_eq!(wire.take_ok().active, 1, "expected one initial announce");
+		let expected = if demand { 0 } else { COLD };
+		match wire.take_announces().as_slice() {
+			[lite::AnnounceBroadcast::Active { cost, .. }] => assert_eq!(*cost, lite::RouteCost(expected)),
+			other => panic!("expected the initial announce, got {other:?}"),
+		}
+
+		(
+			Harness {
+				origin,
+				source,
+				downstream,
+				wire,
+				task,
+			},
+			track,
+		)
+	}
+
+	/// Demand draining while zero is advertised must not re-price immediately:
+	/// the restore waits out the linger, so viewer churn doesn't flap routing.
+	#[tokio::test(start_paused = true)]
+	async fn drain_defers_the_cold_restore() {
+		let (h, track) = harness(true).await;
+
+		drop(track);
+		settle().await;
+		h.assert_idle();
+
+		// Still inside the linger window: still quiet.
+		tokio::time::sleep(Duration::from_secs(3)).await;
+		h.assert_idle();
+	}
+
+	/// Demand returning within the linger cancels the pending restore, and the
+	/// next drain starts a fresh window rather than inheriting the old deadline.
+	///
+	/// The second drain is what makes the cancellation observable. Silence alone
+	/// can't distinguish "the deadline was cleared" from "it fired but re-priced
+	/// to the same zero cost, so nothing went out": both are quiet. By draining
+	/// again at t=4s, an uncancelled t=0 deadline would fire at t=5s with demand
+	/// already gone, sending the restart a full four seconds early.
+	#[tokio::test(start_paused = true)]
+	async fn demand_return_cancels_the_restore() {
+		let (mut h, track) = harness(true).await;
+
+		// t=0: demand drains, arming the restore for t=5s.
+		drop(track);
+		tokio::time::sleep(Duration::from_secs(3)).await;
+
+		// t=3s: a new viewer inside the window cancels it.
+		let track = h.downstream.track("video").unwrap();
+		tokio::time::sleep(Duration::from_secs(1)).await;
+
+		// t=4s: drained again, so the restore is due at t=9s, not t=5s.
+		drop(track);
+		tokio::time::sleep(Duration::from_secs(2)).await;
+
+		// t=6s: past the stale deadline. A restart here means it was never cleared.
+		h.assert_idle();
+
+		// t=10s: past the fresh deadline, so the restore finally lands.
+		tokio::time::sleep(Duration::from_secs(4)).await;
+		match h.wire.take_announces().as_slice() {
+			[lite::AnnounceBroadcast::Restart { id: 0, cost, .. }] => assert_eq!(*cost, lite::RouteCost(COLD)),
+			other => panic!("expected the restore on the fresh deadline, got {other:?}"),
+		}
+	}
+
+	/// Each lingering broadcast restores on its own deadline: the loop sleeps
+	/// until the *earliest* pending restore, not the latest.
+	///
+	/// With one broadcast the deadline scan is trivially correct, so this stages
+	/// two with staggered drains. Taking the maximum instead would hold the first
+	/// broadcast's restore back until the second's deadline.
+	#[tokio::test(start_paused = true)]
+	async fn staggered_lingers_restore_independently() {
+		let (mut h, first) = harness(true).await;
+		let (_second_source, second) = h.announce("cam2").await;
+
+		// t=0: the first drains, due at t=5s.
+		drop(first);
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		h.assert_idle();
+
+		// t=2s: the second drains, due at t=7s.
+		drop(second);
+		tokio::time::sleep(Duration::from_secs(4)).await;
+
+		// t=6s: only the first has expired.
+		match h.wire.take_announces().as_slice() {
+			[lite::AnnounceBroadcast::Restart { id: 0, cost, .. }] => assert_eq!(*cost, lite::RouteCost(COLD)),
+			other => panic!("expected only the first restore, got {other:?}"),
+		}
+
+		// t=8s: now the second's own deadline has passed.
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		match h.wire.take_announces().as_slice() {
+			[lite::AnnounceBroadcast::Restart { id: 1, cost, .. }] => assert_eq!(*cost, lite::RouteCost(COLD)),
+			other => panic!("expected the second restore, got {other:?}"),
+		}
+	}
+
+	/// An expired linger sends exactly one restart restoring the cold cost.
+	#[tokio::test(start_paused = true)]
+	async fn linger_expiry_restores_the_cold_cost() {
+		let (mut h, track) = harness(true).await;
+
+		drop(track);
+		tokio::time::sleep(Duration::from_secs(6)).await;
+
+		match h.wire.take_announces().as_slice() {
+			[lite::AnnounceBroadcast::Restart { id: 0, cost, .. }] => assert_eq!(*cost, lite::RouteCost(COLD)),
+			other => panic!("expected one cold-cost restart, got {other:?}"),
+		}
+
+		// The restore is a one-shot: the loop settles back to idle.
+		tokio::time::sleep(Duration::from_secs(30)).await;
+		h.assert_idle();
+	}
+
+	/// A route change during the linger supersedes the pending restore: the
+	/// restart it triggers carries the new chain (and, with demand still gone,
+	/// the cold cost), and the old deadline then passes without a second one.
+	#[tokio::test(start_paused = true)]
+	async fn route_change_supersedes_the_linger() {
+		let (mut h, track) = harness(true).await;
+
+		drop(track);
+		tokio::time::sleep(Duration::from_secs(3)).await;
+		h.wire.assert_quiet();
+
+		// An upstream failover mid-linger.
+		let hops = OriginList::try_from(vec![Origin::new(9).unwrap()]).unwrap();
+		h.source
+			.set_route(
+				crate::broadcast::Route::new()
+					.with_hops(hops.clone())
+					.with_cost(COLD)
+					.with_announce(true),
+			)
+			.unwrap();
+		settle().await;
+
+		match h.wire.take_announces().as_slice() {
+			[
+				lite::AnnounceBroadcast::Restart {
+					id: 0,
+					hops: sent,
+					cost,
+				},
+			] => {
+				assert_eq!(sent, &hops);
+				assert_eq!(*cost, lite::RouteCost(COLD));
+			}
+			other => panic!("expected the failover restart, got {other:?}"),
+		}
+
+		// The pending restore went with it: the old deadline passes silently.
+		tokio::time::sleep(Duration::from_secs(30)).await;
+		h.assert_idle();
+	}
+
+	/// The warm edge has no hysteresis: a viewer arriving on a cold
+	/// advertisement re-prices to zero immediately.
+	#[tokio::test(start_paused = true)]
+	async fn demand_reprices_warm_immediately() {
+		let (mut h, _) = harness(false).await;
+
+		let _track = h.downstream.track("video").unwrap();
+		settle().await;
+
+		match h.wire.take_announces().as_slice() {
+			[lite::AnnounceBroadcast::Restart { id: 0, cost, .. }] => assert_eq!(*cost, lite::RouteCost(0)),
+			other => panic!("expected the warm restart, got {other:?}"),
+		}
+	}
+}
+
 /// Encode the per-frame timing prefix when the track advertises a timescale:
 /// `[zigzag-delta timestamp]` (the lite-05 FRAME format). With `None` the field is
 /// omitted entirely, saving the bytes on tracks where timing isn't meaningful
@@ -1164,16 +1417,12 @@ async fn write_fetch_frame<W: web_transport_trait::SendStream>(
 	frame: &mut frame::Consumer,
 	timescale: Option<crate::Timescale>,
 	prev_ts: &mut u64,
-	track_stats: &stats::PublisherTrack,
 ) -> Result<(), Error> {
 	encode_frame_timing(writer, frame, timescale, prev_ts).await?;
 
 	writer.encode(&frame.size).await?;
-	track_stats.frame();
 	while let Some(chunk) = frame.read_chunk().await? {
-		let n = chunk.len() as u64;
 		writer.write_chunk(chunk).await?;
-		track_stats.bytes(n);
 	}
 
 	Ok(())
@@ -1251,7 +1500,6 @@ struct Subscription<S: web_transport_trait::Session> {
 	session: S,
 	id: u64,
 	track_name: Arc<str>,
-	track_stats: Arc<stats::PublisherTrack>,
 	priority: PriorityQueue,
 	track_priority: kio::Consumer<u8>,
 	/// Last track priority observed by this clone, so a change only fires once.
@@ -1413,26 +1661,44 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 			sequence,
 		};
 		let stream = self.session.open_uni().await.map_err(Error::from_transport)?;
-
 		let mut stream = Writer::new(stream, self.version);
-		stream.set_priority(priority.current());
-		stream.encode(&lite::DataType::Group).await?;
-		stream.encode(&msg).await?;
-		self.track_stats.group();
 
-		// Lite05+ delta-encodes per-frame timestamps within the group. The first
-		// frame's delta is absolute (against an implicit prev value of 0), every
-		// subsequent delta is signed against the previous frame.
-		let mut prev_ts: u64 = 0;
-		while let Some(frame) = self.next_frame(&mut stream, &mut priority, &mut group).await? {
-			self.serve_frame(&mut stream, &mut priority, frame, &mut prev_ts)
-				.await?;
+		if let Err(err) = self.write_group(&mut stream, &msg, &mut priority, &mut group).await {
+			// Reset with the real reason (Old, Lagged, Evicted, ...) so the subscriber can
+			// tell a truncated group from a routine cancel. Without this the Writer's Drop
+			// fallback reports every failure as Cancel.
+			stream.abort(&err);
+			return Err(err);
 		}
 
 		stream.finish()?;
 		stream.closed().await?;
 
 		tracing::debug!(sequence, "finished group");
+
+		Ok(())
+	}
+
+	/// Write the group header and every frame, leaving the stream open for the caller to
+	/// finish or abort.
+	async fn write_group(
+		&mut self,
+		stream: &mut Writer<S::SendStream, Version>,
+		msg: &lite::Group,
+		priority: &mut PriorityHandle,
+		group: &mut group::Consumer,
+	) -> Result<(), Error> {
+		stream.set_priority(priority.current());
+		stream.encode(&lite::DataType::Group).await?;
+		stream.encode(msg).await?;
+
+		// Lite05+ delta-encodes per-frame timestamps within the group. The first
+		// frame's delta is absolute (against an implicit prev value of 0), every
+		// subsequent delta is signed against the previous frame.
+		let mut prev_ts: u64 = 0;
+		while let Some(frame) = self.next_frame(stream, priority, group).await? {
+			self.serve_frame(stream, priority, frame, &mut prev_ts).await?;
+		}
 
 		Ok(())
 	}
@@ -1465,9 +1731,7 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 			return;
 		}
 
-		if self.session.send_datagram(body).is_ok() {
-			self.track_stats.group();
-		}
+		let _ = self.session.send_datagram(body);
 	}
 
 	/// Send one frame: the size, then the payload streamed chunk-by-chunk so we
@@ -1482,7 +1746,6 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 		encode_frame_timing(stream, &frame, self.timescale, prev_ts).await?;
 
 		stream.encode(&frame.size).await?;
-		self.track_stats.frame();
 
 		while let Some(chunk) = self.read_chunk(stream, priority, &mut frame).await? {
 			self.write_chunk(stream, priority, chunk).await?;
@@ -1589,20 +1852,17 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 		self.track_priority_seen
 	}
 
-	/// Write a whole chunk, applying priority changes between partial writes,
-	/// then count the bytes sent.
+	/// Write a whole chunk, applying priority changes between partial writes.
 	async fn write_chunk(
 		&mut self,
 		stream: &mut Writer<S::SendStream, Version>,
 		priority: &mut PriorityHandle,
 		mut chunk: bytes::Bytes,
 	) -> Result<(), Error> {
-		let n = chunk.len() as u64;
 		while chunk.has_remaining() {
 			self.apply_priority(stream, priority);
 			stream.write(&mut chunk).await?;
 		}
-		self.track_stats.bytes(n);
 		Ok(())
 	}
 
@@ -1610,5 +1870,51 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 		let track_priority = self.track_priority_current();
 		priority.set_track(track_priority);
 		stream.set_priority(priority.current());
+	}
+}
+
+/// A group that fails mid-stream must reset with its own error code. The subscriber uses
+/// that code to tell a truncated group (Old, Lagged, Evicted) from a routine cancel, so a
+/// blanket [`Error::Cancel`] from the writer's drop fallback loses the reason.
+#[cfg(test)]
+mod serve_group_test {
+	use super::*;
+	use crate::lite::test_transport::*;
+	use crate::{Timestamp, broadcast};
+
+	#[tokio::test]
+	async fn resets_with_the_abort_code() {
+		let log = Log::default();
+		let session = SinkSession::new(log.clone());
+
+		let track_priority = kio::Producer::new(0u8);
+		let subscription = Subscription {
+			session,
+			id: 0,
+			track_name: "test".into(),
+			priority: PriorityQueue::default(),
+			track_priority: track_priority.consume(),
+			track_priority_seen: 0,
+			version: Version::Lite06Wip,
+			timescale: Some(crate::Timescale::default()),
+		};
+
+		let mut track = track::Producer::new(Arc::new(broadcast::Info::default()), "test", None);
+		let mut group = track.create_group(group::Info { sequence: 0 }).unwrap();
+		group
+			.write_frame(Timestamp::from_millis(0).unwrap(), b"hello".as_slice())
+			.unwrap();
+
+		let handle = subscription.priority.insert(Priority::new(0, 0));
+		let mut serve = std::pin::pin!(subscription.serve_group(0, handle, group.consume()));
+
+		// Drain the frame, leaving the task parked awaiting the next one.
+		assert!(futures::poll!(serve.as_mut()).is_pending());
+
+		// The group is dropped from the cache mid-stream: a truncated group, not a cancel.
+		group.abort(Error::Old).unwrap();
+
+		assert!(matches!(serve.await, Err(Error::Old)));
+		assert_eq!(log.resets(), vec![Error::Old.to_code()]);
 	}
 }

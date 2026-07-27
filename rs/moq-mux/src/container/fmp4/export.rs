@@ -3,7 +3,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use bytes::Bytes;
-use hang::catalog::{Catalog, Container, VideoConfig};
+use hang::catalog::{AudioCodec, Catalog, Container, VideoConfig};
 use mp4_atom::{DecodeMaybe, Encode};
 
 use crate::Result;
@@ -86,6 +86,9 @@ struct Fmp4Track {
 
 	/// True if this track is video. Video tracks roll fragments on keyframes.
 	is_video: bool,
+
+	/// True for Opus audio, whose packets carry their duration in the TOC byte.
+	opus: bool,
 
 	/// Fallback duration for a trailing frame that carries no per-sample duration
 	/// (Legacy / LOC sources). Derived from the catalog framerate / sample rate.
@@ -243,11 +246,28 @@ impl<S: Stream> Export<S> {
 
 		if let Some(name) = chosen {
 			let frag = self.fragment_duration;
-			let has_video_track = self.tracks.values().any(|t| t.is_video);
+			// One fragment per frame: a zero cap, or the audio-only default where
+			// no keyframe will ever roll the fragment. These never depend on the
+			// successor, so emit immediately instead of buffering the frame until
+			// the next one flushes it.
+			let has_video = self.tracks.values().any(|t| t.is_video);
+			let per_frame = frag == Some(Duration::ZERO) || (frag.is_none() && !has_video);
 			let track = self.tracks.get_mut(&name).unwrap();
 			let frame = track.pending.take().unwrap();
-			let flush_before = should_flush(track, &frame, frag, has_video_track);
-			if flush_before {
+			if per_frame {
+				// A catalog change can leave buffered frames behind. Drain them
+				// first and retry this frame on the next poll.
+				if !track.buffer.is_empty() {
+					let frames = std::mem::take(&mut track.buffer);
+					let fragment = emit_fragment(track, frames, Some(&frame))?;
+					track.pending = Some(frame);
+					return Poll::Ready(Ok(Some(fragment)));
+				}
+				track.buffer_independent = frame.keyframe;
+				let fragment = emit_fragment(track, vec![frame], None)?;
+				return Poll::Ready(Ok(Some(fragment)));
+			}
+			if should_flush(track, &frame, frag) {
 				let frames = std::mem::take(&mut track.buffer);
 				let fragment = emit_fragment(track, frames, Some(&frame))?;
 				// The flushed run is done; the incoming frame opens the next buffer.
@@ -298,6 +318,18 @@ impl<S: Stream> Export<S> {
 	}
 
 	fn update_catalog(&mut self, catalog: &Catalog) -> Result<()> {
+		// A rendition we can't parse is ignored rather than failing the whole export.
+		let mut catalog = catalog.clone();
+		catalog
+			.video
+			.renditions
+			.retain(|name, config| crate::catalog::hang::supported(name, &config.container));
+		catalog
+			.audio
+			.renditions
+			.retain(|name, config| crate::catalog::hang::supported(name, &config.container));
+		let catalog = &catalog;
+
 		let mut active: HashMap<String, ()> = HashMap::new();
 		for name in catalog.video.renditions.keys() {
 			active.insert(name.clone(), ());
@@ -315,7 +347,7 @@ impl<S: Stream> Export<S> {
 				continue;
 			}
 			let source = ExportSource::for_video(&self.source, name, config, self.latency)?;
-			let timescale = catalog_timescale_video(config);
+			let timescale = catalog_timescale_video(config)?;
 			// A zero / NaN / infinite framerate would make `1.0 / fps` non-finite and panic
 			// `Duration::from_secs_f64`; fall back to the default in that case.
 			let framerate = config
@@ -330,6 +362,7 @@ impl<S: Stream> Export<S> {
 					buffer: Vec::new(),
 					buffer_independent: false,
 					is_video: true,
+					opus: false,
 					default_frame: Duration::from_secs_f64(1.0 / framerate),
 					finished: false,
 					track_id: next_track_id,
@@ -345,7 +378,7 @@ impl<S: Stream> Export<S> {
 				continue;
 			}
 			let source = ExportSource::for_audio(&self.source, name, config, self.latency)?;
-			let timescale = catalog_timescale_audio(config);
+			let timescale = catalog_timescale_audio(config)?;
 			self.tracks.insert(
 				name.clone(),
 				Fmp4Track {
@@ -354,6 +387,7 @@ impl<S: Stream> Export<S> {
 					buffer: Vec::new(),
 					buffer_independent: false,
 					is_video: false,
+					opus: matches!(config.codec, AudioCodec::Opus),
 					// Fallback for a duration-less trailing sample (~1024 samples/frame).
 					default_frame: Duration::from_secs_f64(1024.0 / config.sample_rate.max(1) as f64),
 					finished: false,
@@ -413,6 +447,7 @@ impl<S: Stream> Export<S> {
 					});
 					traks.push(trak);
 				}
+				Container::Unknown(unknown) => return Err(crate::Error::unsupported_container(unknown)),
 			}
 		}
 
@@ -434,6 +469,7 @@ impl<S: Stream> Export<S> {
 					});
 					traks.push(trak);
 				}
+				Container::Unknown(unknown) => return Err(crate::Error::unsupported_container(unknown)),
 			}
 		}
 
@@ -514,45 +550,29 @@ pub(crate) fn extract_init(
 	Ok(())
 }
 
-/// Should we flush `track.buffer` *before* appending the incoming `frame`?
-///
-/// Triggers:
-/// - Video keyframe and buffer non-empty (one fragment per GOP)
-/// - Optional duration cap exceeded
-/// - Per-frame mode (`Some(ZERO)`)
-/// - Audio in an audio-only broadcast under default `None` mode (otherwise
-///   the buffer would never flush — no keyframe boundary and no time cap)
-fn should_flush(track: &Fmp4Track, frame: &Frame, fragment_duration: Option<Duration>, has_video_track: bool) -> bool {
+/// Should we flush `track.buffer` before appending the incoming `frame`?
+/// Triggers on a video keyframe (one fragment per GOP) or the duration cap.
+/// Per-frame modes never buffer and are handled before this check.
+fn should_flush(track: &Fmp4Track, frame: &Frame, fragment_duration: Option<Duration>) -> bool {
 	if track.buffer.is_empty() {
 		return false;
 	}
 	if track.is_video && frame.keyframe {
 		return true;
 	}
-	match fragment_duration {
-		Some(d) if d.is_zero() => true,
-		Some(d) => {
-			// Frames within a track are in *decode* order; B-frames have
-			// non-monotonic PTS, so the span of the buffer is min..max of all
-			// PTS, not just first..incoming.
-			let mut min = Duration::from(frame.timestamp);
-			let mut max = min;
-			for f in &track.buffer {
-				let pts = Duration::from(f.timestamp);
-				if pts < min {
-					min = pts;
-				}
-				if pts > max {
-					max = pts;
-				}
-			}
-			max.saturating_sub(min) >= d
-		}
-		// No video keyframe will ever arrive to roll the fragment, so for
-		// audio-only broadcasts in `None` mode we fall back to per-frame
-		// fragments (matches the pre-batching default).
-		None => !track.is_video && !has_video_track,
+	let Some(cap) = fragment_duration else {
+		return false;
+	};
+	// Frames within a track are in *decode* order; B-frames have non-monotonic
+	// PTS, so the span of the buffer is min..max of all PTS.
+	let mut min = Duration::from(frame.timestamp);
+	let mut max = min;
+	for f in &track.buffer {
+		let pts = Duration::from(f.timestamp);
+		min = min.min(pts);
+		max = max.max(pts);
 	}
+	max.saturating_sub(min) >= cap
 }
 
 /// Encode a buffered run of samples as a single CMAF moof+mdat fragment.
@@ -572,7 +592,8 @@ fn encode_fragment(track: &mut Fmp4Track, frames: Vec<Frame>) -> Result<Bytes> {
 }
 
 /// Encode a buffered run and wrap it with the metadata a segmenting consumer needs.
-fn emit_fragment(track: &mut Fmp4Track, frames: Vec<Frame>, successor: Option<&Frame>) -> Result<Fragment> {
+fn emit_fragment(track: &mut Fmp4Track, mut frames: Vec<Frame>, successor: Option<&Frame>) -> Result<Fragment> {
+	apply_codec_durations(&mut frames, track.opus);
 	// Audio has no keyframes, so every audio fragment is independent; video is
 	// independent only when its buffer opened on a keyframe (a GOP boundary).
 	let independent = !track.is_video || track.buffer_independent;
@@ -617,6 +638,46 @@ fn fragment_seconds(frames: &[Frame], default_frame: Duration) -> f64 {
 	((max - min) + default_frame).as_secs_f64()
 }
 
+/// Fill in the durations the codec states outright, before anything has to be inferred
+/// from a neighbouring frame.
+///
+/// Opus packets carry their duration in the TOC byte (at 48 kHz), so an Opus track never
+/// has to look at its neighbours at all -- which matters most at a group boundary, where
+/// the neighbour is off limits (see [`infer_missing_durations`]) and the fallback would
+/// otherwise mis-time every packet of a one-packet-per-group audio track.
+pub(crate) fn apply_codec_durations(frames: &mut [Frame], opus: bool) {
+	if !opus {
+		return;
+	}
+	for frame in frames {
+		if frame.duration.is_none() {
+			frame.duration = crate::codec::opus::packet_samples(&frame.payload)
+				.and_then(|samples| Timestamp::from_scale(samples as u64, 48_000).ok());
+		}
+	}
+}
+
+/// Fill in the duration of every remaining frame from the timestamp of the frame that
+/// follows it, as long as that frame is in the same group.
+///
+/// The gap between two frames is only a duration while they sit on one continuous
+/// timeline, and a group boundary is where that stops holding. Groups are independently
+/// decodable, so a publisher may pause and resume across one (moq-boy keeps its PTS on a
+/// clock that runs through the pause), a subscriber may join mid-stream or skip to a
+/// newer group, and a fetch may span a hole. Consecutive sequence numbers do not rule any
+/// of that out, so the gap across a boundary is treated as a discontinuity, never a
+/// duration. Reading it as one makes a single sample last as long as the gap: a recording
+/// that woke a paused publisher got a 2405 second video sample, whose `EXTINF` put the HLS
+/// video timeline 9620 seconds ahead of audio and stalled the player outright
+/// (moq-dev/moq.pro#814).
+///
+/// The last frame before a boundary falls back to `default_frame` (the catalog framerate /
+/// sample rate), which is what the gap works out to anyway on a continuous constant-rate
+/// source -- the two answers only diverge when there IS a gap.
+///
+/// The publisher is the one that actually knows where its group's content ends, and
+/// [`Producer::cut`](crate::container::Producer::cut) is how it says so: the durations it
+/// writes arrive already set and are left alone here.
 pub(crate) fn infer_missing_durations(
 	mut frames: Vec<Frame>,
 	successor: Option<&Frame>,
@@ -637,9 +698,9 @@ pub(crate) fn infer_missing_durations(
 		}
 
 		frames[i].duration = infer_from_pts
-			.then(|| next_timestamp(&frames, successor, i))
+			.then(|| duration_bound(&frames, successor, i))
 			.flatten()
-			.and_then(|timestamp| timestamp.checked_sub(frames[i].timestamp).ok())
+			.and_then(|next| next.timestamp.checked_sub(frames[i].timestamp).ok())
 			.filter(|duration| !duration.is_zero())
 			.or(fallback);
 	}
@@ -649,34 +710,43 @@ pub(crate) fn infer_missing_durations(
 
 fn pts_monotonic(frames: &[Frame], successor: Option<&Frame>) -> bool {
 	let frames_monotonic = frames.windows(2).all(|pair| pair[1].timestamp >= pair[0].timestamp);
-	let successor_monotonic = match (frames.last(), successor) {
+	// Only a successor we'd actually read from gets a say: one in the next group bounds
+	// nothing here, so a rewind across that boundary must not veto inference either.
+	let successor_monotonic = match (frames.last(), successor.filter(|next| !next.keyframe)) {
 		(Some(last), Some(successor)) => successor.timestamp >= last.timestamp,
 		_ => true,
 	};
 	frames_monotonic && successor_monotonic
 }
 
-fn next_timestamp(frames: &[Frame], successor: Option<&Frame>, index: usize) -> Option<Timestamp> {
-	frames
-		.get(index + 1)
-		.map(|next| next.timestamp)
-		.or_else(|| successor.map(|next| next.timestamp))
+/// The frame that bounds `frames[index]`'s duration, or `None` when the only candidate is
+/// in the next group.
+///
+/// Every group starts with a keyframe -- the wire may carry the flag, and
+/// [`Consumer`](crate::container::Consumer) asserts it on each group's first frame
+/// regardless -- so a keyframe is where a group boundary can be. Video only ever meets one
+/// as the successor (a keyframe flushes the fragment before it can be appended), but audio
+/// has no keyframe roll, so a boundary can also fall interior to `frames`; both land here.
+fn duration_bound<'a>(frames: &'a [Frame], successor: Option<&'a Frame>, index: usize) -> Option<&'a Frame> {
+	frames.get(index + 1).or(successor).filter(|next| !next.keyframe)
 }
 
-pub(crate) fn catalog_timescale_video(config: &VideoConfig) -> u64 {
-	match &config.container {
+pub(crate) fn catalog_timescale_video(config: &VideoConfig) -> Result<u64> {
+	Ok(match &config.container {
 		Container::Cmaf { init, .. } => {
 			parse_timescale_from_init(init).unwrap_or_else(|_| crate::container::fmp4::default_video_timescale(config))
 		}
 		Container::Loc | Container::Legacy => crate::container::fmp4::default_video_timescale(config),
-	}
+		Container::Unknown(unknown) => return Err(crate::Error::unsupported_container(unknown)),
+	})
 }
 
-pub(crate) fn catalog_timescale_audio(config: &hang::catalog::AudioConfig) -> u64 {
-	match &config.container {
+pub(crate) fn catalog_timescale_audio(config: &hang::catalog::AudioConfig) -> Result<u64> {
+	Ok(match &config.container {
 		Container::Cmaf { init, .. } => parse_timescale_from_init(init).unwrap_or(config.sample_rate as u64),
 		Container::Loc | Container::Legacy => config.sample_rate as u64,
-	}
+		Container::Unknown(unknown) => return Err(crate::Error::unsupported_container(unknown)),
+	})
 }
 
 fn parse_timescale_from_init(init: &[u8]) -> Result<u64> {
@@ -709,6 +779,15 @@ mod tests {
 		}
 	}
 
+	/// A frame that opens a group. Every group starts with a keyframe, so this is what
+	/// the far side of a group boundary looks like to `infer_missing_durations`.
+	fn group_start(timestamp_us: u64) -> Frame {
+		Frame {
+			keyframe: true,
+			..frame(timestamp_us, None)
+		}
+	}
+
 	#[test]
 	fn infer_missing_durations_uses_default_for_trailing_sample() {
 		let frames = infer_missing_durations(
@@ -738,6 +817,91 @@ mod tests {
 
 		assert_eq!(frames[0].duration, Some(ts(41_667)));
 		assert_eq!(fragment_seconds(&frames, Duration::from_millis(33)), 0.041667);
+	}
+
+	/// The regression for moq-dev/moq.pro#814: a subscriber that got a stale cached group
+	/// and then jumped to live sees a huge gap across the boundary. That gap is a
+	/// discontinuity, not a duration, so the frame before it must NOT swallow it -- it
+	/// takes `default_frame` and the fragment stays one frame long.
+	#[test]
+	fn infer_stops_at_a_group_boundary() {
+		let next_group = group_start(2_405_070_000);
+		let frames = infer_missing_durations(vec![frame(63_244, None)], Some(&next_group), Duration::from_millis(33));
+
+		assert_eq!(frames[0].duration, Some(ts(33_000)));
+		assert_eq!(fragment_seconds(&frames, Duration::from_millis(33)), 0.033);
+	}
+
+	/// Audio never rolls a fragment on a keyframe, so its buffer can span whole groups.
+	/// The boundary is then interior to `frames`, and bounds the frame before it just
+	/// the same.
+	#[test]
+	fn infer_stops_at_an_interior_group_boundary() {
+		let frames = infer_missing_durations(
+			vec![frame(0, None), frame(21_333, None), group_start(600_000_000)],
+			None,
+			Duration::from_millis(21),
+		);
+
+		assert_eq!(frames[0].duration, Some(ts(21_333)), "same group, real delta");
+		assert_eq!(frames[1].duration, Some(ts(21_000)), "bounded by the next group");
+		assert_eq!(frames[2].duration, Some(ts(21_000)), "nothing after it at all");
+	}
+
+	/// The duration cap splits a GOP across fragments, so the successor is a delta frame
+	/// in the SAME group. That one is a real bound and is still used.
+	#[test]
+	fn infer_crosses_a_mid_group_fragment_boundary() {
+		let successor = frame(83_334, None);
+		let frames = infer_missing_durations(vec![frame(41_667, None)], Some(&successor), Duration::from_millis(33));
+
+		assert_eq!(frames[0].duration, Some(ts(41_667)));
+	}
+
+	/// The HLS fetch origin concatenates a segment's groups, and for audio those are often
+	/// one packet each -- so EVERY packet sits at a boundary and none of them may be timed
+	/// by the next. Opus states its own duration, which is what keeps that exact instead of
+	/// dropping each packet onto the ~21.3 ms `1024/sample_rate` fallback.
+	#[test]
+	fn codec_durations_keep_one_packet_groups_exact() {
+		// 20 ms of 48 kHz stereo Opus: TOC config 15 (SILK/WB 20 ms), one frame.
+		let packet = Bytes::from_static(&[0x78, 0x00, 0x00, 0x00]);
+		let mut frames: Vec<Frame> = (0..3)
+			.map(|i| Frame {
+				payload: packet.clone(),
+				..group_start(i * 20_000)
+			})
+			.collect();
+
+		apply_codec_durations(&mut frames, true);
+		let frames = infer_missing_durations(frames, None, Duration::from_micros(21_333));
+
+		for f in &frames {
+			assert_eq!(
+				f.duration.unwrap().as_micros(),
+				20_000,
+				"TOC duration, not the fallback"
+			);
+		}
+	}
+
+	/// A rewind across a group boundary bounds nothing here, so it must not veto
+	/// inference for the frames that do have an in-group successor.
+	#[test]
+	fn infer_ignores_a_rewound_group_boundary() {
+		let next_group = group_start(0);
+		let frames = infer_missing_durations(
+			vec![frame(1_000_000, None), frame(1_033_000, None)],
+			Some(&next_group),
+			Duration::from_millis(50),
+		);
+
+		assert_eq!(
+			frames[0].duration,
+			Some(ts(33_000)),
+			"in-group delta survives the rewind"
+		);
+		assert_eq!(frames[1].duration, Some(ts(50_000)), "last in group falls back");
 	}
 
 	#[test]

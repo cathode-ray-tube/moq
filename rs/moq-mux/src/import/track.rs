@@ -32,7 +32,7 @@ fn build_h264_avc3<E: CatalogExt>(
 	init: &[u8],
 	hint: VideoHint,
 ) -> Result<(crate::codec::h264::Split, crate::codec::h264::Import<E>)> {
-	let mut import = crate::codec::h264::Import::new(track, reserved, hint);
+	let mut import = crate::codec::h264::Import::new(track, reserved, hint)?;
 	import.initialize(init)?;
 	let mut split = crate::codec::h264::Split::new();
 	let frames = split.decode(init, None)?;
@@ -49,7 +49,7 @@ fn build_h264_avc1<E: CatalogExt>(
 	init: &[u8],
 	hint: VideoHint,
 ) -> Result<(usize, crate::codec::h264::Import<E>)> {
-	let mut import = crate::codec::h264::Import::new(track, reserved, hint);
+	let mut import = crate::codec::h264::Import::new(track, reserved, hint)?;
 	import.initialize(init)?;
 	let length_size = crate::codec::h264::Avcc::parse(init)?.length_size;
 	Ok((length_size, import))
@@ -62,12 +62,27 @@ fn build_h265<E: CatalogExt>(
 	init: &[u8],
 	hint: VideoHint,
 ) -> Result<(crate::codec::h265::Split, crate::codec::h265::Import<E>)> {
-	let mut import = crate::codec::h265::Import::new(track, reserved, hint);
+	let mut import = crate::codec::h265::Import::new(track, reserved, hint)?;
 	import.initialize(init)?;
 	let mut split = crate::codec::h265::Split::new();
 	let frames = split.decode(init, None)?;
 	import.decode(frames)?;
 	Ok((split, import))
+}
+
+/// Build an H.265 hvc1 import, resolving the config and the NALU length size from
+/// the hvcC. hvc1 has no splitter: each access unit is wrapped directly via
+/// [`crate::codec::h265::hvc1_frame`].
+fn build_h265_hvc1<E: CatalogExt>(
+	track: moq_net::track::Producer,
+	reserved: crate::catalog::Reserved<E>,
+	init: &[u8],
+	hint: VideoHint,
+) -> Result<(usize, crate::codec::h265::Import<E>)> {
+	let mut import = crate::codec::h265::Import::new(track, reserved, hint)?;
+	import.initialize(init)?;
+	let length_size = crate::codec::h265::Hvcc::parse(init)?.length_size;
+	Ok((length_size, import))
 }
 
 /// Build an AV1 split + import pair.
@@ -77,7 +92,7 @@ fn build_av1<E: CatalogExt>(
 	init: &[u8],
 	hint: VideoHint,
 ) -> Result<(crate::codec::av1::Split, crate::codec::av1::Import<E>)> {
-	let mut import = crate::codec::av1::Import::new(track, reserved, hint);
+	let mut import = crate::codec::av1::Import::new(track, reserved, hint)?;
 	import.initialize(init)?;
 	let mut split = crate::codec::av1::Split::new();
 	// av1C (leading 0x81, ISO/IEC 14496-15) is an out-of-band config record, not an
@@ -110,6 +125,13 @@ enum TrackKind<E: CatalogExt = ()> {
 		split: crate::codec::h265::Split,
 		import: crate::codec::h265::Import<E>,
 	},
+	/// H.265 hvc1 (length-prefixed NALU, out-of-band hvcC). No splitter: each
+	/// access unit is wrapped directly. `length_size` is the NALU length prefix
+	/// width read from the hvcC.
+	Hvc1 {
+		length_size: usize,
+		import: crate::codec::h265::Import<E>,
+	},
 	Av01 {
 		split: crate::codec::av1::Split,
 		import: crate::codec::av1::Import<E>,
@@ -127,6 +149,12 @@ enum TrackKind<E: CatalogExt = ()> {
 /// Use this when the caller already has whole frames (the typical case for files
 /// and reassembled network input). Each [`decode`](Self::decode) call takes one
 /// complete frame.
+///
+/// Audio is independently decodable per frame, so this cuts a group after each audio frame (one
+/// group, one QUIC stream, forwarded without waiting); video groups by its own keyframes. For
+/// multi-frame audio groups (aligning to a segment cadence), drive a codec importer (e.g.
+/// [`codec::opus::Import`](crate::codec::opus::Import)) directly and bound groups with its `cut` /
+/// `seek` rather than going through this facade.
 pub struct Track<E: CatalogExt = ()> {
 	kind: TrackKind<E>,
 }
@@ -156,6 +184,10 @@ impl<E: CatalogExt> Track<E> {
 				let (split, import) = build_h264_avc3(track, reserved, data, video_hint(&init, None))?;
 				TrackKind::Avc3 { split, import }
 			}
+			"hvc1" | "hvcc" => {
+				let (length_size, import) = build_h265_hvc1(track, reserved, data, video_hint(&init, None))?;
+				TrackKind::Hvc1 { length_size, import }
+			}
 			"hev1" => {
 				let (split, import) = build_h265(track, reserved, data, video_hint(&init, None))?;
 				TrackKind::Hev1 { split, import }
@@ -166,12 +198,12 @@ impl<E: CatalogExt> Track<E> {
 			}
 			"vp8" | "vp08" => {
 				let mut import =
-					crate::codec::vp8::Import::new(track, reserved, video_hint(&init, Some(VideoCodec::VP8)));
+					crate::codec::vp8::Import::new(track, reserved, video_hint(&init, Some(VideoCodec::VP8)))?;
 				import.initialize(data)?;
 				TrackKind::Vp8(import)
 			}
 			"vp9" | "vp09" => {
-				let mut import = crate::codec::vp9::Import::new(track, reserved, video_hint(&init, None));
+				let mut import = crate::codec::vp9::Import::new(track, reserved, video_hint(&init, None))?;
 				import.initialize(data)?;
 				TrackKind::Vp9(import)
 			}
@@ -179,20 +211,20 @@ impl<E: CatalogExt> Track<E> {
 			// OpusHead, AudioSpecificConfig, ...); `codec::config` errors when they're missing or bad.
 			"aac" => {
 				let config = crate::codec::aac::config(data)?;
-				TrackKind::Aac(crate::codec::aac::Import::new(track, reserved, config))
+				TrackKind::Aac(crate::codec::aac::Import::new(track, reserved, config)?)
 			}
 			"opus" => {
 				let config = crate::codec::opus::config(data)?;
-				TrackKind::Opus(crate::codec::opus::Import::new(track, reserved, config))
+				TrackKind::Opus(crate::codec::opus::Import::new(track, reserved, config)?)
 			}
 			"flac" => {
 				// `data` is a FLAC header: the `fLaC` marker plus the STREAMINFO block.
 				let config = crate::codec::flac::config(data)?;
-				TrackKind::Flac(crate::codec::flac::Import::new(track, reserved, config))
+				TrackKind::Flac(crate::codec::flac::Import::new(track, reserved, config)?)
 			}
 			"mp3" => {
 				let config = crate::codec::mp3::config(data)?;
-				TrackKind::Mp3(crate::codec::mp3::Import::new(track, reserved, config))
+				TrackKind::Mp3(crate::codec::mp3::Import::new(track, reserved, config)?)
 			}
 			_ => return Err(crate::Error::UnknownFormat(init.format)),
 		};
@@ -229,6 +261,14 @@ impl<E: CatalogExt> Track<E> {
 				frames.extend(split.flush(pts)?);
 				import.decode(frames)?;
 			}
+			TrackKind::Hvc1 {
+				length_size,
+				ref mut import,
+			} => {
+				let pts = pts.ok_or(crate::codec::h265::Error::MissingTimestamp)?;
+				let frame = crate::codec::h265::hvc1_frame(frame, length_size, pts)?;
+				import.decode([frame])?;
+			}
 			TrackKind::Av01 {
 				ref mut split,
 				ref mut import,
@@ -239,10 +279,24 @@ impl<E: CatalogExt> Track<E> {
 			}
 			TrackKind::Vp8(ref mut import) => import.decode(frame, pts)?,
 			TrackKind::Vp9(ref mut import) => import.decode(frame, pts)?,
-			TrackKind::Aac(ref mut import) => import.decode(frame, pts)?,
-			TrackKind::Opus(ref mut import) => import.decode(frame, pts)?,
-			TrackKind::Mp3(ref mut import) => import.decode(frame, pts)?,
-			TrackKind::Flac(ref mut import) => import.decode(frame, pts)?,
+			// Audio: one group (one QUIC stream) per frame, so the relay forwards each without
+			// waiting. A caller wanting multi-frame audio groups drives a codec importer directly.
+			TrackKind::Aac(ref mut import) => {
+				import.decode(frame, pts)?;
+				import.cut(None)?;
+			}
+			TrackKind::Opus(ref mut import) => {
+				import.decode(frame, pts)?;
+				import.cut(None)?;
+			}
+			TrackKind::Mp3(ref mut import) => {
+				import.decode(frame, pts)?;
+				import.cut(None)?;
+			}
+			TrackKind::Flac(ref mut import) => {
+				import.decode(frame, pts)?;
+				import.cut(None)?;
+			}
 		}
 
 		Ok(())
@@ -254,6 +308,7 @@ impl<E: CatalogExt> Track<E> {
 			TrackKind::Avc3 { ref mut import, .. } => import.finish(),
 			TrackKind::Avc1 { ref mut import, .. } => import.finish(),
 			TrackKind::Hev1 { ref mut import, .. } => import.finish(),
+			TrackKind::Hvc1 { ref mut import, .. } => import.finish(),
 			TrackKind::Av01 { ref mut import, .. } => import.finish(),
 			TrackKind::Vp8(ref mut import) => import.finish(),
 			TrackKind::Vp9(ref mut import) => import.finish(),
@@ -265,19 +320,20 @@ impl<E: CatalogExt> Track<E> {
 	}
 
 	/// Abort the track with `err` instead of finishing it cleanly, so subscribers
-	/// see the real cause rather than [`moq_net::Error::Dropped`].
-	pub fn abort(&mut self, err: moq_net::Error) {
+	/// see the real cause rather than [`moq_net::Error::Dropped`]. Consumes the importer.
+	pub fn abort(self, err: moq_net::Error) {
 		match self.kind {
-			TrackKind::Avc3 { ref mut import, .. } => import.abort(err),
-			TrackKind::Avc1 { ref mut import, .. } => import.abort(err),
-			TrackKind::Hev1 { ref mut import, .. } => import.abort(err),
-			TrackKind::Av01 { ref mut import, .. } => import.abort(err),
-			TrackKind::Vp8(ref mut import) => import.abort(err),
-			TrackKind::Vp9(ref mut import) => import.abort(err),
-			TrackKind::Aac(ref mut import) => import.abort(err),
-			TrackKind::Opus(ref mut import) => import.abort(err),
-			TrackKind::Mp3(ref mut import) => import.abort(err),
-			TrackKind::Flac(ref mut import) => import.abort(err),
+			TrackKind::Avc3 { import, .. } => import.abort(err),
+			TrackKind::Avc1 { import, .. } => import.abort(err),
+			TrackKind::Hev1 { import, .. } => import.abort(err),
+			TrackKind::Hvc1 { import, .. } => import.abort(err),
+			TrackKind::Av01 { import, .. } => import.abort(err),
+			TrackKind::Vp8(import) => import.abort(err),
+			TrackKind::Vp9(import) => import.abort(err),
+			TrackKind::Aac(import) => import.abort(err),
+			TrackKind::Opus(import) => import.abort(err),
+			TrackKind::Mp3(import) => import.abort(err),
+			TrackKind::Flac(import) => import.abort(err),
 		}
 	}
 
@@ -287,6 +343,7 @@ impl<E: CatalogExt> Track<E> {
 			TrackKind::Avc3 { ref mut import, .. } => import.cut(end),
 			TrackKind::Avc1 { ref mut import, .. } => import.cut(end),
 			TrackKind::Hev1 { ref mut import, .. } => import.cut(end),
+			TrackKind::Hvc1 { ref mut import, .. } => import.cut(end),
 			TrackKind::Av01 { ref mut import, .. } => import.cut(end),
 			TrackKind::Vp8(ref mut import) => import.cut(end),
 			TrackKind::Vp9(ref mut import) => import.cut(end),
@@ -315,6 +372,7 @@ impl<E: CatalogExt> Track<E> {
 				split.reset();
 				import.seek(sequence)
 			}
+			TrackKind::Hvc1 { ref mut import, .. } => import.seek(sequence),
 			TrackKind::Av01 {
 				ref mut split,
 				ref mut import,
@@ -337,6 +395,7 @@ impl<E: CatalogExt> Track<E> {
 			TrackKind::Avc3 { ref import, .. } => import.demand(),
 			TrackKind::Avc1 { ref import, .. } => import.demand(),
 			TrackKind::Hev1 { ref import, .. } => import.demand(),
+			TrackKind::Hvc1 { ref import, .. } => import.demand(),
 			TrackKind::Av01 { ref import, .. } => import.demand(),
 			TrackKind::Vp8(ref import) => import.demand(),
 			TrackKind::Vp9(ref import) => import.demand(),
@@ -423,15 +482,15 @@ impl<E: CatalogExt> TrackStream<E> {
 		let kind = match init.format.as_str() {
 			"avc3" | "h264" => TrackStreamKind::Avc3 {
 				split: crate::codec::h264::Split::new(),
-				import: crate::codec::h264::Import::new(track, reserved, hint),
+				import: crate::codec::h264::Import::new(track, reserved, hint)?,
 			},
 			"hev1" => TrackStreamKind::Hev1 {
 				split: crate::codec::h265::Split::new(),
-				import: crate::codec::h265::Import::new(track, reserved, hint),
+				import: crate::codec::h265::Import::new(track, reserved, hint)?,
 			},
 			"av01" | "av1" | "av1c" | "av1C" => TrackStreamKind::Av01 {
 				split: crate::codec::av1::Split::new(),
-				import: crate::codec::av1::Import::new(track, reserved, hint),
+				import: crate::codec::av1::Import::new(track, reserved, hint)?,
 			},
 			_ => return Err(crate::Error::UnknownFormat(init.format)),
 		};
@@ -541,12 +600,12 @@ impl<E: CatalogExt> TrackStream<E> {
 	}
 
 	/// Abort the track with `err` instead of finishing it cleanly, so subscribers
-	/// see the real cause rather than [`moq_net::Error::Dropped`].
-	pub fn abort(&mut self, err: moq_net::Error) {
+	/// see the real cause rather than [`moq_net::Error::Dropped`]. Consumes the importer.
+	pub fn abort(self, err: moq_net::Error) {
 		match self.kind {
-			TrackStreamKind::Avc3 { ref mut import, .. } => import.abort(err),
-			TrackStreamKind::Hev1 { ref mut import, .. } => import.abort(err),
-			TrackStreamKind::Av01 { ref mut import, .. } => import.abort(err),
+			TrackStreamKind::Avc3 { import, .. } => import.abort(err),
+			TrackStreamKind::Hev1 { import, .. } => import.abort(err),
+			TrackStreamKind::Av01 { import, .. } => import.abort(err),
 		}
 	}
 
@@ -707,11 +766,8 @@ mod tests {
 		let track = broadcast.create_track("audio", hang::container::track_info()).unwrap();
 		let subscriber = track.subscribe(None);
 
-		let config = crate::codec::opus::Config {
-			sample_rate: 48_000,
-			channel_count: 2,
-		};
-		let mut import = crate::codec::opus::Import::new(track, catalog.reserve(), config.into());
+		let config = crate::codec::opus::Config::new(48_000, 2);
+		let mut import = crate::codec::opus::Import::new(track, catalog.reserve(), config.into()).unwrap();
 		assert!(catalog.snapshot().audio.renditions.contains_key("audio"));
 
 		let mut media = crate::container::Consumer::new(subscriber, crate::catalog::hang::Container::Legacy);
@@ -730,6 +786,99 @@ mod tests {
 		assert_eq!(frame.timestamp, Timestamp::from_micros(1_000).unwrap());
 
 		import.finish().unwrap();
+	}
+
+	/// Count the frames in each group of a finished track.
+	async fn collect_groups(mut subscriber: moq_net::track::Subscriber) -> Vec<usize> {
+		let mut groups = Vec::new();
+		while let Some(mut group) = subscriber.recv_group().await.unwrap() {
+			let mut count = 0;
+			while group.next_frame().await.unwrap().is_some() {
+				count += 1;
+			}
+			groups.push(count);
+		}
+		groups
+	}
+
+	fn opus_import(
+		broadcast: &mut moq_net::broadcast::Producer,
+		catalog: &crate::catalog::Producer,
+	) -> (crate::codec::opus::Import, moq_net::track::Subscriber) {
+		let track = broadcast.create_track("audio", hang::container::track_info()).unwrap();
+		let subscriber = track.subscribe(None);
+		let config = crate::codec::opus::Config::new(48_000, 2);
+		let import = crate::codec::opus::Import::new(track, catalog.reserve(), config.into()).unwrap();
+		(import, subscriber)
+	}
+
+	/// The facade cuts a group after each audio frame: one group (one QUIC stream) per packet, so the
+	/// relay forwards it without waiting for the next.
+	#[tokio::test(start_paused = true)]
+	async fn audio_cuts_a_group_per_frame() {
+		let (mut broadcast, catalog) = new_broadcast();
+		let (import, subscriber) = opus_import(&mut broadcast, &catalog);
+		let mut import: Track = import.into();
+
+		import.decode(b"a", Some(Timestamp::from_micros(0).unwrap())).unwrap();
+		import
+			.decode(b"b", Some(Timestamp::from_micros(10_000).unwrap()))
+			.unwrap();
+		import
+			.decode(b"c", Some(Timestamp::from_micros(20_000).unwrap()))
+			.unwrap();
+		import.finish().unwrap();
+
+		assert_eq!(collect_groups(subscriber).await, vec![1, 1, 1]);
+	}
+
+	/// Driven directly (not through the facade), the codec importer accumulates audio frames into the
+	/// current group until an explicit `seek`/`cut`, marking only the first frame of each group a
+	/// keyframe. This is how a caller drives its own audio grouping.
+	#[tokio::test(start_paused = true)]
+	async fn codec_import_accumulates_until_boundary() {
+		let (mut broadcast, catalog) = new_broadcast();
+		let (mut import, subscriber) = opus_import(&mut broadcast, &catalog);
+
+		import.decode(b"a", Some(Timestamp::from_micros(0).unwrap())).unwrap();
+		import
+			.decode(b"b", Some(Timestamp::from_micros(10_000).unwrap()))
+			.unwrap();
+		import.seek(1).unwrap();
+		import
+			.decode(b"c", Some(Timestamp::from_micros(20_000).unwrap()))
+			.unwrap();
+		import.finish().unwrap();
+
+		assert_eq!(collect_groups(subscriber).await, vec![2, 1]);
+	}
+
+	/// A caller-provided `cut(Some(end))` boundary reaches the bitrate estimator: it finalizes the
+	/// pending window at `end` so the caller's segment cut is measured. Without it the last window
+	/// stays open, the 1s averaging window never closes, and no bitrate is detected. Regression for
+	/// the metrics hole in caller-driven grouping (a bare `cut(None)` stays neutral by design).
+	#[tokio::test(start_paused = true)]
+	async fn explicit_cut_finalizes_bitrate_at_boundary() {
+		let (mut broadcast, catalog) = new_broadcast();
+		let (mut import, _subscriber) = opus_import(&mut broadcast, &catalog);
+
+		// A full second of audio, then an explicit boundary at 1s. The estimator averages bitrate
+		// over a 1s window, so it's the boundary that closes the final packet's window and carries
+		// the accumulated duration to the reporting threshold.
+		let payload = vec![0u8; 4_000];
+		for us in [0u64, 250_000, 500_000, 750_000] {
+			import
+				.decode(&payload, Some(Timestamp::from_micros(us).unwrap()))
+				.unwrap();
+		}
+		import.cut(Some(Timestamp::from_micros(1_000_000).unwrap())).unwrap();
+		import.finish().unwrap();
+
+		let audio = catalog.snapshot().audio.renditions.get("audio").cloned().unwrap();
+		assert!(
+			audio.bitrate.is_some(),
+			"an explicit cut boundary should finalize the bitrate window"
+		);
 	}
 
 	#[tokio::test(start_paused = true)]
@@ -802,5 +951,58 @@ mod tests {
 
 		let video = catalog.snapshot().video.renditions.get("video").cloned().unwrap();
 		assert_eq!(video.codec.to_string(), "vp8");
+	}
+
+	/// hvc1 publishes the catalog up front from the out-of-band hvcC: dimensions
+	/// from the parsed SPS and the record itself as the `description`.
+	#[tokio::test(start_paused = true)]
+	async fn existing_track_hvc1_uses_existing_name_in_catalog() {
+		let hvcc = crate::codec::h265::fixtures::hvcc();
+		let (mut broadcast, catalog) = new_broadcast();
+		let request = broadcast.reserve_track("camera").unwrap();
+
+		let import = Track::new(request, catalog.reserve(), Init::new("hvc1", hvcc.clone())).unwrap();
+
+		assert_eq!(import.name(), "camera");
+		let snapshot = catalog.snapshot();
+		let video = snapshot.video.renditions.get("camera").unwrap();
+		assert_eq!(video.coded_width, Some(1280));
+		assert_eq!(video.coded_height, Some(720));
+		assert_eq!(video.description.as_deref(), Some(hvcc.as_ref()));
+	}
+
+	/// hvc1: a length-prefixed keyframe access unit is delivered verbatim with the
+	/// keyframe flag set. The payload stays length-prefixed on the wire, matching
+	/// the out-of-band description the catalog advertises.
+	#[tokio::test(start_paused = true)]
+	async fn hvc1_track_delivers_length_prefixed_keyframe() {
+		let hvcc = crate::codec::h265::fixtures::hvcc();
+		let (mut broadcast, catalog) = new_broadcast();
+		let consumer = broadcast.consume();
+		let request = broadcast.reserve_track("video").unwrap();
+		let mut import = Track::new(request, catalog.reserve(), Init::new("hvc1", hvcc)).unwrap();
+
+		let track = consumer.track("video").unwrap().subscribe(None).await.unwrap();
+		let mut media = crate::container::Consumer::new(track, crate::catalog::hang::Container::Legacy);
+
+		let idr: &[u8] = &[0x26, 0x01, 0x80, 0xaa]; // IdrWRadl (19)
+		let mut au = Vec::new();
+		au.extend_from_slice(&(idr.len() as u32).to_be_bytes());
+		au.extend_from_slice(idr);
+
+		import
+			.decode(&au, Some(Timestamp::from_micros(1_000).unwrap()))
+			.unwrap();
+
+		let frame = tokio::time::timeout(Duration::from_secs(1), media.read())
+			.await
+			.unwrap()
+			.unwrap()
+			.unwrap();
+		assert!(frame.keyframe, "an IDR access unit must open a group");
+		assert_eq!(frame.payload, au, "the payload must pass through verbatim");
+		assert_eq!(frame.timestamp, Timestamp::from_micros(1_000).unwrap());
+
+		import.finish().unwrap();
 	}
 }

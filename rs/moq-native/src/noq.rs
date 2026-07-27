@@ -1,6 +1,7 @@
 //! The noq QUIC backend, used for both WebTransport (`https://`) and raw QUIC (`moqt://`, `moql://`).
 
 use crate::client::ClientConfig;
+use crate::quic::CongestionControl;
 use crate::quic::Resolved;
 use crate::quic::ServerId;
 use crate::server::ServerConfig;
@@ -14,8 +15,31 @@ use web_transport_noq::noq;
 
 pub use web_transport_noq;
 
+/// Attach a qlog factory writing into the configured directory, if any.
+///
+/// noq's factory opens one file per connection, named after its initial destination
+/// connection ID, so nothing needs to be unique per endpoint here.
+fn apply_qlog(transport: &mut noq::TransportConfig, quic: &Resolved, role: &str) -> Result<()> {
+	// `Client::validate` already rejected a directory this build can't honor, so the
+	// block below is only reached where capture actually works.
+	let Some(dir) = quic.qlog_dir() else {
+		return Ok(());
+	};
+
+	#[cfg(feature = "qlog")]
+	{
+		transport.qlog_from_path(dir, &format!("moq-{role}"));
+		tracing::info!(dir = %dir.display(), "writing qlog");
+	}
+
+	#[cfg(not(feature = "qlog"))]
+	let _ = (transport, dir, role);
+
+	Ok(())
+}
+
 /// Apply the resolved quic knobs to a noq transport config.
-fn apply_transport(transport: &mut noq::TransportConfig, quic: Resolved) {
+fn apply_transport(transport: &mut noq::TransportConfig, quic: &Resolved) {
 	transport.max_idle_timeout(Some(quic.idle_timeout.try_into().expect("idle timeout out of range")));
 	transport.keep_alive_interval(quic.keep_alive);
 
@@ -30,6 +54,26 @@ fn apply_transport(transport: &mut noq::TransportConfig, quic: Resolved) {
 
 	if let Some(gso) = quic.gso {
 		transport.enable_segmentation_offload(gso);
+	}
+
+	transport.congestion_controller_factory(congestion_factory(congestion_control(quic)));
+}
+
+/// The congestion control family to install, defaulting to loss-based.
+///
+/// Unlike the other backends we don't default to BBR here: noq's BBRv3 subtracts
+/// without a floor when computing the inflight bytes at the loss event, so a single
+/// packet loss can underflow and panic, taking the whole process with it. Delay-based
+/// stays reachable, but only when an operator asks for it by name.
+fn congestion_control(quic: &Resolved) -> CongestionControl {
+	quic.congestion_control.unwrap_or(CongestionControl::Loss)
+}
+
+/// The noq controller factory for a congestion control family. noq's BBR is v3.
+fn congestion_factory(family: CongestionControl) -> Arc<dyn noq::congestion::ControllerFactory + Send + Sync> {
+	match family {
+		CongestionControl::Loss => Arc::new(noq::congestion::CubicConfig::default()),
+		CongestionControl::Delay => Arc::new(noq::congestion::Bbr3Config::default()),
 	}
 }
 
@@ -185,8 +229,9 @@ impl NoqClient {
 		let socket = crate::bind::udp(config.bind).map_err(Error::BindSocket)?;
 
 		let mut transport = noq::TransportConfig::default();
-		transport.congestion_controller_factory(Arc::new(noq::congestion::Bbr3Config::default()));
-		apply_transport(&mut transport, config.quic.resolve());
+		let quic = config.quic.resolve();
+		apply_transport(&mut transport, &quic);
+		apply_qlog(&mut transport, &quic, "client")?;
 		let transport = Arc::new(transport);
 
 		// There's a bit more boilerplate to make a generic endpoint.
@@ -363,8 +408,9 @@ pub(crate) struct NoqServer {
 impl NoqServer {
 	pub fn new(config: ServerConfig) -> Result<Self> {
 		let mut transport = noq::TransportConfig::default();
-		transport.congestion_controller_factory(Arc::new(noq::congestion::Bbr3Config::default()));
-		apply_transport(&mut transport, config.quic.resolve());
+		let quic = config.quic.resolve();
+		apply_transport(&mut transport, &quic);
+		apply_qlog(&mut transport, &quic, "server")?;
 		let transport = Arc::new(transport);
 
 		let provider = crate::crypto::provider();
@@ -587,5 +633,36 @@ impl noq::ConnectionIdGenerator for ServerIdGenerator {
 
 	fn cid_lifetime(&self) -> Option<Duration> {
 		None
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// Build a controller from each family's factory and downcast it to the
+	/// concrete noq implementation it must map to.
+	#[test]
+	fn congestion_factory_maps_each_family() {
+		let now = std::time::Instant::now();
+		let mtu = 1200;
+
+		let loss = congestion_factory(CongestionControl::Loss).build(now, mtu);
+		assert!(loss.into_any().downcast::<noq::congestion::Cubic>().is_ok());
+
+		let delay = congestion_factory(CongestionControl::Delay).build(now, mtu);
+		assert!(delay.into_any().downcast::<noq::congestion::Bbr3>().is_ok());
+	}
+
+	/// noq's BBRv3 panics on loss, so an unset knob must land on CUBIC here even
+	/// though every other backend defaults to BBR.
+	#[test]
+	fn congestion_control_defaults_to_loss() {
+		let mut quic = crate::quic::Client::default();
+		assert_eq!(congestion_control(&quic.resolve()), CongestionControl::Loss);
+
+		// An explicit request still gets through.
+		quic.congestion_control = Some(CongestionControl::Delay);
+		assert_eq!(congestion_control(&quic.resolve()), CongestionControl::Delay);
 	}
 }

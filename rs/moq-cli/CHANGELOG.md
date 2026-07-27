@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3](https://github.com/moq-dev/moq/compare/moq-cli-v0.9.2...moq-cli-v0.9.3) - 2026-07-25
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.9.2](https://github.com/moq-dev/moq/compare/moq-cli-v0.9.1...moq-cli-v0.9.2) - 2026-07-24
+
+### Added
+
+- *(capture)* enumerate Linux and Windows sources ([#2486](https://github.com/moq-dev/moq/pull/2486))
+- *(native)* expose a qlog feature on moq-relay and moq-cli ([#2470](https://github.com/moq-dev/moq/pull/2470))
+
+## [0.9.1](https://github.com/moq-dev/moq/compare/moq-cli-v0.9.0...moq-cli-v0.9.1) - 2026-07-23
+
+### Other
+
+- *(rust)* pin the toolchain and correct the MSRV claims ([#2462](https://github.com/moq-dev/moq/pull/2462))
+
+## [0.9.0](https://github.com/moq-dev/moq/compare/moq-cli-v0.8.7...moq-cli-v0.9.0) - 2026-07-22
+
+### Fixed
+
+- [**breaking**] correct catalog, timeline, token, and teardown contracts found in API review ([#2439](https://github.com/moq-dev/moq/pull/2439))
+
+### Other
+
+- [**breaking**] pre-bump API polish across the release batch ([#2423](https://github.com/moq-dev/moq/pull/2423))
+- *(net)* [**breaking**] route everything through create_broadcast, gate announce on Route.live ([#2396](https://github.com/moq-dev/moq/pull/2396))
+- Merge branch 'main' into dev
+
 ## [0.8.7](https://github.com/moq-dev/moq/compare/moq-cli-v0.8.6...moq-cli-v0.8.7) - 2026-07-18
 
 ### Other

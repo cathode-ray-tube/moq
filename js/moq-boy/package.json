@@ -1,7 +1,7 @@
 {
 	"name": "@moq/boy",
 	"type": "module",
-	"version": "0.2.14",
+	"version": "0.3.0",
 	"jsr": false,
 	"description": "MoQ Boy - Crowd-controlled Game Boy streaming via MoQ",
 	"license": "(MIT OR Apache-2.0)",
@@ -37,6 +37,6 @@
 		"solid-js": "^1.9.14",
 		"typescript": "7.0.2",
 		"vite": "^8.1.4",
-		"vite-plugin-solid": "^2.11.12"
+		"vite-plugin-solid": "^2.11.13"
 	}
 }

@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.12...moq-audio-v0.0.13) - 2026-07-25
+
+### Added
+
+- *(moq-mux)* caller-driven audio grouping via dumb importers ([#2496](https://github.com/moq-dev/moq/pull/2496))
+- *(moq-audio)* add PCM codec ([#2493](https://github.com/moq-dev/moq/pull/2493))
+
+### Fixed
+
+- *(moq-audio)* bound capture buffer queue ([#2487](https://github.com/moq-dev/moq/pull/2487))
+- *(opus)* propagate pre-skip and encoder controls ([#2492](https://github.com/moq-dev/moq/pull/2492))
+
+## [0.0.12](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.11...moq-audio-v0.0.12) - 2026-07-24
+
+### Added
+
+- *(moq-mux,moq-boy)* mark discontinuities, and never time a sample across one ([#2475](https://github.com/moq-dev/moq/pull/2475))
+
+## [0.0.11](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.10...moq-audio-v0.0.11) - 2026-07-23
+
+### Other
+
+- *(rust)* pin the toolchain and correct the MSRV claims ([#2462](https://github.com/moq-dev/moq/pull/2462))
+
+## [0.0.10](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.9...moq-audio-v0.0.10) - 2026-07-22
+
+### Fixed
+
+- [**breaking**] correct catalog, timeline, token, and teardown contracts found in API review ([#2439](https://github.com/moq-dev/moq/pull/2439))
+
+### Other
+
+- *(mux)* [**breaking**] unseal catalog renditions and make timelines explicit/shareable ([#2420](https://github.com/moq-dev/moq/pull/2420))
+- compile doc examples across the workspace ([#2421](https://github.com/moq-dev/moq/pull/2421))
+- Merge remote-tracking branch 'origin/main' into dev
+- *(deps)* bump the cargo group with 2 updates ([#2409](https://github.com/moq-dev/moq/pull/2409))
+
 ## [0.0.9](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.8...moq-audio-v0.0.9) - 2026-07-16
 
 ### Added

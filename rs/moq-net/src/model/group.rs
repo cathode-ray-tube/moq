@@ -10,7 +10,7 @@
 //! The stream is closed with [Error] when all writers or readers are dropped.
 use crate::cache;
 use crate::frame::{self, Frame, FrameBuf};
-use crate::{Timescale, track};
+use crate::{Timescale, stats, track};
 use std::collections::VecDeque;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
@@ -105,8 +105,9 @@ pub(crate) struct GroupState {
 	// pool can evict the least-recently-read groups under memory pressure.
 	charge: cache::Charge,
 
-	// Whether the group has been finalized (no more frames).
-	pub(crate) fin: bool,
+	// Once finalized, the total number of frames the group will ever contain. Recorded
+	// at finish so the count outlives an abort that clears the cache.
+	pub(crate) fin: Option<usize>,
 
 	// The error that caused the group to be aborted, if any.
 	pub(crate) abort: Option<Error>,
@@ -138,25 +139,32 @@ impl GroupState {
 			};
 			return Poll::Ready(Ok(Some((info, frame::Source::Partial(p.buf.clone())))));
 		}
-		// `abort` is checked before `fin`: an evicted group is both finished and
-		// aborted with its frames cleared, and the reader must see the abort rather
-		// than a clean end-of-group at the wrong index.
-		if let Some(err) = &self.abort {
-			return Poll::Ready(Err(err.clone()));
+		ready!(self.poll_terminal(index))?;
+		Poll::Ready(Ok(None))
+	}
+
+	/// Resolve the group's terminal state for a reader positioned at `index`.
+	///
+	/// A finished group is still aborted once its frames are released to free memory
+	/// (aged out of the track's latency window, or evicted by the cache pool). A reader
+	/// that already consumed every frame is missing nothing, so it gets the clean end of
+	/// group; one that fell short sees the abort rather than a silently truncated stream.
+	fn poll_terminal(&self, index: usize) -> Poll<Result<()>> {
+		match (self.fin, &self.abort) {
+			(Some(total), Some(err)) if index < total => Poll::Ready(Err(err.clone())),
+			(Some(_), _) => Poll::Ready(Ok(())),
+			(None, Some(err)) => Poll::Ready(Err(err.clone())),
+			(None, None) => Poll::Pending,
 		}
-		if self.fin {
-			return Poll::Ready(Ok(None));
-		}
-		Poll::Pending
 	}
 
 	fn poll_finished(&self) -> Poll<Result<u64>> {
-		if let Some(err) = &self.abort {
-			// Checked before `fin`: an evicted group is both finished and aborted,
-			// and its cleared frames would report a bogus count.
+		// The count is recorded at finish, so a later abort that cleared the cache
+		// doesn't turn a complete group into an error.
+		if let Some(total) = self.fin {
+			Poll::Ready(Ok(total as u64))
+		} else if let Some(err) = &self.abort {
 			Poll::Ready(Err(err.clone()))
-		} else if self.fin {
-			Poll::Ready(Ok((self.offset + self.frames.len()) as u64))
 		} else {
 			Poll::Pending
 		}
@@ -220,6 +228,10 @@ pub struct Producer {
 	// timestamp into the track scale before it enters the stream. Threaded down by
 	// value from [`track::Producer::create_group`] / `append_group`.
 	track: track::Info,
+
+	// Ingress payload meter, set by a tagged [`track::Producer`] via
+	// [`Self::with_meter`]. Empty (no-op) for an untagged group.
+	stats: stats::Meter,
 }
 
 impl std::ops::Deref for Producer {
@@ -246,7 +258,20 @@ impl Producer {
 		let weak = state.weak();
 		let charge = track.broadcast.origin.pool.register(Box::new(move || evict(&weak)));
 		state.write().ok().expect("a new group is open").charge = charge;
-		Self { info, state, track }
+		Self {
+			info,
+			state,
+			track,
+			stats: stats::Meter::default(),
+		}
+	}
+
+	/// Attach an ingress payload meter, counting this as one delivered group.
+	/// Called by a tagged [`track::Producer`] when it creates the group.
+	pub(crate) fn with_meter(mut self, meter: stats::Meter) -> Self {
+		meter.group();
+		self.stats = meter;
+		self
 	}
 
 	/// The group header.
@@ -276,7 +301,7 @@ impl Producer {
 		}
 
 		let mut state = modify(&self.state)?;
-		if state.fin {
+		if state.fin.is_some() {
 			return Err(Error::Closed);
 		}
 		debug_assert!(state.partial.is_none(), "a frame is already open");
@@ -290,6 +315,10 @@ impl Producer {
 		// lock. Reached via the parent chain; a no-op when the pool is unbounded.
 		drop(state);
 		self.track.broadcast.origin.pool.evict();
+
+		// Ingress payload: one whole frame written.
+		self.stats.frames(1);
+		self.stats.bytes(size);
 		Ok(())
 	}
 
@@ -312,7 +341,7 @@ impl Producer {
 		let buf = FrameBuf::new(frame.size as usize);
 
 		let mut state = modify(&self.state)?;
-		if state.fin {
+		if state.fin.is_some() {
 			return Err(Error::Closed);
 		}
 		debug_assert!(state.partial.is_none(), "a frame is already open");
@@ -329,11 +358,16 @@ impl Producer {
 		drop(state);
 		self.track.broadcast.origin.pool.evict();
 
+		// Ingress payload: one frame opened; its bytes are counted per chunk as the
+		// frame::Producer writes them.
+		self.stats.frames(1);
+		let meter = self.stats.clone();
+
 		let info = frame::Info {
 			size: frame.size,
 			timestamp,
 		};
-		Ok(frame::Producer::new(self, buf, info))
+		Ok(frame::Producer::new(self, buf, info).with_meter(meter))
 	}
 
 	/// Wake consumers parked on the group channel (called after a partial write).
@@ -355,7 +389,7 @@ impl Producer {
 	/// Fail the group because an in-flight frame couldn't complete (called by
 	/// [`frame::Producer::abort`] / its drop).
 	pub(crate) fn frame_abort(&mut self, err: Error) {
-		let _ = self.abort(err);
+		let _ = self.clone().abort(err);
 	}
 
 	/// Return the number of frames written so far (completed plus any in-flight).
@@ -365,18 +399,21 @@ impl Producer {
 	}
 
 	/// Mark the group as complete; no more frames will be written.
+	///
+	/// Borrows rather than consumes, so a later failure can still be reported through
+	/// [`abort`](Self::abort). The handle also keeps the cached frames readable.
 	pub fn finish(&mut self) -> Result<()> {
 		let mut state = modify(&self.state)?;
-		state.fin = true;
+		state.fin = Some(state.offset + state.frames.len());
 		Ok(())
 	}
 
 	/// Abort the group with the given error.
 	///
-	/// No updates can be made after this point. Drops the cached frames so a stale
-	/// [`Consumer`] can't pin their buffers in memory forever; consumers that haven't
-	/// drained yet surface the abort error instead of the leftover cache.
-	pub fn abort(&mut self, err: Error) -> Result<()> {
+	/// Consumes the handle. Drops the cached frames so a stale [`Consumer`] can't pin
+	/// their buffers in memory forever; consumers that haven't drained yet surface the
+	/// abort error instead of the leftover cache.
+	pub fn abort(self, err: Error) -> Result<()> {
 		let mut guard = modify(&self.state)?;
 		guard.abort = Some(err);
 		guard.release();
@@ -404,6 +441,9 @@ impl Producer {
 			track: self.track.clone(),
 			index: 0,
 			prefetch: Prefetch::default(),
+			// Untagged: a tagged track attaches the egress meter via `with_meter`
+			// when it hands the consumer to a subscriber/fetch.
+			stats: stats::Meter::default(),
 		}
 	}
 
@@ -434,6 +474,7 @@ impl Clone for Producer {
 			info: self.info,
 			state: self.state.clone(),
 			track: self.track.clone(),
+			stats: self.stats.clone(),
 		}
 	}
 }
@@ -447,7 +488,7 @@ impl Drop for Producer {
 			return;
 		}
 		if let Ok(mut state) = modify(&self.state)
-			&& !state.fin
+			&& state.fin.is_none()
 		{
 			// Dropped without finish() or abort(), so consumers will see
 			// Error::Dropped mid-group. Deliberate ends go through finish()/abort().
@@ -498,6 +539,17 @@ impl Prefetch {
 			self.len += 1;
 		}
 	}
+
+	/// `(frame count, total payload bytes)` of the buffered, not-yet-taken frames.
+	/// Read once per fill to bump the egress payload counters for the whole batch.
+	fn buffered(&self) -> (u64, u64) {
+		let mut bytes = 0u64;
+		for slot in &self.frames[self.pos..self.len] {
+			// SAFETY: slots in `pos..len` are initialized (written by `fill`, not yet popped).
+			bytes += unsafe { slot.assume_init_ref() }.payload.len() as u64;
+		}
+		((self.len - self.pos) as u64, bytes)
+	}
 }
 
 impl Default for Prefetch {
@@ -537,6 +589,10 @@ pub struct Consumer {
 
 	// A batch of completed frames drained ahead under one lock (whole-frame reads only).
 	prefetch: Prefetch,
+
+	// Egress payload meter, set by a tagged track via [`Self::with_meter`]. Empty
+	// (no-op) for an untagged group.
+	stats: stats::Meter,
 }
 
 impl Clone for Consumer {
@@ -549,6 +605,9 @@ impl Clone for Consumer {
 			track: self.track.clone(),
 			index: self.index,
 			prefetch: Prefetch::default(),
+			// Inherit the meter without re-counting the group: the original already
+			// counted it when the track handed it out.
+			stats: self.stats.clone(),
 		}
 	}
 }
@@ -562,6 +621,14 @@ impl std::ops::Deref for Consumer {
 }
 
 impl Consumer {
+	/// Attach an egress payload meter, counting this as one delivered group.
+	/// Called by a tagged track when it hands the consumer to a subscriber or fetch.
+	pub(crate) fn with_meter(mut self, meter: stats::Meter) -> Self {
+		meter.group();
+		self.stats = meter;
+		self
+	}
+
 	/// The parent track's timescale.
 	pub fn timescale(&self) -> Timescale {
 		self.track.timescale
@@ -589,6 +656,8 @@ impl Consumer {
 	/// Returns None if the group is finished and the index is out of range.
 	pub fn poll_next_frame(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<frame::Consumer>>> {
 		// Hand out any frames a prior read_frame prefetched before touching the tail.
+		// Their bytes were already counted at the batch fill, so the frame::Consumer
+		// carries no meter.
 		if let Some(frame) = self.prefetch.pop() {
 			self.index += 1;
 			let info = frame::Info {
@@ -605,7 +674,12 @@ impl Consumer {
 		};
 
 		self.index += 1;
-		Poll::Ready(Ok(Some(frame::Consumer::new(self.state.clone(), info, source))))
+		// A direct read (not prefetched): count the frame here; the frame::Consumer
+		// counts its bytes per chunk as they're read out.
+		self.stats.frames(1);
+		Poll::Ready(Ok(Some(
+			frame::Consumer::new(self.state.clone(), info, source).with_meter(self.stats.clone()),
+		)))
 	}
 
 	/// Read the next frame (timestamp and payload) all at once, without blocking.
@@ -639,13 +713,7 @@ impl Consumer {
 			}
 			// Nothing completed at `index`: an in-flight tail waits, otherwise resolve
 			// the terminal state (whole-frame reads never stream the partial).
-			if let Some(err) = &state.abort {
-				return Poll::Ready(Err(err.clone()));
-			}
-			if state.fin {
-				return Poll::Ready(Ok(()));
-			}
-			Poll::Pending
+			state.poll_terminal(index)
 		});
 
 		match ready!(res) {
@@ -653,6 +721,12 @@ impl Consumer {
 			Ok(Err(err)) => return Poll::Ready(Err(err)),
 			Err(state) => return Poll::Ready(Err(state.abort.clone().unwrap_or(Error::Dropped))),
 		}
+
+		// A fresh batch was just filled (empty only on a clean end). Count the whole
+		// batch once here, under no lock, so the drained pops that follow stay free.
+		let (frames, bytes) = self.prefetch.buffered();
+		self.stats.frames(frames);
+		self.stats.bytes(bytes);
 
 		Poll::Ready(Ok(self.prefetch.pop().inspect(|_| {
 			self.index += 1;
@@ -811,7 +885,7 @@ mod test {
 
 	#[test]
 	fn abort_propagates() {
-		let mut producer = Info { sequence: 0 }.produce();
+		let producer = Info { sequence: 0 }.produce();
 		let mut consumer = producer.consume();
 		producer.abort(crate::Error::Cancel).unwrap();
 
@@ -830,7 +904,7 @@ mod test {
 		let _consumer = producer.consume();
 		assert_eq!(producer.state.read().frames.len(), 1);
 
-		producer.abort(crate::Error::Cancel).unwrap();
+		producer.clone().abort(crate::Error::Cancel).unwrap();
 
 		let state = producer.state.read();
 		assert!(state.frames.is_empty(), "cached frames should be dropped on abort");
@@ -976,6 +1050,47 @@ mod test {
 			assert_eq!(frame.payload, Bytes::from(vec![i as u8; 4]));
 		}
 		assert!(consumer.read_frame().now_or_never().unwrap().unwrap().is_none());
+	}
+
+	/// A finished group is still aborted once its frames are released to free memory (the
+	/// track's latency window, or the cache pool). A reader that already drained every frame
+	/// is missing nothing, so it must see the clean end of group rather than the abort.
+	#[test]
+	fn abort_after_finish_keeps_the_clean_end_for_a_drained_reader() {
+		let mut producer = Info { sequence: 0 }.produce();
+		producer
+			.write_frame(Timestamp::ZERO, Bytes::from_static(b"hello"))
+			.unwrap();
+		producer.finish().unwrap();
+
+		let mut drained = producer.consume();
+		let mut behind = producer.consume();
+		let frame = drained.read_frame().now_or_never().unwrap().unwrap().unwrap();
+		assert_eq!(frame.payload, Bytes::from_static(b"hello"));
+
+		producer.abort(Error::Old).unwrap();
+
+		// Drained everything before the abort: nothing is missing.
+		assert!(drained.read_frame().now_or_never().unwrap().unwrap().is_none());
+		assert!(drained.next_frame().now_or_never().unwrap().unwrap().is_none());
+
+		// Never read the frame, and its bytes are gone: a truncated stream, not a clean end.
+		assert!(matches!(behind.read_frame().now_or_never().unwrap(), Err(Error::Old)));
+	}
+
+	/// The frame count is fixed at finish, so an abort that clears the cache can't turn a
+	/// complete group into an error.
+	#[test]
+	fn finished_survives_a_later_abort() {
+		let mut producer = Info { sequence: 0 }.produce();
+		producer.write_frame(Timestamp::ZERO, Bytes::from_static(b"a")).unwrap();
+		producer.write_frame(Timestamp::ZERO, Bytes::from_static(b"b")).unwrap();
+		producer.finish().unwrap();
+
+		let mut consumer = producer.consume();
+		producer.abort(Error::Old).unwrap();
+
+		assert_eq!(consumer.finished().now_or_never().unwrap().unwrap(), 2);
 	}
 
 	/// `next_frame` drains frames a prior `read_frame` prefetched, preserving order.

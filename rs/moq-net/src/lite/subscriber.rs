@@ -1,4 +1,4 @@
-use crate::{frame, group, origin, stats, track};
+use crate::{frame, group, origin, track};
 use std::{
 	collections::HashMap,
 	sync::{Arc, atomic},
@@ -23,14 +23,13 @@ use web_async::Lock;
 
 pub(super) struct SubscriberConfig<S: web_transport_trait::Session> {
 	pub session: S,
-	/// The origin into which remote broadcasts are inserted.
+	/// The origin into which remote broadcasts are inserted. Traffic stats are
+	/// attributed through this handle: tag it with [`origin::Producer::with_stats`]
+	/// first.
 	pub origin: origin::Producer,
 	/// Receiver-side bandwidth producer for PROBE feedback. None disables the
 	/// feature (used by versions that don't carry probe streams).
 	pub recv_bandwidth: Option<bandwidth::Producer>,
-	/// Stats aggregator for this session's ingress. Use [`stats::Handle::default`]
-	/// to opt out.
-	pub stats: stats::Handle,
 	pub version: Version,
 	/// Shared slot for the peer's SETUP (lite-05+). Written when the peer's Setup
 	/// stream is read; the probe stream waits on it before opening.
@@ -48,11 +47,6 @@ pub(super) struct Subscriber<S: web_transport_trait::Session> {
 	session: S,
 
 	origin: origin::Producer,
-	stats: stats::Handle,
-	/// Per-session ingress broadcast-subscription tracker. Each upstream
-	/// subscription holds a guard so `broadcasts - broadcasts_closed` counts the
-	/// distinct upstream sessions feeding each broadcast.
-	broadcasts: stats::SessionBroadcasts,
 	recv_bandwidth: Option<bandwidth::Producer>,
 	// Session-level origin id shared with the Publisher. Used to filter out
 	// reflected announces: we ask the peer (via AnnounceInterest.exclude_hop)
@@ -79,7 +73,6 @@ pub(super) struct Subscriber<S: web_transport_trait::Session> {
 #[derive(Clone)]
 struct TrackEntry {
 	producer: track::Producer,
-	stats: Arc<stats::SubscriberTrack>,
 	/// Timestamp scale from this track's TRACK_INFO, known before the SUBSCRIBE is
 	/// even opened, so group streams decode frames without blocking.
 	timescale: Option<Timescale>,
@@ -92,12 +85,9 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 		// every session sharing that origin, required for cross-session
 		// loop detection.
 		let self_origin = *config.origin;
-		let broadcasts = config.stats.subscriber_broadcasts();
 		Self {
 			session: config.session,
 			origin: config.origin,
-			stats: config.stats,
-			broadcasts,
 			recv_bandwidth: config.recv_bandwidth,
 			self_origin,
 			session_origin: crate::Origin::random(),
@@ -264,11 +254,6 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 		let link_cost = self.resolve_cost().await;
 
 		let mut routes = HashMap::new();
-		// Per-broadcast subscriber-side stats guards. Dropping the guard records
-		// `subscriber.broadcasts_closed`. We only insert a guard when start_announce
-		// actually accepted the announcement (it may drop reflected loops), so the
-		// guard set tracks `routes` exactly.
-		let mut stats_guards: HashMap<PathOwned, stats::Subscriber> = HashMap::new();
 
 		// Lite06+: announce ids. Each received `active` implicitly assigns the next
 		// per-stream ordinal; `ended`/`restart` reference it instead of repeating the
@@ -277,10 +262,6 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 		// but a peer may.
 		let mut next_announce_id: u64 = 0;
 		let mut announced_by_id: HashMap<u64, PathOwned> = HashMap::new();
-
-		// Stats keys are absolute paths (matching the publisher side) so the
-		// fanned-out level keys line up with the absolute broadcast paths a
-		// dashboard sees on the origin.
 
 		// `connecting` is a local (a param), not a `self` field, so the `self.clone()` that
 		// start_announce uses for long-lived broadcast tasks doesn't carry the producer
@@ -293,23 +274,17 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 				let msg: lite::AnnounceInit = stream.reader.decode().await?;
 				for suffix in msg.suffixes {
 					let path = prefix.join(&suffix);
-					let abs = self.origin.absolute(&path).to_owned();
-					// Count every received name, even ones start_announce drops as loops.
-					self.stats
-						.broadcast(&abs)
-						.subscriber_announced_bytes(abs.as_str().len() as u64);
 					// Lite01/02 don't carry hop information; the broadcast starts with
-					// an empty chain and an unpriced link.
-					if self.start_announce(
+					// an empty chain and an unpriced link. Stats are attributed in the
+					// model when this enters the origin via `create_broadcast`.
+					self.start_announce(
 						path.clone(),
 						crate::OriginList::new(),
 						RouteCost::default(),
 						0,
 						responder_origin,
 						&mut routes,
-					)? {
-						stats_guards.insert(abs.clone(), self.stats.broadcast(&abs).subscriber());
-					}
+					)?;
 				}
 			}
 			_ => {
@@ -341,12 +316,6 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 			match announce {
 				lite::AnnounceBroadcast::Active { suffix, hops, cost } => {
 					let path = prefix.join(&suffix);
-					let abs = self.origin.absolute(&path).to_owned();
-					// Count the broadcast name length (not the encoded message size) for
-					// every received announce, even ones start_announce drops as loops.
-					self.stats
-						.broadcast(&abs)
-						.subscriber_announced_bytes(abs.as_str().len() as u64);
 					if self.version.has_announce_id() {
 						// Every `active` assigns the next ordinal, even ones we drop locally.
 						announced_by_id.insert(next_announce_id, path.clone());
@@ -360,16 +329,9 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 						// atomically replace the broadcast. Lite06+ restarts by announce id, and older
 						// versions never defined restarts, so both fall through to start_announce, which
 						// rejects the duplicate (Error::Duplicate).
-						if self.restart_announce(path.clone(), hops, cost, link_cost, responder_origin, &mut routes)? {
-							// Continuity: keep the existing stats guard if present.
-							stats_guards
-								.entry(abs.clone())
-								.or_insert_with(|| self.stats.broadcast(&abs).subscriber());
-						} else {
-							stats_guards.remove(&abs);
-						}
-					} else if self.start_announce(path.clone(), hops, cost, link_cost, responder_origin, &mut routes)? {
-						stats_guards.insert(abs.clone(), self.stats.broadcast(&abs).subscriber());
+						self.restart_announce(path.clone(), hops, cost, link_cost, responder_origin, &mut routes)?;
+					} else {
+						self.start_announce(path.clone(), hops, cost, link_cost, responder_origin, &mut routes)?;
 					}
 					// The first `initial_count` Active messages are the initial set; once
 					// they're all in, drop our producer to mark this prefix connected.
@@ -383,11 +345,6 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 				lite::AnnounceBroadcast::Ended { suffix, .. } => {
 					let path = prefix.join(&suffix);
 					tracing::debug!(broadcast = %self.log_path(&path), "unannounced");
-					let abs = self.origin.absolute(&path).to_owned();
-					// Count the unannounce name length whether or not a matching guard exists.
-					self.stats
-						.broadcast(&abs)
-						.subscriber_announced_bytes(abs.as_str().len() as u64);
 
 					// The matching Active may have been silently dropped by
 					// start_announce as a reflected loop, in which case
@@ -396,7 +353,6 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 					// unannounces if this was the broadcast's last route.
 					if let Some(entry) = routes.remove(&path) {
 						entry.finish();
-						stats_guards.remove(&abs);
 					}
 				}
 				lite::AnnounceBroadcast::EndedId { id } => {
@@ -406,11 +362,6 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 						return Err(Error::ProtocolViolation);
 					};
 					tracing::debug!(broadcast = %self.log_path(&path), "unannounced");
-					let abs = self.origin.absolute(&path).to_owned();
-					// Count the unannounce name length whether or not a matching guard exists.
-					self.stats
-						.broadcast(&abs)
-						.subscriber_announced_bytes(abs.as_str().len() as u64);
 
 					// The matching Active may have been silently dropped by
 					// start_announce as a reflected loop, in which case
@@ -419,7 +370,6 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 					// unannounces if this was the broadcast's last route.
 					if let Some(entry) = routes.remove(&path) {
 						entry.finish();
-						stats_guards.remove(&abs);
 					}
 				}
 				lite::AnnounceBroadcast::Restart { id, hops, cost } => {
@@ -428,23 +378,12 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 					let Some(path) = announced_by_id.get(&id).cloned() else {
 						return Err(Error::ProtocolViolation);
 					};
-					let abs = self.origin.absolute(&path).to_owned();
-					self.stats
-						.broadcast(&abs)
-						.subscriber_announced_bytes(abs.as_str().len() as u64);
 					if routes.contains_key(&path) {
-						if self.restart_announce(path.clone(), hops, cost, link_cost, responder_origin, &mut routes)? {
-							// Continuity: keep the existing stats guard if present.
-							stats_guards
-								.entry(abs.clone())
-								.or_insert_with(|| self.stats.broadcast(&abs).subscriber());
-						} else {
-							stats_guards.remove(&abs);
-						}
-					} else if self.start_announce(path.clone(), hops, cost, link_cost, responder_origin, &mut routes)? {
+						self.restart_announce(path.clone(), hops, cost, link_cost, responder_origin, &mut routes)?;
+					} else {
 						// The original announce was dropped locally (e.g. a reflected loop);
 						// the replacement may be routable, so treat it as a fresh start.
-						stats_guards.insert(abs.clone(), self.stats.broadcast(&abs).subscriber());
+						self.start_announce(path.clone(), hops, cost, link_cost, responder_origin, &mut routes)?;
 					}
 				}
 			}
@@ -718,16 +657,10 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 			};
 
 			let name = request.name().to_string();
-			let abs = self.origin.absolute(&path);
-			// Subscriber-side track stats; counters bump as frames/bytes/groups arrive.
-			// subscriber_track avoids double-counting broadcasts: the broadcast lifetime
-			// is tracked separately by the announce loop's `stats_guards`.
-			let track_stats = Arc::new(self.stats.broadcast(&abs).subscriber_track(&name));
 
 			let serve = TrackServe {
 				subscriber: self.clone(),
 				path: path.clone(),
-				track_stats,
 				name,
 			};
 
@@ -777,30 +710,28 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 			timestamp,
 			payload: dg.payload,
 		})?;
-		entry.stats.group();
 		Ok(())
 	}
 
 	pub async fn recv_group(&mut self, stream: &mut Reader<S::RecvStream, Version>) -> Result<(), Error> {
 		let hdr: lite::Group = stream.decode().await?;
 
-		let (mut group, track, track_stats, timescale) = {
+		let (mut group, track, timescale) = {
 			let mut subs = self.subscribes.lock();
 			let entry = subs.get_mut(&hdr.subscribe).ok_or(Error::Cancel)?;
 
 			let group_info = group::Info { sequence: hdr.sequence };
+			// Stats (groups/frames/bytes) are counted in the model as the group is
+			// written, through the tagged `track::Producer`.
 			let group = entry.producer.create_group(group_info)?;
-			(group, entry.producer.clone(), entry.stats.clone(), entry.timescale)
+			(group, entry.producer.clone(), entry.timescale)
 		};
-
-		// Bump groups counter for this incoming group on the subscriber side.
-		track_stats.group();
 
 		// The timescale came from TRACK_INFO (read before this subscription was even
 		// registered), so frames decode immediately. No SUBSCRIBE_OK to wait on.
 
 		let res = {
-			let mut serve = std::pin::pin!(self.run_group(stream, group.clone(), track_stats.clone(), timescale));
+			let mut serve = std::pin::pin!(self.run_group(stream, group.clone(), timescale));
 			kio::wait(|waiter| {
 				if let Poll::Ready(err) = track.poll_closed(waiter) {
 					return Poll::Ready(Err(err));
@@ -833,7 +764,6 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 		&mut self,
 		stream: &mut Reader<S::RecvStream, Version>,
 		mut group: group::Producer,
-		track_stats: Arc<stats::SubscriberTrack>,
 		timescale: Option<Timescale>,
 	) -> Result<(), Error> {
 		// Previous frame's raw timestamp value (in `timescale` units), for the
@@ -868,9 +798,8 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 			// (pre-lite-05) means local receive time.
 			let timestamp = timestamp.unwrap_or_else(Timestamp::now);
 			let mut frame = group.create_frame(frame::Info { size, timestamp })?;
-			track_stats.frame();
 
-			if let Err(err) = self.run_frame(stream, &mut frame, &track_stats).await {
+			if let Err(err) = self.run_frame(stream, &mut frame).await {
 				let _ = frame.abort(err.clone());
 				return Err(err);
 			}
@@ -885,12 +814,10 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 		&mut self,
 		stream: &mut Reader<S::RecvStream, Version>,
 		frame: &mut frame::Producer<'_>,
-		track_stats: &stats::SubscriberTrack,
 	) -> Result<(), Error> {
 		while frame.remaining() > 0 {
 			match stream.read_chunk(frame.remaining()).await? {
 				Some(chunk) if !chunk.is_empty() => {
-					track_stats.bytes(chunk.len() as u64);
 					frame.write(chunk)?;
 				}
 				_ => return Err(Error::WrongSize),
@@ -910,23 +837,97 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 	}
 }
 
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::coding::Decode;
+	use crate::lite::test_transport::SinkSession;
+	use crate::util::TaskSet;
+
+	const VERSION: Version = Version::Lite05;
+
+	/// `establish` puts exactly one SUBSCRIBE on the wire, and the id is registered
+	/// before any of it reaches the transport.
+	///
+	/// Both halves matter: a second stream re-requests the same id, which the peer is
+	/// free to serve twice, and a late insert loses the race with a publisher that
+	/// serves its first group the instant it reads the request (`recv_group` drops a
+	/// group whose id isn't in the map yet).
+	#[tokio::test]
+	async fn establish_sends_one_registered_subscribe() {
+		// Writes park until this opens, so the assertions below run at the exact moment
+		// the request would hit the wire.
+		let gate = kio::Producer::new(false);
+		let session = SinkSession::gated_bi(gate.consume());
+
+		let origin = origin::Info::new(crate::Origin::new(1).unwrap()).produce();
+		let (tasks, _task_set) = TaskSet::new();
+		let subscriber = Subscriber::new(SubscriberConfig {
+			session: session.clone(),
+			origin,
+			recv_bandwidth: None,
+			version: VERSION,
+			peer_setup: Default::default(),
+			cost: None,
+			tasks,
+		});
+		let subscribes = subscriber.subscribes.clone();
+		let serve = TrackServe {
+			subscriber,
+			path: Path::new("room/host").to_owned(),
+			name: "catalog.json".to_string(),
+		};
+
+		let mut broadcast = crate::broadcast::Info::new().produce();
+		let mut producer = broadcast.create_track("catalog.json", None).unwrap();
+		let mut sub = Sub::None;
+		let mut establish = std::pin::pin!(serve.establish(
+			&mut producer,
+			&mut sub,
+			Subscription::default(),
+			Some(Timescale::default()),
+		));
+
+		// Parked on the first write: the stream is open and nothing has been sent yet.
+		assert!(futures::poll!(establish.as_mut()).is_pending());
+		assert_eq!(session.log.bi_opens(), 1);
+		assert!(subscribes.lock().contains_key(&0), "registered before the wire");
+
+		let Ok(mut open) = gate.write() else {
+			panic!("gate closed")
+		};
+		*open = true;
+		drop(open);
+
+		establish.await.unwrap();
+
+		// One request, on one stream, and nothing else behind it.
+		assert_eq!(session.log.bi_opens(), 1);
+
+		let writes = session.log.writes.lock().unwrap().clone();
+		let mut wire = writes.as_slice();
+		assert_eq!(
+			lite::ControlType::decode(&mut wire, VERSION).unwrap(),
+			lite::ControlType::Subscribe
+		);
+		let msg = lite::Subscribe::decode(&mut wire, VERSION).unwrap();
+		assert_eq!(msg.id, 0);
+		assert_eq!(msg.track, "catalog.json");
+		assert!(wire.is_empty(), "a second SUBSCRIBE trailed the first");
+	}
+}
+
 /// The at-most-one live upstream subscription: its control stream plus the params
 /// echoed in every SUBSCRIBE_UPDATE.
 struct SubStream<S: web_transport_trait::Session> {
 	stream: Stream<S, Version>,
 	id: u64,
-	/// Capped at the latest group and dropped to priority 0 because the last
-	/// downstream subscriber left. The stream stays open during the linger window
-	/// so a returning consumer resumes without a fresh SUBSCRIBE.
-	paused: bool,
 	/// Original SUBSCRIBE params, echoed in every SUBSCRIBE_UPDATE; refreshed as the
 	/// downstream aggregate changes.
 	ordered: bool,
 	max_latency: Duration,
 	start_group: Option<u64>,
 	priority: u8,
-	/// Per-(session, broadcast) viewer sentinel, held for the subscription's life.
-	_broadcast_sub: stats::BroadcastSubscription,
 }
 
 enum Sub<S: web_transport_trait::Session> {
@@ -970,6 +971,10 @@ enum Teardown {
 	/// The route or session failed: abort the track so the origin re-splices it
 	/// from another source.
 	GiveBack(Error),
+	/// The origin released this copy: nobody is reading it, so drop it (and the
+	/// `TRACK_INFO` behind it) rather than holding the state for a reader that
+	/// may never come back.
+	Released,
 }
 
 /// One step for the [`TrackServe`] loop, produced by racing track demand, the
@@ -985,26 +990,27 @@ enum Event {
 	SubResponse(lite::SubscribeResponse),
 	/// The upstream subscribe stream closed: `Ok` is a clean FIN, `Err` a transport error.
 	SubClosed(Result<(), Error>),
+	/// Every reader of this copy went away (the origin released it).
+	Unused,
 	/// The whole session died.
 	SessionClosed,
 }
 
 /// Serves one requested track for a relay: owns this session's copy of the
 /// track (spliced into the origin's logical track), driving the single upstream
-/// subscription (opened lazily on the first downstream subscriber,
-/// paused/resumed across consumer churn) concurrently with any number of
-/// one-shot fetches.
+/// subscription (opened lazily on the first downstream subscriber, canceled when
+/// the last one leaves) concurrently with any number of one-shot fetches.
 #[derive(Clone)]
 struct TrackServe<S: web_transport_trait::Session> {
 	subscriber: Subscriber<S>,
 	path: PathOwned,
-	track_stats: Arc<stats::SubscriberTrack>,
 	name: String,
 }
 
 impl<S: web_transport_trait::Session> TrackServe<S> {
 	async fn run(self, request: track::Request) {
-		// SUBSCRIBE_UPDATE (and thus pause/resume) only exists on Lite03+.
+		// SUBSCRIBE_UPDATE only exists on Lite03+, so older peers can't carry a
+		// preference change to an established subscription.
 		let supports_update = !matches!(self.subscriber.version, Version::Lite01 | Version::Lite02);
 		let supports_fetch = self.subscriber.version.has_track_stream();
 
@@ -1082,7 +1088,15 @@ impl<S: web_transport_trait::Session> TrackServe<S> {
 						}
 					}
 
-					// (3) The upstream subscribe stream closed, or carried a START/END/DROP.
+					// (3) Nobody reads this copy anymore: the origin released it after its
+					// idle linger, so drop it instead of holding the track state (and its
+					// TRACK_INFO) for a reader that may never return. In-flight fetches
+					// keep it alive: work already accepted still gets finished.
+					if fetches.is_empty() && serving.poll_unused(waiter).is_ready() {
+						return Poll::Ready(Event::Unused);
+					}
+
+					// (4) The upstream subscribe stream closed, or carried a START/END/DROP.
 					if let Poll::Ready(res) = waiter.poll_future(sub_msg.as_mut()) {
 						return Poll::Ready(match res {
 							Ok(Some(msg)) => Event::SubResponse(msg),
@@ -1091,7 +1105,7 @@ impl<S: web_transport_trait::Session> TrackServe<S> {
 						});
 					}
 
-					// (4) The session died: hand the track back for another route.
+					// (5) The session died: hand the track back for another route.
 					if waiter.poll_future(session_closed.as_mut()).is_ready() {
 						return Poll::Ready(Event::SessionClosed);
 					}
@@ -1151,6 +1165,10 @@ impl<S: web_transport_trait::Session> TrackServe<S> {
 					tracing::warn!(broadcast = %self.subscriber.log_path(&self.path), track = %self.name, %err, "subscribe error");
 					break Teardown::GiveBack(err);
 				}
+				Event::Unused => {
+					tracing::debug!(broadcast = %self.subscriber.log_path(&self.path), track = %self.name, "track released (idle)");
+					break Teardown::Released;
+				}
 				Event::SessionClosed => {
 					break Teardown::GiveBack(Error::Dropped);
 				}
@@ -1172,6 +1190,12 @@ impl<S: web_transport_trait::Session> TrackServe<S> {
 				// Mark this copy dead: subscribers stall while the origin
 				// re-splices the track from the next source.
 				let _ = serving.abort(err);
+			}
+			Teardown::Released => {
+				// A deliberate end with no reader to observe it, which also drops the
+				// cached groups. The origin re-requests the track from this session if
+				// one comes back.
+				let _ = serving.abort(Error::Cancel);
 			}
 		}
 	}
@@ -1216,7 +1240,7 @@ impl<S: web_transport_trait::Session> TrackServe<S> {
 	}
 
 	/// Apply a subscription-demand change: open the upstream SUBSCRIBE on the first
-	/// subscriber, resume/update it while live, or pause it when the last leaves.
+	/// subscriber, update it while live, or cancel it when the last one leaves.
 	async fn handle_subscription(
 		&self,
 		producer: &mut track::Producer,
@@ -1231,16 +1255,6 @@ impl<S: web_transport_trait::Session> TrackServe<S> {
 					// Open an upstream SUBSCRIBE for the first subscriber.
 					self.establish(producer, sub, subscription, timescale).await?;
 				}
-				Sub::Active(active) if active.paused => {
-					// A consumer returned: resume by uncapping.
-					active.paused = false;
-					active.priority = subscription.priority;
-					active.ordered = subscription.ordered;
-					active.max_latency = subscription.latency_max;
-					active.start_group = subscription.group_start;
-					self.send_update(active, subscription.group_end).await?;
-					tracing::info!(track = %self.name, "subscribe resumed");
-				}
 				Sub::Active(active) => {
 					// Downstream preferences changed: forward them upstream as a
 					// SUBSCRIBE_UPDATE (Lite03+ only; older peers can't carry one).
@@ -1254,29 +1268,11 @@ impl<S: web_transport_trait::Session> TrackServe<S> {
 				}
 			},
 			None => {
-				// Last subscriber left: pause the upstream (cap at the latest cached
-				// group, priority 0) but keep the stream open in case one returns.
-				if supports_update {
-					if let Sub::Active(active) = sub {
-						if !active.paused {
-							active.paused = true;
-							active.start_group = None;
-							let cap = producer.latest().unwrap_or(0);
-							let update = lite::SubscribeUpdate {
-								priority: 0,
-								ordered: active.ordered,
-								max_latency: active.max_latency,
-								start_group: active.start_group,
-								end_group: Some(cap),
-							};
-							active.stream.writer.encode(&update).await?;
-						}
-					}
-				} else if let Sub::Active(active) = sub {
-					// No SUBSCRIBE_UPDATE to pause with (Lite01/02): cancel the
-					// upstream subscription outright, or it streams every group into
-					// the cache with zero consumers. A returning subscriber
-					// re-establishes from the current demand.
+				// Last subscriber left: cancel the upstream subscription outright. An
+				// idle subscription still streams every group into a cache nobody
+				// reads, and the upstream counts it as a live viewer of the broadcast.
+				// A returning subscriber re-establishes from the current demand.
+				if let Sub::Active(active) = sub {
 					self.subscriber.subscribes.lock().remove(&active.id);
 					let _ = active.stream.writer.finish();
 					tracing::info!(track = %self.name, "subscribe canceled (idle)");
@@ -1323,18 +1319,6 @@ impl<S: web_transport_trait::Session> TrackServe<S> {
 
 		tracing::info!(id, broadcast = %self.subscriber.log_path(&self.path), track = %self.name, "subscribe started");
 
-		let mut stream = Stream::open(&self.subscriber.session, self.subscriber.version).await?;
-		stream.writer.encode(&lite::ControlType::Subscribe).await?;
-		stream.writer.encode(&msg).await?;
-
-		// Pre-lite-05 acknowledges with SUBSCRIBE_OK; it arrives on this stream and
-		// is consumed (and logged) by the serve loop's response arm.
-
-		// This session is now actively feeding the broadcast, so take the per-(session,
-		// broadcast) viewer sentinel for the subscription's life.
-		let abs = self.subscriber.origin.absolute(&self.path).to_owned();
-		let broadcast_sub = self.subscriber.broadcasts.subscribe(&abs);
-
 		// Register before the SUBSCRIBE hits the wire. `id` is live the moment the peer
 		// reads it, and a publisher may serve its first group immediately, so a late
 		// insert races the group stream: `recv_group` would find no entry and drop it,
@@ -1343,7 +1327,6 @@ impl<S: web_transport_trait::Session> TrackServe<S> {
 			id,
 			TrackEntry {
 				producer: producer.clone(),
-				stats: self.track_stats.clone(),
 				timescale,
 			},
 		);
@@ -1389,12 +1372,10 @@ impl<S: web_transport_trait::Session> TrackServe<S> {
 		*sub = Sub::Active(SubStream {
 			stream,
 			id,
-			paused: false,
 			ordered: subscription.ordered,
 			max_latency: subscription.latency_max,
 			start_group: subscription.group_start,
 			priority: subscription.priority,
-			_broadcast_sub: broadcast_sub,
 		});
 
 		Ok(())
@@ -1421,7 +1402,6 @@ impl<S: web_transport_trait::Session> TrackServe<S> {
 		let TrackServe {
 			mut subscriber,
 			path,
-			track_stats,
 			name,
 		} = self;
 		let group = request.sequence();
@@ -1470,7 +1450,7 @@ impl<S: web_transport_trait::Session> TrackServe<S> {
 		};
 
 		let res = subscriber
-			.run_group(&mut stream.reader, producer.clone(), track_stats, timescale)
+			.run_group(&mut stream.reader, producer.clone(), timescale)
 			.await;
 		match res {
 			Ok(()) => {

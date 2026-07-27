@@ -2,7 +2,7 @@
 
 Reference for the `/rs` Cargo workspace. Universal rules (writing style, no em dashes, Root Cause First, Cross-Package Sync, Public API Scrutiny, Refactor As You Go) live in the root `/CLAUDE.md`; PR/commit/release mechanics live in `/CONTRIBUTING.md`. Neither is repeated here.
 
-Workspace members live in the root `Cargo.toml` (`[workspace]`). `rust-version = "1.85"`, edition 2024. Shared versions/paths are pinned under `[workspace.dependencies]`; new crates should add their dep there and reference it via `{ workspace = true }`.
+Workspace members live in the root `Cargo.toml` (`[workspace]`). `rust-version = "1.91"` (the library floor; `moq-relay` overrides to 1.95 for `sysinfo`), edition 2024. Shared versions/paths are pinned under `[workspace.dependencies]`; new crates should add their dep there and reference it via `{ workspace = true }`.
 
 ## Crate Map
 
@@ -40,7 +40,7 @@ Layered roughly transport -> container/format -> media -> apps/bindings.
 - `moq-hls` (lib): HLS / LL-HLS gateway (import + export, playlists + fMP4 via `moq-mux`).
 - `moq-bench` (bin): relay load generator. `JoinSet`-spawned staggered connections, rand sampling.
 - `moq-boy` (bin): crowd-controlled Game Boy emulator publisher (blocking emulator thread + async monitor tasks).
-- `moq-token` (lib) / `moq-token` (bin from the `moq-token-cli` crate): JWT auth. `Claims`, `Algorithm`, `KeyType` (EC/RSA/OCT/OKP), JWKS. CLI does generate/sign/verify.
+- `moq-token` (lib) / `moq-token` (bin from the `moq-token-cli` crate): JWT auth. `Claims`, `Algorithm`, `KeyMaterial` (EC/RSA/OCT/OKP), JWKS. CLI does generate/sign/verify.
 
 **Bindings**
 
@@ -119,8 +119,10 @@ Negotiation: `version::NEGOTIATED` lists SETUP-negotiated versions in preference
   3. A struct that will probably grow with additive, *defaultable* fields (the classic `Config`), paired with `Default`/a constructor so callers build via `default()`/`new()` + field set, not a struct literal. Prefer adding a field to such a struct over adding a positional parameter.
 
   Skip it everywhere else: on a struct that won't grow, or where a new field would *change behavior* rather than default to a no-op. There the addition should be a deliberate breaking change, not one the attribute waves through.
+- **Enum variant order**: append new variants to the end of a public fieldless enum that uses implicit discriminants. Inserting one earlier changes the numeric values exposed by `as`, which is a semver break even when the enum is `#[non_exhaustive]`.
 - **Builders** (private fields + chained `.with_x()` setters) are the orthogonal construction-ergonomics layer: reach for one when a struct has a lot of optional knobs, or is `#[non_exhaustive]` and you want construction to stay clean as fields get added (e.g. `select::Broadcast`).
 - **Make misuse unrepresentable in the type system** (root Public API Scrutiny): make terminal operations consume `self` (e.g. `fn close(self)`) so use-after-close can't even be written, rather than `&mut self` plus a `closed` flag. Return owned handles whose `Drop` runs the cleanup instead of asking callers to remember a teardown call.
+- **Borrow in, own out**: a parameter the callee only reads is a slice (`&[T]`, `&str`), and what you hand back is owned (`Vec<T>`, `String`). `fn publish(&mut self, encoded: &[Encoded])` accepts a `Vec`, an array, a boxed slice, or a sub-range without the caller rebuilding anything, and the signature already says the callee won't keep it. Take `Vec<T>` only when it genuinely takes ownership of the elements: it stores them (`I420::new(w, h, data: Vec<u8>)`) or moves fields out of them. When it merely consumes them once, `impl IntoIterator<Item = T>` says that without demanding a `Vec` the caller may not have.
 - **Unwrapping**: prefer `if let Some(v) = x { ... }` / `let Some(v) = x else { ... };` over a `match` whose only job is to bind the inner value. Keep `match` when both arms do real work.
 - **Naming / namespacing**: name by role, not by today's only implementation (`capture::Config`, `publish_capture`, not `CameraConfig`/`publish_camera`), so a second implementation slots in without a rename; don't bundle generic options under a specific-case name. Split a growing crate into role modules (`capture`, `encode`, `decode`) so each owns short, unprefixed names: the module supplies the prefix, so `encode::Config` beats `EncoderConfig` and `encode::Producer` beats `VideoProducer`. Don't nest a module whose name echoes its main type (`encode::encoder::Encoder` stutters): keep `mod encoder` private and re-export flat (`pub use encoder::{Encoder, Config}`) so it reads `encode::Encoder`.
 - **Deprecation mechanics** (root Deprecation explains the why): a deprecated CLI flag stays a hidden alias (clap `alias = "..."`, or a separate `#[arg(..., hide = true)]` when it needs its own runtime deprecation warning); a deprecated public item gets `#[doc(hidden)]` **and** `#[deprecated(note = "...")]`. Reach for the attribute: it fires at the *use* site, which is the whole point, while `#[doc(hidden)]` drops the symbol off docs.rs. What's banned is advertising the dead name on a published surface: no `--help` entry, and no "deprecated, use X" prose in the doc comment itself. Deprecating an item we still call internally also warns on our own call sites (CI runs `-D warnings`), so repoint those at the private helper.

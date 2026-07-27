@@ -227,10 +227,10 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 
 	fn handle_tracks(&mut self, entries: Vec<MatroskaSpec>) -> Result<()> {
 		for entry in entries {
-			if let MatroskaSpec::TrackEntry(Master::Full(children)) = entry {
-				if let Err(e) = self.add_track(children) {
-					tracing::warn!(error = ?e, "skipping MKV track");
-				}
+			if let MatroskaSpec::TrackEntry(Master::Full(children)) = entry
+				&& let Err(e) = self.add_track(children)
+			{
+				tracing::warn!(error = ?e, "skipping MKV track");
 			}
 		}
 		Ok(())
@@ -273,17 +273,26 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 		let track = self
 			.broadcast
 			.create_track(self.broadcast.unique_name(suffix), hang::container::track_info())?;
+		let name = track.name().to_string();
+
+		// Build the media producer before publishing the rendition. It is fallible (its
+		// timeline track can collide), and a rendition published for a track we then fail
+		// to produce would be advertised to consumers but never served.
+		let media = self
+			.catalog
+			.media_producer(track, crate::catalog::hang::Container::Legacy)?;
+
 		let mut catalog = self.catalog.clone();
 		let mut catalog = catalog.lock();
 
 		match kind {
 			TrackKind::Video => {
 				let config = build_video_config(&codec_id, codec_private.as_ref(), video_children.as_deref())?;
-				catalog.video.renditions.insert(track.name().to_string(), config);
+				catalog.video.renditions.insert(name, config);
 			}
 			TrackKind::Audio => {
 				let config = build_audio_config(&codec_id, codec_private.as_ref(), audio_children.as_deref())?;
-				catalog.audio.renditions.insert(track.name().to_string(), config);
+				catalog.audio.renditions.insert(name, config);
 			}
 		}
 
@@ -293,9 +302,7 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			track_number,
 			MkvTrack {
 				kind,
-				track: self
-					.catalog
-					.media_producer(track, crate::catalog::hang::Container::Legacy),
+				track: media,
 				group: None,
 				last_emitted_ticks: None,
 			},
@@ -368,10 +375,8 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 		// Manage groups: new group on video keyframe; audio always finishes its group immediately.
 		match track.kind {
 			TrackKind::Video => {
-				if keyframe {
-					if let Some(mut prev) = track.group.take() {
-						prev.finish()?;
-					}
+				if keyframe && let Some(mut prev) = track.group.take() {
+					prev.finish()?;
 				}
 				track.track.write(frame)?;
 			}
@@ -407,19 +412,19 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	}
 
 	/// Abort all tracks with `err` instead of finishing, so subscribers see the real
-	/// cause rather than [`moq_net::Error::Dropped`].
-	pub fn abort(&mut self, err: moq_net::Error) {
-		for track in self.tracks.values_mut() {
-			if let Some(mut g) = track.group.take() {
+	/// cause rather than [`moq_net::Error::Dropped`]. Consumes the importer.
+	pub fn abort(mut self, err: moq_net::Error) {
+		self.unregister();
+		for mut track in std::mem::take(&mut self.tracks).into_values() {
+			if let Some(g) = track.group.take() {
 				let _ = g.abort(err.clone());
 			}
 			track.track.abort(err.clone());
 		}
 	}
-}
 
-impl<E: crate::catalog::hang::CatalogExt> Drop for Import<E> {
-	fn drop(&mut self) {
+	/// Drop every rendition this importer registered from the catalog.
+	fn unregister(&mut self) {
 		let mut catalog = self.catalog.lock();
 		for track in self.tracks.values() {
 			match track.kind {
@@ -431,6 +436,12 @@ impl<E: crate::catalog::hang::CatalogExt> Drop for Import<E> {
 				}
 			}
 		}
+	}
+}
+
+impl<E: crate::catalog::hang::CatalogExt> Drop for Import<E> {
+	fn drop(&mut self) {
+		self.unregister();
 	}
 }
 
@@ -528,6 +539,7 @@ fn build_audio_config(
 				if cfg_rate > 0 { cfg_rate } else { sample_rate },
 				if cfg_channels > 0 { cfg_channels } else { channels },
 			);
+			config.description = codec_private.cloned();
 			config.container = Container::Legacy;
 			Ok(config)
 		}

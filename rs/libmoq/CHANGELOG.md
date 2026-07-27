@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/moq-dev/moq/compare/libmoq-v0.4.2...libmoq-v0.5.0) - 2026-07-25
+
+### Added
+
+- *(bindings)* expose shared video properties ([#2457](https://github.com/moq-dev/moq/pull/2457))
+
+### Other
+
+- *(moq-video)* [**breaking**] one raw Frame type, and carry timestamps through encode ([#2503](https://github.com/moq-dev/moq/pull/2503))
+
+## [0.4.2](https://github.com/moq-dev/moq/compare/libmoq-v0.4.1...libmoq-v0.4.2) - 2026-07-24
+
+### Other
+
+- updated the following local packages: moq-mux, moq-audio, moq-video
+
+## [0.4.1](https://github.com/moq-dev/moq/compare/libmoq-v0.4.0...libmoq-v0.4.1) - 2026-07-23
+
+### Other
+
+- updated the following local packages: moq-json, moq-audio, moq-video
+
+## [0.4.0](https://github.com/moq-dev/moq/compare/libmoq-v0.3.14...libmoq-v0.4.0) - 2026-07-22
+
+### Fixed
+
+- [**breaking**] correct catalog, timeline, token, and teardown contracts found in API review ([#2439](https://github.com/moq-dev/moq/pull/2439))
+
+### Other
+
+- [**breaking**] pre-bump API polish across the release batch ([#2423](https://github.com/moq-dev/moq/pull/2423))
+- *(net)* [**breaking**] route everything through create_broadcast, gate announce on Route.live ([#2396](https://github.com/moq-dev/moq/pull/2396))
+- Merge branch 'main' into dev
+
 ### Fixed
 
 - Linking `libmoq.a` on macOS no longer fails on undefined Apple framework

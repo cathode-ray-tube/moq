@@ -1,4 +1,4 @@
-use crate::{broadcast, cache, track};
+use crate::{broadcast, cache, stats, track};
 use kio::Pollable;
 use std::{
 	collections::{BTreeMap, HashMap},
@@ -6,6 +6,7 @@ use std::{
 	sync::Arc,
 	sync::atomic::{AtomicU64, Ordering},
 	task::{Poll, ready},
+	time::Duration,
 };
 
 use rand::RngExt;
@@ -106,6 +107,24 @@ pub struct Info {
 	/// relay sets a bounded one (via [`Self::with_pool`]) so cached groups across the
 	/// whole process share one memory budget.
 	pub pool: cache::Pool,
+
+	/// Ceiling on how long any non-latest group under this origin is retained. Each
+	/// track's own [`latency_max`](track::Info::latency_max) window is clamped down to
+	/// this when the track binds, so a group is never held longer than this regardless
+	/// of what a publisher advertises. The age budget alongside [`Self::pool`]'s byte
+	/// budget: a relay bounds memory by both. [`Duration::MAX`] (the default) imposes no
+	/// ceiling, leaving each track's own window in force.
+	pub cache_duration: Duration,
+
+	/// How long a broadcast under this origin outlives the *ungraceful* loss of its
+	/// last source before closing. Within the window the path stays announced and a
+	/// source re-attaching at it (a session reconnecting, a publisher re-announcing)
+	/// splices in seamlessly, so consumers never observe the gap. A source that ends
+	/// deliberately ([`broadcast::Producer::finish`], a clean unannounce from a peer)
+	/// closes the broadcast immediately regardless. Zero (the default) closes
+	/// immediately either way; a duration too large to represent as a deadline
+	/// (e.g. [`Duration::MAX`]) lingers indefinitely.
+	pub linger: Duration,
 }
 
 impl Default for Info {
@@ -115,6 +134,8 @@ impl Default for Info {
 		Self {
 			id: Origin::UNKNOWN,
 			pool: cache::Pool::default(),
+			cache_duration: Duration::MAX,
+			linger: Duration::ZERO,
 		}
 	}
 }
@@ -122,15 +143,26 @@ impl Default for Info {
 impl Info {
 	/// Config for the given origin id with an unbounded cache pool.
 	pub fn new(id: Origin) -> Self {
-		Self {
-			id,
-			pool: cache::Pool::default(),
-		}
+		Self { id, ..Self::default() }
 	}
 
 	/// Set the cache pool this origin's broadcasts inherit, returning `self` for chaining.
 	pub fn with_pool(mut self, pool: cache::Pool) -> Self {
 		self.pool = pool;
+		self
+	}
+
+	/// Set the retention ceiling (see [`Self::cache_duration`]) applied to every track
+	/// under this origin, returning `self` for chaining.
+	pub fn with_cache_duration(mut self, cache_duration: Duration) -> Self {
+		self.cache_duration = cache_duration;
+		self
+	}
+
+	/// Set how long a broadcast survives ungracefully losing its last source (see
+	/// [`Self::linger`]), returning `self` for chaining.
+	pub fn with_linger(mut self, linger: Duration) -> Self {
+		self.linger = linger;
 		self
 	}
 
@@ -768,6 +800,19 @@ pub struct Producer {
 	// The cache pool inherited by broadcasts created under this origin (sessions
 	// mint their remote broadcasts with it). Unbounded by default.
 	pool: cache::Pool,
+
+	// Retention ceiling inherited by broadcasts created under this origin (see
+	// [`Info::cache_duration`]). `Duration::MAX` (no ceiling) by default.
+	cache_duration: Duration,
+
+	// How long a broadcast outlives ungracefully losing its last source (see
+	// [`Info::linger`]). Zero by default.
+	linger: Duration,
+
+	// Ingress stats context. Broadcasts created through this producer are attributed
+	// to it (writes counted on the subscriber/ingress side). Empty (no-op) unless a
+	// session tagged this handle via [`Self::with_stats`].
+	stats: stats::Session,
 }
 
 impl std::ops::Deref for Producer {
@@ -789,7 +834,31 @@ impl Producer {
 			root: PathOwned::default(),
 			dynamic: kio::Shared::default(),
 			pool: info.pool,
+			cache_duration: info.cache_duration,
+			linger: info.linger,
+			stats: stats::Session::default(),
 		}
+	}
+
+	/// Attach an ingress stats context: broadcasts created through this handle (and
+	/// any handle derived from it) are attributed to `session` on the subscriber
+	/// (ingress) side. Pass [`stats::Session::default`] to opt out.
+	pub fn with_stats(mut self, session: stats::Session) -> Self {
+		self.stats = session;
+		self
+	}
+
+	/// Set the linger (see [`Info::linger`]) for broadcasts created through this
+	/// handle and any handle derived from it.
+	///
+	/// A broadcast adopts the window of the handle whose source *created* it (the
+	/// first source at the path), so set this before handing the producer to
+	/// whatever attaches sources through it (e.g. a session). Lets one supplier
+	/// declare its own recovery promise, like a reconnecting client lingering for
+	/// as long as its retry loop keeps trying, without reconfiguring the origin.
+	pub fn with_linger(mut self, linger: Duration) -> Self {
+		self.linger = linger;
+		self
 	}
 
 	/// This origin's [`Info`] (identity + cache pool), the parent handle a broadcast
@@ -798,6 +867,8 @@ impl Producer {
 		Info {
 			id: self.info,
 			pool: self.pool.clone(),
+			cache_duration: self.cache_duration,
+			linger: self.linger,
 		}
 	}
 
@@ -812,6 +883,9 @@ impl Producer {
 			root: PathOwned::default(),
 			dynamic: kio::Shared::default(),
 			pool: cache::Pool::default(),
+			cache_duration: Duration::MAX,
+			linger: Duration::ZERO,
+			stats: stats::Session::default(),
 		}
 	}
 
@@ -839,9 +913,11 @@ impl Producer {
 	/// consumer finds them.
 	///
 	/// End the broadcast with [`broadcast::Producer::finish`]; dropping it
-	/// without finishing also works, but logs a warning. Either way the path
-	/// unannounces once the last source detaches, so a replacement splices in
-	/// without consumers noticing only if it attaches before that happens.
+	/// without finishing also works, but logs a warning. A finish closes and
+	/// unannounces the path immediately once it was the last source. An unfinished
+	/// drop is treated as an outage: the path survives for the origin's
+	/// [`Info::linger`] (zero by default), so a replacement source attaching within
+	/// that window splices in without consumers noticing.
 	///
 	/// Fails with [`Error::Unauthorized`] if `path` is outside the prefixes this
 	/// producer may publish under (after [`scope`](Self::scope) /
@@ -869,10 +945,17 @@ impl Producer {
 			return Err(BoundsExceeded.into());
 		}
 
-		let mut source = broadcast::Info { origin: self.info() }.produce();
+		// Resolve the ingress counters once, keyed by the absolute broadcast path.
+		// The source producer tags its tracks; run_source drives the announce guard
+		// off route transitions.
+		let ingress = self.stats.ingress(&full);
+
+		let mut source = broadcast::Info { origin: self.info() }
+			.produce()
+			.with_stats(ingress.clone());
 		source.set_route(route).expect("fresh producer");
 
-		web_async::spawn(run_source(self.info(), node, full, rest, source.consume()));
+		web_async::spawn(run_source(self.info(), node, full, rest, source.consume(), ingress));
 
 		Ok(source)
 	}
@@ -890,6 +973,9 @@ impl Producer {
 			root: self.root.clone(),
 			dynamic: self.dynamic.clone(),
 			pool: self.pool.clone(),
+			cache_duration: self.cache_duration,
+			linger: self.linger,
+			stats: self.stats.clone(),
 		})
 	}
 
@@ -910,7 +996,15 @@ impl Producer {
 	/// Use [`Consumer::announced`] to register interest and start receiving
 	/// announcement events; the consumer itself does not allocate any channels.
 	pub fn consume(&self) -> Consumer {
-		Consumer::new(self.info, self.root.clone(), self.nodes.clone(), self.dynamic.clone())
+		// Untagged: a session tags the egress consumer separately via
+		// `origin::Consumer::with_stats` (ingress and egress are distinct sides).
+		Consumer::new(
+			self.info,
+			self.root.clone(),
+			self.nodes.clone(),
+			self.dynamic.clone(),
+			stats::Session::default(),
+		)
 	}
 
 	/// Handle to the announcement stream for this producer's subtree.
@@ -935,6 +1029,9 @@ impl Producer {
 			nodes: self.nodes.root(&prefix)?,
 			dynamic: self.dynamic.clone(),
 			pool: self.pool.clone(),
+			cache_duration: self.cache_duration,
+			linger: self.linger,
+			stats: self.stats.clone(),
 		})
 	}
 
@@ -961,6 +1058,20 @@ impl Producer {
 /// rejecting one track.
 const MAX_TRACK_RETRIES: u32 = 3;
 
+/// How long a spliced track stays warm after its last reader leaves.
+///
+/// Within the window a returning viewer, or the next of a run of back-to-back
+/// fetches, reuses the source's copy: no new track request, and no second round
+/// trip for its `TRACK_INFO`. After it, the copy is released so an idle track
+/// costs nothing upstream.
+///
+/// Sized above the fetch cadence of a segmented consumer: HLS polls every
+/// `TARGETDURATION` seconds, commonly 6 or 10, so a shorter window would drop the
+/// copy between every segment and re-request the track each time. A warm copy
+/// holds no upstream subscription (that is canceled as soon as demand ends), so
+/// waiting longer costs cached state, not a viewer.
+const TRACK_IDLE_LINGER: Duration = Duration::from_secs(30);
+
 /// One attached source in a [`FrontState`] table.
 struct FrontRoute {
 	id: u64,
@@ -981,8 +1092,12 @@ struct FrontState {
 	routes: Vec<FrontRoute>,
 	/// The source tracks are dispatched to. Backups park until promoted.
 	active: Option<u64>,
+	/// How long the front outlives ungracefully losing its last source (see
+	/// [`Info::linger`]). [`run_front`] arms the countdown when the table empties.
+	linger: Duration,
 	/// Terminal: no more sources may attach and every poller stops. Set
-	/// synchronously by the detach that empties the table.
+	/// synchronously by the detach that empties the table, or by [`run_front`]
+	/// when the linger window expires without a replacement.
 	closed: bool,
 }
 
@@ -1085,10 +1200,22 @@ fn sync_front(state: &kio::Producer<FrontState>, broadcast: &broadcast::Producer
 /// Detach source `id`, promoting the next-best source; the tracks it was serving
 /// re-splice on their own. Idempotent.
 ///
-/// Detaching the last source closes the broadcast synchronously, which
-/// guarantees a following create at the path is a *new* broadcast rather than
-/// splicing new content into this one.
-fn detach_source(state: &kio::Producer<FrontState>, broadcast: &broadcast::Producer, leaf: &Lock<OriginNode>, id: u64) {
+/// `graceful` says how the source ended: a deliberate finish (a publisher done
+/// publishing, a peer's clean unannounce) or an abrupt loss (a session dying).
+/// Detaching the last source *gracefully* closes the broadcast synchronously,
+/// which guarantees a following create at the path is a *new* broadcast rather
+/// than splicing new content into this one. An abrupt last detach instead leaves
+/// the front open for the configured linger ([`Info::linger`]), so a source
+/// re-attaching within the window (a reconnect) splices in seamlessly;
+/// [`run_front`] closes it if the window expires empty. A zero linger closes
+/// abrupt detaches synchronously too.
+fn detach_source(
+	state: &kio::Producer<FrontState>,
+	broadcast: &broadcast::Producer,
+	leaf: &Lock<OriginNode>,
+	id: u64,
+	graceful: bool,
+) {
 	let close = {
 		let carrying = broadcast.demand().is_used();
 		let Ok(mut s) = state.write() else { return };
@@ -1097,7 +1224,7 @@ fn detach_source(state: &kio::Producer<FrontState>, broadcast: &broadcast::Produ
 		};
 		s.routes.remove(pos);
 		s.reselect(carrying);
-		if s.routes.is_empty() && !s.closed {
+		if s.routes.is_empty() && !s.closed && (graceful || s.linger.is_zero()) {
 			// Last one out: close now. The front task observes `closed` and
 			// finishes the teardown (unpublish).
 			s.closed = true;
@@ -1121,6 +1248,7 @@ async fn run_source(
 	full: PathOwned,
 	rest: PathOwned,
 	mut source: broadcast::Consumer,
+	ingress: stats::Scope,
 ) {
 	// The first `route_changed` yields the current route immediately; nothing is
 	// visible to consumers until this attach, giving the creator a window to set
@@ -1129,6 +1257,12 @@ async fn run_source(
 		// Closed before ever attaching; nothing became visible.
 		return;
 	};
+
+	// Ingress announce guard: held while this source's route is announced. Opening
+	// bumps `announced` + `announced_bytes`; dropping (route offline, or the source
+	// closing below) bumps `announced_closed` + `announced_bytes`. Empty scope =
+	// no-op.
+	let mut announce = route.announce.then(|| ingress.announce());
 
 	let leaf = if rest.is_empty() {
 		node.clone()
@@ -1141,6 +1275,7 @@ async fn run_source(
 	loop {
 		match source.route_changed().await {
 			Ok(route) => {
+				let announced = route.announce;
 				{
 					let carrying = broadcast.demand().is_used();
 					let Ok(mut s) = state.write() else { return };
@@ -1153,10 +1288,18 @@ async fn run_source(
 					entry.route = route;
 					s.reselect(carrying);
 				}
+				// Toggle the ingress announce guard on a live/offline transition.
+				match (announced, announce.is_some()) {
+					(true, false) => announce = Some(ingress.announce()),
+					(false, true) => announce = None,
+					_ => {}
+				}
 				sync_front(&state, &broadcast, &leaf);
 			}
 			Err(_) => {
-				detach_source(&state, &broadcast, &leaf, id);
+				// A deliberate finish closes the front immediately; an abrupt loss
+				// (dropped producer, dead session) may linger for a replacement.
+				detach_source(&state, &broadcast, &leaf, id, source.is_finished());
 				return;
 			}
 		}
@@ -1219,6 +1362,7 @@ fn attach_source(
 			source: source.clone(),
 		}],
 		active: Some(0),
+		linger: origin.linger,
 		closed: false,
 	});
 
@@ -1251,34 +1395,104 @@ fn attach_source(
 /// until the last source detaches, then unpublishes the broadcast.
 async fn run_front(
 	state: kio::Producer<FrontState>,
-	broadcast: broadcast::Producer,
+	mut broadcast: broadcast::Producer,
 	node: Lock<OriginNode>,
 	rest: PathOwned,
 ) {
 	enum Step {
 		Serve(Arc<str>, super::resume::Producer),
+		/// The source table emptied or refilled: re-arm the linger countdown.
+		Changed,
+		/// The linger window expired: close if the table is still empty.
+		Expired,
 		Closed,
 	}
 
+	let linger = state.read().linger;
+	// Armed while the table is ungracefully empty: the instant the front gives up
+	// waiting for a replacement source. A graceful close never gets here (the
+	// detach sets `closed` synchronously), so a running countdown always means a
+	// reconnect is welcome.
+	let mut deadline: Option<web_async::time::Instant> = None;
+
 	loop {
-		let step = kio::wait(|waiter| {
-			if let Poll::Ready((name, resume)) = broadcast.poll_spliced_assigned(waiter) {
-				return Poll::Ready(Step::Serve(name, resume));
-			}
-			// `closed` is set by the detach that empties the table, so an empty
-			// table is always terminal.
-			match state.poll(waiter, |s| if s.closed { Poll::Ready(()) } else { Poll::Pending }) {
-				Poll::Ready(_) => Poll::Ready(Step::Closed),
-				Poll::Pending => Poll::Pending,
-			}
-		})
-		.await;
+		let empty = {
+			let s = state.read();
+			!s.closed && s.routes.is_empty()
+		};
+		deadline = match (empty, deadline) {
+			// An unrepresentable deadline (e.g. `Duration::MAX`) lingers forever:
+			// no timer, only a re-attach or teardown moves the front on.
+			(true, None) => web_async::time::Instant::now().checked_add(linger),
+			(true, at) => at,
+			(false, _) => None,
+		};
+
+		let step = {
+			// Pending forever while no countdown is running. Fused via `fired`: a
+			// completed future must not be polled again.
+			let mut sleep = std::pin::pin!(async {
+				match deadline {
+					Some(at) => {
+						web_async::time::sleep(at.saturating_duration_since(web_async::time::Instant::now())).await
+					}
+					None => std::future::pending().await,
+				}
+			});
+			let mut fired = false;
+			kio::wait(|waiter| {
+				if let Poll::Ready((name, resume)) = broadcast.poll_spliced_assigned(waiter) {
+					return Poll::Ready(Step::Serve(name, resume));
+				}
+				// Watch for the close, and for the table changing shape so the
+				// countdown re-arms (a detach emptying it, a reconnect refilling it).
+				match state.poll(waiter, |s| {
+					if s.closed || s.routes.is_empty() != empty {
+						Poll::Ready(())
+					} else {
+						Poll::Pending
+					}
+				}) {
+					Poll::Ready(Ok(guard)) => {
+						return Poll::Ready(if guard.closed { Step::Closed } else { Step::Changed });
+					}
+					Poll::Ready(Err(_)) => return Poll::Ready(Step::Closed),
+					Poll::Pending => {}
+				}
+				if deadline.is_some() && !fired && waiter.poll_future(sleep.as_mut()).is_ready() {
+					fired = true;
+				}
+				match fired {
+					true => Poll::Ready(Step::Expired),
+					false => Poll::Pending,
+				}
+			})
+			.await
+		};
 
 		match step {
 			Step::Serve(name, resume) => {
 				// Serve tasks self-terminate when the track completes or the
 				// front closes.
 				web_async::spawn(serve_track(state.clone(), name, resume));
+			}
+			Step::Changed => {}
+			Step::Expired => {
+				// Close only if the table is still empty: a source that re-attached
+				// as the window expired wins the write-lock race and keeps the
+				// broadcast alive.
+				let close = {
+					let Ok(mut s) = state.write() else { break };
+					if !s.closed && s.routes.is_empty() {
+						s.closed = true;
+						true
+					} else {
+						false
+					}
+				};
+				if close {
+					break;
+				}
 			}
 			Step::Closed => break,
 		}
@@ -1308,6 +1522,10 @@ async fn serve_track(state: kio::Producer<FrontState>, name: Arc<str>, mut resum
 		Splice(u64, broadcast::Consumer),
 		Complete,
 		Failed,
+		/// The linger expired with the track still unread: release the segment.
+		Idle,
+		/// A reader arrived or the last one left: recompute the demand gate.
+		Demand,
 	}
 
 	let mut fails = 0u32;
@@ -1317,51 +1535,101 @@ async fn serve_track(state: kio::Producer<FrontState>, name: Arc<str>, mut resum
 	// about to detach it, so wait for the table to move on rather than burning
 	// the strike budget on a corpse (ids are never reused, so this cannot wedge).
 	let mut dead: Option<u64> = None;
+	// When the spliced segment stopped being read, starting the release countdown.
+	let mut idle_since: Option<web_async::time::Instant> = None;
 
 	loop {
 		let serving_id = serving.as_ref().map(|(id, _)| *id);
-		let step = kio::wait(|waiter| {
-			// Watch the source table: the front closing, or the active source
-			// moving away from the one currently spliced in (skipping one whose
-			// closure we already observed).
-			match state.poll(waiter, |s| {
-				if s.closed || matches!(s.active, Some(active) if Some(active) != serving_id && Some(active) != dead) {
-					Poll::Ready(())
-				} else {
-					Poll::Pending
-				}
-			}) {
-				Poll::Ready(Ok(guard)) => {
-					if guard.closed {
-						return Poll::Ready(Step::Closed);
-					}
-					let active = guard.active.expect("predicate guaranteed an active source");
-					let source = guard
-						.routes
-						.iter()
-						.find(|r| r.id == active)
-						.expect("active source in table")
-						.source
-						.clone();
-					return Poll::Ready(Step::Splice(active, source));
-				}
-				Poll::Ready(Err(_)) => return Poll::Ready(Step::Closed),
-				Poll::Pending => {}
-			}
 
-			// Watch the spliced copy for its end: complete means the logical
-			// track is over; anything else means the serving source died.
-			if let Some((_, track)) = &serving
-				&& let Poll::Ready(result) = track.poll_complete(waiter)
-			{
-				return Poll::Ready(match result {
-					Ok(()) => Step::Complete,
-					Err(_) => Step::Failed,
-				});
-			}
-			Poll::Pending
-		})
-		.await;
+		// Demand gates both directions: an unread track never splices a source in,
+		// and a spliced one is released once the linger expires. Both sides use the
+		// same signal, so a release can't immediately re-splice and spin.
+		let used = resume.is_used();
+		idle_since = match (serving.is_some(), used) {
+			(true, false) => idle_since.or_else(|| Some(web_async::time::Instant::now())),
+			_ => None,
+		};
+		let deadline = idle_since.and_then(|at| at.checked_add(TRACK_IDLE_LINGER));
+
+		let step = {
+			// Pinned outside the closure: a future re-created on every poll would
+			// restart the countdown each time and never fire. Fused via `fired`: a
+			// completed future must not be polled again.
+			let mut sleep = std::pin::pin!(async {
+				match deadline {
+					Some(at) => {
+						web_async::time::sleep(at.saturating_duration_since(web_async::time::Instant::now())).await
+					}
+					None => std::future::pending().await,
+				}
+			});
+			let mut fired = false;
+
+			kio::wait(|waiter| {
+				// Watch the source table: the front closing, or the active source
+				// moving away from the one currently spliced in (skipping one whose
+				// closure we already observed). Splicing waits for a reader.
+				match state.poll(waiter, |s| {
+					if s.closed
+						|| (used
+							&& matches!(s.active, Some(active) if Some(active) != serving_id && Some(active) != dead))
+					{
+						Poll::Ready(())
+					} else {
+						Poll::Pending
+					}
+				}) {
+					Poll::Ready(Ok(guard)) => {
+						if guard.closed {
+							return Poll::Ready(Step::Closed);
+						}
+						let active = guard.active.expect("predicate guaranteed an active source");
+						let source = guard
+							.routes
+							.iter()
+							.find(|r| r.id == active)
+							.expect("active source in table")
+							.source
+							.clone();
+						return Poll::Ready(Step::Splice(active, source));
+					}
+					Poll::Ready(Err(_)) => return Poll::Ready(Step::Closed),
+					Poll::Pending => {}
+				}
+
+				// Watch the demand edge in whichever direction is unmet. This has to end
+				// the wait, not just wake it: `used` and the countdown are computed by
+				// the outer loop, so a wake that stayed inside would re-poll with the
+				// stale value and never arm (or cancel) the linger.
+				let edge = match used {
+					true => resume.poll_unused(waiter),
+					false => resume.poll_used(waiter),
+				};
+				if edge.is_ready() {
+					return Poll::Ready(Step::Demand);
+				}
+
+				// Watch the spliced copy for its end: complete means the logical
+				// track is over; anything else means the serving source died.
+				if let Some((_, track)) = &serving
+					&& let Poll::Ready(result) = track.poll_complete(waiter)
+				{
+					return Poll::Ready(match result {
+						Ok(()) => Step::Complete,
+						Err(_) => Step::Failed,
+					});
+				}
+
+				if deadline.is_some() && !fired && waiter.poll_future(sleep.as_mut()).is_ready() {
+					fired = true;
+				}
+				if fired {
+					return Poll::Ready(Step::Idle);
+				}
+				Poll::Pending
+			})
+			.await
+		};
 
 		match step {
 			// The front's teardown aborts the logical track.
@@ -1373,6 +1641,19 @@ async fn serve_track(state: kio::Producer<FrontState>, name: Arc<str>, mut resum
 			Step::Failed => {
 				// The spliced copy died mid-serve: failover, not a strike.
 				// Re-splice from the (possibly same) active source.
+				serving = None;
+			}
+			// The outer loop recomputes `used` and the countdown on the next pass.
+			Step::Demand => {}
+			Step::Idle => {
+				// Nobody has read the track for the linger: drop the source's copy so
+				// its session can release the track (and the cached `track::Info` that
+				// came with it). The logical track stays alive and re-splices on the
+				// next reader, so a returning viewer or a follow-up fetch resumes.
+				if resume.release().is_err() {
+					// Finished or aborted meanwhile; the track is over either way.
+					return;
+				}
 				serving = None;
 			}
 			Step::Splice(id, source) => {
@@ -1663,6 +1944,9 @@ impl Drop for Request {
 /// handler drops before serving it.
 pub struct Requesting {
 	inner: RequestState,
+	// Egress scope applied to the resolved broadcast, so its reads are attributed.
+	// Empty (no-op) for an untagged consumer.
+	stats: stats::Scope,
 }
 
 enum RequestState {
@@ -1679,32 +1963,40 @@ impl Requesting {
 	fn ready(broadcast: broadcast::Consumer) -> Self {
 		Self {
 			inner: RequestState::Ready(broadcast),
+			stats: stats::Scope::default(),
 		}
 	}
 
 	fn failed(error: Error) -> Self {
 		Self {
 			inner: RequestState::Failed(error),
+			stats: stats::Scope::default(),
 		}
 	}
 
 	fn pending(consumer: kio::Consumer<PendingBroadcast>) -> Self {
 		Self {
 			inner: RequestState::Pending(consumer),
+			stats: stats::Scope::default(),
 		}
+	}
+
+	fn with_stats(mut self, scope: stats::Scope) -> Self {
+		self.stats = scope;
+		self
 	}
 
 	/// Poll for the requested broadcast without blocking.
 	pub fn poll_ok(&self, waiter: &kio::Waiter) -> Poll<Result<broadcast::Consumer, Error>> {
 		match &self.inner {
-			RequestState::Ready(broadcast) => Poll::Ready(Ok(broadcast.clone())),
+			RequestState::Ready(broadcast) => Poll::Ready(Ok(broadcast.clone().with_stats(self.stats.clone()))),
 			RequestState::Failed(error) => Poll::Ready(Err(error.clone())),
 			RequestState::Pending(consumer) => Poll::Ready(
 				match ready!(consumer.poll(waiter, |state| match &state.resolved {
 					Some(result) => Poll::Ready(result.clone()),
 					None => Poll::Pending,
 				})) {
-					Ok(result) => result,
+					Ok(result) => result.map(|broadcast| broadcast.with_stats(self.stats.clone())),
 					// Every handler dropped without resolving: nobody could route it.
 					Err(_closed) => Err(Error::Unroutable),
 				},
@@ -1742,8 +2034,15 @@ impl<T, U: Consume<T>> Consume<T> for &U {
 impl Consume<Consumer> for Producer {
 	fn consume(&self) -> Consumer {
 		// Mirrors the inherent `Producer::consume`; inlined to avoid the
-		// inherent-vs-trait `consume` ambiguity.
-		Consumer::new(self.info, self.root.clone(), self.nodes.clone(), self.dynamic.clone())
+		// inherent-vs-trait `consume` ambiguity. Untagged: egress is tagged
+		// separately from ingress.
+		Consumer::new(
+			self.info,
+			self.root.clone(),
+			self.nodes.clone(),
+			self.dynamic.clone(),
+			stats::Session::default(),
+		)
 	}
 }
 
@@ -1795,6 +2094,11 @@ pub struct Consumer {
 	// Shared fallback request queue, fed to any `Dynamic` handler on the
 	// producer side. Used only by `request_broadcast`; announced lookups ignore it.
 	dynamic: kio::Shared<OriginDynamicState>,
+
+	// Egress stats context. Broadcasts handed out through this consumer (and any
+	// handle derived from them) are attributed to it (reads counted on the
+	// publisher/egress side). Empty (no-op) unless a session tagged this handle.
+	stats: stats::Session,
 }
 
 impl std::ops::Deref for Consumer {
@@ -1806,12 +2110,37 @@ impl std::ops::Deref for Consumer {
 }
 
 impl Consumer {
-	fn new(info: Origin, root: PathOwned, nodes: OriginNodes, dynamic: kio::Shared<OriginDynamicState>) -> Self {
+	fn new(
+		info: Origin,
+		root: PathOwned,
+		nodes: OriginNodes,
+		dynamic: kio::Shared<OriginDynamicState>,
+		stats: stats::Session,
+	) -> Self {
 		Self {
 			info,
 			nodes,
 			root,
 			dynamic,
+			stats,
+		}
+	}
+
+	/// Attach an egress stats context: broadcasts handed out through this handle (and
+	/// any handle derived from it) are attributed to `session` on the publisher
+	/// (egress) side. Pass [`stats::Session::default`] to opt out.
+	pub fn with_stats(mut self, session: stats::Session) -> Self {
+		self.stats = session;
+		self
+	}
+
+	/// A clone of this consumer with its stats context cleared, so an internal
+	/// lookup stream (e.g. [`Self::announced_broadcast`]) doesn't drive the egress
+	/// announce guards; the caller re-attributes the result itself.
+	fn untagged(&self) -> Self {
+		Self {
+			stats: stats::Session::default(),
+			..self.clone()
 		}
 	}
 
@@ -1825,6 +2154,7 @@ impl Consumer {
 			nodes: OriginNodes { nodes: Vec::new() },
 			root: self.root.clone(),
 			dynamic: self.dynamic.clone(),
+			stats: self.stats.clone(),
 		}
 	}
 
@@ -1835,7 +2165,7 @@ impl Consumer {
 	/// set as initial announcements. Drop the returned [`AnnounceConsumer`]
 	/// to unregister.
 	pub fn announced(&self) -> AnnounceConsumer {
-		AnnounceConsumer::new(self.root.clone(), self.nodes.clone())
+		AnnounceConsumer::new(self.root.clone(), self.nodes.clone(), self.stats.clone())
 	}
 
 	/// Returns a cheap duplicate of this read handle.
@@ -1880,17 +2210,21 @@ impl Consumer {
 			return None;
 		}
 
-		let mut announced = consumer.announced();
+		// Use an untagged stream: this is a lookup, not egress announce forwarding, so
+		// it must not drive the announce guards. The matched result is attributed
+		// with the egress scope instead.
+		let mut announced = consumer.untagged().announced();
+		let scope = self.stats.egress(self.root.join(&path).to_owned());
 		loop {
 			let OriginAnnounce {
 				path: announced_path,
 				broadcast,
 			} = announced.next().await?;
 			// `scope` narrows by prefix, but we only want an exact-path match.
-			if announced_path.as_path() == path {
-				if let Some(broadcast) = broadcast {
-					return Some(broadcast);
-				}
+			if announced_path.as_path() == path
+				&& let Some(broadcast) = broadcast
+			{
+				return Some(broadcast.with_stats(scope));
 			}
 		}
 	}
@@ -1907,6 +2241,7 @@ impl Consumer {
 			self.root.clone(),
 			self.nodes.select(&prefixes)?,
 			self.dynamic.clone(),
+			self.stats.clone(),
 		))
 	}
 
@@ -1931,14 +2266,16 @@ impl Consumer {
 	pub fn request_broadcast(&self, path: impl AsPath) -> kio::Pending<Requesting> {
 		let path = path.as_path();
 
+		// Key requests by absolute path so a scoped/rooted consumer and the handler
+		// (which may have a different root) agree on the same entry, and so the egress
+		// counters resolve against the same broadcast the ingress side wrote.
+		let absolute = self.root.join(&path).to_owned();
+		let scope = self.stats.egress(&absolute);
+
 		// Prefer a live announcement when one is present; the dynamic queue is only a fallback.
 		if let Some(broadcast) = self.get_broadcast(&path) {
-			return kio::Pending::new(Requesting::ready(broadcast));
+			return kio::Pending::new(Requesting::ready(broadcast).with_stats(scope));
 		}
-
-		// Key requests by absolute path so a scoped/rooted consumer and the handler
-		// (which may have a different root) agree on the same entry.
-		let absolute = self.root.join(&path).to_owned();
 
 		let mut state = self.dynamic.lock();
 
@@ -1946,7 +2283,7 @@ impl Consumer {
 		// requests share one upstream subscription. A closed entry is stale; `get` drops it
 		// and returns `None`, so we fall through and re-serve below.
 		if let Some(weak) = state.served.get(&absolute) {
-			return kio::Pending::new(Requesting::ready(weak.consume()));
+			return kio::Pending::new(Requesting::ready(weak.consume()).with_stats(scope));
 		}
 
 		// Coalesce onto a pending request for the same path; otherwise register a new
@@ -1962,7 +2299,7 @@ impl Consumer {
 			consumer
 		};
 
-		kio::Pending::new(Requesting::pending(consumer))
+		kio::Pending::new(Requesting::pending(consumer).with_stats(scope))
 	}
 
 	/// Returns a new Consumer that automatically strips out the provided prefix.
@@ -1977,6 +2314,7 @@ impl Consumer {
 			self.root.join(&prefix).to_owned(),
 			self.nodes.root(&prefix)?,
 			self.dynamic.clone(),
+			self.stats.clone(),
 		))
 	}
 
@@ -2018,7 +2356,9 @@ impl AnnounceProducer {
 	/// as initial announcements. Drop the returned [`AnnounceConsumer`] to
 	/// unregister.
 	pub fn consume(&self) -> AnnounceConsumer {
-		AnnounceConsumer::new(self.root.clone(), self.nodes.clone())
+		// Untagged: `AnnounceProducer` is used for internal announce plumbing, not
+		// egress attribution (which flows through `origin::Consumer::announced`).
+		AnnounceConsumer::new(self.root.clone(), self.nodes.clone(), stats::Session::default())
 	}
 
 	/// Returns the prefix that is automatically stripped from announced paths.
@@ -2039,10 +2379,19 @@ pub struct AnnounceConsumer {
 	// Pending updates queued for this cursor. Coalesced so a slow consumer
 	// can't accumulate redundant announce/unannounce pairs.
 	state: kio::Producer<OriginConsumerState>,
+
+	// Egress stats context (empty for an untagged stream). Announce events drive the
+	// per-broadcast announce guards below and tag the broadcasts handed out.
+	stats: stats::Session,
+
+	// Live egress announce guards, keyed by absolute broadcast path. An announce
+	// opens one (bumping `announced` + `announced_bytes`); the matching unannounce
+	// drops it (bumping `announced_closed` + `announced_bytes`).
+	guards: HashMap<PathOwned, stats::Announce>,
 }
 
 impl AnnounceConsumer {
-	fn new(root: PathOwned, nodes: OriginNodes) -> Self {
+	fn new(root: PathOwned, nodes: OriginNodes, stats: stats::Session) -> Self {
 		let state = kio::Producer::<OriginConsumerState>::default();
 		let id = ConsumerId::new();
 
@@ -2054,7 +2403,38 @@ impl AnnounceConsumer {
 			node.lock().consume(id, notify);
 		}
 
-		Self { id, nodes, root, state }
+		Self {
+			id,
+			nodes,
+			root,
+			state,
+			stats,
+			guards: HashMap::new(),
+		}
+	}
+
+	/// Drive the egress announce guards and tag the broadcast for one update.
+	///
+	/// An announce opens a guard (keyed by absolute path) and tags the yielded
+	/// broadcast with the egress scope; an unannounce drops the guard. A no-op for
+	/// an untagged stream.
+	fn attribute(&mut self, update: OriginAnnounce) -> OriginAnnounce {
+		let OriginAnnounce { path, broadcast } = update;
+		let absolute = self.root.join(&path).to_owned();
+		match broadcast {
+			Some(broadcast) => {
+				let scope = self.stats.egress(&absolute);
+				self.guards.entry(absolute).or_insert_with(|| scope.announce());
+				OriginAnnounce {
+					path,
+					broadcast: Some(broadcast.with_stats(scope)),
+				}
+			}
+			None => {
+				self.guards.remove(&absolute);
+				OriginAnnounce { path, broadcast: None }
+			}
+		}
 	}
 
 	/// Returns the next (un)announced broadcast and its path relative to this
@@ -2073,18 +2453,21 @@ impl AnnounceConsumer {
 	/// cursor is closed, or `Poll::Pending` after registering `waiter` to be
 	/// notified when the next update arrives.
 	pub fn poll_next(&mut self, waiter: &kio::Waiter) -> Poll<Option<OriginAnnounce>> {
-		let mut state = match ready!(self.state.poll(waiter, |state| {
-			if state.pending.is_empty() {
-				Poll::Pending
-			} else {
-				Poll::Ready(())
-			}
-		})) {
-			Ok(state) => state,
-			// Closed: discard the Ref so its MutexGuard doesn't escape this call.
-			Err(_) => return Poll::Ready(None),
+		let update = {
+			let mut state = match ready!(self.state.poll(waiter, |state| {
+				if state.pending.is_empty() {
+					Poll::Pending
+				} else {
+					Poll::Ready(())
+				}
+			})) {
+				Ok(state) => state,
+				// Closed: discard the Ref so its MutexGuard doesn't escape this call.
+				Err(_) => return Poll::Ready(None),
+			};
+			state.take().expect("predicate guaranteed an update")
 		};
-		Poll::Ready(Some(state.take().expect("predicate guaranteed an update")))
+		Poll::Ready(Some(self.attribute(update)))
 	}
 
 	/// Returns the next (un)announced broadcast without blocking.
@@ -2092,7 +2475,8 @@ impl AnnounceConsumer {
 	/// Returns None if there is no update available; NOT because the cursor is closed.
 	/// Use [`Self::is_closed`] to check if the cursor is closed.
 	pub fn try_next(&mut self) -> Option<OriginAnnounce> {
-		self.state.write().ok()?.take()
+		let update = self.state.write().ok()?.take()?;
+		Some(self.attribute(update))
 	}
 
 	/// Returns true if the cursor is closed (no more updates will arrive).
@@ -2226,6 +2610,7 @@ mod tests {
 				})
 				.collect(),
 			active: Some(0),
+			linger: Duration::ZERO,
 			closed: false,
 		}
 	}
@@ -2361,6 +2746,212 @@ mod tests {
 		request.accept(None)
 	}
 
+	/// Tagging both origin handles with one context attributes the full model path:
+	/// ingress writes on the subscriber side, egress reads on the publisher side,
+	/// each counter landing exactly once (the model-layer silent-zero guard).
+	#[tokio::test]
+	async fn test_stats_tagged_end_to_end() {
+		use crate::Timestamp;
+		use crate::stats::{Config, Registry, Tier};
+		use bytes::Bytes;
+
+		tokio::time::pause();
+
+		let registry = Registry::new(Config::new());
+		let ctx = registry.tier(Tier::default()).session("acme");
+
+		let origin = Origin::random().produce();
+		let ingress = origin.clone().with_stats(ctx.clone());
+		let egress = origin.consume().with_stats(ctx.clone());
+
+		// Egress announce stream: this is the tagged stream that drives the egress
+		// announce guard.
+		let mut announced = egress.announced();
+
+		// Ingress publishes an announced broadcast.
+		let source = ingress.create_broadcast("demo", announce()).unwrap();
+		let mut dynamic = source.dynamic();
+		settle().await;
+		settle().await;
+
+		// Egress observes the announce and gets the tagged broadcast.
+		let update = announced.next().await.unwrap();
+		assert_eq!(update.path.as_str(), "demo");
+		let broadcast = update.broadcast.unwrap();
+
+		// Egress subscribes; the ingress side serves the track on demand.
+		let subscribing = broadcast.track("video").unwrap().subscribe(None);
+		let mut producer = accept_track(&mut dynamic, "video").await;
+		settle().await;
+		let mut sub = subscribing.await.unwrap();
+
+		// Ingress writes one group with two 5-byte frames.
+		let mut group = producer.append_group().unwrap();
+		group
+			.write_frame(Timestamp::ZERO, Bytes::from_static(b"hello"))
+			.unwrap();
+		group
+			.write_frame(Timestamp::ZERO, Bytes::from_static(b"world"))
+			.unwrap();
+		group.finish().unwrap();
+
+		// Egress reads the group and both frames.
+		let mut group_c = sub.recv_group().await.unwrap().unwrap();
+		let mut frames = 0;
+		while let Some(frame) = group_c.read_frame().await.unwrap() {
+			assert_eq!(frame.payload.len(), 5);
+			frames += 1;
+		}
+		assert_eq!(frames, 2);
+		settle().await;
+
+		let report = registry.report();
+		let entry = report
+			.traffic
+			.iter()
+			.find(|e| e.path.as_str() == "demo")
+			.expect("demo tracked");
+		let path_len = "demo".len() as u64;
+
+		// Egress (publisher side): reads out of the model.
+		let egress = &entry.publisher;
+		assert_eq!(egress.announced, 1, "one egress announce");
+		assert_eq!(egress.announced_bytes, path_len);
+		assert_eq!(egress.subscriptions, 1, "one egress subscription");
+		assert_eq!(egress.broadcasts, 1, "one viewer");
+		assert_eq!(egress.groups, 1);
+		assert_eq!(egress.frames, 2);
+		assert_eq!(egress.bytes, 10);
+		assert_eq!(egress.fetches, 0);
+
+		// Ingress (subscriber side): writes into the model.
+		let ingress = &entry.subscriber;
+		assert_eq!(ingress.announced, 1, "one ingress announce");
+		assert_eq!(ingress.announced_bytes, path_len);
+		assert_eq!(ingress.subscriptions, 1, "one ingress track");
+		assert_eq!(ingress.broadcasts, 0, "ingress has no viewer refcount");
+		assert_eq!(ingress.groups, 1);
+		assert_eq!(ingress.frames, 2);
+		assert_eq!(ingress.bytes, 10);
+
+		// A fetch bumps only `fetches` on the egress side, plus the delivered group.
+		let fetched = broadcast.track("video").unwrap().fetch_group(0, None).await.unwrap();
+		let _ = fetched;
+		settle().await;
+		let report = registry.report();
+		let entry = report.traffic.iter().find(|e| e.path.as_str() == "demo").unwrap();
+		assert_eq!(entry.publisher.fetches, 1, "one fetch");
+		assert_eq!(entry.publisher.subscriptions, 1, "fetch does not bump subscriptions");
+		assert_eq!(entry.publisher.broadcasts, 1, "fetch does not bump the viewer refcount");
+		// `fetches` is egress-only for the same structural reason as `broadcasts`:
+		// only a `track::Consumer` can fetch, and the ingress scope never reaches one
+		// (`broadcast::Producer::consume` hands out an untagged consumer).
+		assert_eq!(entry.subscriber.fetches, 0, "ingress cannot fetch");
+	}
+
+	/// `Subscriber::read_frame` collapses a group to its first frame. The paths it
+	/// delegates to (plain and spliced) build their own *unmetered* group consumers,
+	/// so the wrapper is the only place that can attribute the read: exactly one
+	/// group, one frame, and the payload bytes, counted once each.
+	#[tokio::test]
+	async fn test_stats_read_frame_counts_once() {
+		use crate::Timestamp;
+		use crate::stats::{Config, Registry, Tier};
+		use bytes::Bytes;
+
+		tokio::time::pause();
+
+		let registry = Registry::new(Config::new());
+		let ctx = registry.tier(Tier::default()).session("acme");
+
+		let origin = Origin::random().produce();
+		let ingress = origin.clone().with_stats(ctx.clone());
+		let egress = origin.consume().with_stats(ctx.clone());
+
+		let mut announced = egress.announced();
+		let source = ingress.create_broadcast("demo", announce()).unwrap();
+		let mut dynamic = source.dynamic();
+		settle().await;
+		settle().await;
+
+		let broadcast = announced.next().await.unwrap().broadcast.unwrap();
+		let subscribing = broadcast.track("video").unwrap().subscribe(None);
+		let mut producer = accept_track(&mut dynamic, "video").await;
+		settle().await;
+		let mut sub = subscribing.await.unwrap();
+
+		// A single-frame group, read back through the collapsing helper.
+		producer
+			.write_frame(Timestamp::ZERO, Bytes::from_static(b"hello"))
+			.unwrap();
+
+		let frame = sub.read_frame().await.unwrap().expect("frame");
+		assert_eq!(frame.payload.len(), 5);
+		settle().await;
+
+		let report = registry.report();
+		let entry = report
+			.traffic
+			.iter()
+			.find(|e| e.path.as_str() == "demo")
+			.expect("demo tracked");
+		assert_eq!(entry.publisher.groups, 1, "one group, counted once");
+		assert_eq!(entry.publisher.frames, 1, "one frame, counted once");
+		assert_eq!(
+			entry.publisher.bytes, 5,
+			"payload counted once, not zero and not doubled"
+		);
+	}
+
+	/// Datagrams bypass the group/frame handles entirely, so they're metered at the
+	/// producer (ingress write) and the subscriber (egress read). Each one counts as
+	/// the single-frame group it stands in for, plus the `datagrams` breakout.
+	#[tokio::test]
+	async fn test_stats_datagrams_counted_both_sides() {
+		use crate::Timestamp;
+		use crate::stats::{Config, Registry, Tier};
+
+		tokio::time::pause();
+
+		let registry = Registry::new(Config::new());
+		let ctx = registry.tier(Tier::default()).session("acme");
+
+		let origin = Origin::random().produce();
+		let ingress = origin.clone().with_stats(ctx.clone());
+		let egress = origin.consume().with_stats(ctx.clone());
+
+		let mut announced = egress.announced();
+		let source = ingress.create_broadcast("demo", announce()).unwrap();
+		let mut dynamic = source.dynamic();
+		settle().await;
+		settle().await;
+
+		let broadcast = announced.next().await.unwrap().broadcast.unwrap();
+		let subscribing = broadcast.track("video").unwrap().subscribe(None);
+		let mut producer = accept_track(&mut dynamic, "video").await;
+		settle().await;
+		let mut sub = subscribing.await.unwrap();
+
+		producer.append_datagram(Timestamp::ZERO, &b"hello"[..]).unwrap();
+		let datagram = sub.recv_datagram().await.unwrap().expect("datagram");
+		assert_eq!(&datagram.payload[..], b"hello");
+		settle().await;
+
+		let report = registry.report();
+		let entry = report
+			.traffic
+			.iter()
+			.find(|e| e.path.as_str() == "demo")
+			.expect("demo tracked");
+
+		for (side, traffic) in [("egress", &entry.publisher), ("ingress", &entry.subscriber)] {
+			assert_eq!(traffic.datagrams, 1, "{side}: one datagram");
+			assert_eq!(traffic.groups, 1, "{side}: counted as its single-frame group");
+			assert_eq!(traffic.frames, 1, "{side}: one frame");
+			assert_eq!(traffic.bytes, 5, "{side}: payload counted once");
+		}
+	}
+
 	#[test]
 	fn origin_rejects_reserved_ids() {
 		assert!(Origin::new(0).is_err());
@@ -2422,7 +3013,7 @@ mod tests {
 		consumer1.assert_next_wait();
 
 		// Publish the first broadcast; it becomes visible asynchronously.
-		let broadcast1 = origin.create_broadcast("test1", announce()).unwrap();
+		let mut broadcast1 = origin.create_broadcast("test1", announce()).unwrap();
 		settle().await;
 
 		consumer1.assert_next_some("test1");
@@ -2433,7 +3024,7 @@ mod tests {
 		let mut consumer2 = origin.consume().announced();
 
 		// Publish the second broadcast.
-		let broadcast2 = origin.create_broadcast("test2", announce()).unwrap();
+		let mut broadcast2 = origin.create_broadcast("test2", announce()).unwrap();
 		settle().await;
 
 		consumer1.assert_next_some("test2");
@@ -2477,9 +3068,9 @@ mod tests {
 		let consumer = origin.consume();
 		let mut announced = consumer.announced();
 
-		let broadcast1 = origin.create_broadcast("test", announce()).unwrap();
-		let broadcast2 = origin.create_broadcast("test", announce()).unwrap();
-		let broadcast3 = origin.create_broadcast("test", announce()).unwrap();
+		let mut broadcast1 = origin.create_broadcast("test", announce()).unwrap();
+		let mut broadcast2 = origin.create_broadcast("test", announce()).unwrap();
+		let mut broadcast3 = origin.create_broadcast("test", announce()).unwrap();
 		settle().await;
 		assert!(consumer.get_broadcast("test").is_some());
 
@@ -2554,10 +3145,9 @@ mod tests {
 
 		// Source A dies (session loss): the track re-splices from B and nothing
 		// is announced.
+		// abort() consumes the producer, so this both aborts and drops it.
 		producer.abort(Error::Dropped).unwrap();
-		drop(producer);
-		source_a.abort();
-		drop(source_a);
+		source_a.abort(Error::Dropped).unwrap();
 		drop(dynamic_a);
 		settle().await;
 		announced.assert_next_wait();
@@ -2713,8 +3303,7 @@ mod tests {
 		sub.assert_closed();
 
 		// A detaching must not re-dispatch the finished track to B.
-		source_a.abort();
-		drop(source_a);
+		source_a.abort(Error::Dropped).unwrap();
 		drop(dynamic_a);
 		settle().await;
 		dynamic_b.assert_no_request();
@@ -2832,7 +3421,7 @@ mod tests {
 		let mut announced = consumer.announced();
 
 		let hops = OriginList::try_from(vec![Origin::new(1).unwrap()]).unwrap();
-		let source = origin
+		let mut source = origin
 			.create_broadcast("test", announce().with_hops(hops.clone()))
 			.unwrap();
 		settle().await;
@@ -2856,9 +3445,10 @@ mod tests {
 		);
 	}
 
-	/// A dying source (a session drop, not a deliberate unannounce) closes the
-	/// broadcast just as promptly as a graceful one: no reconnect window, the
-	/// tracks abort, and a re-create is a fresh broadcast rather than a splice.
+	/// With the default zero linger, a dying source (a session drop, not a
+	/// deliberate unannounce) closes the broadcast just as promptly as a graceful
+	/// one: no reconnect window, the tracks abort, and a re-create is a fresh
+	/// broadcast rather than a splice.
 	#[tokio::test(start_paused = true)]
 	async fn test_route_detach_immediate() {
 		let origin = Origin::random().produce();
@@ -2882,8 +3472,7 @@ mod tests {
 
 		// The session dies without unannouncing.
 		drop(producer);
-		source.abort();
-		drop(source);
+		source.abort(Error::Dropped).unwrap();
 		drop(dynamic);
 
 		settle().await;
@@ -2900,6 +3489,305 @@ mod tests {
 		assert!(
 			!fresh.is_clone(&broadcast),
 			"re-create must not splice the old broadcast"
+		);
+	}
+
+	/// A track nobody reads keeps the source's copy for [`TRACK_IDLE_LINGER`], then
+	/// releases it. Crucially, the release must not immediately re-splice: the same
+	/// demand signal gates both directions, so an idle track settles instead of
+	/// re-requesting the track (and its info) every linger.
+	#[tokio::test(start_paused = true)]
+	async fn test_idle_track_releases_without_respinning() {
+		let origin = Info::new(Origin::random()).produce();
+		let consumer = origin.consume();
+
+		let hops = OriginList::try_from(vec![Origin::new(1).unwrap()]).unwrap();
+		let source = origin.create_broadcast("test", announce().with_hops(hops)).unwrap();
+		let mut dynamic = source.dynamic();
+		settle().await;
+		let broadcast = consumer.request_broadcast("test").await.unwrap();
+
+		let subscribing = broadcast.track("video").unwrap().subscribe(None);
+		let producer = accept_track(&mut dynamic, "video").await;
+		settle().await;
+		let sub = subscribing.await.unwrap();
+
+		// The reader leaves, but the copy stays warm inside the window so a viewer
+		// coming back (or a follow-up fetch) reuses it.
+		drop(sub);
+		tokio::time::sleep(TRACK_IDLE_LINGER / 2).await;
+		settle().await;
+		assert!(
+			producer.poll_unused(&kio::Waiter::noop()).is_pending(),
+			"the copy must stay spliced inside the linger",
+		);
+
+		// Past the window the segment is released, so the serving session sees its
+		// copy go unused and can drop it (along with the track info).
+		tokio::time::sleep(TRACK_IDLE_LINGER).await;
+		settle().await;
+		assert!(
+			producer.poll_unused(&kio::Waiter::noop()).is_ready(),
+			"an idle copy must be released after the linger",
+		);
+
+		// The anti-spin property: the release must not re-arm the splice. Ungated,
+		// the loop re-attaches the copy immediately and drops it again every linger,
+		// re-requesting the track (and its info) from the session each time it dies.
+		for _ in 0..3 {
+			tokio::time::sleep(TRACK_IDLE_LINGER).await;
+			settle().await;
+			assert!(
+				producer.poll_unused(&kio::Waiter::noop()).is_ready(),
+				"an unread copy must stay released, not be re-spliced",
+			);
+		}
+		assert!(
+			dynamic.requested_track().now_or_never().is_none(),
+			"an unread track must not be re-requested",
+		);
+		drop(producer);
+
+		// A returning reader re-splices: the origin asks the source for a fresh copy.
+		let subscribing = broadcast.track("video").unwrap().subscribe(None);
+		let mut producer = accept_track(&mut dynamic, "video").await;
+		settle().await;
+		let mut sub = subscribing.await.unwrap();
+		producer.append_group().unwrap();
+		assert_eq!(sub.assert_group().sequence, 0);
+	}
+
+	/// Back-to-back fetches reuse the source's copy: only the first asks the source
+	/// for the track, so a fetch-driven consumer (HLS pulling segment after segment)
+	/// doesn't re-request the track, and its `TRACK_INFO`, for every group.
+	#[tokio::test(start_paused = true)]
+	async fn test_back_to_back_fetches_reuse_the_track() {
+		let origin = Info::new(Origin::random()).produce();
+		let consumer = origin.consume();
+
+		let hops = OriginList::try_from(vec![Origin::new(1).unwrap()]).unwrap();
+		let source = origin.create_broadcast("test", announce().with_hops(hops)).unwrap();
+		let mut dynamic = source.dynamic();
+		settle().await;
+		let broadcast = consumer.request_broadcast("test").await.unwrap();
+
+		// The first fetch has to ask the source for the track.
+		let fetching = broadcast.track("video").unwrap().fetch_group(0, None);
+		let mut producer = accept_track(&mut dynamic, "video").await;
+		producer.append_group().unwrap().finish().unwrap();
+		settle().await;
+		let first = fetching.await.expect("first fetch");
+		drop(first);
+
+		// A second fetch inside the linger reuses the copy already spliced in.
+		settle().await;
+		let fetching = broadcast.track("video").unwrap().fetch_group(0, None);
+		settle().await;
+		assert!(
+			dynamic.requested_track().now_or_never().is_none(),
+			"a fetch inside the linger must reuse the track, not re-request it",
+		);
+		drop(fetching.await.expect("second fetch"));
+
+		// Once the fetches stop, the copy is released like any other idle track.
+		tokio::time::sleep(TRACK_IDLE_LINGER * 2).await;
+		settle().await;
+		assert!(
+			producer.poll_unused(&kio::Waiter::noop()).is_ready(),
+			"the copy must be released once the fetches stop",
+		);
+		drop(producer);
+
+		// And a later fetch re-requests it: `accept_track` times out if it doesn't.
+		settle().await;
+		let fetching = broadcast.track("video").unwrap().fetch_group(0, None);
+		let mut producer = accept_track(&mut dynamic, "video").await;
+		producer.append_group().unwrap().finish().unwrap();
+		settle().await;
+		fetching.await.expect("fetch after the linger");
+	}
+
+	/// With a linger configured, an ungraceful source loss keeps the broadcast
+	/// alive and announced; a source re-attaching within the window splices in and
+	/// consumers resume at the group boundary, never observing the outage.
+	#[tokio::test(start_paused = true)]
+	async fn test_linger_reconnect_splices() {
+		let origin = Info::new(Origin::random())
+			.with_linger(Duration::from_secs(5))
+			.produce();
+		let consumer = origin.consume();
+		let mut announced = consumer.announced();
+
+		let hops = OriginList::try_from(vec![Origin::new(1).unwrap()]).unwrap();
+		let source = origin
+			.create_broadcast("test", announce().with_hops(hops.clone()))
+			.unwrap();
+		let mut dynamic = source.dynamic();
+		settle().await;
+		settle().await;
+		let broadcast = consumer.request_broadcast("test").await.unwrap();
+		announced.assert_next_some("test");
+
+		let subscribing = broadcast.track("video").unwrap().subscribe(None);
+		let mut producer = accept_track(&mut dynamic, "video").await;
+		settle().await;
+		let mut sub = subscribing.await.unwrap();
+
+		producer.append_group().unwrap();
+		producer.append_group().unwrap();
+		assert_eq!(sub.assert_group().sequence, 0);
+		assert_eq!(sub.assert_group().sequence, 1);
+
+		// The session dies without unannouncing: the broadcast enters the linger
+		// window instead of closing.
+		drop(producer);
+		source.abort(Error::Dropped).unwrap();
+		drop(dynamic);
+		settle().await;
+
+		// No unannounce, no track error: the outage is invisible so far.
+		announced.assert_next_wait();
+		sub.assert_no_group();
+		sub.assert_not_closed();
+
+		// A consumer arriving mid-outage still resolves the lingering broadcast.
+		let during = consumer.request_broadcast("test").await.unwrap();
+		assert!(during.is_clone(&broadcast), "the lingering broadcast still resolves");
+
+		// The session reconnects within the window: the new source splices into
+		// the same broadcast.
+		let source = origin.create_broadcast("test", announce().with_hops(hops)).unwrap();
+		let mut dynamic = source.dynamic();
+		settle().await;
+		settle().await;
+		announced.assert_next_wait();
+		let again = consumer.request_broadcast("test").await.unwrap();
+		assert!(again.is_clone(&broadcast), "the reconnect must splice, not replace");
+
+		// The pending track re-splices from the new source and resumes one past
+		// the groups the old source already delivered. Demand registers as the
+		// subscriber polls.
+		let mut producer = accept_track(&mut dynamic, "video").await;
+		settle().await;
+		sub.assert_no_group();
+		assert_eq!(producer.subscription().unwrap().group_start, Some(2));
+		producer.create_group(group::Info { sequence: 2 }).unwrap();
+		assert_eq!(sub.assert_group().sequence, 2);
+		sub.assert_not_closed();
+	}
+
+	/// The linger window expiring without a replacement closes the broadcast: the
+	/// path unannounces, tracks abort, and a later re-create is a fresh broadcast.
+	#[tokio::test(start_paused = true)]
+	async fn test_linger_expiry_closes() {
+		let origin = Info::new(Origin::random())
+			.with_linger(Duration::from_secs(5))
+			.produce();
+		let consumer = origin.consume();
+		let mut announced = consumer.announced();
+
+		let hops = OriginList::try_from(vec![Origin::new(1).unwrap()]).unwrap();
+		let source = origin
+			.create_broadcast("test", announce().with_hops(hops.clone()))
+			.unwrap();
+		let mut dynamic = source.dynamic();
+		settle().await;
+		settle().await;
+		let broadcast = consumer.request_broadcast("test").await.unwrap();
+		announced.assert_next_some("test");
+
+		let subscribing = broadcast.track("video").unwrap().subscribe(None);
+		let producer = accept_track(&mut dynamic, "video").await;
+		settle().await;
+		let mut sub = subscribing.await.unwrap();
+
+		drop(producer);
+		source.abort(Error::Dropped).unwrap();
+		drop(dynamic);
+		settle().await;
+		announced.assert_next_wait();
+
+		// Nobody comes back: the window expires and the broadcast closes.
+		tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+		settle().await;
+		announced.assert_next_none("test");
+		sub.assert_error();
+
+		// A session reconnecting after the window gets a brand-new broadcast.
+		let _source = origin.create_broadcast("test", announce().with_hops(hops)).unwrap();
+		settle().await;
+		settle().await;
+		let fresh = consumer.request_broadcast("test").await.unwrap();
+		announced.assert_next_some("test");
+		assert!(
+			!fresh.is_clone(&broadcast),
+			"a late re-create must not splice the expired broadcast"
+		);
+	}
+
+	/// A linger too large to represent as a deadline never expires: the broadcast
+	/// outlives an arbitrarily long outage (a reconnect loop with no give-up
+	/// timeout promises to retry forever).
+	#[tokio::test(start_paused = true)]
+	async fn test_linger_forever() {
+		let origin = Info::new(Origin::random()).with_linger(Duration::MAX).produce();
+		let consumer = origin.consume();
+		let mut announced = consumer.announced();
+
+		let hops = OriginList::try_from(vec![Origin::new(1).unwrap()]).unwrap();
+		let source = origin
+			.create_broadcast("test", announce().with_hops(hops.clone()))
+			.unwrap();
+		settle().await;
+		let broadcast = consumer.request_broadcast("test").await.unwrap();
+		announced.assert_next_some("test");
+
+		source.abort(Error::Dropped).unwrap();
+		settle().await;
+
+		// Days later the broadcast is still announced and still splices a reconnect.
+		tokio::time::sleep(std::time::Duration::from_secs(60 * 60 * 24 * 3)).await;
+		announced.assert_next_wait();
+		let source = origin.create_broadcast("test", announce().with_hops(hops)).unwrap();
+		settle().await;
+		settle().await;
+		let again = consumer.request_broadcast("test").await.unwrap();
+		assert!(again.is_clone(&broadcast), "the reconnect must splice, not replace");
+		drop(source);
+	}
+
+	/// A deliberate finish never lingers, even with a linger configured: a clean
+	/// unannounce from a peer must propagate immediately.
+	#[tokio::test(start_paused = true)]
+	async fn test_linger_skipped_on_finish() {
+		let origin = Info::new(Origin::random())
+			.with_linger(Duration::from_secs(5))
+			.produce();
+		let consumer = origin.consume();
+		let mut announced = consumer.announced();
+
+		let hops = OriginList::try_from(vec![Origin::new(1).unwrap()]).unwrap();
+		let mut source = origin
+			.create_broadcast("test", announce().with_hops(hops.clone()))
+			.unwrap();
+		settle().await;
+		let broadcast = consumer.request_broadcast("test").await.unwrap();
+		announced.assert_next_some("test");
+
+		// A clean unannounce: the broadcast is gone as soon as the teardown task
+		// observes the close, with no reconnect window.
+		source.finish();
+		settle().await;
+		announced.assert_next_none("test");
+
+		// A re-create at the same path is a brand-new broadcast.
+		let _source = origin.create_broadcast("test", announce().with_hops(hops)).unwrap();
+		settle().await;
+		let fresh = consumer.request_broadcast("test").await.unwrap();
+		announced.assert_next_some("test");
+		assert!(
+			!fresh.is_clone(&broadcast),
+			"a finish must not leave a lingering broadcast to splice into"
 		);
 	}
 
@@ -2968,7 +3856,7 @@ mod tests {
 
 		// An announced source with a worse cost still wins: the path announces
 		// and advertises its route.
-		let announced_source = origin.create_broadcast("test", announce().with_cost(10)).unwrap();
+		let mut announced_source = origin.create_broadcast("test", announce().with_cost(10)).unwrap();
 		settle().await;
 		announced.assert_next_some("test");
 		let face = consumer.get_broadcast("test").unwrap();
@@ -3013,8 +3901,8 @@ mod tests {
 
 		let origin = Origin::random().produce();
 
-		let broadcast1 = origin.create_broadcast("test", announce()).unwrap();
-		let broadcast2 = origin.create_broadcast("test", announce()).unwrap();
+		let mut broadcast1 = origin.create_broadcast("test", announce()).unwrap();
+		let mut broadcast2 = origin.create_broadcast("test", announce()).unwrap();
 		settle().await;
 		assert!(origin.consume().get_broadcast("test").is_some());
 
@@ -3705,7 +4593,7 @@ mod tests {
 		let prefix = "some_prefix/".to_string();
 		let mut consumer = origin.consume().with_root(prefix).unwrap().announced();
 
-		let b = origin.create_broadcast("some_prefix/test", announce()).unwrap();
+		let mut b = origin.create_broadcast("some_prefix/test", announce()).unwrap();
 		settle().await;
 		consumer.assert_next_some("test");
 
@@ -3965,7 +4853,7 @@ mod tests {
 		let origin = Origin::random().produce();
 		let mut announced = origin.consume().announced();
 
-		let broadcast = origin.create_broadcast("test", announce()).unwrap();
+		let mut broadcast = origin.create_broadcast("test", announce()).unwrap();
 		settle().await;
 		broadcast.finish();
 
@@ -3983,7 +4871,7 @@ mod tests {
 		let origin = Origin::random().produce();
 		let mut announced = origin.consume().announced();
 
-		let broadcast1 = origin.create_broadcast("test", announce()).unwrap();
+		let mut broadcast1 = origin.create_broadcast("test", announce()).unwrap();
 		settle().await;
 		broadcast1.finish();
 		settle().await;
@@ -4001,7 +4889,7 @@ mod tests {
 		tokio::time::pause();
 
 		let origin = Origin::random().produce();
-		let broadcast1 = origin.create_broadcast("test", announce()).unwrap();
+		let mut broadcast1 = origin.create_broadcast("test", announce()).unwrap();
 		settle().await;
 
 		let mut announced = origin.consume().announced();
@@ -4027,7 +4915,7 @@ mod tests {
 		tokio::time::pause();
 
 		let origin = Origin::random().produce();
-		let broadcast1 = origin.create_broadcast("test", announce()).unwrap();
+		let mut broadcast1 = origin.create_broadcast("test", announce()).unwrap();
 		settle().await;
 
 		let mut announced = origin.consume().announced();
@@ -4036,7 +4924,7 @@ mod tests {
 		broadcast1.finish();
 		settle().await;
 
-		let broadcast2 = origin.create_broadcast("test", announce()).unwrap();
+		let mut broadcast2 = origin.create_broadcast("test", announce()).unwrap();
 		settle().await;
 		broadcast2.finish();
 		settle().await;
@@ -4057,7 +4945,7 @@ mod tests {
 		let mut announced = origin.consume().announced();
 
 		for _ in 0..1000 {
-			let broadcast = origin.create_broadcast("test", announce()).unwrap();
+			let mut broadcast = origin.create_broadcast("test", announce()).unwrap();
 			settle().await;
 			broadcast.finish();
 		}

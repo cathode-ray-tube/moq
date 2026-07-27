@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.2...moq-ffi-v0.3.3) - 2026-07-25
+
+### Added
+
+- *(bindings)* expose shared video properties ([#2457](https://github.com/moq-dev/moq/pull/2457))
+
+## [0.3.2](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.1...moq-ffi-v0.3.2) - 2026-07-24
+
+### Fixed
+
+- *(go-ffi)* install cross target std before building moq-ffi ([#2482](https://github.com/moq-dev/moq/pull/2482))
+
+## [0.3.1](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.0...moq-ffi-v0.3.1) - 2026-07-23
+
+### Fixed
+
+- *(moq-ffi)* pin uniffi to 0.31 for uniffi-bindgen-go compatibility ([#2452](https://github.com/moq-dev/moq/pull/2452))
+
+## [0.3.0](https://github.com/moq-dev/moq/compare/moq-ffi-v0.2.33...moq-ffi-v0.3.0) - 2026-07-22
+
+### Fixed
+
+- [**breaking**] correct catalog, timeline, token, and teardown contracts found in API review ([#2439](https://github.com/moq-dev/moq/pull/2439))
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into dev
+- *(deps)* bump the cargo group with 2 updates ([#2409](https://github.com/moq-dev/moq/pull/2409))
+
 ### Added
 
 - Expose explicit raw group sequences, known track ends, and raw group aborts

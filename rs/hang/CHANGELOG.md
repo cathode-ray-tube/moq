@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.1](https://github.com/moq-dev/moq/compare/hang-v0.20.0...hang-v0.20.1) - 2026-07-25
+
+### Added
+
+- *(bindings)* expose shared video properties ([#2457](https://github.com/moq-dev/moq/pull/2457))
+- *(moq-audio)* add PCM codec ([#2493](https://github.com/moq-dev/moq/pull/2493))
+
+### Fixed
+
+- *(hang)* preserve audio codec kind discriminants ([#2511](https://github.com/moq-dev/moq/pull/2511))
+
+## [0.20.0](https://github.com/moq-dev/moq/compare/hang-v0.19.5...hang-v0.20.0) - 2026-07-22
+
+### Fixed
+
+- [**breaking**] correct catalog, timeline, token, and teardown contracts found in API review ([#2439](https://github.com/moq-dev/moq/pull/2439))
+
+### Other
+
+- [**breaking**] pre-bump API polish across the release batch ([#2423](https://github.com/moq-dev/moq/pull/2423))
+- compile doc examples across the workspace ([#2421](https://github.com/moq-dev/moq/pull/2421))
+- *(net)* [**breaking**] route everything through create_broadcast, gate announce on Route.live ([#2396](https://github.com/moq-dev/moq/pull/2396))
+- *(hang)* [**breaking**] non_exhaustive catalog sections, shared container::track_info, hang draft catch-up ([#2341](https://github.com/moq-dev/moq/pull/2341))
+- align media docs and priorities ([#2336](https://github.com/moq-dev/moq/pull/2336))
+- *(moq-net)* [**breaking**] remove Announced::Restart; a replacement is an unannounce/announce pair ([#2307](https://github.com/moq-dev/moq/pull/2307))
+- *(net)* remove implicit frame timestamp helpers ([#2232](https://github.com/moq-dev/moq/pull/2232))
+- moq-net + js/net: pre-merge API hardening for moq-lite-05 ([#2170](https://github.com/moq-dev/moq/pull/2170))
+- Merge origin/main into dev
+
 ## [0.19.5](https://github.com/moq-dev/moq/compare/hang-v0.19.4...hang-v0.19.5) - 2026-07-09
 
 ### Other

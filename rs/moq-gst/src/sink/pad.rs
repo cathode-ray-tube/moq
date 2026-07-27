@@ -118,7 +118,7 @@ impl Pad {
 				let name = broadcast.unique_name(".mp3");
 				let request = broadcast.reserve_track(name)?;
 				let producer = request.accept(hang::container::track_info());
-				moq_mux::codec::mp3::Import::new(producer, catalog.reserve(), config.into()).into()
+				moq_mux::codec::mp3::Import::new(producer, catalog.reserve(), config.into())?.into()
 			}
 			"audio/mpeg" => {
 				// AAC: the AudioSpecificConfig rides in caps as codec_data, not in the bitstream.
@@ -140,16 +140,13 @@ impl Pad {
 					"multichannel Opus is not supported yet (channels={channels})"
 				);
 				ensure!(rate > 0, "Opus caps has non-positive sample rate {rate}");
-				let config = moq_mux::codec::opus::Config {
-					sample_rate: rate as u32,
-					channel_count: channels as u32,
-				};
+				let config = moq_mux::codec::opus::Config::new(rate as u32, channels as u32);
 				// Opus builds its config from caps (not an OpusHead init buffer), so it constructs the codec
 				// importer directly and lifts it into a `Track` via `.into()`.
 				let name = broadcast.unique_name(".opus");
 				let request = broadcast.reserve_track(name)?;
 				let producer = request.accept(hang::container::track_info());
-				moq_mux::codec::opus::Import::new(producer, catalog.reserve(), config.into()).into()
+				moq_mux::codec::opus::Import::new(producer, catalog.reserve(), config.into())?.into()
 			}
 			other => anyhow::bail!("unsupported caps: {other}"),
 		};

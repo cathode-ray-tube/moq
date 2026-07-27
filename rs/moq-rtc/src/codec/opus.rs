@@ -16,12 +16,9 @@ impl Bridge {
 		sample_rate: u32,
 		channel_count: u32,
 	) -> Result<Self> {
-		let config = moq_mux::codec::opus::Config {
-			sample_rate,
-			channel_count,
-		};
+		let config = moq_mux::codec::opus::Config::new(sample_rate, channel_count);
 		let track = moq_mux::import::unique_track(&mut broadcast, ".opus")?;
-		let import = moq_mux::codec::opus::Import::new(track, catalog.reserve(), config.into());
+		let import = moq_mux::codec::opus::Import::new(track, catalog.reserve(), config.into())?;
 		Ok(Self { import })
 	}
 }
@@ -31,10 +28,13 @@ impl codec::Bridge for Bridge {
 		let pts = moq_net::Timestamp::from_micros(frame.timestamp_us)
 			.map_err(|err| crate::Error::Other(anyhow::anyhow!("invalid timestamp: {err}")))?;
 		self.import.decode(&frame.payload, Some(pts))?;
+		// The importer accumulates; cut each packet into its own group (one QUIC stream) so the
+		// relay forwards it without waiting for the next.
+		self.import.cut(None)?;
 		Ok(())
 	}
 
-	fn abort(&mut self, err: moq_net::Error) {
+	fn abort(self: Box<Self>, err: moq_net::Error) {
 		self.import.abort(err);
 	}
 }

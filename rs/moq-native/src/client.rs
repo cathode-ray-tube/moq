@@ -160,6 +160,8 @@ impl Client {
 		#[cfg(any(feature = "noq", feature = "quinn", feature = "quiche"))]
 		let backend = config.backend.clone().unwrap_or_else(crate::default_quic_backend);
 
+		config.quic.validate()?;
+
 		let tls = config.tls.build()?;
 
 		#[cfg(feature = "noq")]
@@ -236,8 +238,9 @@ impl Client {
 		self
 	}
 
-	/// Attach a tier-scoped [`moq_net::stats::Handle`] to all sessions opened by this client.
-	pub fn with_stats(mut self, stats: moq_net::stats::Handle) -> Self {
+	/// Attach a per-connection [`moq_net::stats::Session`] context to all sessions
+	/// opened by this client.
+	pub fn with_stats(mut self, stats: moq_net::stats::Session) -> Self {
 		self.moq = self.moq.with_stats(stats);
 		self
 	}
@@ -270,9 +273,16 @@ impl Client {
 	/// into `origin` and reconnecting with backoff until the returned handle is
 	/// dropped.
 	///
+	/// Broadcasts fed by these sessions linger across a session drop for as long
+	/// as the reconnect loop keeps retrying ([`Backoff::linger`]): a relay restart
+	/// is a bounded gap the reconnect splices over, not a teardown. When the loop
+	/// gives up, its error surfaces (via [`Reconnect::closed`]) just before the
+	/// broadcasts abort.
+	///
 	/// Returns `None` when no `--client-connect` URL was configured.
 	pub fn consume(self, origin: moq_net::origin::Producer) -> Option<Reconnect> {
 		let url = self.connect.clone()?;
+		let origin = origin.with_linger(self.backoff.linger());
 		Some(self.with_subscriber(origin).reconnect(url))
 	}
 
@@ -310,7 +320,9 @@ impl Client {
 		feature = "uds"
 	))]
 	pub async fn connect(&self, url: Url) -> crate::Result<moq_net::Session> {
-		let pair = self.connect_inner(url).await?;
+		// Each compiled backend adds state to this dispatch future. Keep it off the
+		// caller's stack so all-feature builds remain safe on standard 2 MiB threads.
+		let pair = Box::pin(self.connect_inner(url)).await?;
 		tracing::info!(version = %pair.0.version(), "connected");
 		Ok(crate::spawn_session(pair))
 	}

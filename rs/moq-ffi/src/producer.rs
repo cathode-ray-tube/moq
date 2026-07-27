@@ -5,7 +5,7 @@ use moq_mux::catalog::hang::Extra;
 use crate::consumer::{MoqBroadcastConsumer, MoqGroupConsumer, MoqSubscription, MoqTrackConsumer};
 use crate::error::MoqError;
 use crate::ffi::Task;
-use crate::media::{MoqFrame, MoqInit};
+use crate::media::{MoqFrame, MoqInit, MoqVideoProperties};
 use crate::origin::MoqRoute;
 
 /// Publisher-side track properties, mirroring [`moq_net::track::Info`].
@@ -288,6 +288,27 @@ impl MoqBroadcastProducer {
 		self.with_state(|state| {
 			let route = state.broadcast.consume().route();
 			Ok(state.broadcast.set_route(route.with_announce(announce))?)
+		})
+	}
+
+	/// Replace the catalog properties shared by every video rendition.
+	///
+	/// Rotation is clockwise and normalized to the nearest quarter turn. An absent field is removed from the next catalog update.
+	pub fn set_video_properties(&self, properties: MoqVideoProperties) -> Result<(), MoqError> {
+		let _guard = crate::ffi::RUNTIME.enter();
+		let mut value = hang::catalog::VideoProperties::default();
+		value.display = properties.display.map(|display| hang::catalog::Display {
+			width: display.width,
+			height: display.height,
+		});
+		value.rotation = properties.rotation;
+		value.flip = properties.flip;
+
+		self.with_state(|state| {
+			let mut catalog = state.catalog.lock();
+			catalog.video.set_properties(value)?;
+			catalog.commit()?;
+			Ok(())
 		})
 	}
 
@@ -744,7 +765,7 @@ impl MoqTrackProducer {
 	pub fn abort(&self, error_code: u16) -> Result<(), MoqError> {
 		let _guard = crate::ffi::RUNTIME.enter();
 		let mut guard = self.inner.lock().unwrap();
-		let mut track = guard.take().ok_or(MoqError::Closed)?;
+		let track = guard.take().ok_or(MoqError::Closed)?;
 		track.abort(moq_net::Error::App(error_code))?;
 		Ok(())
 	}
@@ -824,7 +845,7 @@ impl MoqGroupProducer {
 	pub fn abort(&self, error_code: u16) -> Result<(), MoqError> {
 		let _guard = crate::ffi::RUNTIME.enter();
 		let mut guard = self.inner.lock().unwrap();
-		let mut group = guard.take().ok_or(MoqError::Closed)?;
+		let group = guard.take().ok_or(MoqError::Closed)?;
 		group.abort(moq_net::Error::App(error_code))?;
 		Ok(())
 	}

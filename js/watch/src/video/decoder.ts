@@ -7,6 +7,7 @@ import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Si
 import { base64ToBytes } from "../base64";
 
 import type { Sync } from "../sync";
+import { rotateVideoDimensions } from "./presentation";
 import type { Source } from "./source";
 
 // The amount of time to wait before considering the video to be buffering.
@@ -181,20 +182,17 @@ export class Decoder {
 
 		const display = catalog.display;
 		if (display) {
-			effect.set(this.#out.display, {
-				width: display.width,
-				height: display.height,
-			});
+			effect.set(this.#out.display, { width: display.width, height: display.height });
 			return;
 		}
 
 		const frame = effect.get(this.#out.frame);
 		if (!frame) return;
 
-		effect.set(this.#out.display, {
-			width: frame.displayWidth,
-			height: frame.displayHeight,
-		});
+		effect.set(
+			this.#out.display,
+			rotateVideoDimensions({ width: frame.displayWidth, height: frame.displayHeight }, catalog.rotation),
+		);
 	}
 
 	#runBuffering(effect: Effect): void {
@@ -413,9 +411,10 @@ class DecoderTrack {
 	}
 
 	#runCmaf(effect: Effect, sub: Moq.Track.Subscriber, decoder: VideoDecoder): void {
-		if (this.config.container.kind !== "cmaf") return;
+		const container = this.config.container;
+		if (container.kind !== "cmaf") return;
 
-		const initSegment = base64ToBytes(this.config.container.init);
+		const initSegment = base64ToBytes(container.init);
 		const init = Container.Cmaf.decodeInitSegment(initSegment);
 		const description = this.config.description ? Util.Hex.toBytes(this.config.description) : init.description;
 
@@ -555,6 +554,13 @@ class DecoderTrack {
 }
 
 async function supported(config: Catalog.VideoConfig): Promise<boolean> {
+	if (!Catalog.containerSupported(config.container)) {
+		// `kind` is the literal "unknown" tag; the container the publisher actually named is in `raw`.
+		const kind = config.container.kind === "unknown" ? config.container.raw.kind : config.container.kind;
+		console.warn(`video: ignoring rendition with unknown container: ${kind}`);
+		return false;
+	}
+
 	let description: Uint8Array | undefined;
 	if (config.description) {
 		description = Util.Hex.toBytes(config.description);

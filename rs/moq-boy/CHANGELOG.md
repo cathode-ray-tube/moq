@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/moq-dev/moq/compare/moq-boy-v0.3.2...moq-boy-v0.4.0) - 2026-07-25
+
+### Other
+
+- *(moq-video)* [**breaking**] one raw Frame type, and carry timestamps through encode ([#2503](https://github.com/moq-dev/moq/pull/2503))
+
+## [0.3.2](https://github.com/moq-dev/moq/compare/moq-boy-v0.3.1...moq-boy-v0.3.2) - 2026-07-24
+
+### Added
+
+- *(moq-mux,moq-boy)* mark discontinuities, and never time a sample across one ([#2475](https://github.com/moq-dev/moq/pull/2475))
+
+## [0.3.1](https://github.com/moq-dev/moq/compare/moq-boy-v0.3.0...moq-boy-v0.3.1) - 2026-07-23
+
+### Other
+
+- *(rust)* pin the toolchain and correct the MSRV claims ([#2462](https://github.com/moq-dev/moq/pull/2462))
+
+## [0.3.0](https://github.com/moq-dev/moq/compare/moq-boy-v0.2.28...moq-boy-v0.3.0) - 2026-07-22
+
+### Other
+
+- *(net)* [**breaking**] route everything through create_broadcast, gate announce on Route.live ([#2396](https://github.com/moq-dev/moq/pull/2396))
+- Merge branch 'main' into dev
+
 ## [0.2.28](https://github.com/moq-dev/moq/compare/moq-boy-v0.2.27...moq-boy-v0.2.28) - 2026-07-18
 
 ### Other

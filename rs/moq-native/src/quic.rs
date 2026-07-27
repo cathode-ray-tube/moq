@@ -10,6 +10,7 @@
 //! every backend honors every knob, see the field docs.
 
 use std::net;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// The routable server ID a QUIC-LB load balancer encodes into connection IDs.
@@ -41,6 +42,24 @@ impl std::str::FromStr for ServerId {
 	}
 }
 
+/// The congestion control family for a QUIC connection.
+///
+/// This selects a family rather than a named algorithm because each backend ships a
+/// different generation: BBRv1 on quinn, BBRv2 on quiche, BBRv3 on noq and iroh. A
+/// `Bbr` variant would promise more than any one backend delivers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum CongestionControl {
+	/// Loss-based (CUBIC): grows until it drops packets, so the send rate sawtooths.
+	/// Throughput-oriented, and the default on most stacks.
+	Loss,
+	/// Delay-based (BBR): tracks the measured delivery rate and RTT instead of waiting
+	/// for loss, which keeps queues short and the send rate steady enough for an encoder
+	/// to track.
+	Delay,
+}
+
 /// Default maximum number of concurrent QUIC streams (bidi and uni) per connection.
 pub(crate) const DEFAULT_MAX_STREAMS: u64 = 1024;
 
@@ -69,8 +88,8 @@ pub struct Client {
 	/// Enable UDP generic segmentation offload (GSO).
 	///
 	/// GSO batches sends into one syscall for throughput, but some NICs and
-	/// middleboxes mangle segmented packets. Defaults to on. Only the quinn and
-	/// noq backends can turn it off; setting `false` errors at init on quiche/iroh.
+	/// middleboxes mangle segmented packets. Defaults to on. The iroh backend
+	/// cannot turn it off and rejects an explicit `false`.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[arg(
 		id = "client-quic-gso",
@@ -94,7 +113,7 @@ pub struct Client {
 	pub idle_timeout: Option<Duration>,
 
 	/// Keep-alive ping interval. Defaults to 5s; set `0s` to disable.
-	/// Ignored by the quiche and iroh backends, which have no keep-alive knob.
+	/// Ignored by the iroh backend, which has no keep-alive knob.
 	#[serde(default, skip_serializing_if = "Option::is_none", with = "humantime_serde::option")]
 	#[arg(
 		id = "client-quic-keep-alive",
@@ -116,9 +135,43 @@ pub struct Client {
 		value_parser = clap::value_parser!(bool),
 	)]
 	pub mtu_discovery: Option<bool>,
+
+	/// Congestion control family. Defaults to `delay` on quinn and quiche, and to
+	/// `loss` on noq and iroh, whose shared BBRv3 can panic on packet loss and take
+	/// the process with it. Selecting `delay` there is for deliberate testing only.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[arg(
+		id = "client-quic-congestion-control",
+		long = "client-quic-congestion-control",
+		env = "MOQ_CLIENT_QUIC_CONGESTION_CONTROL",
+		value_enum
+	)]
+	pub congestion_control: Option<CongestionControl>,
+
+	/// Write qlog traces into this directory. See [`Server::qlog`].
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[arg(id = "client-quic-qlog", long = "client-quic-qlog", env = "MOQ_CLIENT_QUIC_QLOG")]
+	pub qlog: Option<PathBuf>,
+}
+
+/// Reject a qlog directory that this build can't honor.
+///
+/// Erroring beats silently ignoring the flag: the operator asked for traces and would
+/// otherwise go looking for files that were never going to appear. Checked once when
+/// the client/server is built, so the backends can assume the directory is usable.
+fn validate_qlog(qlog: Option<&PathBuf>) -> crate::Result<()> {
+	match qlog {
+		Some(_) if cfg!(not(feature = "qlog")) => Err(crate::Error::QlogUnsupported),
+		_ => Ok(()),
+	}
 }
 
 impl Client {
+	/// Reject knobs this build can't honor. Called when the client is built.
+	pub(crate) fn validate(&self) -> crate::Result<()> {
+		validate_qlog(self.qlog.as_ref())
+	}
+
 	/// The per-connection knobs with defaults applied, ready to hand to a backend.
 	pub(crate) fn resolve(&self) -> Resolved {
 		Resolved::new(
@@ -127,6 +180,8 @@ impl Client {
 			self.idle_timeout,
 			self.keep_alive,
 			self.mtu_discovery,
+			self.congestion_control,
+			self.qlog.clone(),
 		)
 	}
 }
@@ -174,7 +229,6 @@ pub struct Server {
 	pub idle_timeout: Option<Duration>,
 
 	/// Keep-alive ping interval. Defaults to 5s; set `0s` to disable.
-	/// Ignored by the quiche backend, which has no keep-alive knob.
 	#[serde(default, skip_serializing_if = "Option::is_none", with = "humantime_serde::option")]
 	#[arg(
 		id = "server-quic-keep-alive",
@@ -196,6 +250,18 @@ pub struct Server {
 		value_parser = clap::value_parser!(bool),
 	)]
 	pub mtu_discovery: Option<bool>,
+
+	/// Congestion control family. Defaults to `delay` on quinn and quiche, and to
+	/// `loss` on noq, whose BBRv3 can panic on packet loss and take the process with
+	/// it. Selecting `delay` there is for deliberate testing only.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[arg(
+		id = "server-quic-congestion-control",
+		long = "server-quic-congestion-control",
+		env = "MOQ_SERVER_QUIC_CONGESTION_CONTROL",
+		value_enum
+	)]
+	pub congestion_control: Option<CongestionControl>,
 
 	/// IPv4 address advertised as the QUIC preferred_address.
 	///
@@ -237,9 +303,25 @@ pub struct Server {
 	)]
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub quic_lb_nonce: Option<usize>,
+
+	/// Write qlog traces into this directory, which must already exist.
+	///
+	/// The layout is backend-specific: quiche and noq write one file per connection,
+	/// while quinn writes one file per endpoint and tags each event with the qlog
+	/// `group_id` of the connection it belongs to.
+	///
+	/// Requires the `qlog` feature; setting it errors at init otherwise.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[arg(id = "server-quic-qlog", long = "server-quic-qlog", env = "MOQ_SERVER_QUIC_QLOG")]
+	pub qlog: Option<PathBuf>,
 }
 
 impl Server {
+	/// Reject knobs this build can't honor. Called when the server is built.
+	pub(crate) fn validate(&self) -> crate::Result<()> {
+		validate_qlog(self.qlog.as_ref())
+	}
+
 	/// The per-connection knobs with defaults applied, ready to hand to a backend.
 	pub(crate) fn resolve(&self) -> Resolved {
 		Resolved::new(
@@ -248,6 +330,8 @@ impl Server {
 			self.idle_timeout,
 			self.keep_alive,
 			self.mtu_discovery,
+			self.congestion_control,
+			self.qlog.clone(),
 		)
 	}
 }
@@ -257,7 +341,7 @@ impl Server {
 ///
 /// Internal: the backends consume it and [`crate::iroh::EndpointConfig::bind`]
 /// resolves it from a [`Client`], so it never appears in the public surface.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Resolved {
 	/// Max concurrent streams (bidi and uni).
 	pub max_streams: u64,
@@ -269,6 +353,11 @@ pub(crate) struct Resolved {
 	pub keep_alive: Option<Duration>,
 	/// Whether to run path MTU discovery.
 	pub mtu_discovery: bool,
+	/// Congestion control override, or `None` for the backend's own default. Each
+	/// backend picks that default itself, since they don't all agree.
+	pub congestion_control: Option<CongestionControl>,
+	/// Directory to write qlog traces into, or `None` to not capture them.
+	pub qlog: Option<PathBuf>,
 }
 
 impl Resolved {
@@ -278,6 +367,8 @@ impl Resolved {
 		idle_timeout: Option<Duration>,
 		keep_alive: Option<Duration>,
 		mtu_discovery: Option<bool>,
+		congestion_control: Option<CongestionControl>,
+		qlog: Option<PathBuf>,
 	) -> Self {
 		// A zero keep-alive means "disabled"; anything else (including unset) keeps
 		// the connection warm, defaulting to 5s.
@@ -293,15 +384,25 @@ impl Resolved {
 			idle_timeout: idle_timeout.unwrap_or(DEFAULT_IDLE_TIMEOUT),
 			keep_alive,
 			mtu_discovery: mtu_discovery.unwrap_or(false),
+			congestion_control,
+			qlog,
 		}
+	}
+
+	/// The directory to write qlog traces into, if any.
+	///
+	/// Only meaningful once [`Client::validate`] / [`Server::validate`] has passed; a
+	/// build without the `qlog` feature never gets here with a directory set.
+	#[cfg_attr(not(any(feature = "quinn", feature = "noq", feature = "quiche")), allow(dead_code))]
+	pub(crate) fn qlog_dir(&self) -> Option<&std::path::Path> {
+		self.qlog.as_deref()
 	}
 
 	/// Whether the config asks to turn GSO off, which not every backend can honor.
 	///
-	/// Only the quiche and iroh backends consult this, to reject a GSO-off request
-	/// they can't satisfy; quinn and noq toggle GSO directly. A default build
-	/// compiles neither, so the method is intentionally unused there.
-	#[cfg_attr(not(any(feature = "quiche", feature = "iroh")), allow(dead_code))]
+	/// Only the iroh backend consults this, to reject a GSO-off request it can't
+	/// satisfy; the other backends toggle GSO directly.
+	#[cfg_attr(not(feature = "iroh"), allow(dead_code))]
 	pub(crate) fn gso_disabled(&self) -> bool {
 		self.gso == Some(false)
 	}
@@ -392,15 +493,66 @@ mod tests {
 	}
 
 	#[test]
+	fn qlog_flags_are_distinct_per_role() {
+		let both = parse(&["--client-quic-qlog", "/tmp/client", "--server-quic-qlog", "/tmp/server"]);
+		assert_eq!(both.client.qlog.as_deref(), Some(std::path::Path::new("/tmp/client")));
+		assert_eq!(both.server.qlog.as_deref(), Some(std::path::Path::new("/tmp/server")));
+
+		assert_eq!(
+			both.client.resolve().qlog_dir(),
+			Some(std::path::Path::new("/tmp/client"))
+		);
+		assert_eq!(Client::default().resolve().qlog_dir(), None);
+	}
+
+	/// A build that can't capture must reject the flag rather than ignore it, so an
+	/// operator isn't left waiting on trace files that will never appear.
+	#[test]
+	fn qlog_requires_the_feature() {
+		let unset = Client::default().validate();
+		assert!(unset.is_ok(), "no directory configured is always fine");
+
+		let set = Client {
+			qlog: Some("/tmp/qlog".into()),
+			..Default::default()
+		};
+
+		if cfg!(feature = "qlog") {
+			assert!(set.validate().is_ok());
+		} else {
+			assert!(matches!(set.validate(), Err(crate::Error::QlogUnsupported)));
+		}
+	}
+
+	#[test]
 	fn toml_round_trips() {
 		let toml = r#"
 			max_streams = 7000
 			gso = false
 			preferred_v4 = "192.0.2.1:443"
+			congestion_control = "delay"
+			qlog = "/tmp/qlog"
 		"#;
 		let quic: Server = toml::from_str(toml).unwrap();
 		assert_eq!(quic.max_streams, Some(7000));
 		assert_eq!(quic.gso, Some(false));
 		assert_eq!(quic.preferred_v4, Some("192.0.2.1:443".parse().unwrap()));
+		assert_eq!(quic.congestion_control, Some(CongestionControl::Delay));
+		assert_eq!(quic.qlog.as_deref(), Some(std::path::Path::new("/tmp/qlog")));
+	}
+
+	#[test]
+	fn congestion_control_flags_parse() {
+		let both = parse(&[
+			"--client-quic-congestion-control",
+			"delay",
+			"--server-quic-congestion-control",
+			"loss",
+		]);
+		assert_eq!(both.client.congestion_control, Some(CongestionControl::Delay));
+		assert_eq!(both.server.congestion_control, Some(CongestionControl::Loss));
+
+		// Unset stays None; each backend then picks its own default.
+		assert_eq!(Client::default().resolve().congestion_control, None);
 	}
 }

@@ -14,7 +14,7 @@
 //! The track is closed with [Error] when all writers or readers are dropped.
 
 use crate::{Error, Result, Timescale, Timestamp, coding};
-use crate::{broadcast, cache, frame, group};
+use crate::{broadcast, cache, frame, group, stats};
 
 use super::{Datagram, Requests};
 
@@ -130,6 +130,17 @@ impl Info {
 	pub fn with_ordered(mut self, ordered: bool) -> Self {
 		self.ordered = ordered;
 		self
+	}
+
+	/// Bind this track to its parent `broadcast`, the moment groups gain a shared
+	/// cache pool to register with. Also clamps [`Self::latency_max`] down to the
+	/// origin's [`cache_duration`](crate::origin::Info::cache_duration) ceiling, so a
+	/// group is never retained longer than the origin allows regardless of the window
+	/// the publisher advertised. Every bind path funnels through here, so the clamp
+	/// covers local publishers and relayed (lite / IETF) tracks alike.
+	pub(crate) fn bind(&mut self, broadcast: Arc<broadcast::Info>) {
+		self.latency_max = self.latency_max.min(broadcast.origin.cache_duration);
+		self.broadcast = broadcast;
 	}
 }
 
@@ -460,13 +471,13 @@ impl TrackState {
 			}
 
 			self.duplicates.remove(&group.sequence);
-			// Abort the group before dropping it so any consumer still reading it
-			// surfaces `Error::Old` instead of blocking forever on a frame that will
-			// never arrive (the cached producer is about to be gone). Without this a
-			// reader parked on an aged-out group hangs indefinitely, since the group
-			// was never finished or aborted -- it just silently disappeared.
-			let _ = group.abort(Error::Old);
-			*slot = None;
+			// Take the group out of the cache and abort it, so any consumer still reading
+			// surfaces `Error::Old` instead of blocking forever on a frame that will never
+			// arrive. Without this a reader parked on an aged-out group hangs indefinitely,
+			// since the group is neither finished nor aborted.
+			if let Some((group, _)) = slot.take() {
+				let _ = group.abort(Error::Old);
+			}
 		}
 
 		// Trim leading tombstones to advance the offset.
@@ -578,7 +589,7 @@ impl TrackState {
 			.info
 			.get_or_insert_with(|| {
 				let mut info = info.unwrap_or_default();
-				info.broadcast = broadcast;
+				info.bind(broadcast);
 				info
 			})
 			.clone();
@@ -609,6 +620,10 @@ pub struct Producer {
 	broadcast: Arc<broadcast::Info>,
 	state: kio::Producer<TrackState>,
 	prev_subscription: Option<Subscription>,
+	// Ingress stats scope, inherited from a tagged [`broadcast::Producer`]. Bumped as
+	// one subscription on tag and closed when the last producer clone drops. Empty
+	// (no-op) for an untagged broadcast.
+	stats: stats::Scope,
 }
 
 impl Producer {
@@ -625,7 +640,7 @@ impl Producer {
 		info: impl Into<Option<Info>>,
 	) -> Self {
 		let mut info = info.into().unwrap_or_default();
-		info.broadcast = broadcast.clone();
+		info.bind(broadcast.clone());
 		Self {
 			name: name.into(),
 			state: kio::Producer::new(TrackState {
@@ -635,7 +650,17 @@ impl Producer {
 			}),
 			broadcast,
 			prev_subscription: None,
+			stats: stats::Scope::default(),
 		}
+	}
+
+	/// Attach the parent broadcast's ingress stats scope, counting this track as one
+	/// ingress subscription (closed when the last producer clone drops). Called by a
+	/// tagged [`broadcast::Producer`] when it creates the track.
+	pub(crate) fn with_stats(mut self, scope: stats::Scope) -> Self {
+		scope.open_subscription();
+		self.stats = scope;
+		self
 	}
 
 	/// The track's name, unique within its broadcast.
@@ -668,7 +693,7 @@ impl Producer {
 				.unwrap_or(Err(Error::Duplicate));
 		}
 
-		let group = group::Producer::new(group, track);
+		let group = group::Producer::new(group, track).with_meter(self.stats.meter());
 		state.max_sequence = Some(state.max_sequence.unwrap_or(0).max(group.sequence));
 		state.groups.push_back(Some((group.clone(), now)));
 		state.pin_latest(&group);
@@ -694,7 +719,7 @@ impl Producer {
 		let track = info.clone();
 		let latency_max = info.latency_max;
 
-		let group = group::Producer::new(group::Info { sequence }, track);
+		let group = group::Producer::new(group::Info { sequence }, track).with_meter(self.stats.meter());
 
 		let now = web_async::time::Instant::now();
 		state.duplicates.insert(sequence);
@@ -722,6 +747,8 @@ impl Producer {
 		if payload.len() > super::datagram::MAX_DATAGRAM_PAYLOAD {
 			return Err(Error::FrameTooLarge);
 		}
+		// Resolved before the state guard borrows `self`.
+		let meter = self.stats.meter();
 		let mut state = self.modify()?;
 		// Normalize into the track's timescale, like frames (see `group::Producer::create_frame`).
 		let timescale = state.info.as_ref().unwrap().timescale;
@@ -736,6 +763,7 @@ impl Producer {
 			return Err(Error::Closed);
 		}
 		state.max_sequence = Some(sequence);
+		meter.datagram(payload.len() as u64);
 		state.push_datagram(Datagram {
 			sequence,
 			timestamp,
@@ -753,6 +781,8 @@ impl Producer {
 		if datagram.payload.len() > super::datagram::MAX_DATAGRAM_PAYLOAD {
 			return Err(Error::FrameTooLarge);
 		}
+		// Resolved before the state guard borrows `self`.
+		let meter = self.stats.meter();
 		let mut state = self.modify()?;
 		// Normalize into the track's timescale, like frames (see `group::Producer::create_frame`).
 		let timescale = state.info.as_ref().unwrap().timescale;
@@ -766,6 +796,7 @@ impl Producer {
 			return Err(Error::Closed);
 		}
 		state.max_sequence = Some(state.max_sequence.unwrap_or(0).max(datagram.sequence));
+		meter.datagram(datagram.payload.len() as u64);
 		state.push_datagram(datagram);
 		Ok(())
 	}
@@ -821,12 +852,15 @@ impl Producer {
 
 	/// Abort the track with the given error.
 	///
-	/// Drops the cached groups so a stale [`Consumer`] can't pin them (and
-	/// their frame buffers) in memory forever. Consumers that haven't drained yet
-	/// surface the abort error instead of the leftover cache. Child groups are
-	/// independent: a consumer that already pulled a [`group::Consumer`] keeps its
-	/// own handle and can finish reading it.
-	pub fn abort(&mut self, err: Error) -> Result<()> {
+	/// Consumes the handle, since nothing can be written to an aborted track. Drops the
+	/// cached groups so a stale [`Consumer`] can't pin them (and their frame buffers) in
+	/// memory forever. Consumers that haven't drained yet surface the abort error instead
+	/// of the leftover cache. Child groups are independent: a consumer that already pulled
+	/// a [`group::Consumer`] keeps its own handle and can finish reading it.
+	///
+	/// [`finish`](Self::finish) is deliberately not terminal: it declares the final
+	/// sequence, and lower-numbered groups may still be written afterwards.
+	pub fn abort(self, err: Error) -> Result<()> {
 		let mut guard = self.modify()?;
 		guard.abort = Some(err);
 		guard.groups.clear();
@@ -940,6 +974,9 @@ impl Producer {
 				next_sequence: 0,
 				end_sequence: None,
 			}),
+			// A producer-side (in-process) subscribe is not egress: stay untagged.
+			stats: stats::Scope::default(),
+			_stats_sub: stats::Subscription::default(),
 		}
 	}
 
@@ -1149,6 +1186,8 @@ impl Drop for Producer {
 		if !self.state.is_last() {
 			return;
 		}
+		// The last ingress producer closing the track ends its subscription.
+		self.stats.close_subscription();
 		if let Ok(mut state) = self.state.write()
 			&& state.final_sequence.is_none()
 		{
@@ -1182,6 +1221,11 @@ fn combined_subscription(subs: &Subscriptions, bound: Option<Duration>, waiter: 
 		if sub.is_closed() {
 			continue;
 		}
+		// Arm the closed waiter explicitly. `poll` below registers on the value
+		// channel only when it returns Pending, so a subscriber that contributes
+		// demand (always the case for the first one) would leave nothing watching
+		// for its departure, and the last one leaving would never wake this poll.
+		let _ = sub.poll_closed(waiter);
 		if let Poll::Ready(Ok(sub)) = sub.poll(waiter, |sub| sub.poll_combined(&combined)) {
 			combined = Some(sub);
 		}
@@ -1334,6 +1378,9 @@ impl Demand {
 pub struct Consumer {
 	name: Arc<str>,
 	inner: ConsumerKind,
+	// Egress stats scope, set by a tagged [`broadcast::Consumer`] via
+	// [`Self::with_stats`]. Empty (no-op) for an untagged track.
+	stats: stats::Scope,
 }
 
 #[derive(Clone)]
@@ -1347,6 +1394,7 @@ impl Consumer {
 		Self {
 			name,
 			inner: ConsumerKind::Plain(state),
+			stats: stats::Scope::default(),
 		}
 	}
 
@@ -1355,7 +1403,15 @@ impl Consumer {
 		Self {
 			name,
 			inner: ConsumerKind::Spliced(resume),
+			stats: stats::Scope::default(),
 		}
+	}
+
+	/// Attach an egress stats scope, inherited by the subscriptions, fetches, and
+	/// groups derived from this handle. Called by a tagged [`broadcast::Consumer`].
+	pub(crate) fn with_stats(mut self, scope: stats::Scope) -> Self {
+		self.stats = scope;
+		self
 	}
 
 	/// The track name this handle is bound to.
@@ -1386,6 +1442,7 @@ impl Consumer {
 			name: self.name.clone(),
 			inner,
 			subscription,
+			stats: self.stats.clone(),
 		})
 	}
 
@@ -1416,6 +1473,11 @@ impl Consumer {
 	pub fn fetch_group(&self, sequence: u64, options: impl Into<Option<group::Fetch>>) -> kio::Pending<Fetching> {
 		let options = options.into().unwrap_or_default();
 
+		// One fetch per calling context, counted here (coalesced upstream work is
+		// still one request served). Independent of `subscriptions` and the viewer
+		// refcount.
+		self.stats.fetch();
+
 		let state = match &self.inner {
 			ConsumerKind::Plain(state) => state,
 			// Spliced: routed to the newest segment's (plain) track, waiting for a
@@ -1423,6 +1485,7 @@ impl Consumer {
 			ConsumerKind::Spliced(resume) => {
 				return kio::Pending::new(Fetching {
 					inner: FetchingKind::Spliced(resume.fetch_group(sequence, options)),
+					stats: self.stats.clone(),
 				});
 			}
 		};
@@ -1467,6 +1530,7 @@ impl Consumer {
 				sequence,
 				result,
 			},
+			stats: self.stats.clone(),
 		})
 	}
 
@@ -1523,6 +1587,7 @@ pub struct Subscribing {
 	name: Arc<str>,
 	inner: SubscribingKind,
 	subscription: kio::Producer<Subscription>,
+	stats: stats::Scope,
 }
 
 enum SubscribingKind {
@@ -1552,6 +1617,8 @@ impl Subscribing {
 						next_sequence: 0,
 						end_sequence: None,
 					}),
+					stats: self.stats.clone(),
+					_stats_sub: self.stats.subscribe(),
 				}))
 			}
 			SubscribingKind::Spliced(resume) => {
@@ -1563,6 +1630,8 @@ impl Subscribing {
 					name: self.name.clone(),
 					info,
 					inner: SubscriberKind::Spliced(Box::new(resume.subscribe_shared(self.subscription.clone()))),
+					stats: self.stats.clone(),
+					_stats_sub: self.stats.subscribe(),
 				}))
 			}
 		}
@@ -1708,6 +1777,9 @@ impl Drop for GroupRequest {
 /// or produced after a wire FETCH), or [`Error::NotFound`] if it can never exist.
 pub struct Fetching {
 	inner: FetchingKind,
+	// Egress stats scope, so the resolved group carries a payload meter (and counts
+	// as one delivered group). Empty (no-op) for an untagged track.
+	stats: stats::Scope,
 }
 
 enum FetchingKind {
@@ -1733,13 +1805,18 @@ impl kio::Pollable for Fetching {
 				sequence,
 				result,
 			} => (state, fetch, *sequence, result.as_ref()),
-			FetchingKind::Spliced(spliced) => return kio::Pollable::poll(&**spliced, waiter),
+			FetchingKind::Spliced(spliced) => {
+				// A fetched group is metered here (once), at the tagged handle: the
+				// spliced source track it comes from is the origin's own, untagged.
+				return kio::Pollable::poll(&**spliced, waiter)
+					.map(|res| res.map(|group| group.with_meter(self.stats.meter())));
+			}
 		};
 
 		// Track side: the cached group, the abort error, or past-final. The outer
 		// error is the channel closing without any of those.
 		match state.poll(waiter, |state| state.poll_fetch_cached(sequence)) {
-			Poll::Ready(Ok(res)) => return Poll::Ready(res),
+			Poll::Ready(Ok(res)) => return Poll::Ready(res.map(|group| group.with_meter(self.stats.meter()))),
 			Poll::Ready(Err(closed)) => {
 				return Poll::Ready(Err(closed.abort.clone().unwrap_or(Error::Dropped)));
 			}
@@ -1798,6 +1875,12 @@ pub struct Subscriber {
 	name: Arc<str>,
 	info: Info,
 	inner: SubscriberKind,
+	// Egress stats scope, used to meter the groups this subscriber reads. Empty
+	// (no-op) for an untagged track.
+	stats: stats::Scope,
+	// The subscription guard: bumps `subscriptions` (and the egress viewer refcount)
+	// while held, closing them on drop. Empty (no-op) for an untagged track.
+	_stats_sub: stats::Subscription,
 }
 
 enum SubscriberKind {
@@ -1948,10 +2031,12 @@ impl Subscriber {
 	/// `Poll::Ready(Err(e))` when the track has been aborted, or
 	/// `Poll::Pending` when no group is available yet.
 	pub fn poll_recv_group(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<group::Consumer>>> {
-		match &mut self.inner {
+		let meter = self.stats.meter();
+		let res = match &mut self.inner {
 			SubscriberKind::Plain(plain) => plain.poll_recv_group(waiter),
 			SubscriberKind::Spliced(spliced) => spliced.poll_recv_group(waiter),
-		}
+		};
+		res.map(|res| res.map(|group| group.map(|group| group.with_meter(meter))))
 	}
 
 	/// Receive the next group in arrival order.
@@ -1974,10 +2059,17 @@ impl Subscriber {
 	/// `Poll::Ready(Ok(None))` when the track is finished, `Poll::Ready(Err(e))` when the track
 	/// is aborted, or `Poll::Pending` when none is buffered yet.
 	pub fn poll_recv_datagram(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<Datagram>>> {
-		match &mut self.inner {
+		let meter = self.stats.meter();
+		let res = match &mut self.inner {
 			SubscriberKind::Plain(plain) => plain.poll_recv_datagram(waiter),
 			SubscriberKind::Spliced(spliced) => spliced.poll_recv_datagram(waiter),
+		};
+		// Unlike a group (metered lazily as its frames are read), a datagram is
+		// delivered whole here, so count it as the single-frame group it stands in for.
+		if let Poll::Ready(Ok(Some(datagram))) = &res {
+			meter.datagram(datagram.payload.len() as u64);
 		}
+		res
 	}
 
 	/// Receive the next datagram in arrival order.
@@ -1999,10 +2091,12 @@ impl Subscriber {
 	/// Honors the cap set by [`Self::end_at`]: groups with sequence past the cap are left
 	/// in the producer's cache and become eligible again if the cap is raised or removed.
 	pub fn poll_next_group(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<group::Consumer>>> {
-		match &mut self.inner {
+		let meter = self.stats.meter();
+		let res = match &mut self.inner {
 			SubscriberKind::Plain(plain) => plain.poll_next_group(waiter),
 			SubscriberKind::Spliced(spliced) => spliced.poll_next_group(waiter),
-		}
+		};
+		res.map(|res| res.map(|group| group.map(|group| group.with_meter(meter))))
 	}
 
 	/// Return the next group with a higher sequence number than any previously returned.
@@ -2018,10 +2112,19 @@ impl Subscriber {
 	/// (timestamp and payload), skipping the rest of the group. Intended for
 	/// single-frame groups (see [`Producer::write_frame`]).
 	pub fn poll_read_frame(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<frame::Frame>>> {
-		match &mut self.inner {
+		let meter = self.stats.meter();
+		let res = match &mut self.inner {
 			SubscriberKind::Plain(plain) => plain.poll_read_frame(waiter),
 			SubscriberKind::Spliced(spliced) => spliced.poll_read_frame(waiter),
+		};
+		// This helper collapses a group to its first frame: count the group, the one
+		// frame, and the bytes actually read.
+		if let Poll::Ready(Ok(Some(frame))) = &res {
+			meter.group();
+			meter.frames(1);
+			meter.bytes(frame.payload.len() as u64);
 		}
+		res
 	}
 
 	/// Read a single full frame (timestamp and payload) from the next group in
@@ -2147,6 +2250,10 @@ pub struct Request {
 	// racing the producer (e.g. a relay) into creating its own handler. Released
 	// when the request is accepted or dropped; by then the relay holds its own.
 	_dynamic: Dynamic,
+
+	// Ingress stats scope, threaded into the accepted [`Producer`]. Empty (no-op)
+	// unless this request was reserved on a tagged broadcast.
+	stats: stats::Scope,
 }
 
 impl Request {
@@ -2163,7 +2270,15 @@ impl Request {
 			state,
 			prev_subscription: None,
 			_dynamic: dynamic,
+			stats: stats::Scope::default(),
 		}
+	}
+
+	/// Attach an ingress stats scope, applied to the [`Producer`] on accept. Set by
+	/// a tagged [`broadcast::Producer::reserve_track`].
+	pub(crate) fn with_stats(mut self, scope: stats::Scope) -> Self {
+		self.stats = scope;
+		self
 	}
 
 	/// The requested track name.
@@ -2197,17 +2312,21 @@ impl Request {
 	/// aborted immediately after accepting.
 	pub fn accept(self, info: impl Into<Option<Info>>) -> Producer {
 		let mut info = info.into().unwrap_or_default();
-		info.broadcast = self.broadcast.clone();
+		info.bind(self.broadcast.clone());
 		// A closed state means the track was aborted under us. Mirror `reject` and
 		// tolerate it: the Producer we hand back simply can't write.
 		if let Ok(mut state) = self.state.write() {
 			state.info = Some(info);
 		}
+		// Accepting the request creates the track producer: count it as one ingress
+		// subscription (closed on the last producer drop). No-op when untagged.
+		self.stats.open_subscription();
 		Producer {
 			name: self.name,
 			broadcast: self.broadcast,
 			state: self.state,
 			prev_subscription: None,
+			stats: self.stats,
 		}
 	}
 
@@ -2584,6 +2703,30 @@ mod test {
 		}
 	}
 
+	/// A group whose frames outlive `latency_max` is aged out when the next group starts, but
+	/// a subscriber that already drained it must still see the clean end of group. Otherwise a
+	/// track with long groups (a per-minute rollup, say) fails its readers at every boundary.
+	#[tokio::test]
+	async fn aging_out_a_finished_group_keeps_the_clean_end() {
+		tokio::time::pause();
+
+		let mut producer = track_producer("test", None);
+		let mut group = producer.create_group(group::Info { sequence: 0 }).unwrap();
+		let mut consumer = group.consume();
+
+		group
+			.write_frame(Timestamp::from_millis(0).unwrap(), b"hello".as_slice())
+			.unwrap();
+		assert_eq!(consumer.next_frame().await.unwrap().unwrap().size, 5);
+
+		// The group stays open well past latency_max, then the next period starts.
+		tokio::time::advance(DEFAULT_LATENCY_MAX * 12).await;
+		group.finish().unwrap();
+		let _next = producer.create_group(group::Info { sequence: 1 }).unwrap();
+
+		assert!(consumer.next_frame().await.unwrap().is_none());
+	}
+
 	#[tokio::test]
 	async fn evict_keeps_max_sequence() {
 		tokio::time::pause();
@@ -2679,6 +2822,54 @@ mod test {
 		assert_eq!(producer.subscription().unwrap().latency_max, Duration::ZERO);
 	}
 
+	/// Mint a track under an origin whose retention ceiling is `cap`, so the
+	/// track's own window is clamped down to it on bind.
+	fn track_producer_capped(name: impl Into<Arc<str>>, info: Info, cap: Duration) -> Producer {
+		let origin = crate::origin::Info::default().with_cache_duration(cap);
+		Producer::new(Arc::new(broadcast::Info { origin }), name, info)
+	}
+
+	#[test]
+	fn origin_cache_duration_clamps_latency_max() {
+		// A publisher asking to keep groups for a minute is capped to the origin's 1s
+		// ceiling; a publisher already below the ceiling is left alone (it's a min).
+		let capped = track_producer_capped(
+			"test",
+			Info::default().with_latency_max(Duration::from_secs(60)),
+			Duration::from_secs(1),
+		);
+		assert_eq!(capped.state.read().latency_bound(), Some(Duration::from_secs(1)));
+
+		let under = track_producer_capped(
+			"test",
+			Info::default().with_latency_max(Duration::from_millis(500)),
+			Duration::from_secs(1),
+		);
+		assert_eq!(under.state.read().latency_bound(), Some(Duration::from_millis(500)));
+	}
+
+	#[tokio::test]
+	async fn origin_cache_duration_caps_eviction() {
+		tokio::time::pause();
+
+		// The publisher wants a 60s window, but the origin caps retention at 1s.
+		let mut producer = track_producer_capped(
+			"test",
+			Info::default().with_latency_max(Duration::from_secs(60)),
+			Duration::from_secs(1),
+		);
+		producer.append_group().unwrap(); // seq 0
+
+		// Past the origin ceiling but far within the publisher's own 60s window.
+		tokio::time::advance(Duration::from_secs(2)).await;
+		producer.append_group().unwrap(); // seq 1
+
+		// Seq 0 is evicted anyway: the origin ceiling wins over the larger publisher window.
+		let state = producer.state.read();
+		assert_eq!(live_groups(&state), 1);
+		assert_eq!(first_live_sequence(&state), 1);
+	}
+
 	#[test]
 	fn latency_max_clamped_via_every_update_path() {
 		let producer = track_producer("test", Info::default().with_latency_max(Duration::from_secs(2)));
@@ -2756,6 +2947,49 @@ mod test {
 			producer.subscription().is_none(),
 			"snapshot must exclude a dropped subscriber",
 		);
+	}
+
+	#[test]
+	fn dropped_subscriber_wakes_the_aggregate() {
+		// The value being right isn't enough: nothing re-polls the aggregate on its
+		// own, so the drop has to wake the waiter. A subscriber contributing demand
+		// takes `kio::Consumer::poll`'s Ready path, which registers no waiter, so
+		// the departure needs the closed waiter armed explicitly. Without it a relay
+		// never learns the last viewer left and holds the upstream subscription (and
+		// the upstream's viewer count) open forever.
+		use std::sync::atomic::{AtomicBool, Ordering};
+
+		let mut producer = track_producer("test", None);
+		let a = producer.subscribe(Subscription::default().with_priority(5));
+
+		let woken = Arc::new(AtomicBool::new(false));
+		let waiter = kio::Waiter::new(futures::task::waker(Arc::new(FlagWake(woken.clone()))));
+
+		// Prime the cursor, then confirm the next poll parks.
+		assert!(matches!(
+			producer.poll_subscription_changed(&waiter),
+			Poll::Ready(Ok(Some(_)))
+		));
+		assert!(
+			producer.poll_subscription_changed(&waiter).is_pending(),
+			"the aggregate is unchanged, so this poll must park",
+		);
+		assert!(!woken.load(Ordering::SeqCst), "nothing happened yet");
+
+		drop(a);
+		assert!(
+			woken.load(Ordering::SeqCst),
+			"the last subscriber leaving must wake the aggregate watcher",
+		);
+	}
+
+	/// An [`ArcWake`] that just records that it was woken.
+	struct FlagWake(Arc<std::sync::atomic::AtomicBool>);
+
+	impl futures::task::ArcWake for FlagWake {
+		fn wake_by_ref(arc_self: &Arc<Self>) {
+			arc_self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+		}
 	}
 
 	#[tokio::test]
@@ -2852,7 +3086,7 @@ mod test {
 		let mut consumer = producer.subscribe(None);
 		assert_eq!(live_groups(&producer.state.read()), 2);
 
-		producer.abort(Error::Cancel).unwrap();
+		producer.clone().abort(Error::Cancel).unwrap();
 
 		{
 			let state = producer.state.read();
@@ -3852,7 +4086,7 @@ mod test {
 		tokio::time::advance(Duration::from_millis(10)).await;
 
 		// The publisher aborts its own latest group; the slot stays at max_sequence.
-		let mut latest = producer.append_group().unwrap(); // seq 1
+		let latest = producer.append_group().unwrap(); // seq 1
 		latest.abort(Error::Cancel).unwrap();
 		tokio::time::advance(Duration::from_millis(10)).await;
 
@@ -3923,7 +4157,7 @@ mod test {
 
 	#[tokio::test]
 	async fn fetch_aborts_with_track() {
-		let mut producer = track_producer("test", None);
+		let producer = track_producer("test", None);
 		let dynamic = producer.dynamic();
 		let consumer = producer.consume();
 

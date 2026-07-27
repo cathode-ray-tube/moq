@@ -136,9 +136,9 @@ The video source is one of `--camera`, `--display`, `--window`, or `--app`;
 without one, `capture` opens the default camera. `--camera` and `--display` also
 take no value, meaning "the default one".
 
-`moq devices` lists every source and the id each flag expects, so you can read an
-id off it and paste it straight in. It talks only to the local hardware, so it is
-the one verb that takes no MoQ side:
+`moq devices` lists every source the current platform can enumerate and the id
+each flag expects, so you can read an id off it and paste it straight in. It
+talks only to the local hardware, so it is the one verb that takes no MoQ side:
 
 ```bash
 moq devices
@@ -370,6 +370,14 @@ rather than mis-described. Elementary streams the CLI does not decode (SCTE-35
 cues, teletext, DVB subtitles, ...) are carried verbatim too, one MoQ track per
 PID, described in the catalog `mpegts` section, and survive `import ts` /
 `export ts` end-to-end.
+
+The service layer rides the same `mpegts` section. The program identity
+(transport stream ID, service number, PMT PID) is captured from the PAT and used to
+rebuild a matching PAT/PMT, while the standalone SI tables (SDT, NIT) are carried as
+opaque sections and re-emitted byte-for-byte on their original PIDs, each at its own
+repetition interval. So the service name, provider, type, and network survive the
+round-trip without being parsed. Regenerated tables (TDT/TOT) and EPG (EIT) are not
+captured: they are live or bulky rather than static identity.
 
 ### FLV
 

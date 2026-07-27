@@ -164,6 +164,13 @@ connect_api = "https://api.example.com/cluster/connect"
 # whose URL has no inline ?jwt=. Required to authenticate gossip / connect_api
 # discovered peers; for static `connect` peers, prefer an inline ?jwt=.
 token = "cluster.jwt"
+
+# Optional. How long a broadcast stays alive and announced after abruptly
+# losing its last publisher (a session dying without unannouncing). A publisher
+# reconnecting within the window resumes the same broadcast and subscribers
+# never notice. A clean unannounce always takes effect immediately. "0"
+# unannounces abrupt losses immediately too. Default: 5s.
+linger = "5s"
 ```
 
 See [Clustering](/bin/relay/cluster) for topology choices and the trade-off between hand-listed peers and gossip.
@@ -186,6 +193,43 @@ tls.disable_verify = true
 # Defaults to true only when no custom root is set.
 # tls.system_roots = true
 ```
+
+### \[server.quic] and \[client.quic]
+
+Per-connection QUIC transport knobs, applied to incoming connections
+(`server.quic`) and to outgoing cluster dials (`client.quic`) independently.
+
+```toml
+[server.quic]
+# "loss" or "delay". Defaults per backend; don't set "delay" on noq/iroh (see below).
+congestion_control = "delay"
+
+[client.quic]
+congestion_control = "delay"
+```
+
+`loss` is CUBIC: it grows until it drops packets, so the send rate sawtooths.
+`delay` is BBR: it tracks the measured delivery rate and RTT instead of waiting
+for loss, which keeps queues shorter and the send rate steady enough for a live
+encoder to follow. Prefer `delay` for interactive media.
+
+The knob names a family rather than an algorithm because each QUIC backend ships
+a different BBR generation:
+
+| Backend | `loss` | `delay` | Default when unset |
+| --- | --- | --- | --- |
+| quinn | CUBIC | BBRv1 | BBRv1 |
+| quiche | CUBIC | BBRv2 | BBRv2 |
+| noq | CUBIC | BBRv3 | CUBIC |
+| iroh | CUBIC | BBRv3 | CUBIC |
+
+noq and iroh are the exception because their shared BBRv3 can panic on packet
+loss, which aborts the process. Do not select `delay` on those backends unless
+you are testing that controller on purpose and can tolerate the crash.
+
+Also available as `--server-quic-congestion-control` /
+`--client-quic-congestion-control`, or `MOQ_SERVER_QUIC_CONGESTION_CONTROL` /
+`MOQ_CLIENT_QUIC_CONGESTION_CONTROL`.
 
 ### \[stats]
 
@@ -263,13 +307,15 @@ counterpart no traffic can flow, so the entry is dropped:
     "announced": 1, "announced_closed": 0, "announced_bytes": 8,
     "broadcasts": 1, "broadcasts_closed": 0,
     "subscriptions": 5, "subscriptions_closed": 2,
-    "bytes": 12345, "frames": 678, "groups": 9
+    "fetches": 3,
+    "bytes": 12345, "frames": 678, "groups": 9, "datagrams": 2
   },
   "anon/foo": {
     "announced": 1, "announced_closed": 0, "announced_bytes": 8,
     "broadcasts": 1, "broadcasts_closed": 0,
     "subscriptions": 2, "subscriptions_closed": 0,
-    "bytes": 234, "frames": 12, "groups": 1
+    "fetches": 0,
+    "bytes": 234, "frames": 12, "groups": 1, "datagrams": 0
   }
 }
 ```
@@ -280,10 +326,12 @@ Field semantics:
   announce/unannounce event on this `(tier, role)` slot, regardless of
   whether any subscription happened. Use this for "all known broadcasts".
 - `announced_bytes`: cumulative broadcast-name length summed over each
-  announce and unannounce of this broadcast. It counts the name, not the
-  encoded message size, so a broadcast isn't charged for hop chains or
+  model-visible announce and unannounce of this broadcast. It counts the name,
+  not the encoded message size, so a broadcast isn't charged for hop chains or
   framing overhead (and the count is the same across protocol versions).
-  Separate from `bytes`, which is media payload.
+  Separate from `bytes`, which is media payload. Announce control traffic that
+  never enters the model (auth-rejected or unmatched-prefix announcements) is
+  not counted.
 - `broadcasts` / `broadcasts_closed`: per-(broadcast, session)
   subscription sentinel. The first active subscription a peer session
   opens for a broadcast bumps `broadcasts`; the last one it closes bumps
@@ -292,9 +340,24 @@ Field semantics:
   subscribed to the broadcast (i.e. viewers on the egress side), which is
   typically what billing and UI want.
 - `subscriptions` / `subscriptions_closed`: cumulative count of
-  track-level subscription guards opened and dropped.
-- `bytes` / `frames` / `groups`: cumulative payload counters from the
-  session loops (both the `moq-lite` and IETF `moq-transport` paths).
+  track-level subscriptions opened and dropped.
+- `fetches`: cumulative one-shot group fetches requested by a calling session,
+  counted once per coalesced fetch when the request is issued, so a fetch that
+  resolves to "not found" still counts. It is separate from `subscriptions` and
+  the viewer sentinel; the fetched payload still flows into `bytes` / `frames` /
+  `groups`.
+- `bytes` / `frames` / `groups`: cumulative payload counters, bumped as
+  groups/frames are read out of the model on the egress side and written into
+  it on the ingress side. Egress bytes are counted when read out of the model
+  (into the QUIC send path), so bytes read but lost to a mid-group stream reset
+  still count. For a fan-out egress reader (e.g. an HLS/DASH muxer) this is
+  bytes read once per segment at the broadcast origin, not per downstream HTTP
+  client.
+- `datagrams`: cumulative single-frame groups delivered over an unreliable QUIC
+  datagram (moq-lite-05+ on a datagram-capable transport). A subset of `groups`:
+  each datagram also counts there, and its payload in `frames` / `bytes`. Counted
+  when the datagram enters or leaves the model, so an egress datagram dropped by
+  congestion or an oversized body still counts.
 
 The session tracks (`sessions.json` and any `<tier>/sessions.json`) instead map
 each auth root to a `{ sessions, sessions_closed }` snapshot. `sessions`
@@ -337,10 +400,11 @@ environment variable (`MOQ_STATS_ENABLED`, `MOQ_STATS_PREFIX`,
 ### \[cache]
 
 Memory budget for cached groups. Old (non-latest) groups stay cached until their
-track's TTL expires or the pool runs out of room, whichever comes first; under
-memory pressure the least-recently-read groups are evicted first. The latest
-group of every track is always retained. With neither knob set the cache is
-unbounded and only the per-track TTL limits memory.
+track's retention window expires, the `duration` ceiling is reached, or the pool
+runs out of room, whichever comes first; under memory pressure the
+least-recently-read groups are evicted first. The latest group of every track is
+always retained. With none of the knobs set the cache is unbounded and only each
+track's own window limits memory.
 
 ```toml
 [cache]
@@ -355,14 +419,31 @@ capacity = "8GiB"
 # the cache is effectively the lowest-priority user of RAM. Combine with
 # `capacity` to also cap the absolute size.
 headroom = "2GiB"
+
+# Maximum age of a non-latest cached group ("30s", "500ms"). Caps each track's
+# own retention window: a publisher advertising a longer window is clamped down
+# to this, bounding how much history a track accumulates no matter what upstream
+# asks for. The latest group of every track is always retained, as it is the
+# live edge. Unbounded (each track keeps its own window) when unset.
+duration = "30s"
 ```
 
 The `capacity` budget counts group payload bytes, not process RSS, so leave
 slack below physical memory (or just use `headroom`, which measures actual
-available memory).
+available memory). `duration` is the age counterpart: it stops a long-running
+relay from accumulating hours of history per track when the byte budget alone
+leaves room for it.
 
-Both flags also accept CLI arguments (`--cache-capacity`, `--cache-headroom`)
-and environment variables (`MOQ_CACHE_CAPACITY`, `MOQ_CACHE_HEADROOM`).
+A track's expiry is evaluated as it writes its next group, so `duration` caps
+how much history an *active* publisher builds up rather than acting as a
+background reaper. A publisher that stops writing but stays connected keeps what
+it had cached until it resumes or the broadcast closes, and a publisher that
+disconnects has its groups released once the broadcast closes (see
+`cluster.linger`). Set `capacity` or `headroom` alongside it to bound those.
+
+All three flags also accept CLI arguments (`--cache-capacity`,
+`--cache-headroom`, `--cache-duration`) and environment variables
+(`MOQ_CACHE_CAPACITY`, `MOQ_CACHE_HEADROOM`, `MOQ_CACHE_DURATION`).
 
 ### \[iroh]
 

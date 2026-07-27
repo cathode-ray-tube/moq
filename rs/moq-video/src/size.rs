@@ -3,7 +3,7 @@ use crate::Error;
 /// A frame resolution in pixels.
 ///
 /// Names the pair that [`decode::Config::resize`](crate::decode::Config::resize)
-/// and [`decode::Frame::resize`](crate::decode::Frame::resize) both take, so
+/// and [`Frame::resize`](crate::Frame::resize) both take, so
 /// width and height can't be swapped at a call site.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Size {
@@ -35,7 +35,7 @@ impl Size {
 				"{what} {self}: dimensions must be non-zero"
 			)));
 		}
-		if self.width % 2 != 0 || self.height % 2 != 0 {
+		if !self.width.is_multiple_of(2) || !self.height.is_multiple_of(2) {
 			return Err(Error::Codec(anyhow::anyhow!("{what} {self}: dimensions must be even")));
 		}
 		Ok(())

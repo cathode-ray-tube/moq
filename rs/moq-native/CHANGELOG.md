@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.3](https://github.com/moq-dev/moq/compare/moq-native-v0.19.2...moq-native-v0.19.3) - 2026-07-25
+
+### Fixed
+
+- *(net)* tear down idle upstream subscriptions ([#2500](https://github.com/moq-dev/moq/pull/2500))
+
+## [0.19.2](https://github.com/moq-dev/moq/compare/moq-native-v0.19.1...moq-native-v0.19.2) - 2026-07-24
+
+### Added
+
+- *(moq-net)* linger a broadcast across an ungraceful source loss ([#2469](https://github.com/moq-dev/moq/pull/2469))
+- *(native)* default quinn and quiche to delay-based congestion control ([#2468](https://github.com/moq-dev/moq/pull/2468))
+
+## [0.19.1](https://github.com/moq-dev/moq/compare/moq-native-v0.19.0...moq-native-v0.19.1) - 2026-07-23
+
+### Added
+
+- *(native)* capture qlog traces on the quinn, quiche, and noq backends ([#2451](https://github.com/moq-dev/moq/pull/2451))
+
+### Other
+
+- *(rust)* pin the toolchain and correct the MSRV claims ([#2462](https://github.com/moq-dev/moq/pull/2462))
+
+## [0.19.0](https://github.com/moq-dev/moq/compare/moq-native-v0.18.3...moq-native-v0.19.0) - 2026-07-22
+
+### Added
+
+- *(moq-native)* expose a congestion control knob on every QUIC backend ([#2432](https://github.com/moq-dev/moq/pull/2432))
+- *(net)* route by cumulative cost on lite-06 announcements ([#2424](https://github.com/moq-dev/moq/pull/2424))
+- *(net)* [**breaking**] accept an empty PATH and default it to "" across protocols ([#2414](https://github.com/moq-dev/moq/pull/2414))
+
+### Fixed
+
+- [**breaking**] correct catalog, timeline, token, and teardown contracts found in API review ([#2439](https://github.com/moq-dev/moq/pull/2439))
+
+### Other
+
+- *(stats)* [**breaking**] collect traffic counters in the model layer ([#2427](https://github.com/moq-dev/moq/pull/2427))
+- Merge branch 'main' into dev
+- *(net)* [**breaking**] route everything through create_broadcast, gate announce on Route.live ([#2396](https://github.com/moq-dev/moq/pull/2396))
+- Merge branch 'main' into dev
+
 ## [0.18.3](https://github.com/moq-dev/moq/compare/moq-native-v0.18.2...moq-native-v0.18.3) - 2026-07-18
 
 ### Fixed

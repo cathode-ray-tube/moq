@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/moq-dev/moq/compare/moq-srt-v0.2.1...moq-srt-v0.2.2) - 2026-07-25
+
+### Fixed
+
+- *(moq-srt)* clamp egress send instants to the first packet (fixes tune-in stall) ([#2501](https://github.com/moq-dev/moq/pull/2501))
+
+## [0.2.1](https://github.com/moq-dev/moq/compare/moq-srt-v0.2.0...moq-srt-v0.2.1) - 2026-07-24
+
+### Other
+
+- updated the following local packages: moq-mux
+
+## [0.2.0](https://github.com/moq-dev/moq/compare/moq-srt-v0.1.2...moq-srt-v0.2.0) - 2026-07-22
+
+### Added
+
+- *(net)* unannounce as soon as the last route detaches ([#2419](https://github.com/moq-dev/moq/pull/2419))
+
+### Fixed
+
+- [**breaking**] correct catalog, timeline, token, and teardown contracts found in API review ([#2439](https://github.com/moq-dev/moq/pull/2439))
+
+### Other
+
+- [**breaking**] pre-bump API polish across the release batch ([#2423](https://github.com/moq-dev/moq/pull/2423))
+- compile doc examples across the workspace ([#2421](https://github.com/moq-dev/moq/pull/2421))
+- *(net)* [**breaking**] route everything through create_broadcast, gate announce on Route.live ([#2396](https://github.com/moq-dev/moq/pull/2396))
+- *(moq-net)* [**breaking**] model Timestamp as an instant; drop panicking arithmetic operators ([#2366](https://github.com/moq-dev/moq/pull/2366))
+- Merge branch 'main' into dev
+- Merge branch 'main' into dev
+
 ## [0.1.2](https://github.com/moq-dev/moq/compare/moq-srt-v0.1.1...moq-srt-v0.1.2) - 2026-07-15
 
 ### Fixed

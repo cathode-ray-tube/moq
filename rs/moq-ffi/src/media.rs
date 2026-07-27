@@ -6,6 +6,24 @@ pub struct MoqDimensions {
 	pub height: u32,
 }
 
+/// Catalog properties shared by every video rendition.
+///
+/// Passing an absent field clears it from the next catalog snapshot rather than preserving the previous value.
+#[derive(Clone, Default, uniffi::Record)]
+pub struct MoqVideoProperties {
+	/// Final rendered size after rotation, or absent to clear the explicit display size.
+	#[uniffi(default = None)]
+	pub display: Option<MoqDimensions>,
+
+	/// Clockwise rotation in degrees, or absent to clear the explicit rotation.
+	#[uniffi(default = None)]
+	pub rotation: Option<f64>,
+
+	/// Whether to flip horizontally after rotation, or absent to clear the explicit value.
+	#[uniffi(default = None)]
+	pub flip: Option<bool>,
+}
+
 /// How a track's frames are packaged, as advertised in the catalog.
 #[derive(Clone, uniffi::Enum)]
 pub enum MoqContainer {
@@ -17,12 +35,20 @@ pub enum MoqContainer {
 	Loc,
 }
 
-impl From<hang::catalog::Container> for MoqContainer {
-	fn from(container: hang::catalog::Container) -> Self {
+impl MoqContainer {
+	/// Convert a catalog container, or `None` if its `kind` is not recognized.
+	///
+	/// A rendition we can't parse is dropped from the catalog we hand to bindings, per the
+	/// hang spec: a consumer must ignore a rendition whose container it doesn't recognize.
+	fn from_catalog(container: &hang::catalog::Container) -> Option<Self> {
 		match container {
-			hang::catalog::Container::Legacy => Self::Legacy,
-			hang::catalog::Container::Cmaf { init, .. } => Self::Cmaf { init: init.to_vec() },
-			hang::catalog::Container::Loc => Self::Loc,
+			hang::catalog::Container::Legacy => Some(Self::Legacy),
+			hang::catalog::Container::Cmaf { init, .. } => Some(Self::Cmaf { init: init.to_vec() }),
+			hang::catalog::Container::Loc => Some(Self::Loc),
+			hang::catalog::Container::Unknown(unknown) => {
+				tracing::warn!(kind = unknown.kind(), "ignoring unknown container");
+				None
+			}
 		}
 	}
 }
@@ -176,8 +202,8 @@ pub(crate) fn convert_catalog(catalog: &moq_mux::catalog::hang::Catalog<moq_mux:
 		.video
 		.renditions
 		.iter()
-		.map(|(name, config)| {
-			(
+		.filter_map(|(name, config)| {
+			Some((
 				name.clone(),
 				MoqVideo {
 					codec: config.codec.to_string(),
@@ -192,9 +218,9 @@ pub(crate) fn convert_catalog(catalog: &moq_mux::catalog::hang::Catalog<moq_mux:
 					},
 					bitrate: config.bitrate,
 					framerate: config.framerate,
-					container: config.container.clone().into(),
+					container: MoqContainer::from_catalog(&config.container)?,
 				},
-			)
+			))
 		})
 		.collect();
 
@@ -202,8 +228,8 @@ pub(crate) fn convert_catalog(catalog: &moq_mux::catalog::hang::Catalog<moq_mux:
 		.audio
 		.renditions
 		.iter()
-		.map(|(name, config)| {
-			(
+		.filter_map(|(name, config)| {
+			Some((
 				name.clone(),
 				MoqAudio {
 					codec: config.codec.to_string(),
@@ -211,9 +237,9 @@ pub(crate) fn convert_catalog(catalog: &moq_mux::catalog::hang::Catalog<moq_mux:
 					sample_rate: config.sample_rate,
 					channel_count: config.channel_count,
 					bitrate: config.bitrate,
-					container: config.container.clone().into(),
+					container: MoqContainer::from_catalog(&config.container)?,
 				},
-			)
+			))
 		})
 		.collect();
 

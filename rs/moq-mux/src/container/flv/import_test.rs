@@ -133,8 +133,6 @@ async fn import_emits_frames() {
 	assert!(frame.keyframe);
 	// The payload is the length-prefixed NALU, carried through verbatim.
 	assert_eq!(frame.payload.as_ref(), &[0, 0, 0, 5, 0x65, 0x88, 0x84, 0x21, 0x00]);
-
-	drop(importer);
 }
 
 /// Bytes split across two `decode` calls still reassemble into whole tags.
@@ -195,12 +193,7 @@ async fn import_enhanced_vp9() {
 /// header and carries the frames through.
 #[tokio::test(start_paused = true)]
 async fn import_enhanced_opus() {
-	let head = crate::codec::opus::Config {
-		sample_rate: 48000,
-		channel_count: 2,
-	}
-	.encode()
-	.unwrap();
+	let head = crate::codec::opus::Config::new(48_000, 2).encode().unwrap();
 
 	let mut out = Vec::new();
 	out.extend_from_slice(b"FLV");

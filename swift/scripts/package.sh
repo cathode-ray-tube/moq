@@ -60,7 +60,7 @@ done
 [[ -z "$OUTPUT_DIR" ]] && OUTPUT_DIR="dist"
 
 # Default the moq-ffi pin to the crate's current version. This is the SPM analog
-# of py's `moq-ffi ~= 0.2.x`: the wrapper floats to the latest compatible patch.
+# of py's `moq-ffi ~= 0.3.x`: the wrapper floats to the latest compatible patch.
 if [[ -z "$FFI_VERSION" ]]; then
     FFI_VERSION=$(grep '^version' "$WORKSPACE_DIR/rs/moq-ffi/Cargo.toml" | head -1 | sed 's/.*"\(.*\)".*/\1/')
     [[ -n "$FFI_VERSION" ]] || {
@@ -99,6 +99,10 @@ mkdir -p "$PKG_STAGE/Sources/Moq" "$PKG_STAGE/Tests/MoqTests"
 
 cp -R "$SWIFT_DIR/Sources/Moq/." "$PKG_STAGE/Sources/Moq/"
 cp -R "$SWIFT_DIR/Tests/MoqTests/." "$PKG_STAGE/Tests/MoqTests/"
+
+# Swift Package Index reads .spi.yml from the package root to build and host the
+# DocC docs. Ship it in the mirror so SPI documents the tagged release.
+cp "$SWIFT_DIR/.spi.yml" "$PKG_STAGE/.spi.yml"
 
 # Dual-license files lifted from the workspace root so the mirror isn't
 # licenseless. Both files are required by the MIT OR Apache-2.0 grant.

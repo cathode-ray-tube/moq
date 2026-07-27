@@ -1,6 +1,7 @@
 //! The quinn QUIC backend, used for both WebTransport (`https://`) and raw QUIC (`moqt://`, `moql://`).
 
 use crate::client::ClientConfig;
+use crate::quic::CongestionControl;
 use crate::quic::Resolved;
 use crate::quic::ServerId;
 use crate::server::ServerConfig;
@@ -12,8 +13,43 @@ use url::Url;
 
 pub use web_transport_quinn;
 
+/// Attach a qlog stream writing into `dir`, if one was configured.
+///
+/// quinn's [`quinn::QlogStream`] is a shared handle: every connection on the endpoint
+/// writes into it, tagged with its own qlog `group_id`. So this is one file per
+/// endpoint rather than per connection, unlike the noq and quiche backends.
+fn apply_qlog(transport: &mut quinn::TransportConfig, quic: &Resolved, role: &str) -> Result<()> {
+	// `Client::validate` already rejected a directory this build can't honor, so the
+	// block below is only reached where capture actually works.
+	let Some(dir) = quic.qlog_dir() else {
+		return Ok(());
+	};
+
+	#[cfg(feature = "qlog")]
+	{
+		// The pid keeps concurrent processes sharing a directory from clobbering each other.
+		let path = dir.join(format!("moq-{role}-{}.sqlog", std::process::id()));
+		let file = std::fs::File::create(&path).map_err(Error::CreateQlog)?;
+
+		// Deliberately unbuffered: qlog's streamer only flushes on `finish_log`, which
+		// quinn never calls per event, so a BufWriter would hold every trace in memory
+		// until the endpoint drops and lose the lot if the process is killed. Killing a
+		// stuck process is exactly when these traces are worth having.
+		let mut config = quinn::QlogConfig::default();
+		config.writer(Box::new(file)).title(Some(format!("moq-native {role}")));
+
+		transport.qlog_stream(config.into_stream());
+		tracing::info!(path = %path.display(), "writing qlog");
+	}
+
+	#[cfg(not(feature = "qlog"))]
+	let _ = (transport, dir, role);
+
+	Ok(())
+}
+
 /// Apply the resolved quic knobs to a quinn transport config.
-fn apply_transport(transport: &mut quinn::TransportConfig, quic: Resolved) {
+fn apply_transport(transport: &mut quinn::TransportConfig, quic: &Resolved) {
 	transport.max_idle_timeout(Some(quic.idle_timeout.try_into().expect("idle timeout out of range")));
 	transport.keep_alive_interval(quic.keep_alive);
 
@@ -30,6 +66,24 @@ fn apply_transport(transport: &mut quinn::TransportConfig, quic: Resolved) {
 	if let Some(gso) = quic.gso {
 		transport.enable_segmentation_offload(gso);
 	}
+
+	transport.congestion_controller_factory(congestion_factory(congestion_control(quic)));
+}
+
+/// The congestion control family to install, defaulting to delay-based.
+///
+/// Live media wants a steady send rate an encoder can track, not CUBIC's sawtooth,
+/// so override quinn's own CUBIC default.
+fn congestion_control(quic: &Resolved) -> CongestionControl {
+	quic.congestion_control.unwrap_or(CongestionControl::Delay)
+}
+
+/// The quinn controller factory for a congestion control family. quinn's BBR is v1.
+fn congestion_factory(family: CongestionControl) -> Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> {
+	match family {
+		CongestionControl::Loss => Arc::new(quinn::congestion::CubicConfig::default()),
+		CongestionControl::Delay => Arc::new(quinn::congestion::BbrConfig::default()),
+	}
 }
 
 /// Errors specific to the quinn QUIC backend.
@@ -43,6 +97,10 @@ pub enum Error {
 	/// The bound socket couldn't be turned into a QUIC endpoint.
 	#[error("failed to create QUIC endpoint")]
 	CreateEndpoint(#[source] std::io::Error),
+
+	/// The qlog trace file couldn't be created, usually a missing directory.
+	#[error("failed to create qlog file")]
+	CreateQlog(#[source] std::io::Error),
 
 	/// Quinn found no async runtime. Construct the client or server from within a tokio context.
 	#[error("no async runtime")]
@@ -183,9 +241,10 @@ impl QuinnClient {
 	pub fn new(config: &ClientConfig) -> Result<Self> {
 		let socket = crate::bind::udp(config.bind).map_err(Error::BindSocket)?;
 
-		// TODO Validate the BBR implementation before enabling it
+		let quic = config.quic.resolve();
 		let mut transport = quinn::TransportConfig::default();
-		apply_transport(&mut transport, config.quic.resolve());
+		apply_transport(&mut transport, &quic);
+		apply_qlog(&mut transport, &quic, "client")?;
 		let transport = Arc::new(transport);
 
 		// There's a bit more boilerplate to make a generic endpoint.
@@ -361,10 +420,10 @@ pub(crate) struct QuinnServer {
 
 impl QuinnServer {
 	pub fn new(config: ServerConfig) -> Result<Self> {
-		// Enable BBR congestion control
-		// TODO Validate the BBR implementation before enabling it
+		let quic = config.quic.resolve();
 		let mut transport = quinn::TransportConfig::default();
-		apply_transport(&mut transport, config.quic.resolve());
+		apply_transport(&mut transport, &quic);
+		apply_qlog(&mut transport, &quic, "server")?;
 		let transport = Arc::new(transport);
 
 		let provider = crate::crypto::provider();
@@ -586,5 +645,109 @@ impl quinn::ConnectionIdGenerator for ServerIdGenerator {
 
 	fn cid_lifetime(&self) -> Option<Duration> {
 		None
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// Build a controller from each family's factory and downcast it to the
+	/// concrete quinn implementation it must map to.
+	#[test]
+	fn congestion_factory_maps_each_family() {
+		let now = std::time::Instant::now();
+		let mtu = 1200;
+
+		let loss = congestion_factory(CongestionControl::Loss).build(now, mtu);
+		assert!(loss.into_any().downcast::<quinn::congestion::Cubic>().is_ok());
+
+		let delay = congestion_factory(CongestionControl::Delay).build(now, mtu);
+		assert!(delay.into_any().downcast::<quinn::congestion::Bbr>().is_ok());
+	}
+
+	/// An unset knob must land on BBR rather than quinn's own CUBIC default.
+	#[test]
+	fn congestion_control_defaults_to_delay() {
+		let mut quic = crate::quic::Client::default();
+		assert_eq!(congestion_control(&quic.resolve()), CongestionControl::Delay);
+
+		// An explicit request still gets through.
+		quic.congestion_control = Some(CongestionControl::Loss);
+		assert_eq!(congestion_control(&quic.resolve()), CongestionControl::Loss);
+	}
+
+	/// Loopback regression test: a config selecting BBR must produce live
+	/// connections that actually run quinn's BBR controller, on both ends.
+	#[tokio::test]
+	async fn delay_reaches_the_live_connection() {
+		let server_config = ServerConfig {
+			bind: Some("127.0.0.1:0".to_string()),
+			tls: crate::tls::Server {
+				generate: vec!["localhost".into()],
+				..Default::default()
+			},
+			quic: crate::quic::Server {
+				congestion_control: Some(CongestionControl::Delay),
+				..Default::default()
+			},
+			..Default::default()
+		};
+
+		let server = QuinnServer::new(server_config).expect("server init");
+		let addr = server.local_addr().expect("local addr");
+
+		let accepted = tokio::spawn(async move {
+			let incoming = server.accept().await.expect("no incoming connection");
+			let conn = incoming.accept().expect("accept").await.expect("handshake");
+			conn.congestion_state()
+				.into_any()
+				.downcast::<quinn::congestion::Bbr>()
+				.is_ok()
+		});
+
+		// tls::Client has a private field, so it can't be built with a struct literal.
+		let mut tls_config = crate::tls::Client::default();
+		tls_config.disable_verify = Some(true);
+
+		let client_config = ClientConfig {
+			bind: "127.0.0.1:0".parse().unwrap(),
+			tls: tls_config,
+			quic: crate::quic::Client {
+				congestion_control: Some(CongestionControl::Delay),
+				..Default::default()
+			},
+			..Default::default()
+		};
+
+		let tls = client_config.tls.build().expect("tls config");
+		let client = QuinnClient::new(&client_config).expect("client init");
+		// Dial the loopback IP directly so the system resolver is never involved.
+		let url: Url = format!("moqt://127.0.0.1:{}", addr.port()).parse().unwrap();
+
+		// Bound the whole connect + accept + assert flow so a handshake
+		// regression fails fast instead of stalling CI.
+		tokio::time::timeout(Duration::from_secs(5), async move {
+			let session = client
+				.connect(&tls, url, &moq_net::Versions::default())
+				.await
+				.expect("connect failed");
+
+			// web_transport_quinn::Session derefs to the quinn connection.
+			assert!(
+				session
+					.congestion_state()
+					.into_any()
+					.downcast::<quinn::congestion::Bbr>()
+					.is_ok(),
+				"client connection is not running BBR"
+			);
+			assert!(
+				accepted.await.expect("server task panicked"),
+				"server connection is not running BBR"
+			);
+		})
+		.await
+		.expect("test timed out");
 	}
 }

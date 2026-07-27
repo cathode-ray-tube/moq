@@ -26,12 +26,12 @@ The raw UniFFI bindings (`uniffi.moq.*`) plus the native binaries (JNI on Androi
 ```kotlin
 // build.gradle.kts
 dependencies {
-    implementation("dev.moq:moq:0.3.0")
+    implementation("dev.moq:moq:0.4.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
 }
 ```
 
-The wrapper depends on `dev.moq:moq-ffi:[0.2,0.3)`, so Gradle pulls the newest bindings patch (with its bundled native binaries) automatically; no extra setup is needed on the consumer side. The wrapper publishes via [release-kt-lib.yml](https://github.com/moq-dev/moq/blob/main/.github/workflows/release-kt-lib.yml) and the bindings via [release-kt-ffi.yml](https://github.com/moq-dev/moq/blob/main/.github/workflows/release-kt-ffi.yml).
+The wrapper depends on `dev.moq:moq-ffi:[0.3,0.4)`, so Gradle pulls the newest bindings patch (with its bundled native binaries) automatically; no extra setup is needed on the consumer side. The wrapper publishes via [release-kt-lib.yml](https://github.com/moq-dev/moq/blob/main/.github/workflows/release-kt-lib.yml) and the bindings via [release-kt-ffi.yml](https://github.com/moq-dev/moq/blob/main/.github/workflows/release-kt-ffi.yml).
 
 ## Quickstart
 
@@ -54,6 +54,7 @@ Moq.connect("https://relay.example.com").use { moq ->
 
 ## Source and issues
 
+- API reference: [javadoc.io/doc/dev.moq/moq](https://javadoc.io/doc/dev.moq/moq)
 - Source: [kt/](https://github.com/moq-dev/moq/tree/main/kt) (in the monorepo)
 - README: [kt/README.md](https://github.com/moq-dev/moq/blob/main/kt/README.md)
 - Maven Central: [dev.moq:moq](https://central.sonatype.com/artifact/dev.moq/moq)

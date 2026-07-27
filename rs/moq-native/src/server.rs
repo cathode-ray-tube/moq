@@ -145,6 +145,8 @@ impl Server {
 		// Build a QUIC backend when `--server-bind` is set, or when nothing else
 		// is (the default). A stream-only server (`--server-unix-bind` with no
 		// `--server-bind`) doesn't also open UDP/443.
+		config.quic.validate()?;
+
 		let build_quic = config.bind.is_some() || !config.has_stream_listener();
 
 		if build_quic && !config.tls.root.is_empty() {
@@ -153,6 +155,8 @@ impl Server {
 				QuicBackend::Quinn => true,
 				#[cfg(feature = "noq")]
 				QuicBackend::Noq => true,
+				#[cfg(feature = "quiche")]
+				QuicBackend::Quiche => true,
 				#[allow(unreachable_patterns)]
 				_ => false,
 			};
@@ -252,8 +256,9 @@ impl Server {
 		self
 	}
 
-	/// Attach a tier-scoped [`moq_net::stats::Handle`] to all sessions accepted by this server.
-	pub fn with_stats(mut self, stats: moq_net::stats::Handle) -> Self {
+	/// Attach a per-connection [`moq_net::stats::Session`] context to all sessions
+	/// accepted by this server.
+	pub fn with_stats(mut self, stats: moq_net::stats::Session) -> Self {
 		self.moq = self.moq.with_stats(stats);
 		self
 	}
@@ -581,10 +586,10 @@ async fn serve_session(request: Request) -> crate::Result<()> {
 #[cfg(any(feature = "tcp", all(feature = "uds", unix)))]
 fn stream_versions(base: &moq_net::Versions) -> moq_net::Versions {
 	let mut versions: Vec<moq_net::Version> = base.iter().copied().collect();
-	if let Ok(lite05) = "moq-lite-05".parse::<moq_net::Version>() {
-		if !versions.contains(&lite05) {
-			versions.push(lite05);
-		}
+	if let Ok(lite05) = "moq-lite-05".parse::<moq_net::Version>()
+		&& !versions.contains(&lite05)
+	{
+		versions.push(lite05);
 	}
 	moq_net::Versions::from(versions)
 }
@@ -932,8 +937,8 @@ impl Request {
 		}
 	}
 
-	/// Attach a tier-scoped [`moq_net::stats::Handle`] to this session.
-	pub fn with_stats(self, stats: moq_net::stats::Handle) -> Self {
+	/// Attach a per-connection [`moq_net::stats::Session`] context to this session.
+	pub fn with_stats(self, stats: moq_net::stats::Session) -> Self {
 		let Request {
 			transport,
 			url,
