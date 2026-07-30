@@ -98,7 +98,7 @@
     },
     "js/hang": {
       "name": "@moq/hang",
-      "version": "0.3.2",
+      "version": "0.3.3",
       "dependencies": {
         "@kixelated/libavjs-webcodecs-polyfill": "^0.5.5",
         "@libav.js/variant-opus-af": "^6.9.8",
@@ -201,7 +201,7 @@
     },
     "js/publish": {
       "name": "@moq/publish",
-      "version": "0.4.1",
+      "version": "0.4.2",
       "dependencies": {
         "@moq/hang": "workspace:^",
         "@moq/net": "workspace:^",
@@ -265,12 +265,13 @@
     },
     "js/watch": {
       "name": "@moq/watch",
-      "version": "0.4.2",
+      "version": "0.4.3",
       "dependencies": {
         "@moq/hang": "workspace:^",
         "@moq/msf": "workspace:^",
         "@moq/net": "workspace:^",
         "@moq/signals": "workspace:^",
+        "media-captions": "0.0.18",
       },
       "devDependencies": {
         "@types/audioworklet": "^0.0.100",
@@ -1299,6 +1300,8 @@
     "mdast-util-to-string": ["mdast-util-to-string@4.0.0", "", { "dependencies": { "@types/mdast": "^4.0.0" } }, "sha512-0H44vDimn51F0YwvxSJSm0eCDOJTRlmN0R1yBh4HLj9wiV1Dn0QoXGbvFAWj2hSItVTlCmBF1hqKlIyUBVFLPg=="],
 
     "mediabunny": ["mediabunny@1.51.0", "", { "dependencies": { "@types/dom-mediacapture-transform": "^0.1.11", "@types/dom-webcodecs": "0.1.13" } }, "sha512-u327374xU8Ho0gCaMII7fUK8t0PnqkabCox1k8uUwvgvGb9o6YQGZEG2Qr4DTe7nTMpzfL7ukgnHDvDROySZ+Q=="],
+
+    "media-captions": ["media-captions@0.0.18", "", {}, "sha512-JW18P6FuHdyLSGwC4TQ0kF3WdNj/+wMw2cKOb8BnmY6vSJGtnwJ+vkYj+IjHOV34j3XMc70HDeB/QYKR7E7fuQ=="],
 
     "merge-anything": ["merge-anything@5.1.7", "", { "dependencies": { "is-what": "^4.1.8" } }, "sha512-eRtbOb1N5iyH0tkQDAoQ4Ipsp/5qSR79Dzrz8hEPxRX10RWWR/iQXdoKmBSRCThY1Fh5EhISDtpSc93fpxUniQ=="],
 

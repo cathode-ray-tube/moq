@@ -68,6 +68,7 @@ impl<E: CatalogExt> Stream for Consumer<E> {
 					video: m.video,
 					audio: m.audio,
 					timeline: m.timeline,
+					text: m.text,
 					ext: E::default(),
 				})))
 			}
