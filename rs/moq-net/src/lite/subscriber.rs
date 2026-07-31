@@ -1215,6 +1215,107 @@ mod tests {
 		assert_eq!((msg.start_group, msg.start_frame), (Some(5), 0));
 		assert_eq!((msg.end_group, msg.end_frame), (Some(5), None));
 	}
+
+	/// A buffered SUBSCRIBE_START describes the demand its SUBSCRIBE carried, so
+	/// it applies exactly while the current start matches that demand: an update
+	/// that moves the start makes it stale (applying it could reopen a range the
+	/// publisher no longer serves, or clamp one it still does), and an update
+	/// that moves back restores it (the publisher declared that range gone and
+	/// sends no replacement START).
+	#[tokio::test]
+	async fn buffered_start_applies_iff_demand_matches() {
+		let mut h = Harness::new(Version::Lite05);
+		let mut sub = Sub::None;
+
+		let demand = |group: u64| Some(Subscription::default().with_start(Position::group(group)));
+		let applies = |sub: &Sub<SinkSession>| matches!(sub, Sub::Active(active) if active.start == active.requested);
+
+		// Establish from group 3; the peer's START is considered in flight.
+		h.serve
+			.handle_subscription(&mut h.producer, &mut sub, demand(3), true, Some(Timescale::default()))
+			.await
+			.unwrap();
+		assert!(applies(&sub), "a fresh subscription accepts its START");
+
+		// An end-only update leaves the start intact: the START stays valid.
+		h.serve
+			.handle_subscription(
+				&mut h.producer,
+				&mut sub,
+				Some(
+					Subscription::default()
+						.with_start(Position::group(3))
+						.with_end(Position::group(9)),
+				),
+				true,
+				Some(Timescale::default()),
+			)
+			.await
+			.unwrap();
+		assert!(applies(&sub), "an unmoved start keeps the START applicable");
+
+		// The start moves: a buffered START is stale while it sits elsewhere.
+		h.serve
+			.handle_subscription(&mut h.producer, &mut sub, demand(8), true, Some(Timescale::default()))
+			.await
+			.unwrap();
+		assert!(!applies(&sub), "a moved start must invalidate a buffered START");
+
+		// The start returns: the declaration matches the demand again, so the
+		// publisher's skip (it sends no replacement START) must land.
+		h.serve
+			.handle_subscription(&mut h.producer, &mut sub, demand(3), true, Some(Timescale::default()))
+			.await
+			.unwrap();
+		assert!(applies(&sub), "demand returning restores the START");
+	}
+
+	/// The permanent-miss floor follows the demand in every direction: an update
+	/// that moves the start forward retires the skipped range (the publisher
+	/// stops serving it and no fresh START says so), one that moves it backward
+	/// reopens it, and dropping to the live edge clears it entirely.
+	#[tokio::test]
+	async fn updates_move_the_declared_floor_both_ways() {
+		let mut h = Harness::new(Version::Lite05);
+		let mut sub = Sub::None;
+
+		let demand = |group: u64| Some(Subscription::default().with_start(Position::group(group)));
+
+		// Establish from group 5: the floor tracks the request until START lands.
+		h.serve
+			.handle_subscription(&mut h.producer, &mut sub, demand(5), true, Some(Timescale::default()))
+			.await
+			.unwrap();
+		assert_eq!(h.producer.start_sequence(), Some(5));
+
+		// Forward: a reader waiting in [5, 8) must fail over, not stall.
+		h.serve
+			.handle_subscription(&mut h.producer, &mut sub, demand(8), true, Some(Timescale::default()))
+			.await
+			.unwrap();
+		assert_eq!(h.producer.start_sequence(), Some(8));
+
+		// Backward: the reopened range must stop being a permanent miss.
+		h.serve
+			.handle_subscription(&mut h.producer, &mut sub, demand(3), true, Some(Timescale::default()))
+			.await
+			.unwrap();
+		assert_eq!(h.producer.start_sequence(), Some(3));
+
+		// Live edge: the floor is unknown until the next declaration, so a
+		// group below the stale one must not be a permanent miss.
+		h.serve
+			.handle_subscription(
+				&mut h.producer,
+				&mut sub,
+				Some(Subscription::default()),
+				true,
+				Some(Timescale::default()),
+			)
+			.await
+			.unwrap();
+		assert_eq!(h.producer.start_sequence(), None);
+	}
 }
 
 /// The four wire fields a subscription's half-open range encodes to.
@@ -1266,6 +1367,12 @@ struct SubStream<S: web_transport_trait::Session> {
 	max_latency: Duration,
 	start: Option<Position>,
 	priority: u8,
+	/// The start the SUBSCRIBE itself carried, fixed for the stream's life. A
+	/// SUBSCRIBE_START describes this demand and no fresh one follows an update,
+	/// so a buffered START only applies while `start` still equals it: while the
+	/// start sits elsewhere the request-tracked floor stands instead, and demand
+	/// returning here makes the declaration valid again.
+	requested: Option<Position>,
 }
 
 enum Sub<S: web_transport_trait::Session> {
@@ -1472,13 +1579,12 @@ impl<S: web_transport_trait::Session> TrackServe<S> {
 					}
 				}
 				Event::FetchDone => {}
-				Event::SubResponse(msg) => {
+				Event::SubResponse(msg) => match &msg {
 					// SUBSCRIBE_END declares the track's exclusive final sequence, which may
 					// arrive while trailing groups are still in flight. Record it on this
 					// segment's producer so consumers learn the boundary early; the later
-					// stream FIN then finds the track already finished. START/DROP just
-					// resolve the range (the producer already orders groups), so log on.
-					if let lite::SubscribeResponse::End(end) = &msg {
+					// stream FIN then finds the track already finished.
+					lite::SubscribeResponse::End(end) => {
 						// finish_at rejects a boundary at or below the live edge, which is what a
 						// peer sending an inclusive bound looks like once the final group has
 						// already arrived. Don't abort: the stream FIN still finishes the track,
@@ -1487,10 +1593,26 @@ impl<S: web_transport_trait::Session> TrackServe<S> {
 						if let Err(err) = serving.finish_at(end.group) {
 							tracing::warn!(track = %self.name, group = end.group, %err, "invalid subscribe end");
 						}
-					} else {
-						tracing::debug!(track = %self.name, ?msg, "subscribe response");
 					}
-				}
+					// SUBSCRIBE_START names the first group this feed serves: the publisher
+					// skipped everything below it (e.g. it could not serve the requested
+					// frame). Record it as a drop signal, so a spliced reader waiting on a
+					// skipped group fails over instead of stalling on a live route.
+					lite::SubscribeResponse::Start(start) => {
+						// A START describes the demand the SUBSCRIBE carried. It applies
+						// only while the current start still matches that demand (updates
+						// get no fresh START, so an update that moved the start makes it
+						// stale, and one that moved back restores it); elsewhere the
+						// request-tracked floor stands rather than a guess.
+						if let Sub::Active(active) = &sub
+							&& active.start == active.requested
+						{
+							let _ = serving.start_at(start.group);
+						}
+					}
+					// OK/DROP just resolve the range (the producer already orders groups).
+					_ => tracing::debug!(track = %self.name, ?msg, "subscribe response"),
+				},
 				Event::SubClosed(Ok(())) => {
 					tracing::info!(broadcast = %self.subscriber.log_path(&self.path), track = %self.name, "subscribe complete");
 					// Upstream FIN'd the subscription: the publisher only FINs once the
@@ -1642,11 +1764,23 @@ impl<S: web_transport_trait::Session> TrackServe<S> {
 					Sub::Active(active) => {
 						// Downstream preferences changed: forward them upstream as a
 						// SUBSCRIBE_UPDATE (Lite03+ only; older peers can't carry one).
+						let start_moved = active.start != subscription.start;
 						active.priority = subscription.priority;
 						active.ordered = subscription.ordered;
 						active.max_latency = subscription.latency_max;
 						active.start = subscription.start;
 						if supports_update {
+							// The floor follows the requested start, in both directions:
+							// moving below a declared SUBSCRIBE_START reopens those groups
+							// (the peer may serve them now), moving forward retires the
+							// skipped range (the peer stops serving it, and no fresh START
+							// will say so), and dropping to the live edge clears it until
+							// the next declaration. A buffered START re-applies only if the
+							// start returns to the demand that produced it (see
+							// `SubStream::requested`).
+							if start_moved {
+								let _ = producer.start_at(active.start.map(|start| start.group));
+							}
 							self.send_update(active, subscription.end).await?;
 						}
 					}
@@ -1694,6 +1828,12 @@ impl<S: web_transport_trait::Session> TrackServe<S> {
 
 		// Both halves of each bound come from the same position, so a frame can never
 		// reach the wire without the group it counts from (which the peer would reject).
+		// The floor tracks the requested start until this subscription's own
+		// SUBSCRIBE_START refines it: the peer never serves below the request, a
+		// previous subscription's declaration must not outlive its demand, and
+		// live-edge demand (None) starts with no floor at all.
+		let _ = producer.start_at(subscription.start.map(|start| start.group));
+
 		let bounds = WireBounds::new(subscription.start, subscription.end);
 		let msg = lite::Subscribe {
 			id,
@@ -1767,6 +1907,7 @@ impl<S: web_transport_trait::Session> TrackServe<S> {
 			max_latency: subscription.latency_max,
 			start: subscription.start,
 			priority: subscription.priority,
+			requested: subscription.start,
 		});
 
 		Ok(())

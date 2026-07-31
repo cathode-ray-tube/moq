@@ -790,6 +790,14 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 	/// production cost and for a pure forwarder is the price of the fetch a
 	/// subscription would trigger.
 	///
+	/// A ceiling-cost route pierces the carrying discount. For a drain (the
+	/// ceiling's primary producer) the paid-for ingress is going away, so
+	/// advertising zero would keep pulling subscribers onto a path about to
+	/// vanish when a peer with any other edge should move now, while the seam is
+	/// seamless. The rule keys on the value, not the reason: the reason does not
+	/// travel on the wire, and a cost that saturated through charges marks a
+	/// path of last resort all the same.
+	///
 	/// The receiving side adds its own link price on top, so we never account for
 	/// the link we are sending over. Pre-lite-06 peers get nothing (the field isn't
 	/// on their wire), leaving hop count as the metric exactly as before.
@@ -803,7 +811,8 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 			return lite::RouteCost::default();
 		}
 
-		match serving && demand.is_used() {
+		let draining = route.cost >= crate::broadcast::DRAIN_COST;
+		match serving && demand.is_used() && !draining {
 			true => lite::RouteCost(0),
 			// Clamp to what a varint can carry. Costs that arrive from a peer are
 			// already capped by `RouteCost::charged`, but a locally created route sets
@@ -1090,6 +1099,44 @@ mod test {
 
 	fn track_producer(name: impl Into<Arc<str>>) -> track::Producer {
 		track::Producer::new(Arc::new(broadcast::Info::default()), name, None)
+	}
+
+	/// The run_track contract behind SUBSCRIBE_OK's implicit drop: once the first
+	/// served group resolves the start, the cursor floor rises to it, so a lower
+	/// group arriving late (unordered delivery) is never served after the range
+	/// was declared dropped.
+	#[tokio::test]
+	async fn start_floor_suppresses_late_lower_arrivals() {
+		use futures::FutureExt;
+
+		let mut producer = track_producer("test");
+		let mut subscriber = producer.subscribe(None);
+
+		let write = |producer: &mut track::Producer, sequence: u64| {
+			let mut group = producer.create_group(crate::group::Info { sequence }).unwrap();
+			group
+				.write_frame(Timestamp::from_millis(1).unwrap(), b"x".to_vec())
+				.unwrap();
+			group.finish().unwrap();
+		};
+
+		// Group 7 arrives first: run_track resolves the start there and raises
+		// the floor.
+		write(&mut producer, 7);
+		match recv_next(&mut subscriber, false, false).await.unwrap() {
+			Recv::Group(group) => {
+				assert_eq!(group.sequence, 7);
+				subscriber.start_at(group.sequence);
+			}
+			_ => panic!("expected the first group"),
+		}
+
+		// Group 5 lands late: below the resolved start, it must not be served.
+		write(&mut producer, 5);
+		assert!(
+			recv_next(&mut subscriber, false, false).now_or_never().is_none(),
+			"a group below the resolved start must be suppressed"
+		);
 	}
 
 	#[tokio::test]
@@ -1737,6 +1784,66 @@ mod announce_test {
 		cost.encode(&mut buf, Version::Lite06Wip)
 			.expect("an advertised cost must always encode");
 	}
+
+	/// A draining serving route must advertise its drain cost even while the
+	/// broadcast has demand. The carrying discount exists because the ingress is
+	/// already paid for; a draining ingress is going away, and masking it with
+	/// zero would keep downstream peers glued to a path about to vanish instead
+	/// of migrating to another edge while the handover is seamless.
+	#[test]
+	fn outgoing_cost_advertises_a_drain_despite_demand() {
+		use crate::broadcast;
+
+		let mut producer = broadcast::Info::new().produce();
+		producer
+			.set_route(broadcast::Route::announced().with_cost(broadcast::DRAIN_COST))
+			.unwrap();
+		let consumer = producer.consume();
+		let route = consumer.route();
+		let demand = consumer.demand();
+
+		// A consumed track: demand.is_used() is true, which is exactly the case
+		// that used to collapse the cost to zero.
+		let track = producer.create_track("video", None).unwrap();
+		let _reader = track.consume();
+		assert!(demand.is_used(), "the consumed track should register demand");
+
+		let cost = Publisher::<crate::lite::test_transport::SinkSession>::outgoing_cost(
+			Version::Lite06Wip,
+			&demand,
+			&route,
+			true,
+		);
+		assert_eq!(cost, lite::RouteCost(broadcast::DRAIN_COST));
+
+		// A drain that arrived over the wire propagates through a carrying relay:
+		// the upstream's ceiling plus our link price saturates back to the
+		// ceiling, which pierces this hop's discount too. Without that, each
+		// carrying hop would re-mask the drain as cost 0.
+		let forwarded = lite::RouteCost(broadcast::DRAIN_COST).charged(5).0;
+		producer
+			.set_route(broadcast::Route::announced().with_cost(forwarded))
+			.unwrap();
+		let route = consumer.route();
+		let cost = Publisher::<crate::lite::test_transport::SinkSession>::outgoing_cost(
+			Version::Lite06Wip,
+			&demand,
+			&route,
+			true,
+		);
+		assert_eq!(cost, lite::RouteCost(broadcast::DRAIN_COST));
+
+		// A healthy serving route with demand still gets the carrying discount.
+		producer.set_route(broadcast::Route::announced().with_cost(7)).unwrap();
+		let route = consumer.route();
+		let cost = Publisher::<crate::lite::test_transport::SinkSession>::outgoing_cost(
+			Version::Lite06Wip,
+			&demand,
+			&route,
+			true,
+		);
+		assert_eq!(cost, lite::RouteCost(0));
+	}
 }
 
 /// Encode the per-frame timing prefix when the track advertises a timescale:
@@ -2076,6 +2183,12 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 									group: sequence,
 								}))
 								.await?;
+							// SUBSCRIBE_OK is an implicit drop of everything below the
+							// resolved start (the subscriber records it as a permanent
+							// miss), so a lower group arriving late must not be served
+							// after all. A widening SUBSCRIBE_UPDATE re-lowers the floor,
+							// renegotiating the resolved start along with the demand.
+							track.start_at(sequence);
 						}
 						self.queue_serve(group, &mut tasks);
 					}
