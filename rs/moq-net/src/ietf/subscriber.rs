@@ -36,12 +36,12 @@ fn insert_track_alias(aliases: &TrackAliases, alias: u64, request_id: RequestId)
 /// Whether an error means the peer broke the protocol, as opposed to a stream or
 /// transport failing on its own.
 ///
-/// Only the former justifies taking the whole session down.
-fn is_protocol_violation(err: &Error) -> bool {
+/// Only the former justifies taking the whole session down. An encode error is ours,
+/// not the peer's: we cannot ask it to answer for a message we failed to write.
+pub(super) fn is_protocol_violation(err: &Error) -> bool {
 	matches!(
 		err,
 		Error::Decode(_)
-			| Error::Encode(_)
 			| Error::BoundsExceeded(_)
 			| Error::WrongSize
 			| Error::TooManyParameters
@@ -309,6 +309,10 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 	/// Send SUBSCRIBE_NAMESPACE for one prefix on a bidi stream.
 	/// The caller is responsible for opening the appropriate stream type
 	/// (virtual for v14/v15, real bidi for v16+), one per prefix.
+	///
+	/// A failure here is per-prefix, so the caller decides what it means for the
+	/// session: [`is_protocol_violation`] separates the peer's fault (fatal) from a
+	/// stream of ours that simply died (survivable).
 	pub async fn run_subscribe_namespace<T: web_transport_trait::Session>(
 		&mut self,
 		mut stream: Stream<T, Version>,
@@ -542,8 +546,7 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 			tracing::debug!(%path, "dropping reflected publish_namespace");
 			self.write_error(&mut stream, request_id, 400, "route loops through this relay")
 				.await?;
-			let _ = stream.writer.finish();
-			let _ = stream.writer.closed().await;
+			let _ = stream.writer.close().await;
 			return Ok(());
 		};
 
@@ -557,8 +560,7 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 			}
 			Err(err) => {
 				self.write_error(&mut stream, request_id, 400, &err.to_string()).await?;
-				let _ = stream.writer.finish();
-				let _ = stream.writer.closed().await;
+				let _ = stream.writer.close().await;
 				return Ok(());
 			}
 		}
@@ -698,9 +700,9 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 
 		self.write_publish_error(&mut stream, msg.request_id, 400, "PUBLISH is not supported")
 			.await?;
-		// Finish rather than awaiting the peer's close: the rejection is the whole
-		// exchange, and dropping `stream` on return tears down the rest.
-		let _ = stream.writer.finish();
+		// The rejection is the whole exchange, but it still has to arrive: a finish alone
+		// leaves the drop-time reset free to discard it before the peer acknowledges it.
+		let _ = stream.writer.close().await;
 
 		Ok(())
 	}
@@ -1013,7 +1015,13 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 		// Set the track timescale to microseconds: IETF object timestamps default to
 		// microseconds, and `create_frame` normalizes each frame into the track scale.
 		// Accepting at milliseconds (the default) would truncate microsecond precision.
-		let info = track::Info::default().with_timescale(crate::Timescale::MICRO);
+		//
+		// moq-transport carries no publisher retention property, so the window comes
+		// from the accepting side (see `origin::Info::latency_default`) rather than
+		// from the peer.
+		let info = track::Info::default()
+			.with_timescale(crate::Timescale::MICRO)
+			.with_latency_max(self.origin.latency_default());
 		let mut track = request.accept(info);
 
 		// A peer that sent GOAWAY told us to stop opening streams on this session.
@@ -1175,7 +1183,7 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 			ietf::SubscribeOk::ID => {
 				let msg = ietf::SubscribeOk::decode_msg(&mut data, self.version)?;
 				tracing::debug!(message = ?msg, "received subscribe ok");
-				Ok(Some((msg.track_alias, msg.timescale)))
+				Ok(Some((msg.track_alias, msg.properties.timescale)))
 			}
 			ietf::SubscribeError::ID if self.version == Version::Draft14 => {
 				let msg = ietf::SubscribeError::decode_msg(&mut data, self.version)?;
@@ -2346,10 +2354,9 @@ mod tests {
 			track_namespace: crate::Path::new("room/host"),
 			track_name: "video".into(),
 			track_alias: 7,
-			group_order: ietf::GroupOrder::Ascending,
 			largest_location: None,
 			forward: true,
-			timescale: None,
+			properties: ietf::Properties::default(),
 		};
 
 		// Errors are surfaced to the peer on the stream, not raised as a session error.
