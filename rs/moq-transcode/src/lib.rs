@@ -109,6 +109,7 @@ pub async fn run(
 							config: source_config.clone(),
 							encoder: config.encoder.clone(),
 							decoder: config.decoder.clone(),
+							resize: config.resize,
 							info: info.clone(),
 						};
 						tasks.spawn(rung::serve(rung, request));
@@ -278,8 +279,9 @@ mod tests {
 			let gray = vec![0x80u8; 320 * 240 * 4];
 
 			for sequence in 0..groups {
-				// Under `tokio::time::pause` this advances once every task is
-				// idle, i.e. once all rungs are attached and waiting.
+				// Paces the source: a real sleep, since the rungs encode off the
+				// executor and cannot be sequenced by paused-time idle detection.
+				// Also the window the subscribers attach in, before group 0.
 				tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 				let mut group = track.create_group(sequence.into()).unwrap();
 				for index in 0..frames {
@@ -308,14 +310,19 @@ mod tests {
 	/// both must produce complete groups mirroring the source sequences.
 	#[tokio::test]
 	async fn live_multi_rung() {
-		tokio::time::pause();
-
+		// Real time on purpose, unlike most timed tests here. The rungs encode on
+		// their own threads (`encode::Sink`), so a rung waiting on one looks idle
+		// to tokio and `pause()` auto-advances the source's sleep while the encode
+		// is still in flight. The source then outruns the feed's bounded broadcast
+		// and every rung sees `Lagged` instead of its frames. Real sleeps pace the
+		// source against the encoders the way a live source does.
 		let (source, producer_task) = source_broadcast_live(3, 5);
 		let config = Config {
 			rungs: vec![Rung::new(120, 100_000), Rung::new(60, 50_000)],
 			encoder: moq_video::encode::Kind::Software,
 			decoder: moq_video::decode::Kind::Software,
 			source: None,
+			..Default::default()
 		};
 
 		let output = moq_net::broadcast::Info::default().produce();
@@ -356,24 +363,34 @@ mod tests {
 	/// The multi-rung live path on real hardware: one shared NVDEC session
 	/// decodes the source, the GPU box filter resizes per rung, and each rung's
 	/// NVENC session encodes the CUDA frame in place. Skips without a GPU.
+	#[cfg_attr(
+		target_os = "windows",
+		ignore = "explicit live-DXVA GPU probe; VideoProcessorBlt can hang on affected drivers"
+	)]
 	#[tokio::test]
 	async fn live_multi_rung_hardware() {
 		if !hardware_available() {
 			eprintln!("skipping: no hardware decoder + encoder available");
 			return;
 		}
-		tokio::time::pause();
-
+		// Real time on purpose, unlike most timed tests here. The rungs encode on
+		// their own threads (`encode::Sink`), so a rung waiting on one looks idle
+		// to tokio and `pause()` auto-advances the source's sleep while the encode
+		// is still in flight. The source then outruns the feed's bounded broadcast
+		// and every rung sees `Lagged` instead of its frames. Real sleeps pace the
+		// source against the encoders the way a live source does.
 		let (source, producer_task) = source_broadcast_live(3, 5);
 		// 180p and 120p: NVENC rejects tiny frames (80x60 is below its minimum
 		// encode resolution), so the hardware ladder stays a bit larger than the
 		// software test's.
-		let config = Config {
+		let mut config = Config {
 			rungs: vec![Rung::new(180, 200_000), Rung::new(120, 100_000)],
 			encoder: moq_video::encode::Kind::Hardware,
 			decoder: moq_video::decode::Kind::Hardware,
 			source: None,
+			..Default::default()
 		};
+		config.resize.acceleration = moq_video::resize::Acceleration::Gpu;
 
 		let output = moq_net::broadcast::Info::default().produce();
 		let consumer = output.consume();
@@ -432,6 +449,10 @@ mod tests {
 	/// decoder) into hardware encode (NVENC, consuming the CUDA frame in place).
 	/// Skips on machines without both; on a Linux + NVIDIA box this is the
 	/// zero-copy transcode path under the real broadcast plumbing.
+	#[cfg_attr(
+		target_os = "windows",
+		ignore = "explicit live-DXVA GPU probe; VideoProcessorBlt can hang on affected drivers"
+	)]
 	#[tokio::test]
 	async fn end_to_end_hardware() {
 		if !hardware_available() {
@@ -440,12 +461,14 @@ mod tests {
 		}
 
 		let source = source_broadcast(2, 5);
-		let config = Config {
+		let mut config = Config {
 			rungs: vec![Rung::new(120, 100_000)],
 			encoder: moq_video::encode::Kind::Hardware,
 			decoder: moq_video::decode::Kind::Hardware,
 			source: None,
+			..Default::default()
 		};
+		config.resize.acceleration = moq_video::resize::Acceleration::Gpu;
 
 		let output = moq_net::broadcast::Info::default().produce();
 		let consumer = output.consume();
@@ -482,6 +505,7 @@ mod tests {
 			encoder: moq_video::encode::Kind::Software,
 			decoder: moq_video::decode::Kind::Software,
 			source: Some(moq_net::PathRelativeOwned::from("..".to_string())),
+			..Default::default()
 		};
 
 		let output = moq_net::broadcast::Info::default().produce();
@@ -579,6 +603,7 @@ mod tests {
 			encoder: moq_video::encode::Kind::Software,
 			decoder: moq_video::decode::Kind::Software,
 			source: None,
+			..Default::default()
 		};
 
 		let output = moq_net::broadcast::Info::default().produce();

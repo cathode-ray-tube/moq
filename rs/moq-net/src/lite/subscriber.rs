@@ -37,9 +37,8 @@ pub(super) struct SubscriberConfig<S: web_transport_trait::Session> {
 	/// The origin (hop) id assigned to the peer, used whenever the peer doesn't
 	/// declare one itself. See `Client::with_peer_origin`.
 	pub peer_origin: Option<crate::Origin>,
-	/// What this session's link costs, when we are the side that dialed it and so
-	/// owns the price. `None` on an accepted session, which reads the dialer's
-	/// price out of its SETUP instead so both ends agree.
+	/// Local policy for what pulling from this peer costs, overriding whatever it
+	/// declared in its SETUP. `None` charges the peer's declared price.
 	pub cost: Option<u64>,
 	/// Driver-owned scope for broadcast and track handlers.
 	pub tasks: Tasks,
@@ -61,12 +60,14 @@ pub(super) struct Subscriber<S: web_transport_trait::Session> {
 	// they never hit the wire, but this check is what makes it correct.
 	self_origin: crate::Origin,
 	// The origin stamped into the hop chain of broadcasts from versions that
-	// don't carry real hop ids on the wire (Lite01/02/03). It gives each
-	// upstream session a stable identity in the hop list so two sessions
-	// publishing the same path resolve as distinct routes instead of colliding
-	// on an empty/placeholder chain. Random per connection unless the caller
-	// assigned the peer an identity (`peer_origin`), which then also makes the
-	// route recognizable across sessions.
+	// don't carry real hop ids on the wire (Lite01/02/03), and into the
+	// placeholder entries Lite03 sends in place of real ids.
+	//
+	// This is the peer's assigned identity (`peer_origin`) when the caller gave
+	// it one, which also makes the route recognizable across sessions. Otherwise
+	// it is `Origin::UNKNOWN` (0), the reserved "no identity" value: a random id
+	// would look like an identity the peer never agreed to and cannot exclude
+	// for loop detection.
 	session_origin: crate::Origin,
 	// The identity assigned to the peer by `Client::with_peer_origin`, standing
 	// in wherever the peer declines to declare one (an AnnounceOk reporting
@@ -77,8 +78,7 @@ pub(super) struct Subscriber<S: web_transport_trait::Session> {
 	version: Version,
 	/// The peer's advertised SETUP (lite-05+), set when its Setup stream is read.
 	peer_setup: super::PeerSetup,
-	/// Our own price for this link when we dialed it; `None` when we accepted and
-	/// the dialer's SETUP carries the price instead.
+	/// Local policy overriding the peer's declared egress price. See `resolve_cost`.
 	cost: Option<u64>,
 	tasks: Tasks,
 	going_away: crate::goaway::GoingAway,
@@ -104,7 +104,7 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 			origin: config.origin,
 			recv_bandwidth: config.recv_bandwidth,
 			self_origin,
-			session_origin: config.peer_origin.unwrap_or_else(crate::Origin::random),
+			session_origin: config.peer_origin.unwrap_or(crate::Origin::UNKNOWN),
 			peer_origin: config.peer_origin,
 			subscribes: Default::default(),
 			next_id: Default::default(),
@@ -125,13 +125,14 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 		Ok(())
 	}
 
-	/// What crossing this session's link costs, added to the route cost of every
-	/// announcement received over it.
+	/// What pulling content across this session's link costs, added to the route cost
+	/// of every announcement received over it.
 	///
-	/// The dialing side owns the price (it lives in its connect config) and declares
-	/// it in SETUP, so the accepting side reads it back out and both ends charge the
-	/// same amount for the same link. Falls back to [`super::DEFAULT_COST`] when
-	/// nobody priced it.
+	/// The Cost Parameter is directional: each endpoint declares what subscribing from
+	/// it costs, so the peer's declaration prices this direction while ours prices the
+	/// other. A locally configured price overrides it, since what we charge our own
+	/// routing is local policy. Falls back to [`super::DEFAULT_COST`] when neither
+	/// priced it.
 	async fn resolve_cost(&self) -> u64 {
 		// Older versions carry no cost on the wire, so nothing is charged and their
 		// routes rank on hop count alone. Returning early also avoids blocking on a
@@ -590,15 +591,6 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 		Ok(true)
 	}
 
-	/// Handle a RESTART (an explicit restart status, or a duplicate ANNOUNCE on lite-05).
-	///
-	/// The first hop of the chain identifies the original publisher. When it matches
-	/// the prior advertisement, the broadcast is the same content on a new path:
-	/// this session's route metadata updates in place, in-flight tracks keep
-	/// flowing, and the origin only hands over if the winner changed. Consumers
-	/// observe nothing. When the first hop differs, the original publisher was
-	/// replaced: the old route detaches gracefully and a fresh one attaches, so
-	/// downstream sees a real Ended + Active (a new broadcast, nothing resumes).
 	/// The route to attach to a broadcast this peer announced, charging our link's
 	/// price on top of the cost it advertised.
 	///
@@ -619,6 +611,16 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 		route
 	}
 
+	/// Handle a RESTART (an explicit restart status, or a duplicate ANNOUNCE on lite-05).
+	///
+	/// The first hop of the chain identifies the original publisher. When it matches
+	/// the prior advertisement and is a real identity, the broadcast is the same
+	/// content on a new path: this session's route metadata updates in place,
+	/// in-flight tracks keep flowing, and the origin only hands over if the winner
+	/// changed. Consumers observe nothing. When the first hop differs, or is
+	/// [`Origin::UNKNOWN`](crate::Origin::UNKNOWN), the old route detaches gracefully
+	/// and a fresh one attaches, so downstream sees a real Ended + Active.
+	///
 	/// Returns `Ok(false)` if the new hop chain is a reflected loop (this session's
 	/// route is now gone), `Ok(true)` otherwise.
 	fn restart_announce(
@@ -653,11 +655,12 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 		let metadata = self.announced_route(hops, cost, link_cost);
 
 		match routes.get_mut(&path) {
-			Some(entry) if entry.publisher != publisher => {
-				// A different original publisher: a brand-new broadcast replaced the
-				// old one at this path. Detach gracefully (downstream unannounces if
-				// this was the last source) and attach fresh below; cached TRACK_INFO
-				// and subscriptions must not carry over.
+			Some(entry) if entry.publisher != publisher || publisher == crate::Origin::UNKNOWN => {
+				// A different original publisher, or no identity at all (UNKNOWN
+				// never proves continuity): a brand-new broadcast may have replaced
+				// the old one at this path. Detach gracefully (downstream unannounces
+				// if this was the last source) and attach fresh below; cached
+				// TRACK_INFO and subscriptions must not carry over.
 				let entry = routes.remove(&path).expect("matched above");
 				entry.finish();
 			}
@@ -1381,6 +1384,194 @@ mod tests {
 		let broadcast = consumer.get_broadcast("room/host").unwrap();
 		let hops: Vec<_> = broadcast.routes()[0].hops.iter().copied().collect();
 		assert_eq!(hops, vec![assigned]);
+	}
+
+	/// A peer with no assigned identity is attributed the reserved origin 0
+	/// (UNKNOWN), not a random one: a random id would look like a real identity
+	/// the peer never agreed to and cannot exclude for loop detection.
+	#[tokio::test]
+	async fn absent_peer_origin_stamps_unknown() {
+		let (mut subscriber, consumer) = restart_subscriber(SinkSession::new(Default::default()));
+
+		let mut routes = HashMap::new();
+		subscriber
+			.start_announce(
+				Path::new("room/host").to_owned(),
+				crate::OriginList::new(),
+				RouteCost::default(),
+				0,
+				None,
+				&mut routes,
+			)
+			.unwrap();
+		tokio::time::sleep(Duration::from_millis(1)).await;
+
+		let broadcast = consumer.get_broadcast("room/host").unwrap();
+		let hops: Vec<_> = broadcast.routes()[0].hops.iter().copied().collect();
+		assert_eq!(hops, vec![crate::Origin::UNKNOWN]);
+	}
+
+	fn restart_subscriber(session: SinkSession) -> (Subscriber<SinkSession>, crate::origin::Consumer) {
+		let origin = origin::Info::new(crate::Origin::new(1).unwrap()).produce();
+		let consumer = origin.consume();
+		let (tasks, task_set) = TaskSet::new();
+		// The task set must outlive the test; leak it so spawned run_source tasks stay alive.
+		std::mem::forget(task_set);
+		let subscriber = Subscriber::new(SubscriberConfig {
+			session,
+			origin,
+			recv_bandwidth: None,
+			version: VERSION,
+			peer_setup: Default::default(),
+			cost: None,
+			peer_origin: None,
+			tasks,
+			going_away: Default::default(),
+		});
+		(subscriber, consumer)
+	}
+
+	/// An UNKNOWN (0) first hop identifies nothing, so a restart advertising
+	/// UNKNOWN again may be a different publisher entirely: the old broadcast must
+	/// be replaced, not updated in place. Regression: plain `==` on the publisher
+	/// id treated 0 == 0 as content-continuous and spliced unrelated broadcasts.
+	#[tokio::test]
+	async fn unknown_publisher_restart_replaces() {
+		let (mut subscriber, consumer) = restart_subscriber(SinkSession::new(Default::default()));
+
+		let mut routes = HashMap::new();
+		let path = Path::new("room/host").to_owned();
+		subscriber
+			.start_announce(
+				path.clone(),
+				crate::OriginList::new(),
+				RouteCost::default(),
+				0,
+				Some(crate::Origin::UNKNOWN),
+				&mut routes,
+			)
+			.unwrap();
+		tokio::time::sleep(Duration::from_millis(1)).await;
+		let before = consumer.get_broadcast("room/host").unwrap();
+
+		subscriber
+			.restart_announce(
+				path,
+				crate::OriginList::new(),
+				RouteCost::default(),
+				0,
+				Some(crate::Origin::UNKNOWN),
+				&mut routes,
+			)
+			.unwrap();
+		tokio::time::sleep(Duration::from_millis(1)).await;
+
+		assert!(before.is_closed(), "an UNKNOWN restart must replace the broadcast");
+		assert!(
+			consumer.get_broadcast("room/host").is_some(),
+			"the fresh source re-attaches"
+		);
+	}
+
+	/// The counterpart: a real (non-zero) publisher id restarting is a route
+	/// change for the same content, so the broadcast survives in place.
+	#[tokio::test]
+	async fn known_publisher_restart_updates_in_place() {
+		let (mut subscriber, consumer) = restart_subscriber(SinkSession::new(Default::default()));
+		let publisher = crate::Origin::new(7).unwrap();
+
+		let mut routes = HashMap::new();
+		let path = Path::new("room/host").to_owned();
+		subscriber
+			.start_announce(
+				path.clone(),
+				crate::OriginList::new(),
+				RouteCost::default(),
+				0,
+				Some(publisher),
+				&mut routes,
+			)
+			.unwrap();
+		tokio::time::sleep(Duration::from_millis(1)).await;
+		let before = consumer.get_broadcast("room/host").unwrap();
+
+		subscriber
+			.restart_announce(
+				path,
+				crate::OriginList::new(),
+				RouteCost(5),
+				0,
+				Some(publisher),
+				&mut routes,
+			)
+			.unwrap();
+		tokio::time::sleep(Duration::from_millis(1)).await;
+
+		assert!(
+			!before.is_closed(),
+			"a known publisher restart keeps the broadcast live"
+		);
+	}
+
+	/// An announce stream that dies without an explicit `ended` must detach ABRUPTLY,
+	/// leaving the origin's linger window open so a source reconnecting into it resumes
+	/// the broadcast rather than viewers seeing it end here.
+	///
+	/// This already falls out of `routes` being a local whose `AnnouncedRoute` guards
+	/// drop, which is exactly what makes it worth pinning: a refactor that finished them
+	/// on the way out, or hoisted the map to the session, would be a silent behavior
+	/// change. `ietf::Subscriber` names the same distinction explicitly as `Detach`.
+	/// A zero-linger origin cannot tell the two apart, so this sets one.
+	#[tokio::test(start_paused = true)]
+	async fn a_lost_announce_stream_leaves_the_linger_window_open() {
+		let origin = crate::origin::Info::new(crate::Origin::new(1).unwrap())
+			.with_linger(Duration::from_secs(30))
+			.produce();
+		let consumer = origin.consume();
+		let (tasks, task_set) = TaskSet::new();
+		std::mem::forget(task_set);
+		let mut subscriber = Subscriber::new(SubscriberConfig {
+			session: SinkSession::new(Default::default()),
+			origin,
+			recv_bandwidth: None,
+			version: VERSION,
+			peer_setup: Default::default(),
+			cost: None,
+			peer_origin: None,
+			tasks,
+			going_away: Default::default(),
+		});
+
+		let path = Path::new("room/host").to_owned();
+		let hops = crate::OriginList::try_from(vec![crate::Origin::new(7).unwrap()]).unwrap();
+		let mut routes = HashMap::new();
+		subscriber
+			.start_announce(path.clone(), hops, RouteCost(0), 1, None, &mut routes)
+			.unwrap();
+		tokio::time::sleep(Duration::from_millis(1)).await;
+		assert!(consumer.get_broadcast("room/host").is_some());
+
+		// The stream ends without retracting anything: the map dies with it.
+		drop(routes);
+		tokio::time::sleep(Duration::from_millis(1)).await;
+		assert!(
+			consumer.get_broadcast("room/host").is_some(),
+			"an abnormal stream loss closed the broadcast instead of lingering for a reconnect",
+		);
+
+		// An explicit retraction still closes it now, linger or not.
+		let hops = crate::OriginList::try_from(vec![crate::Origin::new(7).unwrap()]).unwrap();
+		let mut routes = HashMap::new();
+		subscriber
+			.start_announce(path.clone(), hops, RouteCost(0), 1, None, &mut routes)
+			.unwrap();
+		tokio::time::sleep(Duration::from_millis(1)).await;
+		routes.remove(&path).expect("announced").finish();
+		tokio::time::sleep(Duration::from_millis(1)).await;
+		assert!(
+			consumer.get_broadcast("room/host").is_none(),
+			"an explicit retraction lingered instead of closing",
+		);
 	}
 }
 

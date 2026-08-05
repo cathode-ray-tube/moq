@@ -481,11 +481,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 			Linger,
 		}
 
-		// How long a drained broadcast keeps advertising zero before the restart
-		// that restores its cold cost. Pure hysteresis: demand edges arrive
-		// exactly (via `broadcast::Demand`), but re-pricing the instant the last
-		// viewer leaves would flap routing across the mesh on viewer churn.
-		const COST_LINGER: Duration = Duration::from_secs(5);
+		use crate::broadcast::COST_LINGER;
 
 		// Send updates as they arrive. Closure wins the race so a dead peer can't
 		// stall on a busy announce feed.
@@ -784,17 +780,12 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		version: Version,
 		absolute: &crate::Path,
 	) -> Option<SentRoute> {
-		for (index, route) in routes.iter().enumerate() {
-			// Offline routes are reachable by exact path but never advertised.
-			if !route.announce {
-				continue;
-			}
-			if exclude_hop != 0 && route.hops.iter().any(|h| h.id() == exclude_hop) {
-				continue;
-			}
-			if route.hops.contains(&self_origin) {
-				continue;
-			}
+		let exclude = match exclude_hop {
+			0 => Origin::UNKNOWN,
+			id => Origin::new(id).unwrap_or(Origin::UNKNOWN),
+		};
+
+		for (route, serving) in crate::broadcast::advertisable_routes(routes, self_origin, exclude) {
 			let mut hops = route.hops.clone();
 			// Lite05+ moves the self-stamp to the receiver, which appends our id (reported
 			// once via AnnounceOk) on receipt. Older versions stamp it here, dropping if the
@@ -803,7 +794,6 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 				tracing::warn!(broadcast = %absolute, "dropping announce; hop chain at MAX_HOPS (possible loop)");
 				continue;
 			}
-			let serving = index == 0;
 			let cost = Self::outgoing_cost(version, demand, route, serving);
 			return Some(SentRoute { hops, cost, serving });
 		}
@@ -844,16 +834,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 			return lite::RouteCost::default();
 		}
 
-		let draining = route.cost >= crate::broadcast::DRAIN_COST;
-		match serving && demand.is_used() && !draining {
-			true => lite::RouteCost(0),
-			// Clamp to what a varint can carry. Costs that arrive from a peer are
-			// already capped by `RouteCost::charged`, but a locally created route sets
-			// `Route::cost` directly and nothing stops it naming more than the wire can
-			// express. This is the single point every advertised cost passes through, so
-			// it is the one place that has to hold.
-			false => lite::RouteCost(route.cost.min(crate::broadcast::MAX_COST)),
-		}
+		lite::RouteCost(crate::broadcast::outgoing_cost(demand, route, serving))
 	}
 
 	pub async fn recv_track(&self, mut stream: Stream<S, Version>) -> Result<(), Error> {
