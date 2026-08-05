@@ -360,18 +360,20 @@ async fn goaway_gates_new_subscribes_moq_lite_04() {
 		assert!(client.draining().peek().is_some());
 
 		// A NEW subscription must not reach the wire: the upstream open is gated
-		// with GoingAway. In the resume model a failed route delivers a stall
-		// (waiting for another route) rather than an error, so accept either the
-		// specific GoingAway rejection or a stall (a track with content ready
-		// producing nothing within a generous bound). Any OTHER error fails the
-		// test, so a regression that breaks for a different reason still fails.
+		// with GoingAway. The rejection can surface three ways: at subscribe (a
+		// gated request), through the track (lite-04 has no TRACK_INFO, so the
+		// request is accepted and the copy aborts at the gated SUBSCRIBE open,
+		// which the origin treats as a refusal and aborts the logical track), or
+		// as a stall (nothing within a generous bound). Any OTHER error, and any
+		// delivered group, fails the test.
 		match bc.track("audio").unwrap().subscribe(None).await {
 			Err(moq_net::Error::GoingAway) => {}
 			Err(other) => panic!("unexpected error gating a post-GOAWAY subscribe: {other}"),
-			Ok(mut gated) => {
-				let delivered = tokio::time::timeout(Duration::from_millis(500), gated.recv_group()).await;
-				assert!(delivered.is_err(), "new subscribe after GOAWAY must not deliver");
-			}
+			Ok(mut gated) => match tokio::time::timeout(Duration::from_millis(500), gated.recv_group()).await {
+				Err(_) | Ok(Err(moq_net::Error::GoingAway)) => {}
+				Ok(Err(other)) => panic!("unexpected error gating a post-GOAWAY subscribe: {other}"),
+				Ok(Ok(_)) => panic!("new subscribe after GOAWAY must not deliver"),
+			},
 		}
 
 		// The EXISTING subscription keeps flowing.

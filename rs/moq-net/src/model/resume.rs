@@ -284,13 +284,15 @@ impl Producer {
 		if state.finished || state.abort.is_some() {
 			return Err(Error::Closed);
 		}
-		let start = if state.segments.is_empty() {
-			None
-		} else {
-			// Segments exist but never produced anything: replace them, which the very
-			// first position does.
-			Some(state.resume_position().unwrap_or_default())
-		};
+		// One past the newest delivered position. With nothing delivered (or no
+		// segments at all) the replacement outright replaces them and starts
+		// unbounded, exactly like a first splice: a `Position::default()` boundary
+		// here would turn the subscriber's live-edge demand into a full backfill
+		// from group 0.
+		let start = state.resume_position();
+		if start.is_none() {
+			state.segments.clear();
+		}
 		state.switch(track, start)
 	}
 
@@ -327,6 +329,12 @@ impl Producer {
 	/// the condition for arming an idle release.
 	pub(crate) fn is_spliced(&self) -> bool {
 		!self.state.read().segments.is_empty()
+	}
+
+	/// One past the newest delivered position across the segments. The origin's
+	/// serve task reads this as its delivered-progress signal.
+	pub(crate) fn resume_position(&self) -> Option<Position> {
+		self.state.read().resume_position()
 	}
 
 	/// Mark the logical track as complete: no further switches. Subscribers see a
@@ -498,15 +506,21 @@ impl Consumer {
 /// [`kio::Pending`] wrapper.
 ///
 /// Waits for a segment to exist (no route may have served the track yet), then
-/// issues the fetch against the newest segment's track and resolves with it.
+/// issues the fetch against the newest segment's track and resolves with it. A
+/// fetch whose copy dies fails over: it re-latches onto a newer segment if one
+/// already spliced in, or parks for the next takeover like a live subscription
+/// (the front aborting the track ends the wait). An error from a copy that is
+/// still live (e.g. the group is gone upstream) is authoritative and surfaces.
 pub struct Fetching {
 	state: kio::Consumer<ResumeState>,
 	sequence: u64,
 	options: group::Fetch,
-	// The underlying fetch, latched once a segment exists. Behind a shared lock
-	// both to allow `&self` polling and to break the type recursion with
-	// `track::Fetching` (which can wrap a resume [`Fetching`]).
-	inner: web_async::Lock<Option<kio::Pending<track::Fetching>>>,
+	// The latched segment (id, its track, the in-flight fetch), set once a
+	// segment exists. Behind a shared lock both to allow `&self` polling and to
+	// break the type recursion with `track::Fetching` (which can wrap a resume
+	// [`Fetching`]).
+	#[allow(clippy::type_complexity)]
+	inner: web_async::Lock<Option<(u64, track::Consumer, kio::Pending<track::Fetching>)>>,
 }
 
 impl kio::Pollable for Fetching {
@@ -515,31 +529,88 @@ impl kio::Pollable for Fetching {
 	fn poll(&self, waiter: &kio::Waiter) -> Poll<Self::Output> {
 		let mut inner = self.inner.lock();
 
-		if inner.is_none() {
-			// Wait for the first segment; the newest wins if several arrived.
-			let track = match self.state.poll(waiter, |s| {
-				if s.abort.is_some() || !s.segments.is_empty() {
+		loop {
+			if inner.is_none() {
+				// Wait for the first segment; the newest wins if several arrived.
+				let (id, track) = match self.state.poll(waiter, |s| {
+					if s.abort.is_some() || !s.segments.is_empty() {
+						Poll::Ready(match &s.abort {
+							Some(err) => Err(err.clone()),
+							None => {
+								let segment = s.segments.last().expect("nonempty");
+								Ok((segment.id, segment.track.clone()))
+							}
+						})
+					} else {
+						Poll::Pending
+					}
+				}) {
+					Poll::Ready(Ok(res)) => res?,
+					// The producer is gone; use whatever segment it froze with.
+					Poll::Ready(Err(state)) => match (&state.abort, state.segments.last()) {
+						(Some(err), _) => return Poll::Ready(Err(err.clone())),
+						(None, Some(segment)) => (segment.id, segment.track.clone()),
+						(None, None) => return Poll::Ready(Err(Error::NotFound)),
+					},
+					Poll::Pending => return Poll::Pending,
+				};
+				let fetch = track.fetch_group(self.sequence, self.options.clone());
+				*inner = Some((id, track, fetch));
+			}
+
+			let (latched, track, fetch) = inner.as_ref().expect("latched above");
+			let err = match kio::Pollable::poll(&**fetch, waiter) {
+				Poll::Ready(Err(err)) => err,
+				Poll::Ready(Ok(group)) => return Poll::Ready(Ok(group)),
+				// Park on the resume state too: the front aborting must end an
+				// in-flight fetch even when the latched copy never answers it.
+				Poll::Pending => {
+					return match self.state.poll(waiter, |s| match &s.abort {
+						Some(err) => Poll::Ready(err.clone()),
+						None => Poll::Pending,
+					}) {
+						Poll::Ready(Ok(err)) => Poll::Ready(Err(err)),
+						// The producer froze without aborting; only the copy can
+						// answer now.
+						_ => Poll::Pending,
+					};
+				}
+			};
+
+			// The latched copy failed the fetch. Fail over to a segment spliced in
+			// above it, if any; ids are monotonic, so "newer" is a plain compare.
+			let latched = *latched;
+			let next = match self.state.poll(waiter, |s| {
+				if s.abort.is_some() || s.segments.last().is_some_and(|segment| segment.id > latched) {
 					Poll::Ready(match &s.abort {
 						Some(err) => Err(err.clone()),
-						None => Ok(s.segments.last().expect("nonempty").track.clone()),
+						None => {
+							let segment = s.segments.last().expect("checked newer");
+							Ok((segment.id, segment.track.clone()))
+						}
 					})
 				} else {
 					Poll::Pending
 				}
 			}) {
 				Poll::Ready(Ok(res)) => res?,
-				// The producer is gone; use whatever segment it froze with.
-				Poll::Ready(Err(state)) => match (&state.abort, state.segments.last()) {
-					(Some(err), _) => return Poll::Ready(Err(err.clone())),
-					(None, Some(segment)) => segment.track.clone(),
-					(None, None) => return Poll::Ready(Err(Error::NotFound)),
+				// The producer froze; no replacement can arrive.
+				Poll::Ready(Err(_)) => return Poll::Ready(Err(err)),
+				// No replacement yet, and the waiter is registered for the next
+				// switch. A dead copy's failure is the route's, not the group's:
+				// park for the takeover, exactly like a live subscription stalls.
+				// A live copy's answer stands.
+				Poll::Pending => match track.poll_complete(&kio::Waiter::noop()) {
+					Poll::Ready(Err(_)) => return Poll::Pending,
+					_ => return Poll::Ready(Err(err)),
 				},
-				Poll::Pending => return Poll::Pending,
 			};
-			*inner = Some(track.fetch_group(self.sequence, self.options.clone()));
-		}
 
-		kio::Pollable::poll(&**inner.as_ref().expect("latched above"), waiter)
+			let (id, track) = next;
+			let fetch = track.fetch_group(self.sequence, self.options.clone());
+			*inner = Some((id, track, fetch));
+			// Loop: poll the replacement fetch in this same pass.
+		}
 	}
 }
 
@@ -2308,6 +2379,108 @@ mod test {
 		group.start_at(2).unwrap();
 		group.write_frame(Timestamp::ZERO, b"b2".to_vec()).unwrap();
 		assert_eq!(read(&mut reading), b"b2");
+	}
+
+	#[tokio::test]
+	async fn takeover_after_empty_segment_keeps_live_edge() {
+		let (track_a, consumer_a) = track_pair("a");
+		let (track_b, consumer_b) = track_pair("b");
+
+		let mut producer = Producer::new();
+		producer.takeover(&consumer_a).unwrap();
+		let mut sub = producer.consume().subscribe(None);
+		recv_pending(&mut sub);
+		assert_eq!(track_a.subscription().unwrap().start, None);
+
+		// A dies before producing anything; B takes over.
+		drop(track_a);
+		producer.takeover(&consumer_b).unwrap();
+		recv_pending(&mut sub);
+
+		// The replacement must inherit live-edge demand, not a full backfill.
+		assert_eq!(track_b.subscription().unwrap().start, None);
+	}
+
+	#[tokio::test]
+	async fn fetch_fails_over_to_a_newer_segment() {
+		let (track_a, consumer_a) = track_pair("a");
+		let (mut track_b, consumer_b) = track_pair("b");
+
+		let mut producer = Producer::new();
+		producer.takeover(&consumer_a).unwrap();
+		let consumer = producer.consume();
+
+		// The latched copy is dead: the fetch parks for a takeover instead of
+		// surfacing the route's failure as the group's.
+		track_a.abort(Error::Dropped).unwrap();
+		let fetch = consumer.fetch_group(0, None);
+		let mut fetch = std::pin::pin!(fetch);
+		assert!(futures::poll!(fetch.as_mut()).is_pending(), "a dead copy should park");
+
+		// The replacement has the group cached; the fetch fails over to it.
+		write_group(&mut track_b, 0, "b0");
+		producer.takeover(&consumer_b).unwrap();
+		let group = fetch.await.expect("fetch should fail over");
+		assert_eq!(group.sequence, 0);
+	}
+
+	#[tokio::test]
+	async fn fetch_aborts_with_the_track() {
+		let (track_a, consumer_a) = track_pair("a");
+
+		let mut producer = Producer::new();
+		producer.takeover(&consumer_a).unwrap();
+		let consumer = producer.consume();
+
+		track_a.abort(Error::Dropped).unwrap();
+		let fetch = consumer.fetch_group(0, None);
+		let mut fetch = std::pin::pin!(fetch);
+		assert!(futures::poll!(fetch.as_mut()).is_pending(), "a dead copy should park");
+
+		// The logical track aborting ends the wait with its error.
+		producer.abort(Error::Cancel).unwrap();
+		assert!(matches!(fetch.await, Err(Error::Cancel)));
+	}
+
+	#[tokio::test]
+	async fn fetch_pending_ends_when_the_track_aborts() {
+		let (track_a, consumer_a) = track_pair("a");
+
+		let mut producer = Producer::new();
+		producer.takeover(&consumer_a).unwrap();
+		let consumer = producer.consume();
+
+		// A fetch handler exists but never answers: the latched fetch parks.
+		let handler = track_a.dynamic();
+		let fetch = consumer.fetch_group(0, None);
+		let mut fetch = std::pin::pin!(fetch);
+		assert!(
+			futures::poll!(fetch.as_mut()).is_pending(),
+			"unanswered fetch should park"
+		);
+
+		// The front aborting must end the in-flight fetch, not strand it on the
+		// copy that will never answer.
+		producer.abort(Error::Cancel).unwrap();
+		assert!(matches!(fetch.await, Err(Error::Cancel)));
+		drop(handler);
+	}
+
+	#[tokio::test]
+	async fn fetch_error_from_a_live_copy_is_authoritative() {
+		let (_track_a, consumer_a) = track_pair("a");
+
+		let mut producer = Producer::new();
+		producer.takeover(&consumer_a).unwrap();
+		let consumer = producer.consume();
+
+		// The copy is alive and will never carry group 0 (no fetch handler):
+		// its answer surfaces instead of parking for a takeover.
+		let result = consumer
+			.fetch_group(0, None)
+			.now_or_never()
+			.expect("a live copy's answer must resolve immediately");
+		assert!(matches!(result, Err(Error::NotFound)));
 	}
 
 	#[tokio::test]
