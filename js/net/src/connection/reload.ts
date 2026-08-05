@@ -1,5 +1,6 @@
 import { Effect, type Getter, Signal } from "@moq/signals";
 import * as Announce from "../announced.ts";
+import { RemoteError, SessionCode } from "../error.ts";
 import type * as Path from "../path.ts";
 import { empty as emptyPath } from "../path.ts";
 import { type ConnectProps, connect, type WebSocketOptions, type WebTransportProps } from "./connect.ts";
@@ -173,12 +174,13 @@ export class Reload {
 				connected = performance.now();
 
 				// A cancelled effect resolves undefined, so the sentinel tells the session
-				// closing apart from this run being torn down.
-				const closed = await Promise.race([effect.cancel, connection.closed.then(() => true)]);
-				if (!closed) return;
+				// closing (null for clean, an Error otherwise) apart from this run being
+				// torn down.
+				const closed = await Promise.race([effect.cancel, connection.closed]);
+				if (closed === undefined) return;
 
 				console.warn("connection closed, reconnecting");
-				this.#retry(effect, connected);
+				this.#retry(effect, connected, closed ?? undefined);
 			} catch (err) {
 				// Treat teardown as cancellation, not a connection failure.
 				if (signal.aborted) return;
@@ -207,6 +209,16 @@ export class Reload {
 		if (connected !== undefined && performance.now() - connected >= this.delay.initial) {
 			this.#delay = this.delay.initial;
 			this.#retryStart = undefined;
+		}
+
+		// An auth rejection is terminal however long the session lived. UNAUTHORIZED is a
+		// specified code rather than one we guessed at, so this is the peer saying these
+		// credentials will never work; retrying them just burns the window. Matches
+		// moq-native's reconnect loop, which stops on the same close.
+		if (cause instanceof RemoteError && cause.code === SessionCode.Unauthorized) {
+			console.warn("session rejected as unauthorized, not retrying");
+			this.#closedReject(cause);
+			return;
 		}
 
 		// Track retry start for timeout.

@@ -1,6 +1,6 @@
 use crate::origin;
 use crate::{
-	Error, Origin,
+	Error, Origin, SessionError,
 	coding::{Decode, Encode, Reader, Stream, Writer},
 	ietf::{self, FetchHeader, RequestId},
 	setup,
@@ -110,7 +110,7 @@ pub fn start<S: web_transport_trait::Session>(
 			Version::Draft14 | Version::Draft15 | Version::Draft16 => {
 				let Some(setup) = setup else {
 					let err = Error::ProtocolViolation;
-					session.close(err.to_code(), "setup stream required");
+					session.close(SessionError::from(&err).to_code(), "setup stream required");
 					return Err(err);
 				};
 				let control = Control::new(request_id_max, client);
@@ -369,15 +369,15 @@ pub fn start<S: web_transport_trait::Session>(
 		match &res {
 			Err(Error::Transport(_)) => {
 				tracing::info!("session terminated");
-				session.close(1, "");
+				session.close(SessionError::Internal.to_code(), "");
 			}
 			Err(err) => {
 				tracing::warn!(%err, "session error");
-				session.close(err.to_code(), err.to_string().as_ref());
+				session.close(SessionError::from(err).to_code(), err.to_string().as_ref());
 			}
 			_ => {
 				tracing::info!("session closed");
-				session.close(0, "");
+				session.close(SessionError::Cancel.to_code(), "");
 			}
 		}
 
@@ -588,7 +588,7 @@ async fn run_unis<S: web_transport_trait::Session>(
 					Ok(msg) => msg,
 					Err(err) => {
 						tracing::warn!(%err, "setup decode error");
-						session.close(Error::ProtocolViolation.to_code(), "invalid setup");
+						session.close(SessionError::ProtocolViolation.to_code(), "invalid setup");
 						return;
 					}
 				};
@@ -598,7 +598,7 @@ async fn run_unis<S: web_transport_trait::Session>(
 						Ok(peer) => peer,
 						Err(err) => {
 							tracing::warn!(%err, "setup parameter decode error");
-							session.close(Error::ProtocolViolation.to_code(), "invalid setup parameters");
+							session.close(SessionError::ProtocolViolation.to_code(), "invalid setup parameters");
 							return;
 						}
 					};
@@ -833,7 +833,11 @@ mod tests {
 			.expect_err("a malformed NAMESPACE fails the session");
 
 		assert!(is_protocol_violation(&err), "not treated as the peer's fault: {err}");
-		assert_eq!(log.closes(), vec![(err.to_code(), err.to_string())]);
+		// A session close carries a session code, so the peer is told PROTOCOL_VIOLATION
+		// rather than the local table's value for whichever decode error we hit.
+		let (code, reason) = log.closes().first().cloned().expect("the session was closed");
+		assert_eq!(code, SessionError::ProtocolViolation.to_code());
+		assert_eq!(reason, err.to_string());
 	}
 
 	/// A subscriber issues one SUBSCRIBE_NAMESPACE per PERMITTED PREFIX, and asks for
