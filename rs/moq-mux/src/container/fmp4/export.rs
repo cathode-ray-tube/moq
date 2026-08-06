@@ -28,12 +28,12 @@ use moq_net::Timestamp;
 /// fragment duration for downstream consumers that throttle by fragment rate.
 /// Returns `None` when the broadcast ends.
 ///
-/// [`next_fragment`](Self::next_fragment) returns the same bytes wrapped in a
-/// [`Fragment`] that also carries whether the chunk is the init segment, whether
-/// a media fragment begins at a sync sample, and its presentation duration. A
-/// segmenting consumer (e.g. an HLS/LL-HLS packager) needs that to map fragments
-/// onto segments and parts; narrow the catalog to a single rendition with
-/// [`Stream::select`](crate::catalog::Stream::select) so the fragments belong to one track.
+/// [`next_chunk`](Self::next_chunk) returns the same bytes as a [`Chunk`], which
+/// separates the init segment from a [`Fragment`] carrying whether it begins at a
+/// sync sample and how long it lasts. A segmenting consumer (e.g. an HLS/LL-HLS
+/// packager) needs that to map fragments onto segments and parts; narrow the catalog
+/// to a single rendition with [`Stream::select`](crate::catalog::Stream::select) so the
+/// fragments belong to one track.
 pub struct Export<S: Stream> {
 	source: crate::Source,
 	catalog: Option<S>,
@@ -51,23 +51,67 @@ pub struct Export<S: Stream> {
 	init_emitted: bool,
 }
 
-/// One emitted CMAF chunk: either the init segment or a moof+mdat fragment,
-/// with the metadata a segmenting consumer needs.
+/// One emitted CMAF chunk: the init segment, then media fragments.
+///
+/// The two carry different metadata, so they are separate variants rather than one
+/// struct with fields that are meaningless on the init. The set is closed by the
+/// container format, so a `match` on it stays exhaustive.
+#[derive(Clone, Debug)]
+pub enum Chunk {
+	/// The merged init segment (ftyp + multi-track moov), emitted once, first.
+	Init(Bytes),
+
+	/// One moof+mdat fragment.
+	Fragment(Fragment),
+}
+
+impl Chunk {
+	/// The encoded bytes, whichever kind of chunk this is.
+	pub fn data(&self) -> &Bytes {
+		match self {
+			Chunk::Init(data) => data,
+			Chunk::Fragment(fragment) => &fragment.data,
+		}
+	}
+
+	/// Consume the chunk for its encoded bytes, dropping any metadata.
+	pub fn into_data(self) -> Bytes {
+		match self {
+			Chunk::Init(data) => data,
+			Chunk::Fragment(fragment) => fragment.data,
+		}
+	}
+
+	/// The init segment's bytes, or `None` for a media fragment.
+	pub fn init(self) -> Option<Bytes> {
+		match self {
+			Chunk::Init(data) => Some(data),
+			Chunk::Fragment(_) => None,
+		}
+	}
+
+	/// The media fragment, or `None` for the init segment.
+	pub fn fragment(self) -> Option<Fragment> {
+		match self {
+			Chunk::Init(_) => None,
+			Chunk::Fragment(fragment) => Some(fragment),
+		}
+	}
+}
+
+/// One moof+mdat fragment, with the metadata a segmenting consumer needs.
 #[derive(Clone, Debug)]
 pub struct Fragment {
-	/// The encoded bytes: ftyp+moov for the init, otherwise one moof+mdat.
+	/// The encoded moof+mdat bytes.
 	pub data: Bytes,
 
-	/// True only for the first emit (the init segment).
-	pub init: bool,
-
-	/// A media fragment that begins at a sync sample, so it can start a segment.
+	/// A fragment that begins at a sync sample, so it can start a segment.
 	/// Video fragments are independent only at a GOP boundary (keyframe); audio
-	/// fragments are always independent. Always false for the init segment.
+	/// fragments are always independent.
 	pub independent: bool,
 
-	/// Presentation duration of the fragment in seconds (0 for the init segment).
-	pub duration: f64,
+	/// Presentation duration of the fragment.
+	pub duration: Duration,
 }
 
 struct Fmp4Track {
@@ -154,22 +198,24 @@ impl<S: Stream> Export<S> {
 	/// timestamp order across tracks. Returns `None` when the catalog and every track
 	/// have ended.
 	pub async fn next(&mut self) -> Result<Option<Bytes>> {
-		Ok(self.next_fragment().await?.map(|f| f.data))
+		Ok(self.next_chunk().await?.map(Chunk::into_data))
 	}
 
 	/// Poll-based variant of [`Self::next`].
 	pub fn poll_next(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<Bytes>>> {
-		Poll::Ready(Ok(std::task::ready!(self.poll_next_fragment(waiter)?).map(|f| f.data)))
+		Poll::Ready(Ok(
+			std::task::ready!(self.poll_next_chunk(waiter)?).map(Chunk::into_data)
+		))
 	}
 
-	/// Like [`next`](Self::next) but returns a [`Fragment`] carrying segment metadata
-	/// (init flag, sync-sample independence, presentation duration).
-	pub async fn next_fragment(&mut self) -> Result<Option<Fragment>> {
-		kio::wait(|waiter| self.poll_next_fragment(waiter)).await
+	/// Like [`next`](Self::next) but returns a [`Chunk`], which tells the init segment
+	/// apart from a [`Fragment`] and carries that fragment's segmenting metadata.
+	pub async fn next_chunk(&mut self) -> Result<Option<Chunk>> {
+		kio::wait(|waiter| self.poll_next_chunk(waiter)).await
 	}
 
-	/// Poll-based variant of [`Self::next_fragment`].
-	pub fn poll_next_fragment(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<Fragment>>> {
+	/// Poll-based variant of [`Self::next_chunk`].
+	pub fn poll_next_chunk(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<Chunk>>> {
 		// 1. Drain catalog updates and (un)subscribe tracks accordingly.
 		while let Some(catalog) = self.catalog.as_mut() {
 			match catalog.poll_next(waiter)? {
@@ -220,12 +266,7 @@ impl<S: Stream> Export<S> {
 			if self.init_ready() {
 				let init = self.build_init()?;
 				self.init_emitted = true;
-				return Poll::Ready(Ok(Some(Fragment {
-					data: init,
-					init: true,
-					independent: false,
-					duration: 0.0,
-				})));
+				return Poll::Ready(Ok(Some(Chunk::Init(init))));
 			}
 			// Still waiting for codec configs. If every track is finished and
 			// the init still isn't buildable, the source ended before producing
@@ -262,11 +303,11 @@ impl<S: Stream> Export<S> {
 					let frames = std::mem::take(&mut track.buffer);
 					let fragment = emit_fragment(track, frames, Some(&frame))?;
 					track.pending = Some(frame);
-					return Poll::Ready(Ok(Some(fragment)));
+					return Poll::Ready(Ok(Some(Chunk::Fragment(fragment))));
 				}
 				track.buffer_independent = frame.keyframe;
 				let fragment = emit_fragment(track, vec![frame], None)?;
-				return Poll::Ready(Ok(Some(fragment)));
+				return Poll::Ready(Ok(Some(Chunk::Fragment(fragment))));
 			}
 			if should_flush(track, &frame, frag) {
 				let frames = std::mem::take(&mut track.buffer);
@@ -274,14 +315,14 @@ impl<S: Stream> Export<S> {
 				// The flushed run is done; the incoming frame opens the next buffer.
 				track.buffer_independent = frame.keyframe;
 				track.buffer.push(frame);
-				return Poll::Ready(Ok(Some(fragment)));
+				return Poll::Ready(Ok(Some(Chunk::Fragment(fragment))));
 			}
 			if track.buffer.is_empty() {
 				track.buffer_independent = frame.keyframe;
 			}
 			track.buffer.push(frame);
 			// Frame appended to buffer; loop again to look for more work or a flush.
-			return self.poll_next_fragment(waiter);
+			return self.poll_next_chunk(waiter);
 		}
 
 		// 5. No pending frames. Flush any finished tracks' remaining buffers,
@@ -303,7 +344,7 @@ impl<S: Stream> Export<S> {
 			let track = self.tracks.get_mut(&name).unwrap();
 			let frames = std::mem::take(&mut track.buffer);
 			let fragment = emit_fragment(track, frames, None)?;
-			return Poll::Ready(Ok(Some(fragment)));
+			return Poll::Ready(Ok(Some(Chunk::Fragment(fragment))));
 		}
 
 		// 6. If catalog is closed and every track is finished and drained, we're done.
@@ -581,25 +622,24 @@ fn emit_fragment(track: &mut Fmp4Track, mut frames: Vec<Frame>, successor: Optio
 	// independent only when its buffer opened on a keyframe (a GOP boundary).
 	let independent = !track.is_video || track.buffer_independent;
 	let frames = infer_missing_durations(frames, successor, track.default_frame);
-	let duration = fragment_seconds(&frames, track.default_frame);
+	let duration = fragment_duration(&frames, track.default_frame);
 	let data = encode_fragment(track, frames)?;
 	Ok(Fragment {
 		data,
-		init: false,
 		independent,
 		duration,
 	})
 }
 
-/// Presentation duration of a fragment, in seconds.
+/// Presentation duration of a fragment.
 ///
 /// When every sample carries a duration (the CMAF case) the per-sample durations
 /// tile the timeline, so their sum is exact. Legacy / LOC sources carry none, so
 /// fall back to the presentation span plus one `default_frame` for the trailing
 /// sample (which has no successor to bound it).
-fn fragment_seconds(frames: &[Frame], default_frame: Duration) -> f64 {
+fn fragment_duration(frames: &[Frame], default_frame: Duration) -> Duration {
 	if frames.is_empty() {
-		return 0.0;
+		return Duration::ZERO;
 	}
 	if frames
 		.iter()
@@ -608,8 +648,7 @@ fn fragment_seconds(frames: &[Frame], default_frame: Duration) -> f64 {
 		return frames
 			.iter()
 			.map(|f| Duration::from(f.duration.unwrap()))
-			.sum::<Duration>()
-			.as_secs_f64();
+			.sum::<Duration>();
 	}
 	let mut min = Duration::MAX;
 	let mut max = Duration::ZERO;
@@ -618,7 +657,7 @@ fn fragment_seconds(frames: &[Frame], default_frame: Duration) -> f64 {
 		min = min.min(pts);
 		max = max.max(pts);
 	}
-	((max - min) + default_frame).as_secs_f64()
+	(max - min) + default_frame
 }
 
 /// Fill in the durations the codec states outright, before anything has to be inferred
@@ -782,7 +821,10 @@ mod tests {
 		assert_eq!(frames[0].duration, Some(ts(41_667)));
 		assert_eq!(frames[1].duration, Some(ts(41_667)));
 		assert_eq!(frames[2].duration, Some(ts(33_000)));
-		assert_eq!(fragment_seconds(&frames, Duration::from_millis(33)), 0.116334);
+		assert_eq!(
+			fragment_duration(&frames, Duration::from_millis(33)),
+			Duration::from_micros(116_334)
+		);
 	}
 
 	#[test]
@@ -790,7 +832,10 @@ mod tests {
 		let frames = infer_missing_durations(vec![frame(83_333, Some(0))], None, Duration::from_millis(40));
 
 		assert_eq!(frames[0].duration, Some(ts(40_000)));
-		assert_eq!(fragment_seconds(&frames, Duration::from_millis(40)), 0.04);
+		assert_eq!(
+			fragment_duration(&frames, Duration::from_millis(40)),
+			Duration::from_millis(40)
+		);
 	}
 
 	#[test]
@@ -799,7 +844,10 @@ mod tests {
 		let frames = infer_missing_durations(vec![frame(41_667, None)], Some(&successor), Duration::from_millis(33));
 
 		assert_eq!(frames[0].duration, Some(ts(41_667)));
-		assert_eq!(fragment_seconds(&frames, Duration::from_millis(33)), 0.041667);
+		assert_eq!(
+			fragment_duration(&frames, Duration::from_millis(33)),
+			Duration::from_micros(41_667)
+		);
 	}
 
 	/// The regression for moq-dev/moq.pro#814: a subscriber that got a stale cached group
@@ -812,7 +860,10 @@ mod tests {
 		let frames = infer_missing_durations(vec![frame(63_244, None)], Some(&next_group), Duration::from_millis(33));
 
 		assert_eq!(frames[0].duration, Some(ts(33_000)));
-		assert_eq!(fragment_seconds(&frames, Duration::from_millis(33)), 0.033);
+		assert_eq!(
+			fragment_duration(&frames, Duration::from_millis(33)),
+			Duration::from_millis(33)
+		);
 	}
 
 	/// Audio never rolls a fragment on a keyframe, so its buffer can span whole groups.
@@ -899,7 +950,10 @@ mod tests {
 		assert_eq!(frames[0].duration, Some(ts(33_000)));
 		assert_eq!(frames[1].duration, Some(ts(33_000)));
 		assert_eq!(frames[2].duration, Some(ts(33_000)));
-		assert_eq!(fragment_seconds(&frames, Duration::from_millis(33)), 0.099);
+		assert_eq!(
+			fragment_duration(&frames, Duration::from_millis(33)),
+			Duration::from_micros(99_000)
+		);
 	}
 
 	// A source init whose trak carries an edit list must come out of extract_init with
