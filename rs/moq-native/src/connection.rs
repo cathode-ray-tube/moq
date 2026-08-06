@@ -4,14 +4,17 @@ use std::time::Duration;
 use moq_net::Version;
 use moq_net::bandwidth::{Consumer as BandwidthConsumer, Producer as BandwidthProducer};
 use moq_net::kio;
+use rand::RngExt;
 use url::Url;
 
 use crate::{Client, Error};
 
 /// Exponential backoff configuration for reconnection attempts.
 ///
-/// Every field is optional so a value set in TOML survives the CLI re-parse that
-/// follows it; read them through the accessors, which supply the defaults.
+/// Every field is optional so a value set in TOML survives the CLI re-parse that follows it; read
+/// them through the accessors, which supply the defaults. The delays carry jitter, so a fleet
+/// knocked offline together does not reconnect in lockstep. The timeout bounds every failure;
+/// only a settled response from the server short-circuits it.
 #[derive(Clone, Debug, Default, clap::Args, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
@@ -36,7 +39,7 @@ pub struct Backoff {
 	#[arg(id = "backoff-multiplier", long, env = "MOQ_BACKOFF_MULTIPLIER")]
 	pub multiplier: Option<u32>,
 
-	/// Maximum delay between reconnect attempts. Defaults to 30s.
+	/// Maximum delay between reconnect attempts. Defaults to 5s.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[arg(
 		id = "backoff-max",
@@ -47,7 +50,7 @@ pub struct Backoff {
 	#[serde(with = "humantime_serde")]
 	pub max: Option<Duration>,
 
-	/// Maximum time to spend retrying before giving up. Defaults to 5m.
+	/// Maximum time to spend retrying before giving up. Defaults to 10s.
 	///
 	/// Resets after a stable connection (one that outlives the initial backoff), so a flapping
 	/// session that reconnects then immediately drops still counts toward the timeout. Set to 0 for
@@ -235,8 +238,8 @@ pub struct GoawayConfig {
 /// Defaults for the [`Backoff`] knobs, applied by its accessors when a field is unset.
 const DEFAULT_INITIAL: Duration = Duration::from_secs(1);
 const DEFAULT_MULTIPLIER: u32 = 2;
-const DEFAULT_MAX: Duration = Duration::from_secs(30);
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_MAX: Duration = Duration::from_secs(5);
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Floor for the retry delay, which also sets the bar for calling a session
 /// healthy. Small enough to stay out of the way of a fast config, large enough
@@ -483,12 +486,8 @@ impl Connection {
 
 		loop {
 			let timeout = backoff.timeout();
-			if !timeout.is_zero() && retry_start.elapsed() > timeout {
-				let msg = match last_error {
-					Some(err) => format!("reconnect timed out after {timeout:?}: {err}"),
-					None => format!("reconnect timed out after {timeout:?}"),
-				};
-				return Err(Error::Reconnect(msg));
+			if !timeout.is_zero() && retry_start.elapsed() >= timeout {
+				return Err(timeout_error(timeout, last_error.as_ref()));
 			}
 
 			tracing::info!(%url, "connecting");
@@ -563,10 +562,13 @@ impl Connection {
 						// through backoff and eventually give up. The old session serves
 						// across the sleep, so the redirect loop costs time, not data.
 						last_error = Some(Error::Reconnect("peer redirected immediately".to_string()));
-						tracing::warn!(%url, ?delay, "peer redirected immediately; retrying after backoff");
+						let Some(wait) = retry_wait(delay, retry_start, timeout) else {
+							return Err(timeout_error(timeout, last_error.as_ref()));
+						};
+						tracing::warn!(%url, ?wait, "peer redirected immediately; retrying after backoff");
 						// Keep the handover bounded across the sleep: nothing else polls the
 						// predecessor while the loop is between connections.
-						sleep_draining(delay, &mut draining, shared).await;
+						sleep_draining(wait, &mut draining, shared).await;
 						delay = pacing.next(delay);
 						continue;
 					}
@@ -623,20 +625,28 @@ impl Connection {
 					}
 				}
 				Err(err) => {
-					if err.is_auth() || !client.reconnect {
+					if err.is_auth()
+						|| err
+							.status()
+							.is_some_and(|status| !crate::error::status_retryable(status))
+						|| !client.reconnect
+					{
 						return Err(err);
 					}
 					last_error = Some(err);
 				}
 			}
 
-			tracing::warn!(%url, ?delay, "reconnecting after backoff");
+			let Some(wait) = retry_wait(delay, retry_start, timeout) else {
+				return Err(timeout_error(timeout, last_error.as_ref()));
+			};
+			tracing::warn!(%url, ?wait, "reconnecting after backoff");
 			// Drain-aware: a GOAWAY off a healthy session continues straight to the
 			// replacement dial, so a predecessor can still be draining when that dial
 			// fails and lands here. A plain sleep would stop enforcing its handover
 			// until some later dial succeeded, holding an upstream that asked to drain
 			// open for the whole retry window, or forever with `--backoff-timeout=0`.
-			sleep_draining(delay, &mut draining, shared).await;
+			sleep_draining(wait, &mut draining, shared).await;
 			delay = pacing.next(delay);
 		}
 	}
@@ -770,6 +780,24 @@ impl Connection {
 			state: self.state.clone(),
 		}
 	}
+}
+
+/// Build the terminal error for an exhausted retry window without discarding the last real cause.
+fn timeout_error(timeout: Duration, last_error: Option<&Error>) -> Error {
+	let message = match last_error {
+		Some(err) => format!("reconnect timed out after {timeout:?}: {err}"),
+		None => format!("reconnect timed out after {timeout:?}"),
+	};
+	Error::Reconnect(message)
+}
+
+/// Jitter the next delay and cap it at the retry window. `None` means the window is exhausted.
+fn retry_wait(delay: Duration, retry_start: tokio::time::Instant, timeout: Duration) -> Option<Duration> {
+	let wait = delay.mul_f64(0.5 + rand::rng().random::<f64>() / 2.0);
+	if timeout.is_zero() {
+		return Some(wait);
+	}
+	Some(wait.min(timeout.checked_sub(retry_start.elapsed())?))
 }
 
 /// Why a session stopped being the live one.
@@ -1220,8 +1248,8 @@ mod tests {
 		let backoff = Backoff::default();
 		assert_eq!(backoff.initial(), Duration::from_secs(1));
 		assert_eq!(backoff.multiplier(), 2);
-		assert_eq!(backoff.max(), Duration::from_secs(30));
-		assert_eq!(backoff.timeout(), Duration::from_secs(300));
+		assert_eq!(backoff.max(), Duration::from_secs(5));
+		assert_eq!(backoff.timeout(), Duration::from_secs(10));
 	}
 
 	/// The linger outlives the give-up timeout (so the reconnect error surfaces
