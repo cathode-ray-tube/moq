@@ -1,8 +1,6 @@
 import type * as Catalog from "@moq/hang/catalog";
-import type * as Moq from "@moq/net";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 import type { Broadcast } from "../broadcast";
-import { renditionJitter } from "./playhead";
 
 /**
  * A function that checks if a video configuration can be played.
@@ -50,9 +48,6 @@ type SourceOutput = {
 	// The name of the active rendition.
 	track: Signal<string | undefined>;
 	config: Signal<Catalog.VideoConfig | undefined>;
-
-	// The per-rendition jitter (ms) to add to the sync buffer. Wired into Sync by the parent.
-	jitter: Signal<Moq.Time.Milli | undefined>;
 };
 
 /**
@@ -220,7 +215,6 @@ export class Source {
 		error: new Signal<SourceError | undefined>(undefined),
 		track: new Signal<string | undefined>(undefined),
 		config: new Signal<Catalog.VideoConfig | undefined>(undefined),
-		jitter: new Signal<Moq.Time.Milli | undefined>(undefined),
 	};
 	readonly out = readonlys(this.#out);
 
@@ -296,7 +290,6 @@ export class Source {
 			const config = available[target.name];
 			effect.set(this.#out.track, target.name);
 			effect.set(this.#out.config, config);
-			effect.set(this.#out.jitter, renditionJitter(config));
 			return;
 		}
 
@@ -320,7 +313,6 @@ export class Source {
 
 		effect.set(this.#out.track, selected);
 		effect.set(this.#out.config, config);
-		effect.set(this.#out.jitter, renditionJitter(config));
 	}
 
 	/**
