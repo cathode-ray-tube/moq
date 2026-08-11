@@ -393,12 +393,7 @@ impl<S: Stream> Export<S> {
 			}
 			let source = ExportSource::for_video(&self.source, name, config, self.latency)?;
 			let timescale = catalog_timescale_video(config)?;
-			// A zero / NaN / infinite framerate would make `1.0 / fps` non-finite and panic
-			// `Duration::from_secs_f64`; fall back to the default in that case.
-			let framerate = config
-				.framerate
-				.filter(|fps| fps.is_finite() && *fps > 0.0)
-				.unwrap_or(30.0);
+			let framerate = super::usable_video_framerate(config).unwrap_or(30.0);
 			self.tracks.insert(
 				name.clone(),
 				Fmp4Track {
@@ -607,12 +602,12 @@ fn encode_fragment(track: &mut Fmp4Track, frames: Vec<Frame>) -> Result<Bytes> {
 	let seq = track.sequence_number;
 	track.sequence_number += 1;
 	let timescale = moq_net::Timescale::new(track.timescale)?;
-	Ok(crate::container::fmp4::encode_fragment(
-		track.track_id,
+	let info = crate::container::fmp4::FragmentInfo {
+		track_id: track.track_id,
 		timescale,
-		seq,
-		&frames,
-	)?)
+		sequence_number: seq,
+	};
+	Ok(crate::container::fmp4::encode_fragment(info, &frames)?)
 }
 
 /// Encode a buffered run and wrap it with the metadata a segmenting consumer needs.
@@ -621,7 +616,8 @@ fn emit_fragment(track: &mut Fmp4Track, mut frames: Vec<Frame>, successor: Optio
 	// Audio has no keyframes, so every audio fragment is independent; video is
 	// independent only when its buffer opened on a keyframe (a GOP boundary).
 	let independent = !track.is_video || track.buffer_independent;
-	let frames = infer_missing_durations(frames, successor, track.default_frame);
+	let timescale = moq_net::Timescale::new(track.timescale)?;
+	infer_missing_durations(&mut frames, successor, track.default_frame, timescale)?;
 	let duration = fragment_duration(&frames, track.default_frame);
 	let data = encode_fragment(track, frames)?;
 	Ok(Fragment {
@@ -701,33 +697,81 @@ pub(crate) fn apply_codec_durations(frames: &mut [Frame], opus: bool) {
 /// [`Producer::cut`](crate::container::Producer::cut) is how it says so: the durations it
 /// writes arrive already set and are left alone here.
 pub(crate) fn infer_missing_durations(
-	mut frames: Vec<Frame>,
+	frames: &mut [Frame],
 	successor: Option<&Frame>,
 	default_frame: Duration,
-) -> Vec<Frame> {
-	let infer_from_pts = pts_monotonic(&frames, successor);
-	// Express the fallback at the frames' own timescale so it matches the durations derived from
-	// their timestamps (a `Timestamp` carries its scale, and `try_from(Duration)` is nanosecond-scale).
-	let fallback = frames.first().map(|f| f.timestamp.scale()).and_then(|scale| {
-		Timestamp::try_from(default_frame)
-			.ok()
-			.and_then(|t| t.convert(scale).ok())
-	});
+	timescale: moq_net::Timescale,
+) -> Result<()> {
+	let infer_from_pts = pts_monotonic(frames, successor);
 
 	for i in 0..frames.len() {
-		if frames[i].duration.is_some_and(|duration| !duration.is_zero()) {
-			continue;
-		}
-
-		frames[i].duration = infer_from_pts
-			.then(|| duration_bound(&frames, successor, i))
+		let successor = infer_from_pts
+			.then(|| duration_bound(frames, successor, i))
 			.flatten()
-			.and_then(|next| next.timestamp.checked_sub(frames[i].timestamp).ok())
-			.filter(|duration| !duration.is_zero())
-			.or(fallback);
+			.cloned();
+		infer_missing_duration(&mut frames[i], successor.as_ref(), default_frame, timescale)?;
 	}
 
-	frames
+	Ok(())
+}
+
+/// Infer one frame's duration from a known same-group successor, else the catalog cadence.
+pub(crate) fn infer_missing_duration(
+	frame: &mut Frame,
+	successor: Option<&Frame>,
+	default_frame: Duration,
+	timescale: moq_net::Timescale,
+) -> Result<()> {
+	if frame.duration.is_some_and(|duration| !duration.is_zero()) {
+		return Ok(());
+	}
+
+	frame.duration = match successor {
+		Some(next) => timestamp_gap(frame.timestamp, next.timestamp, timescale)?,
+		None => None,
+	}
+	.or_else(|| fallback_duration(default_frame, timescale))
+	.filter(|duration| !duration.is_zero());
+	Ok(())
+}
+
+/// Snap floating-point catalog cadence to an output tick only when the mismatch is no more
+/// than the nanosecond precision used by `Duration`.
+fn fallback_duration(default_frame: Duration, timescale: moq_net::Timescale) -> Option<Timestamp> {
+	if let Some(ticks) = super::rounded_duration_ticks(default_frame, timescale.as_u64()) {
+		Timestamp::new(ticks, timescale).ok()
+	} else {
+		Timestamp::try_from(default_frame).ok()
+	}
+}
+
+/// Quantize two absolute instants at the output scale, then subtract their tick positions.
+///
+/// Quantizing endpoints instead of each gap independently carries fractional ticks forward:
+/// a microsecond clock alternating 33,333 and 33,334 microsecond steps at 30 kHz produces
+/// consecutive 1,000-tick samples instead of either drifting or failing as inexact.
+fn timestamp_gap(start: Timestamp, end: Timestamp, timescale: moq_net::Timescale) -> Result<Option<Timestamp>> {
+	let start_scale = u128::from(start.scale().as_u64());
+	let end_scale = u128::from(end.scale().as_u64());
+	let end_numerator = u128::from(end.value()) * start_scale;
+	let start_numerator = u128::from(start.value()) * end_scale;
+	let Some(numerator) = end_numerator.checked_sub(start_numerator) else {
+		return Ok(None);
+	};
+	if numerator == 0 {
+		return Ok(None);
+	}
+
+	let start_ticks = super::timestamp_ticks(start, timescale)?;
+	let end_ticks = super::timestamp_ticks(end, timescale)?;
+	let Some(ticks) = end_ticks.checked_sub(start_ticks) else {
+		return Ok(None);
+	};
+	if ticks == 0 {
+		return Err(Error::SampleDurationTooSmall(timescale.as_u64()).into());
+	}
+
+	Ok(Some(Timestamp::new(ticks, timescale)?))
 }
 
 fn pts_monotonic(frames: &[Frame], successor: Option<&Frame>) -> bool {
@@ -792,6 +836,10 @@ mod tests {
 		Timestamp::from_micros(micros).unwrap()
 	}
 
+	fn duration_micros(frame: &Frame) -> u128 {
+		frame.duration.unwrap().as_micros()
+	}
+
 	fn frame(timestamp_us: u64, duration_us: Option<u64>) -> Frame {
 		Frame {
 			timestamp: ts(timestamp_us),
@@ -812,11 +860,8 @@ mod tests {
 
 	#[test]
 	fn infer_missing_durations_uses_default_for_trailing_sample() {
-		let frames = infer_missing_durations(
-			vec![frame(0, Some(0)), frame(41_667, None), frame(83_334, None)],
-			None,
-			Duration::from_millis(33),
-		);
+		let mut frames = vec![frame(0, Some(0)), frame(41_667, None), frame(83_334, None)];
+		infer_missing_durations(&mut frames, None, Duration::from_millis(33), moq_net::Timescale::MICRO).unwrap();
 
 		assert_eq!(frames[0].duration, Some(ts(41_667)));
 		assert_eq!(frames[1].duration, Some(ts(41_667)));
@@ -829,7 +874,8 @@ mod tests {
 
 	#[test]
 	fn infer_missing_duration_uses_default_for_single_frame() {
-		let frames = infer_missing_durations(vec![frame(83_333, Some(0))], None, Duration::from_millis(40));
+		let mut frames = vec![frame(83_333, Some(0))];
+		infer_missing_durations(&mut frames, None, Duration::from_millis(40), moq_net::Timescale::MICRO).unwrap();
 
 		assert_eq!(frames[0].duration, Some(ts(40_000)));
 		assert_eq!(
@@ -841,13 +887,36 @@ mod tests {
 	#[test]
 	fn infer_trailing_duration_from_successor_frame() {
 		let successor = frame(83_334, None);
-		let frames = infer_missing_durations(vec![frame(41_667, None)], Some(&successor), Duration::from_millis(33));
+		let mut frames = vec![frame(41_667, None)];
+		infer_missing_durations(
+			&mut frames,
+			Some(&successor),
+			Duration::from_millis(33),
+			moq_net::Timescale::MICRO,
+		)
+		.unwrap();
 
 		assert_eq!(frames[0].duration, Some(ts(41_667)));
 		assert_eq!(
 			fragment_duration(&frames, Duration::from_millis(33)),
 			Duration::from_micros(41_667)
 		);
+	}
+
+	#[test]
+	fn inferred_microsecond_clock_carries_fractional_ticks_forward() {
+		let timescale = moq_net::Timescale::new(30_000).unwrap();
+		let mut frames = vec![frame(0, None), frame(33_333, None), frame(66_667, None)];
+		infer_missing_durations(&mut frames, None, Duration::from_nanos(33_333_333), timescale).unwrap();
+
+		let durations: Vec<_> = frames
+			.iter()
+			.map(|frame| {
+				let duration = frame.duration.unwrap();
+				(duration.value(), duration.scale())
+			})
+			.collect();
+		assert_eq!(durations, vec![(1_000, timescale); 3]);
 	}
 
 	/// The regression for moq-dev/moq.pro#814: a subscriber that got a stale cached group
@@ -857,7 +926,14 @@ mod tests {
 	#[test]
 	fn infer_stops_at_a_group_boundary() {
 		let next_group = group_start(2_405_070_000);
-		let frames = infer_missing_durations(vec![frame(63_244, None)], Some(&next_group), Duration::from_millis(33));
+		let mut frames = vec![frame(63_244, None)];
+		infer_missing_durations(
+			&mut frames,
+			Some(&next_group),
+			Duration::from_millis(33),
+			moq_net::Timescale::MICRO,
+		)
+		.unwrap();
 
 		assert_eq!(frames[0].duration, Some(ts(33_000)));
 		assert_eq!(
@@ -871,15 +947,12 @@ mod tests {
 	/// the same.
 	#[test]
 	fn infer_stops_at_an_interior_group_boundary() {
-		let frames = infer_missing_durations(
-			vec![frame(0, None), frame(21_333, None), group_start(600_000_000)],
-			None,
-			Duration::from_millis(21),
-		);
+		let mut frames = vec![frame(0, None), frame(21_333, None), group_start(600_000_000)];
+		infer_missing_durations(&mut frames, None, Duration::from_millis(21), moq_net::Timescale::MICRO).unwrap();
 
 		assert_eq!(frames[0].duration, Some(ts(21_333)), "same group, real delta");
-		assert_eq!(frames[1].duration, Some(ts(21_000)), "bounded by the next group");
-		assert_eq!(frames[2].duration, Some(ts(21_000)), "nothing after it at all");
+		assert_eq!(duration_micros(&frames[1]), 21_000, "bounded by the next group");
+		assert_eq!(duration_micros(&frames[2]), 21_000, "nothing after it at all");
 	}
 
 	/// The duration cap splits a GOP across fragments, so the successor is a delta frame
@@ -887,7 +960,14 @@ mod tests {
 	#[test]
 	fn infer_crosses_a_mid_group_fragment_boundary() {
 		let successor = frame(83_334, None);
-		let frames = infer_missing_durations(vec![frame(41_667, None)], Some(&successor), Duration::from_millis(33));
+		let mut frames = vec![frame(41_667, None)];
+		infer_missing_durations(
+			&mut frames,
+			Some(&successor),
+			Duration::from_millis(33),
+			moq_net::Timescale::MICRO,
+		)
+		.unwrap();
 
 		assert_eq!(frames[0].duration, Some(ts(41_667)));
 	}
@@ -908,7 +988,13 @@ mod tests {
 			.collect();
 
 		apply_codec_durations(&mut frames, true);
-		let frames = infer_missing_durations(frames, None, Duration::from_micros(21_333));
+		infer_missing_durations(
+			&mut frames,
+			None,
+			Duration::from_micros(21_333),
+			moq_net::Timescale::MICRO,
+		)
+		.unwrap();
 
 		for f in &frames {
 			assert_eq!(
@@ -924,28 +1010,34 @@ mod tests {
 	#[test]
 	fn infer_ignores_a_rewound_group_boundary() {
 		let next_group = group_start(0);
-		let frames = infer_missing_durations(
-			vec![frame(1_000_000, None), frame(1_033_000, None)],
+		let mut frames = vec![frame(1_000_000, None), frame(1_033_000, None)];
+		infer_missing_durations(
+			&mut frames,
 			Some(&next_group),
 			Duration::from_millis(50),
-		);
+			moq_net::Timescale::MICRO,
+		)
+		.unwrap();
 
 		assert_eq!(
 			frames[0].duration,
 			Some(ts(33_000)),
 			"in-group delta survives the rewind"
 		);
-		assert_eq!(frames[1].duration, Some(ts(50_000)), "last in group falls back");
+		assert_eq!(duration_micros(&frames[1]), 50_000, "last in group falls back");
 	}
 
 	#[test]
 	fn infer_missing_durations_avoids_non_monotonic_pts() {
 		let successor = frame(66_000, None);
-		let frames = infer_missing_durations(
-			vec![frame(0, None), frame(99_000, None), frame(33_000, None)],
+		let mut frames = vec![frame(0, None), frame(99_000, None), frame(33_000, None)];
+		infer_missing_durations(
+			&mut frames,
 			Some(&successor),
 			Duration::from_millis(33),
-		);
+			moq_net::Timescale::MICRO,
+		)
+		.unwrap();
 
 		assert_eq!(frames[0].duration, Some(ts(33_000)));
 		assert_eq!(frames[1].duration, Some(ts(33_000)));

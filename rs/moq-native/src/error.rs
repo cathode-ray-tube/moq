@@ -45,6 +45,10 @@ pub enum Error {
 	#[error("qlog capture requires the 'qlog' feature")]
 	QlogUnsupported,
 
+	/// The idle timeout is longer than QUIC's millisecond varint can carry.
+	#[error("idle timeout must be under 2^62 milliseconds")]
+	IdleTimeoutRange,
+
 	/// Every backend we tried gave up without reporting why.
 	#[error("failed to connect to server")]
 	ConnectFailed,

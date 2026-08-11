@@ -18,8 +18,21 @@ check *args:
     cargo clippy --all-targets {{ args }} -- -D warnings
     cargo fmt --all --check
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps {{ args }}
+    just rs ffi-dependencies
     cargo shear
     cargo sort --workspace --check --no-format
+
+# moq-ffi exposes raw video encode/decode, not device capture. Keep the capture
+# dependency graph out of cross-compiled Python, Swift, Kotlin, and Go builds.
+ffi-dependencies:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tree=$(cargo tree --locked --package moq-ffi --target x86_64-unknown-linux-gnu)
+    if grep -qE '(^| )(v4l|v4l2-sys-mit|zune-jpeg) v' <<< "$tree"; then
+        echo "moq-ffi unexpectedly enables moq-video capture dependencies" >&2
+        grep -E '(^| )(v4l|v4l2-sys-mit|zune-jpeg) v' <<< "$tree" >&2
+        exit 1
+    fi
 
 # Auto-fix clippy/format/shear/sort.
 fix *args:
@@ -142,10 +155,14 @@ fix-changed $FILES:
 # backend don't build on MSVC, while moq-video's Linux-only nvenc/nvdec defaults
 # are already no-ops off Linux. moq-gst is excluded because it links
 # GStreamer via pkg-config, which the Windows runner doesn't have.
+#
+# `moq-cli/play` is named explicitly because it's off by default and is what
+# turns on moq-video's wgpu renderer and moq-audio's cpal output, neither of
+# which any default-feature build compiles.
 
 # Compile the whole workspace on a Windows host. Must run ON Windows.
 windows *args:
-    cargo check --workspace --exclude moq-gst --all-targets {{ args }}
+    cargo check --workspace --exclude moq-gst --all-targets --features "moq-cli/play moq-cli/capture" {{ args }}
 
 # Runs the `#[cfg(target_os = "macos")]` code past the compiler: moq-video's
 # VideoToolbox encode/decode and its ScreenCaptureKit / AVFoundation capture,
@@ -153,7 +170,7 @@ windows *args:
 #
 # Nothing in CI runs this either; Mac runners cost too much for a per-PR gate.
 # The moq-video half has a release-time backstop, since libmoq's `libmoq-v*` tag
-# build compiles it on both Apple targets. The moq-audio half has none: its
+# build compiles it on Apple Silicon. The moq-audio half has none: its
 # capture backend is behind an off-by-default feature no release build enables,
 # so this recipe is the only thing that ever compiles it.
 #

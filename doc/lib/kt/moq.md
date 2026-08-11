@@ -16,7 +16,7 @@ Full API reference: [javadoc.io/doc/dev.moq/moq](https://javadoc.io/doc/dev.moq/
 ```kotlin
 // build.gradle.kts
 dependencies {
-    implementation("dev.moq:moq:0.4.1")
+    implementation("dev.moq:moq:0.4.2")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
 }
 ```
@@ -24,7 +24,7 @@ dependencies {
 The wrapper depends on `dev.moq:moq-ffi:[0.3,0.4)`, so Gradle resolves the latest bindings patch automatically. The bindings carry the native binaries:
 
 - Android: arm64-v8a, armeabi-v7a, x86\_64
-- JVM: Linux x86\_64 + aarch64, macOS x86\_64 + aarch64, Windows x86\_64
+- JVM: Linux x86\_64 + aarch64, macOS aarch64, Windows x86\_64
 
 Android uses JNI (`jniLibs/`), desktop JVM uses JNA (resource-classpath layout).
 

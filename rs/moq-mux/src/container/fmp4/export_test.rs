@@ -518,6 +518,61 @@ async fn zero_fragment_duration_emits_without_successor() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn ntsc_tail_uses_a_representable_catalog_cadence() {
+	use hang::catalog::{Container, H264, VideoConfig};
+
+	let mut live = Live::new(".ntsc", |catalog, name| {
+		let mut config = VideoConfig::new(H264 {
+			profile: 0x42,
+			constraints: 0xc0,
+			level: 0x1f,
+			inline: true,
+		});
+		config.coded_width = Some(320);
+		config.coded_height = Some(240);
+		config.framerate = Some(30_000.0 / 1001.0);
+		config.container = Container::Legacy;
+		catalog.lock().video.renditions.insert(name, config);
+	});
+	live.track.write(video_frame(0, true)).unwrap();
+	live.track.finish().unwrap();
+
+	let mut exporter = crate::container::fmp4::Export::new(live.source(), live.catalog_stream().await);
+	chunk_now(&mut exporter)
+		.await
+		.init()
+		.expect("the init segment comes first");
+	let fragment = chunk_now(&mut exporter).await.fragment().expect("a media fragment");
+	assert_eq!(super::sample_durations(&fragment.data), vec![Some(1001)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unusable_framerate_uses_the_standard_fallback_rate() {
+	use hang::catalog::{Container, VideoCodec, VideoConfig};
+
+	let mut live = Live::new(".vp8", |catalog, name| {
+		let mut config = VideoConfig::new(VideoCodec::VP8);
+		config.framerate = Some(0.0005);
+		config.container = Container::Legacy;
+		catalog.lock().video.renditions.insert(name, config);
+	});
+	live.track.write(raw_frame(0, &[0x82, 0x00], true)).unwrap();
+	live.track.finish().unwrap();
+
+	let mut exporter = crate::container::fmp4::Export::new(live.source(), live.catalog_stream().await);
+	chunk_now(&mut exporter)
+		.await
+		.init()
+		.expect("the init segment comes first");
+
+	let fragment = chunk_now(&mut exporter).await.fragment().expect("a media fragment");
+	assert_eq!(fragment.duration, std::time::Duration::from_secs_f64(1.0 / 30.0));
+	let timescale = moq_net::Timescale::new(90_000).unwrap();
+	let decoded = super::decode(fragment.data, timescale).unwrap();
+	assert_eq!(decoded[0].duration.unwrap().as_scale(timescale), 3_000);
+}
+
+#[tokio::test(start_paused = true)]
 async fn audio_only_default_mode_emits_without_successor() {
 	use hang::catalog::{AAC, AudioConfig};
 

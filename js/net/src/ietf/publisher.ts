@@ -7,6 +7,7 @@ import { type Stream, Writer } from "../stream.ts";
 import type { Timescale } from "../time.ts";
 import type { Session } from "./adapter.ts";
 import { Frame, Group as GroupMessage } from "./object.ts";
+import { fromWire } from "./priority.ts";
 import { PublishDone } from "./publish.ts";
 import { PublishNamespace, PublishNamespaceDone, PublishNamespaceOk } from "./publish_namespace.ts";
 import { RequestError, RequestOk } from "./request.ts";
@@ -99,7 +100,7 @@ export class Publisher {
 			return;
 		}
 
-		const track = broadcast.subscribe(msg.trackName, { priority: msg.subscriberPriority });
+		const track = broadcast.subscribe(msg.trackName, { priority: fromWire(msg.subscriberPriority) });
 
 		try {
 			// Declaring the timescale is what opts the track into timestamps; every object
@@ -162,7 +163,7 @@ export class Publisher {
 	 */
 	async #runGroup(requestId: bigint, group: group.Consumer, timescale: Timescale) {
 		try {
-			const stream = await Writer.open(this.#quic, this.#session.version);
+			const stream = await Writer.open(this.#quic, { version: this.#session.version });
 
 			const header = new GroupMessage({
 				trackAlias: requestId,

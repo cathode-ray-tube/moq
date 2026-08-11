@@ -1177,7 +1177,7 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 				request_id,
 				track_namespace: broadcast.to_owned(),
 				track_name: track.name().into(),
-				subscriber_priority: track.subscription().map(|s| s.priority).unwrap_or(0),
+				subscriber_priority: super::priority::to_wire(track.subscription().map(|s| s.priority).unwrap_or(0)),
 				group_order: GroupOrder::Descending,
 				filter_type: FilterType::LargestObject,
 			})

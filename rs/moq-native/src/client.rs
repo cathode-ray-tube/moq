@@ -143,14 +143,19 @@ impl ClientConfig {
 		}
 	}
 
-	/// The Happy Eyeballs stagger to use, resolving the default. Every backend
-	/// reads it from here so the four dial paths can't drift apart.
-	#[cfg(any(feature = "quinn", feature = "noq", feature = "quiche", feature = "tcp"))]
-	pub(crate) fn effective_failover_delay(&self) -> std::time::Duration {
+	/// The Happy Eyeballs stagger a dial will actually use, resolving the default.
+	///
+	/// Every backend reads it from here so the four dial paths can't drift apart. The
+	/// [`failover_delay`](Self::failover_delay) field is the override; this is the value
+	/// it resolves to, so `ClientConfig::default().resolved_failover_delay()` is the
+	/// default itself.
+	pub fn resolved_failover_delay(&self) -> std::time::Duration {
 		self.failover_delay.unwrap_or(crate::failover::DEFAULT_DELAY)
 	}
 
-	fn connect_timeout(&self) -> std::time::Duration {
+	/// The deadline one connection attempt will actually get, dial and handshake
+	/// together, resolving the default from the [`timeout`](Self::timeout) override.
+	pub fn resolved_connect_timeout(&self) -> std::time::Duration {
 		self.timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT)
 	}
 }
@@ -270,8 +275,8 @@ impl Client {
 		let versions = config.versions();
 		// Read before the struct literal below moves fields out of `config`.
 		#[cfg(feature = "tcp")]
-		let failover_delay = config.effective_failover_delay();
-		let timeout = config.connect_timeout();
+		let failover_delay = config.resolved_failover_delay();
+		let timeout = config.resolved_connect_timeout();
 
 		Ok(Self {
 			moq: moq_net::Client::new().with_versions(versions.clone()),
@@ -1090,7 +1095,7 @@ mod tests {
 	fn connect_timeout_defaults_to_thirty_seconds() {
 		let config = ClientConfig::parse_from(["test"]);
 		assert_eq!(config.timeout, None);
-		assert_eq!(config.connect_timeout(), DEFAULT_CONNECT_TIMEOUT);
+		assert_eq!(config.resolved_connect_timeout(), DEFAULT_CONNECT_TIMEOUT);
 	}
 
 	/// A peer that completes the TCP handshake and then never speaks: the QUIC arm
