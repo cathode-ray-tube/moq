@@ -1380,10 +1380,7 @@ impl Subscriber {
 				.retain(|sequence, group| *sequence >= min_sequence && !group.is_aborted());
 
 			// Re-offer the lowest parked group back inside the cap once it rises.
-			loop {
-				let Some(&sequence) = self.segments[index].parked.keys().next() else {
-					break;
-				};
+			while let Some(&sequence) = self.segments[index].parked.keys().next() {
 				if beyond_cap(sequence) {
 					break;
 				}
@@ -1399,12 +1396,7 @@ impl Subscriber {
 			}
 
 			loop {
-				let polled = Self::poll_segment(
-					&mut self.segments[index],
-					&self.last_prefs,
-					min_sequence,
-					waiter,
-				);
+				let polled = Self::poll_segment(&mut self.segments[index], &self.last_prefs, min_sequence, waiter);
 				match polled {
 					Poll::Ready(Some(group)) => {
 						if beyond_cap(group.sequence) {
