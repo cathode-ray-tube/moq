@@ -241,6 +241,67 @@ test("nextGroup returns undefined when track closes", async () => {
 	expect(await track.nextGroup()).toBeUndefined();
 });
 
+// Close doesn't erase buffered frames: a group parked above the cap stays readable, so
+// nextGroup must keep waiting for a cap raise rather than fake an end-of-track and lose
+// the data (mirrors the Rust subscriber). Only a drained closed track reports finished.
+test("a closed track still delivers a group parked above the cap once the cap is raised", async () => {
+	const producer = new TrackProducer("test");
+	const track = producer.subscribe();
+
+	for (let sequence = 0; sequence < 3; sequence++) {
+		const group = new GroupProducer(sequence);
+		group.writeString(`frame-${sequence}`);
+		group.close();
+		producer.writeGroup(group);
+	}
+
+	track.endAt(1);
+	expect((await track.nextGroup())?.sequence).toBe(0);
+	expect((await track.nextGroup())?.sequence).toBe(1);
+
+	// Group 2 parks above the cap; a clean close must not resolve it as finished.
+	const parked = track.nextGroup();
+	producer.close();
+	const timeout = new Promise((resolve) => setTimeout(() => resolve("pending"), 10));
+	expect(await Promise.race([parked, timeout])).toBe("pending");
+
+	// Raising the cap after close releases the buffered group, frames intact.
+	track.endAt(2);
+	const released = await parked;
+	expect(released?.sequence).toBe(2);
+	expect(await released?.readString()).toBe("frame-2");
+
+	// Drained and closed: now it's finished.
+	expect(await track.nextGroup()).toBeUndefined();
+});
+
+// The final boundary counts datagrams: they share the group sequence namespace, and a
+// Rust peer feeds SUBSCRIBE_END into finish_at, so a boundary that ignored a trailing
+// datagram would finalize the track before it arrives.
+test("final reports one past the highest produced sequence, datagrams included", async () => {
+	const producer = new TrackProducer("test");
+	const track = producer.subscribe();
+	expect(track.final()).toBeUndefined();
+
+	producer.writeGroup(new GroupProducer(0));
+	producer.appendDatagram(Timestamp.fromMillis(1), enc.encode("x"));
+	producer.close();
+	expect(track.final()).toBe(2);
+});
+
+// 0 is the only encoding for "nothing produced"; an abort declares no boundary at all.
+test("final is 0 for an empty track and undefined after an abort", async () => {
+	const empty = new TrackProducer("test");
+	const emptyTrack = empty.subscribe();
+	empty.close();
+	expect(emptyTrack.final()).toBe(0);
+
+	const aborted = new TrackProducer("test");
+	const abortedTrack = aborted.subscribe();
+	aborted.close(new Error("boom"));
+	expect(abortedTrack.final()).toBeUndefined();
+});
+
 test("readFrame does not livelock when a sole group finishes before the next arrives", async () => {
 	const producer = new TrackProducer("test");
 	const track = producer.subscribe();

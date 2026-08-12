@@ -487,11 +487,27 @@ export class Publisher {
 		// first group is known, SUBSCRIBE_END when the track finishes.
 		const emitRange = supportsTrackStream(this.version);
 		let startSent = false;
+		let endSent = false;
 
-		// The exclusive end of the delivered range. recvGroup is arrival-ordered rather than
-		// sequence-ordered, so this tracks the max and not the last group seen. 0 is already
-		// the encoding for a track that produced no groups.
-		let end = 0;
+		// The track's exclusive final boundary. A Rust subscriber feeds SUBSCRIBE_END
+		// straight into finish_at, so it must name the track's boundary (which counts
+		// datagram sequences too), not the delivered range: a subscription cap can hold
+		// produced groups back. The latest() fallback covers a subscription torn down
+		// before the producer declared it.
+		const boundary = () => track.final() ?? (track.latest() ?? -1) + 1;
+
+		// Settles once the producer closes cleanly, so SUBSCRIBE_END can go out while
+		// groups parked above the subscription's cap stay servable (a SUBSCRIBE_UPDATE
+		// can still raise it; see the Rust publisher's Recv::Boundary). Rejects on abort,
+		// which the catch below turns into a reset.
+		const doneSentinel = Symbol("done");
+		const done = (async (): Promise<typeof doneSentinel> => {
+			const closed = await track.closed;
+			if (closed instanceof Error) throw closed;
+			return doneSentinel;
+		})();
+		// The loop can exit on the peer's FIN before an abort settles this; keep it quiet.
+		void done.catch(() => {});
 
 		// One ranking for the whole subscription, shared by every group it serves.
 		const priority = new Priority(track);
@@ -512,14 +528,27 @@ export class Publisher {
 			() => unsubscribe(),
 		);
 
+		// One read cursor across iterations: a boundary emission must not spawn a
+		// second concurrent nextGroup against the same subscriber. Declared outside the
+		// try so the finally can observe whatever was in flight when the loop exited
+		// (closing a late group, swallowing the rejection from our own teardown abort).
+		let next = track.nextGroup();
 		try {
 			for (;;) {
-				const next = track.nextGroup();
-				const group = await Promise.race([next, stream.closed]);
-				if (!group) {
-					next.then((group) => group?.close()).catch(() => {});
-					break;
+				const result = await Promise.race(endSent ? [next, stream.closed] : [next, stream.closed, done]);
+				if (result === doneSentinel) {
+					// The producer finished: declare the boundary now and keep serving
+					// whatever a later cap raise releases, until the peer FINs.
+					endSent = true;
+					if (emitRange) {
+						await encodeSubscribeResponse(stream, { end: new SubscribeEnd(boundary()) }, this.version);
+					}
+					continue;
 				}
+
+				const group = result;
+				if (!group) break;
+				next = track.nextGroup();
 
 				const range = frameRange(bounds, group.sequence);
 				if (!range) {
@@ -534,7 +563,6 @@ export class Publisher {
 					startSent = true;
 					await encodeSubscribeResponse(stream, { start: new SubscribeStart(group.sequence) }, this.version);
 				}
-				end = Math.max(end, group.sequence + 1);
 
 				void this.#runGroup({
 					sub,
@@ -545,11 +573,10 @@ export class Publisher {
 					start: range.start,
 					end: range.end,
 				});
-				if (bounds.endGroup !== undefined && group.sequence >= bounds.endGroup) break;
 			}
 
-			if (emitRange) {
-				await encodeSubscribeResponse(stream, { end: new SubscribeEnd(end) }, this.version);
+			if (emitRange && !endSent) {
+				await encodeSubscribeResponse(stream, { end: new SubscribeEnd(boundary()) }, this.version);
 			}
 
 			console.debug(`publish close: broadcast=${broadcast} track=${track.name}`);
@@ -563,6 +590,7 @@ export class Publisher {
 			track.close(e);
 			stream.reset(e);
 		} finally {
+			next.then((group) => group?.close()).catch(() => {});
 			priority.close();
 		}
 	}
