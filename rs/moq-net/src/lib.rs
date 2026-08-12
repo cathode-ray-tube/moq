@@ -84,6 +84,7 @@ mod latency;
 mod lite;
 mod model;
 mod path;
+mod poll_set;
 mod server;
 mod session;
 mod setup;
@@ -91,6 +92,7 @@ mod util;
 mod version;
 
 pub mod stats;
+pub mod transport;
 
 pub use client::*;
 pub use coding::{BoundsExceeded, DecodeError, EncodeError, VarInt};
