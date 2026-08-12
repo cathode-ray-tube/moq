@@ -8,6 +8,15 @@ use crate::{Error, QuicBackend};
 use moq_net::Session;
 use url::Url;
 
+// Only the transports that finish their handshake in a spawned future need `.boxed()`;
+// the stream listeners hand back an already-built `Request`.
+#[cfg(any(
+	feature = "noq",
+	feature = "quinn",
+	feature = "quiche",
+	feature = "iroh",
+	feature = "websocket"
+))]
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
@@ -110,6 +119,7 @@ impl ServerConfig {
 }
 
 /// Default bind address used when [`ServerConfig::bind`] is not set.
+#[cfg(any(feature = "noq", feature = "quinn", feature = "quiche"))]
 pub(crate) const DEFAULT_BIND: &str = "[::]:443";
 
 /// Server for accepting MoQ connections.
@@ -141,6 +151,9 @@ impl Server {
 	/// The stream (`tcp`/`unix`) listeners need a runtime, so they wait for
 	/// [`listen`](Self::listen).
 	pub fn new(config: ServerConfig) -> crate::Result<Self> {
+		// `default_quic_backend` panics when no backend is compiled, so a WebSocket- or
+		// stream-only build must not ask it.
+		#[cfg(any(feature = "noq", feature = "quinn", feature = "quiche"))]
 		let backend = config.backend.clone().unwrap_or_else(crate::default_quic_backend);
 
 		let versions = config.versions();
@@ -151,8 +164,17 @@ impl Server {
 		config.quic.validate()?;
 
 		let build_quic = config.bind.is_some() || !config.has_stream_listener();
+		#[cfg(not(any(feature = "noq", feature = "quinn", feature = "quiche")))]
+		if config.bind.is_some() {
+			return Err(Error::NoBackend(
+				"--server-bind requires a noq, quinn, or quiche backend feature",
+			));
+		}
 
 		if build_quic && !config.tls.root.is_empty() {
+			// Only a QUIC backend validates client certificates; the qmux listeners
+			// (tcp/unix/websocket) carry no TLS of their own.
+			#[cfg(any(feature = "noq", feature = "quinn", feature = "quiche"))]
 			let mtls_supported = match backend {
 				#[cfg(feature = "quinn")]
 				QuicBackend::Quinn => true,
@@ -163,6 +185,9 @@ impl Server {
 				#[allow(unreachable_patterns)]
 				_ => false,
 			};
+			#[cfg(not(any(feature = "noq", feature = "quinn", feature = "quiche")))]
+			let mtls_supported = false;
+
 			if !mtls_supported {
 				return Err(Error::MtlsUnsupported);
 			}
@@ -331,6 +356,7 @@ impl Server {
 		feature = "quinn",
 		feature = "quiche",
 		feature = "iroh",
+		feature = "websocket",
 		feature = "tcp",
 		all(feature = "uds", unix)
 	)))]
@@ -338,7 +364,7 @@ impl Server {
 	///
 	/// Panics: no transport feature is compiled in, so nothing can be accepted.
 	async fn accept_next(&mut self) -> Option<Request> {
-		unreachable!("no transport compiled; enable a QUIC backend, tcp, or uds feature");
+		unreachable!("no transport compiled; enable a QUIC backend, websocket, tcp, or uds feature");
 	}
 
 	/// The accept-loop health of every listener this server owns that performs a real
@@ -393,6 +419,7 @@ impl Server {
 		feature = "quinn",
 		feature = "quiche",
 		feature = "iroh",
+		feature = "websocket",
 		feature = "tcp",
 		all(feature = "uds", unix)
 	))]
@@ -448,7 +475,7 @@ impl Server {
 			#[cfg(feature = "websocket")]
 			let ws_accept = async {
 				match ws_ref {
-					Some(ws) => ws.accept().await,
+					Some(ws) => ws.accept_with_url().await,
 					None => std::future::pending().await,
 				}
 			};
@@ -517,12 +544,12 @@ impl Server {
 				Some(_res) = ws_accept => {
 					#[cfg(feature = "websocket")]
 					match _res {
-						Ok(session) => {
+						Ok((session, url)) => {
 							// Read the SETUP off the qmux session before handing it over, so a
 							// slow peer doesn't stall the accept loop (spawned like the others).
 							self.accept.push(async move {
 								let request = server.accept_request(session).await?;
-								Ok(Request { transport: Transport::WebSocket, url: None, identity: None, kind: RequestKind::Qmux(Box::new(request)) })
+								Ok(Request { transport: Transport::WebSocket, url: Some(url), identity: None, kind: RequestKind::Qmux(Box::new(request)) })
 							}.boxed());
 						}
 						// One connection's upgrade, not the listener's: a failed
@@ -737,8 +764,8 @@ impl StreamBind {
 ///
 /// Bound by [`Server::listen`] (they need a runtime), after which each runs an
 /// accept loop in its own task and feeds completed [`Request`]s back over a channel.
-/// The tasks own their listeners and are aborted when the [`Listener`] (and thus
-/// this) is dropped, so bound sockets don't linger.
+/// The tasks own their listeners and are stopped when the [`Listener`] closes or
+/// drops, so bound sockets don't linger.
 #[cfg(any(feature = "tcp", all(feature = "uds", unix)))]
 struct StreamListeners {
 	binds: Vec<StreamBind>,
@@ -843,8 +870,9 @@ impl StreamListeners {
 		}
 	}
 
-	/// Stop every accept task and wait until it has released its listener.
+	/// Stop every accept loop and wait until its listener has released the socket.
 	async fn shutdown(&mut self) {
+		self.binds.clear();
 		self.rx = None;
 		for task in self.tasks.drain(..) {
 			task.abort();
@@ -999,7 +1027,7 @@ impl std::fmt::Display for Transport {
 /// session, or [Self::close] to reject it (which closes the just-established session).
 pub struct Request {
 	transport: Transport,
-	/// The dial URL, for transports that carry one (QUIC/WebTransport). `None` for the
+	/// The request URL, for transports that carry one (QUIC/WebTransport/WebSocket). `None` for the
 	/// URL-less stream bindings, whose request path rides the SETUP instead.
 	url: Option<Url>,
 	/// The peer's validated mTLS identity, captured at the transport handshake (before
@@ -1137,7 +1165,7 @@ impl Request {
 		self.transport
 	}
 
-	/// Returns the URL the client dialed, for transports that carry one (QUIC/WebTransport).
+	/// Returns the request URL for transports that carry one (QUIC/WebTransport/WebSocket).
 	///
 	/// `None` for the URL-less stream bindings (`tcp`/`unix`); use [`Self::path`] for their
 	/// in-band request path.
@@ -1148,17 +1176,31 @@ impl Request {
 	/// The request path the client advertised, uniform across transports.
 	///
 	/// Taken from the SETUP for the URL-less stream bindings (and moq-transport, which
-	/// carries it in-band), and from the dial [`url`](Self::url) for WebTransport/QUIC.
-	/// Empty only when neither carries one.
+	/// carries it in-band), or the request [`url`](Self::url) for
+	/// WebTransport/QUIC/WebSocket.
+	/// The missing or root path is returned as an empty string.
 	pub fn path(&self) -> &str {
 		// An empty SETUP path means the client advertised none, so fall back to the
-		// dial URL. URI-carrying bindings are the ones that must not send a path at
+		// request URL. URL-carrying bindings are the ones that must not send a path at
 		// all, so this never discards a path the client meant us to use.
 		let setup = request_ref!(self, r => r.path());
-		if setup.is_empty() {
+		let path = if setup.is_empty() {
 			self.url.as_ref().map(Url::path).unwrap_or("")
 		} else {
-			setup
+			setup.split_once('?').map_or(setup, |(path, _)| path)
+		};
+		if path == "/" { "" } else { path }
+	}
+
+	/// The encoded request query without the leading `?`, if one was advertised.
+	///
+	/// Query values can contain credentials. Avoid logging this value.
+	pub fn query(&self) -> Option<&str> {
+		let setup = request_ref!(self, r => r.path());
+		if setup.is_empty() {
+			self.url.as_ref().and_then(Url::query)
+		} else {
+			setup.split_once('?').map(|(_, query)| query)
 		}
 	}
 
@@ -1374,6 +1416,40 @@ mod tests {
 		drop(session);
 		serve.abort();
 		let _ = std::fs::remove_file(&path);
+	}
+
+	/// Closing a listener must release its TCP socket before returning. Reusing it
+	/// afterwards is unrepresentable: `listen` consumes the `Server` and `close`
+	/// consumes the `Listener`.
+	#[cfg(feature = "tcp")]
+	#[tokio::test]
+	async fn close_releases_stream_listener_socket() {
+		let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = probe.local_addr().unwrap();
+		drop(probe);
+
+		let mut config = ServerConfig::default();
+		config.tcp.bind = Some(addr);
+		let server = Server::new(config).expect("stream-only server");
+		let listener = server.listen().await.expect("listen");
+		assert!(tokio::net::TcpListener::bind(addr).await.is_err(), "listener is bound");
+
+		listener.close().await;
+		let _rebound = tokio::net::TcpListener::bind(addr)
+			.await
+			.expect("close must release the listener socket");
+	}
+
+	/// An explicit QUIC bind cannot be honored without a QUIC backend.
+	#[cfg(not(any(feature = "noq", feature = "quinn", feature = "quiche")))]
+	#[test]
+	fn quic_bind_without_a_quic_backend_is_rejected() {
+		let config = ServerConfig {
+			bind: Some("127.0.0.1:0".to_string()),
+			..Default::default()
+		};
+
+		assert!(matches!(Server::new(config), Err(Error::NoBackend(_))));
 	}
 
 	/// A QUIC-only server reports nothing. It multiplexes over one UDP socket and

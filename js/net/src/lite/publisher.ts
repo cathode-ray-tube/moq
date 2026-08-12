@@ -528,11 +528,16 @@ export class Publisher {
 			() => unsubscribe(),
 		);
 
+		// Exactly-once serving, not the sequence cursor: on a relay, a burst can be
+		// ingested micro-reordered by the upstream leg, and a sequence cursor would
+		// permanently skip the older group even though it is cached and in demand.
+		// Staleness is the latency window's job (cache expiry), not arrival order's.
+		//
 		// One read cursor across iterations: a boundary emission must not spawn a
-		// second concurrent nextGroup against the same subscriber. Declared outside the
+		// second concurrent recvGroup against the same subscriber. Declared outside the
 		// try so the finally can observe whatever was in flight when the loop exited
 		// (closing a late group, swallowing the rejection from our own teardown abort).
-		let next = track.nextGroup();
+		let next = track.recvGroup();
 		try {
 			for (;;) {
 				const result = await Promise.race(endSent ? [next, stream.closed] : [next, stream.closed, done]);
@@ -548,7 +553,7 @@ export class Publisher {
 
 				const group = result;
 				if (!group) break;
-				next = track.nextGroup();
+				next = track.recvGroup();
 
 				const range = frameRange(bounds, group.sequence);
 				if (!range) {
@@ -561,6 +566,10 @@ export class Publisher {
 
 				if (emitRange && !startSent) {
 					startSent = true;
+					// SUBSCRIBE_START promises nothing below this sequence will be delivered.
+					// Arrival-order serving could later surface a straggler below the first
+					// group, so pin the floor to what was announced.
+					track.startAt(group.sequence);
 					await encodeSubscribeResponse(stream, { start: new SubscribeStart(group.sequence) }, this.version);
 				}
 

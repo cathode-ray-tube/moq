@@ -50,6 +50,25 @@ while True:
 
 `Session.closed()` resolves only when the connection stops for good: it raises the terminal error when the retries are exhausted, and returns normally after a local shutdown.
 
+Inspect a server request's logical endpoint before accepting it with the query-free `request.path`. It is consistent across transports and returns `""` for the root or missing path. `request.query` returns the encoded query and may contain credentials:
+
+```python
+import asyncio
+
+active = set()
+async with moq.Server("127.0.0.1:4443", tls_generate=["localhost"]) as server:
+    async for request in server:
+        if request.path == "/admin":
+            await request.reject(403)
+            continue
+        session = await request.accept()
+        closed = asyncio.create_task(session.closed())
+        active.add(closed)
+        closed.add_done_callback(active.discard)
+
+await asyncio.gather(*active, return_exceptions=True)
+```
+
 A server can reject the connection on auth grounds: `moq.Error.Unauthorized` (HTTP 401) or `moq.Error.Forbidden` (HTTP 403). These are terminal, so handle them separately from a transient transport failure rather than reconnecting. `moq.is_auth(err)` catches both:
 
 ```python

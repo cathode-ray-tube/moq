@@ -806,6 +806,18 @@ impl Consumer {
 		self
 	}
 
+	/// Whether the group has been aborted (including pool eviction); the abort
+	/// dropped the cached frames, so a held consumer has nothing left to read.
+	///
+	/// A spliced group spans several routes, so no single abort empties it; only a
+	/// plain cursor can answer.
+	pub(crate) fn is_aborted(&self) -> bool {
+		match &self.inner {
+			ConsumerKind::Plain(plain) => plain.state.read().abort.is_some(),
+			ConsumerKind::Spliced(_) => false,
+		}
+	}
+
 	/// The parent track's timescale.
 	pub fn timescale(&self) -> Timescale {
 		self.track.timescale

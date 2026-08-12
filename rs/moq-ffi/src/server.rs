@@ -177,6 +177,8 @@ pub struct MoqRequest {
 	task: Task<RequestState>,
 	transport: String,
 	url: Option<String>,
+	path: String,
+	query: Option<String>,
 }
 
 impl MoqRequest {
@@ -187,6 +189,8 @@ impl MoqRequest {
 	) -> Arc<Self> {
 		let transport = request.transport().to_string();
 		let url = request.url().map(|u| u.to_string());
+		let path = request.path().to_string();
+		let query = request.query().map(str::to_string);
 		Arc::new(Self {
 			task: Task::new(RequestState {
 				request: Some(request),
@@ -195,6 +199,8 @@ impl MoqRequest {
 			}),
 			transport,
 			url,
+			path,
+			query,
 		})
 	}
 }
@@ -204,6 +210,16 @@ impl MoqRequest {
 	/// The URL provided by the client, if any.
 	pub fn url(&self) -> Option<String> {
 		self.url.clone()
+	}
+
+	/// The query-free request path, or empty for the root/missing path.
+	pub fn path(&self) -> String {
+		self.path.clone()
+	}
+
+	/// The encoded request query without the leading `?`, if present.
+	pub fn query(&self) -> Option<String> {
+		self.query.clone()
 	}
 
 	/// The transport type, e.g. `"quic"`, `"iroh"`, or `"websocket"`.
