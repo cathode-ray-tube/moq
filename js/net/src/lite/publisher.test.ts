@@ -355,19 +355,82 @@ test("lite draft-05: the fetch response ranks the publisher's own writes", async
 	}
 });
 
+// How long a served-subscription test waits for the next group stream before calling the
+// publisher idle. Nothing waits this out: it only bounds the read when a group never comes.
+const IDLE_MS = 500;
+
+// One macrotask turn, which drains every microtask queued behind it. Signal notifications
+// are coalesced per microtask, so this is what lets a just-written group reach the serving
+// loop's armed `recvGroup` without a test guessing at a delay.
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+// Wraps a writable so its writes park until `release()`, giving a test a window inside
+// whatever the publisher is writing while its other loops keep running. `parked` settles on
+// the first write attempt, held or not.
+function gateWrites(target: WritableStream<Uint8Array>, hold: boolean) {
+	const writer = target.getWriter();
+
+	let release!: () => void;
+	const released = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	if (!hold) release();
+
+	let parking!: () => void;
+	const parked = new Promise<void>((resolve) => {
+		parking = resolve;
+	});
+
+	const writable = new WritableStream<Uint8Array>({
+		async write(chunk) {
+			parking();
+			await released;
+			await writer.write(chunk);
+		},
+		close: () => writer.close(),
+		abort: (err) => writer.abort(err),
+	});
+
+	return { writable, parked, release };
+}
+
 // Opens a served subscription and returns the machinery to write groups and observe
 // which of them the publisher put on the wire (each group gets its own uni stream).
-async function servedSubscription(options: { startGroup?: number } = {}) {
-	const pair = createMockTransportPair(ALPN_05);
-	const publisher = new Publisher(pair.server, Version.DRAFT_05, randomOrigin());
+//
+// `gated` holds the publisher's subscribe-stream writes until `release()`, parking the
+// serving loop mid-iteration so a test can drive the concurrent SUBSCRIBE_UPDATE loop
+// against a group the loop is already holding.
+async function servedSubscription(
+	options: {
+		startGroup?: number;
+		endGroup?: number;
+		endFrame?: number;
+		gated?: boolean;
+		// Frame payloads written into every served group. Frame bounds need draft-06.
+		frames?: string[];
+		version?: Version;
+	} = {},
+) {
+	const version = options.version ?? Version.DRAFT_05;
+	const frames = options.frames ?? ["hello"];
+	const pair = createMockTransportPair(version === Version.DRAFT_06 ? ALPN_06_WIP : ALPN_05);
+	const publisher = new Publisher(pair.server, version, randomOrigin());
 
 	const broadcast = new BroadcastProducer();
 	const track = broadcast.createTrack("video");
 	publisher.publish(Path.from("test"), broadcast);
 
 	const client = await Stream.open(pair.client);
-	const server = await Stream.accept(pair.server);
-	if (!server) throw new Error("publisher never accepted the subscribe stream");
+
+	// Accept by hand rather than via Stream.accept, so the gate sits between the publisher
+	// and the wire.
+	const incoming = pair.server.incomingBidirectionalStreams.getReader();
+	const accepted = await incoming.read();
+	incoming.releaseLock();
+	if (accepted.done) throw new Error("publisher never accepted the subscribe stream");
+
+	const gate = gateWrites(accepted.value.writable, options.gated ?? false);
+	const server = new Stream({ readable: accepted.value.readable, writable: gate.writable });
 
 	const msg = new Subscribe({
 		id: 0n,
@@ -375,6 +438,8 @@ async function servedSubscription(options: { startGroup?: number } = {}) {
 		track: "video",
 		priority: 0,
 		startGroup: options.startGroup,
+		endGroup: options.endGroup,
+		endFrame: options.endFrame,
 	});
 	void publisher.runSubscribe(msg, server);
 
@@ -382,22 +447,46 @@ async function servedSubscription(options: { startGroup?: number } = {}) {
 
 	return {
 		client,
+		track,
+		parked: gate.parked,
+		release: gate.release,
 		serve(sequence: number) {
 			const group = new GroupProducer(sequence);
-			group.writeString("hello");
+			for (const frame of frames) group.writeString(frame);
 			group.close();
 			track.writeGroup(group);
 		},
-		// The sequence of the next group stream the publisher opened.
-		async servedSequence() {
-			const next = await opened.read();
-			if (next.done) throw new Error("publisher never opened the group stream");
+		// The next group stream the publisher opened, drained, or undefined once it has gone
+		// idle. A group the publisher dropped then fails an assertion instead of hanging the
+		// test on a stream that will never arrive.
+		async servedGroup(): Promise<Served | undefined> {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const idle = new Promise<undefined>((resolve) => {
+				timer = setTimeout(() => resolve(undefined), IDLE_MS);
+			});
+			const next = await Promise.race([opened.read(), idle]);
+			clearTimeout(timer);
+			if (!next || next.done) return undefined;
+
 			const reader = new Reader(next.value);
 			await reader.u53(); // stream type
-			return (await GroupMessage.decode(reader, Version.DRAFT_05)).sequence;
+			const header = await GroupMessage.decode(reader, version);
+
+			const payloads: string[] = [];
+			while (!(await reader.done())) {
+				// Each frame is a zigzag timestamp delta, then a length-prefixed payload.
+				await reader.u62();
+				payloads.push(new TextDecoder().decode(await reader.read(await reader.u53())));
+			}
+			return { sequence: header.sequence, frameStart: header.frameStart, payloads };
 		},
-		close() {
-			opened.releaseLock();
+		// The sequence alone, for tests that only care which groups reached the wire.
+		async servedSequence(): Promise<number | undefined> {
+			return (await this.servedGroup())?.sequence;
+		},
+		async close() {
+			// Settles any pending read as well as dropping the stream.
+			await opened.cancel();
 			publisher.close();
 			client.close();
 		},
@@ -420,7 +509,7 @@ test("lite draft-05: a late-arriving older group is still served", async () => {
 		sub.serve(2);
 		expect(await sub.servedSequence()).toBe(2);
 	} finally {
-		sub.close();
+		await sub.close();
 	}
 });
 
@@ -444,7 +533,104 @@ test("lite draft-05: a straggler below the announced start group is not served",
 		sub.serve(3);
 		expect(await sub.servedSequence()).toBe(3);
 	} finally {
-		sub.close();
+		await sub.close();
+	}
+});
+
+// The serving loop prefetches the next group the moment it takes one, so a SUBSCRIBE_UPDATE
+// can lower the cap while a group is already in hand. Dropping it there would be permanent:
+// the group has left the buffer, so raising the cap again could never bring it back. The cap
+// gates what the read cursor hands out, and a group already handed out stays served.
+test("lite draft-05: a group taken before the cap dropped is still served", async () => {
+	const sub = await servedSubscription({ startGroup: 0, gated: true });
+	try {
+		// Group 0 parks the loop inside its SUBSCRIBE_START write, prefetch already armed.
+		sub.serve(0);
+		await sub.parked;
+
+		// So group 1 leaves the buffer here; only the parked loop still holds it.
+		sub.serve(1);
+		await flush();
+
+		// Cap the subscription at group 0, behind the loop's back.
+		await new SubscribeUpdate({ priority: 0, endGroup: 0 }).encode(sub.client.writer, Version.DRAFT_05);
+		while (sub.track.subscription.peek()?.endGroup !== 0) await sub.track.subscription.changed();
+
+		sub.release();
+
+		// Both reach the wire under a cap of 0, because group 1 was taken while it was still
+		// in range. Nothing raises the cap to rescue it, so the assertion stays sensitive to
+		// the window under test: had the prefetch not taken group 1, the cap would hold it in
+		// the buffer and the second read would go idle instead.
+		expect(await sub.servedSequence()).toBe(0);
+		expect(await sub.servedSequence()).toBe(1);
+	} finally {
+		await sub.close();
+	}
+});
+
+// The other end of the subscription is not symmetric. Raising the start floor is destructive
+// by design, since the read cursor shifts and closes every buffered group below it, so a group
+// already in hand has to go the same way: serving it would re-deliver below a floor the
+// subscriber just moved, which on a route splice is duplicate media.
+test("lite draft-05: a group taken before the floor rose is dropped", async () => {
+	const sub = await servedSubscription({ startGroup: 0, gated: true });
+	try {
+		// Same window as the cap test: group 0 parks the loop, so the prefetch takes group 1.
+		sub.serve(0);
+		await sub.parked;
+		sub.serve(1);
+		await flush();
+
+		// Skip ahead past group 1, which the loop is already holding.
+		await new SubscribeUpdate({ priority: 0, startGroup: 2 }).encode(sub.client.writer, Version.DRAFT_05);
+		while (sub.track.subscription.peek()?.startGroup !== 2) await sub.track.subscription.changed();
+
+		// Buffered while the loop is still parked, so it is taken under the raised floor.
+		sub.serve(2);
+		sub.release();
+
+		// Group 0 was already decided and stays in flight; group 1 must not follow it.
+		expect(await sub.servedSequence()).toBe(0);
+		expect(await sub.servedSequence()).toBe(2);
+	} finally {
+		await sub.close();
+	}
+});
+
+// Frame bounds have to travel with the group they were taken under. An update that moves the
+// cap off a group already in hand leaves it matching neither boundary, and mapping that to
+// the whole group would put frames the subscription excluded on the wire. Nothing downstream
+// trims them: a frame range is a wire request, not a receiver-side cursor.
+test("lite draft-06: a prefetched group keeps the frame bounds it was taken under", async () => {
+	const sub = await servedSubscription({
+		version: Version.DRAFT_06,
+		startGroup: 0,
+		endGroup: 1,
+		endFrame: 1,
+		frames: ["a", "b", "c"],
+		gated: true,
+	});
+	try {
+		// Same window as above: group 0 parks the loop, so the armed prefetch takes group 1.
+		sub.serve(0);
+		await sub.parked;
+		sub.serve(1);
+		await flush();
+
+		// Move the cap off group 1, which the loop is already holding.
+		await new SubscribeUpdate({ priority: 0, endGroup: 0 }).encode(sub.client.writer, Version.DRAFT_06);
+		while (sub.track.subscription.peek()?.endGroup !== 0) await sub.track.subscription.changed();
+
+		sub.release();
+
+		// Group 0 was never the end group, so it goes whole either way.
+		expect(await sub.servedGroup()).toEqual({ sequence: 0, frameStart: 0, payloads: ["a", "b", "c"] });
+		// Group 1 was taken while it was the end group, capped at frame 1, so "c" stays off
+		// the wire even though the cap has since moved below it.
+		expect(await sub.servedGroup()).toEqual({ sequence: 1, frameStart: 0, payloads: ["a", "b"] });
+	} finally {
+		await sub.close();
 	}
 });
 

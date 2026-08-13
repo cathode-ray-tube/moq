@@ -75,26 +75,37 @@ function supportsTrackStream(version: Version): boolean {
 /**
  * The frame bounds a subscription placed on its start and end group, as they stand
  * after any SUBSCRIBE_UPDATE.
+ *
+ * Only the two named groups are qualified; the group range itself lives on the
+ * subscriber's read cursor (see {@link frameRange}).
  */
 type FrameBounds = {
+	/** The group {@link startFrame} qualifies, if the subscription named one. */
 	startGroup?: number;
+	/** First frame to send within {@link startGroup}; every other group starts at 0. */
 	startFrame: number;
+	/** The group {@link endFrame} qualifies, if the subscription named one. */
 	endGroup?: number;
+	/** Last frame (inclusive) to send within {@link endGroup}; every other group runs to its end. */
 	endFrame?: number;
 };
 
 /**
- * The frames of `sequence` a subscription asked for, as a start index and an inclusive
- * end, or `undefined` when the group falls outside the subscription entirely.
+ * The frames of `sequence` a subscription asked for, as a start index and an inclusive end.
  *
- * The frame bounds qualify the start and end group only; every group between them is
- * served whole. A group outside `[startGroup, endGroup]` was never asked for, and
- * serving it would also let SUBSCRIBE_START report a group below the requested start.
+ * The frame bounds qualify the start and end group only; every other group is served whole.
+ * Which groups are served at all is the subscriber's read cursor (`startAt` / `endAt`),
+ * applied when a group is popped rather than re-checked here: the serving loop prefetches,
+ * so a group in hand has already left the buffer and rejecting it against a cap lowered in
+ * the meantime would drop it for good, even if a later SUBSCRIBE_UPDATE raises the cap again.
+ *
+ * Call this against the bounds the group was taken under, which is why the serving loop
+ * snapshots it at the cursor handoff. Reading moved bounds here would map a group that now
+ * matches neither boundary to the whole group and send frames the request excluded. Nothing
+ * downstream trims those: a subscription's frame range is a wire request, deliberately
+ * decoupled from the receiver's local read cursor (see `moq_net::Subscription::end`).
  */
-function frameRange(bounds: FrameBounds, sequence: number): { start: number; end?: number } | undefined {
-	if (bounds.startGroup !== undefined && sequence < bounds.startGroup) return;
-	if (bounds.endGroup !== undefined && sequence > bounds.endGroup) return;
-
+function frameRange(bounds: FrameBounds, sequence: number): { start: number; end?: number } {
 	return {
 		start: bounds.startGroup === sequence ? bounds.startFrame : 0,
 		end: bounds.endGroup === sequence ? bounds.endFrame : undefined,
@@ -537,7 +548,22 @@ export class Publisher {
 		// second concurrent recvGroup against the same subscriber. Declared outside the
 		// try so the finally can observe whatever was in flight when the loop exited
 		// (closing a late group, swallowing the rejection from our own teardown abort).
-		let next = track.recvGroup();
+		//
+		// Snapshot the frame bounds as the cursor hands the group over, rather than reading
+		// them in the loop body, which can sit parked in a control-stream write long after the
+		// group left the buffer. Reading `bounds` there serves the group under a range it was
+		// never taken under.
+		//
+		// That narrows the window to the microtask between `recvGroup` removing the group and
+		// this callback, but does not close it: a SUBSCRIBE_UPDATE whose bytes are already
+		// buffered decodes without another transport read, so its continuation can still land
+		// in between. Closing it means handing the bounds back with the group, or the two
+		// loops not sharing mutable state at all.
+		const take = () =>
+			track
+				.recvGroup()
+				.then((group) => (group ? { group, range: frameRange(bounds, group.sequence) } : undefined));
+		let next = take();
 		try {
 			for (;;) {
 				const result = await Promise.race(endSent ? [next, stream.closed] : [next, stream.closed, done]);
@@ -551,15 +577,22 @@ export class Publisher {
 					continue;
 				}
 
-				const group = result;
-				if (!group) break;
-				next = track.recvGroup();
+				if (!result) break;
+				const { group, range } = result;
+				next = take();
 
-				const range = frameRange(bounds, group.sequence);
-				if (!range) {
-					// Outside the subscription's group range, so it was never asked for.
-					// Serving it would also let SUBSCRIBE_START name a group below the
-					// requested start.
+				// The floor is judged against the bounds as they stand now, deliberately unlike
+				// the frame range above, which is the snapshot this group was taken under. The
+				// two ends of a subscription are not symmetric: raising the floor is destructive
+				// (the read cursor shifts and closes every buffered group below it), so dropping
+				// one already in hand discards nothing the subscriber has not discarded itself,
+				// while serving it would re-deliver below a floor they just moved. Lowering the
+				// cap only parks its groups, which is why the cap must not reject here.
+				//
+				// Whole groups only. A floor raised to a frame *within* a group already in hand
+				// still serves it from the snapshotted start frame, since the group clears this
+				// check and carries its own range.
+				if (bounds.startGroup !== undefined && group.sequence < bounds.startGroup) {
 					group.close();
 					continue;
 				}
@@ -599,7 +632,7 @@ export class Publisher {
 			track.close(e);
 			stream.reset(e);
 		} finally {
-			next.then((group) => group?.close()).catch(() => {});
+			next.then((taken) => taken?.group.close()).catch(() => {});
 			priority.close();
 		}
 	}
