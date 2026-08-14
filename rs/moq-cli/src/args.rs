@@ -4,7 +4,7 @@
 //! `<import|export> <endpoint> [endpoint opts]`, plus `moq <MoQ side> play` for
 //! native playback.
 //!
-//! - The MoQ side (`--client-connect`, `--server-bind`, `--cluster-lan`; all
+//! - The MoQ side (`--connect`, `--listen`, `--cluster-lan`; all
 //!   optional, at least one) attaches the shared Origin to the MoQ network, and
 //!   comes before the first stage. They compose: dial a relay, accept incoming
 //!   sessions, and mesh with the LAN all at once.
@@ -61,7 +61,7 @@ pub struct Cli {
 }
 
 // `no_binary_name` because the chunk after a `--` starts at the verb, and the
-// globals are deliberately absent: `--client-connect` past the first stage would
+// globals are deliberately absent: `--connect` past the first stage would
 // read like it scopes that stage, when there is only ever one connection. As with
 // [`Cli`], the doc comment stays one line because clap shows it in `--help`.
 /// A stage after the first: the verb and endpoint, without the globals.
@@ -164,10 +164,10 @@ impl Invocation {
 			.iter()
 			.any(|stage| matches!(stage, Command::Import(import) if import.source.uses_bandwidth()));
 		anyhow::ensure!(
-			self.moq.client.connect.is_none() || !adaptive || imports == 1,
+			self.moq.client.url.is_none() || !adaptive || imports == 1,
 			"a stage that encodes to fit the connection's bandwidth estimate assumes it's the only \
 			 publisher on that connection, but this runs {imports} import stages; run them as separate \
-			 processes, or publish over --server-bind, which has no estimate"
+			 processes, or publish over --listen, which has no estimate"
 		);
 
 		Ok(())
@@ -183,11 +183,11 @@ impl Invocation {
 #[derive(Args, Clone)]
 #[cfg_attr(
 	feature = "cluster-lan",
-	command(group = ArgGroup::new("moq").multiple(true).args(["client-connect", "server-bind", "cluster-lan"]))
+	command(group = ArgGroup::new("moq").multiple(true).args(["connect", "listen", "cluster-lan"]))
 )]
 #[cfg_attr(
 	not(feature = "cluster-lan"),
-	command(group = ArgGroup::new("moq").multiple(true).args(["client-connect", "server-bind"]))
+	command(group = ArgGroup::new("moq").multiple(true).args(["connect", "listen"]))
 )]
 pub struct MoqSide {
 	/// The default broadcast name for every stage that doesn't name its own.
@@ -210,13 +210,17 @@ pub struct MoqSide {
 	#[arg(long, env = "MOQ_ORIGIN", help_heading = "MoQ")]
 	pub origin: Option<u64>,
 
-	/// MoQ client config (`--client-connect`, `--client-bind`, `--client-tls-*`, ...).
+	/// MoQ client config (`--connect`, `--connect-bind`, `--connect-tls-*`, ...).
 	#[command(flatten)]
-	pub client: moq_native::ClientConfig,
+	pub client: moq_native::connect::Config,
 
-	/// MoQ server transport config (`--server-bind`, `--server-tls-*`, `--tls-*`).
+	/// QUIC transport tuning (`--quic-*`), shared by the dial and accept sides.
 	#[command(flatten)]
-	pub server: moq_native::ServerConfig,
+	pub quic: moq_native::quic::Config,
+
+	/// MoQ server transport config (`--listen`, `--listen-tls-*`).
+	#[command(flatten)]
+	pub server: moq_native::listen::Config,
 
 	/// Iroh transport config (`--iroh-*`), used by both the client and server.
 	#[cfg(feature = "iroh")]
@@ -253,10 +257,10 @@ impl MoqSide {
 	///
 	/// `--cluster-lan` needs a listener for peers to dial, so it fills in the two
 	/// things the user would otherwise have to spell out: an ephemeral port and a
-	/// generated certificate. An explicit `--server-bind` or `--tls-*` wins, which
+	/// generated certificate. An explicit `--listen` or `--listen-tls-*` wins, which
 	/// is what puts the mesh on the same port and certificate as everything else.
-	pub fn server_config(&self) -> moq_native::ServerConfig {
-		let mut config = self.server.clone();
+	pub fn server_config(&self) -> moq_native::listen::Config {
+		let mut config = self.server.resolved();
 		if self.lan() {
 			config.bind.get_or_insert_with(|| "[::]:0".to_string());
 			if config.tls.generate.is_empty() && config.tls.cert.is_empty() {
@@ -268,7 +272,7 @@ impl MoqSide {
 
 	/// Whether a listener has to be bound at all.
 	pub fn serves(&self) -> bool {
-		self.server.bind.is_some() || self.lan()
+		self.server.resolved().bind.is_some() || self.lan()
 	}
 
 	/// Reject a verb that needs the MoQ network but was given no way to reach it.
@@ -276,14 +280,14 @@ impl MoqSide {
 	/// `devices` is exempt.
 	pub fn validate(&self) -> anyhow::Result<()> {
 		anyhow::ensure!(
-			self.client.connect.is_some() || self.serves(),
-			"a MoQ side is required: pass --client-connect <url> to dial a relay, --server-bind <addr> to self-host, or --cluster-lan to mesh over the LAN"
+			self.client.resolved().url.is_some() || self.serves(),
+			"a MoQ side is required: pass --connect <url> to dial a relay, --listen <addr> to self-host, or --cluster-lan to mesh over the LAN"
 		);
 		#[cfg(feature = "cluster-lan")]
 		{
 			self.cluster.validate()?;
 			if self.lan() {
-				crate::cluster::validate_versions(&self.client, &self.server_config())?;
+				crate::cluster::validate_versions(&self.client.resolved(), &self.server_config())?;
 			}
 		}
 		Ok(())
@@ -302,9 +306,13 @@ impl MoqSide {
 		#[cfg(not(feature = "cluster-lan"))]
 		let cluster_secret = false;
 
+		// Read through the fold: a legacy `--client-connect` must be rejected here
+		// too, and it only lands in `url` once resolved.
+		let connect = self.client.resolved();
+		let listen = self.server.resolved();
 		let ignored = [
-			("--client-connect", self.client.connect.is_some()),
-			("--server-bind", self.server.bind.is_some()),
+			("--connect", connect.url.is_some()),
+			("--listen", listen.bind.is_some()),
 			("--cluster-lan", self.lan()),
 			("--cluster-lan-secret", cluster_secret),
 			("--broadcast", self.broadcast.is_some()),
@@ -575,7 +583,7 @@ mod tests {
 
 	#[test]
 	fn single_stage() {
-		let cli = Invocation::try_parse_from(["moq", "--client-connect", "http://relay", "import", "ts"]).unwrap();
+		let cli = Invocation::try_parse_from(["moq", "--connect", "http://relay", "import", "ts"]).unwrap();
 		assert_eq!(cli.stages.len(), 1);
 		assert_eq!(cli.stages[0].name(), "import");
 		assert!(cli.validate().is_ok());
@@ -586,7 +594,7 @@ mod tests {
 	fn multiple_stages() {
 		let cli = Invocation::try_parse_from([
 			"moq",
-			"--client-connect",
+			"--connect",
 			"http://localhost:4444/event",
 			"import",
 			"--broadcast",
@@ -616,7 +624,7 @@ mod tests {
 
 		// The globals are read once, from the first chunk, and shared by every stage.
 		assert_eq!(
-			cli.moq.client.connect.as_ref().map(ToString::to_string).as_deref(),
+			cli.moq.client.url.as_ref().map(ToString::to_string).as_deref(),
 			Some("http://localhost:4444/event")
 		);
 
@@ -631,7 +639,7 @@ mod tests {
 	fn broadcast_falls_back_to_the_global() {
 		let cli = Invocation::try_parse_from([
 			"moq",
-			"--client-connect",
+			"--connect",
 			"http://relay",
 			"--broadcast",
 			"room.hang",
@@ -652,7 +660,7 @@ mod tests {
 	/// An unnamed broadcast is the root one at the connection path, not an error.
 	#[test]
 	fn broadcast_defaults_to_root() {
-		let cli = Invocation::try_parse_from(["moq", "--client-connect", "http://relay", "import", "ts"]).unwrap();
+		let cli = Invocation::try_parse_from(["moq", "--connect", "http://relay", "import", "ts"]).unwrap();
 		assert_eq!(cli.stages[0].broadcast(&cli.moq), "");
 	}
 
@@ -661,7 +669,7 @@ mod tests {
 	fn rejects_unstageable_verbs() {
 		let cli = Invocation::try_parse_from([
 			"moq",
-			"--client-connect",
+			"--connect",
 			"http://relay",
 			"import",
 			"ts",
@@ -683,7 +691,7 @@ mod tests {
 	fn stage_errors_are_parse_errors() {
 		let Err(err) = Invocation::try_parse_from([
 			"moq",
-			"--client-connect",
+			"--connect",
 			"http://relay",
 			"import",
 			"ts",
@@ -702,15 +710,8 @@ mod tests {
 	/// starting with `-`. `./-name` is the documented way to write one.
 	#[test]
 	fn a_dash_prefixed_path_is_written_relative() {
-		let cli = Invocation::try_parse_from([
-			"moq",
-			"--client-connect",
-			"http://relay",
-			"import",
-			"hls",
-			"./-odd.m3u8",
-		])
-		.unwrap();
+		let cli =
+			Invocation::try_parse_from(["moq", "--connect", "http://relay", "import", "hls", "./-odd.m3u8"]).unwrap();
 
 		let Command::Import(import) = &cli.stages[0] else {
 			panic!("expected import")
@@ -726,10 +727,10 @@ mod tests {
 	#[test]
 	fn rejects_an_empty_stage() {
 		for argv in [
-			vec!["moq", "--client-connect", "http://relay", "import", "ts", "--"],
+			vec!["moq", "--connect", "http://relay", "import", "ts", "--"],
 			vec![
 				"moq",
-				"--client-connect",
+				"--connect",
 				"http://relay",
 				"import",
 				"ts",
@@ -754,12 +755,12 @@ mod tests {
 	fn stages_reject_globals() {
 		let Err(err) = Invocation::try_parse_from([
 			"moq",
-			"--client-connect",
+			"--connect",
 			"http://relay",
 			"import",
 			"ts",
 			"--",
-			"--client-connect",
+			"--connect",
 			"http://other",
 			"import",
 			"fmp4",
@@ -776,7 +777,7 @@ mod tests {
 	fn imports_without_rate_control_can_share_a_connection() {
 		let cli = Invocation::try_parse_from([
 			"moq",
-			"--client-connect",
+			"--connect",
 			"http://relay",
 			"import",
 			"--broadcast",
@@ -799,12 +800,14 @@ mod tests {
 
 	/// An encoder that follows the estimate targets most of it, so a second publisher
 	/// on the same connection spends what it already claimed. Exports only receive, and
-	/// a `--server-bind` publisher has no estimate to oversubscribe.
+	/// a `--listen` publisher has no estimate to oversubscribe.
 	#[cfg(feature = "capture")]
 	#[test]
 	fn an_adaptive_capture_must_be_the_only_import() {
-		let client: &[&str] = &["--client-connect", "http://relay"];
-		let server: &[&str] = &["--server-bind", "[::]:4443"];
+		// The canonical spellings: `validate` reads the folded fields, which the
+		// released `--client-*` aliases only reach through `resolved()`.
+		let client: &[&str] = &["--connect", "http://relay"];
+		let server: &[&str] = &["--listen", "[::]:4443"];
 
 		let cases: [(&[&str], &[&str], bool); 3] = [
 			// Two video captures follow the same estimate.
@@ -824,7 +827,7 @@ mod tests {
 		// An audio-only capture never reads the estimate, so it may share the connection.
 		let cli = Invocation::try_parse_from([
 			"moq",
-			"--client-connect",
+			"--connect",
 			"http://relay",
 			"import",
 			"capture",
@@ -841,7 +844,7 @@ mod tests {
 		// Exports only receive, so they don't compete for the uplink.
 		let cli = Invocation::try_parse_from([
 			"moq",
-			"--client-connect",
+			"--connect",
 			"http://relay",
 			"import",
 			"capture",
@@ -862,7 +865,7 @@ mod tests {
 	#[test]
 	fn audio_only_capture_is_not_bandwidth_adaptive() {
 		for (args, adaptive) in [(vec!["capture"], true), (vec!["capture", "--no-video"], false)] {
-			let argv = [vec!["moq", "--client-connect", "http://relay", "import"], args].concat();
+			let argv = [vec!["moq", "--connect", "http://relay", "import"], args].concat();
 			let cli = Invocation::try_parse_from(argv).unwrap();
 			let Command::Import(import) = &cli.stages[0] else {
 				panic!("expected import")
@@ -914,13 +917,16 @@ mod tests {
 		assert!(cli.moq.reject("token").is_ok());
 
 		// ...these it refuses, rather than accepting the flag and ignoring it.
-		for flag in [
-			["--client-connect", "https://relay.example.com"],
-			["--broadcast", "room"],
+		for (flag, value, reported) in [
+			("--connect", "https://relay.example.com", "--connect"),
+			// The released spelling folds in, so it is rejected under its
+			// canonical name rather than silently ignored.
+			("--client-connect", "https://relay.example.com", "--connect"),
+			("--broadcast", "room", "--broadcast"),
 		] {
-			let cli = Cli::try_parse_from(["moq", flag[0], flag[1], "token", "generate"]).unwrap();
+			let cli = Cli::try_parse_from(["moq", flag, value, "token", "generate"]).unwrap();
 			let err = cli.moq.reject("token").unwrap_err().to_string();
-			assert!(err.contains(flag[0]), "{err}");
+			assert!(err.contains(reported), "{err}");
 		}
 
 		#[cfg(feature = "cluster-lan")]
@@ -1001,7 +1007,7 @@ mod tests {
 			"--cluster-lan=false",
 			"--cluster-lan-secret",
 			"cluster.key",
-			"--client-connect",
+			"--connect",
 			"https://relay.example.com",
 			"import",
 			"ts",
@@ -1028,11 +1034,17 @@ mod tests {
 	#[cfg(feature = "cluster-lan")]
 	#[test]
 	fn cluster_lan_requires_a_path_capable_version() {
-		for flag in ["--client-version", "--server-version"] {
+		// Both the canonical spellings and the released ones, which fold in.
+		for (flag, reported) in [
+			("--connect-version", "--connect-version"),
+			("--listen-version", "--listen-version"),
+			("--client-version", "--connect-version"),
+			("--server-version", "--listen-version"),
+		] {
 			let cli =
 				Cli::try_parse_from(["moq", "--cluster-lan", flag, "moq-lite-04", "import", "ts"]).expect("parse");
 			let err = cli.moq.validate().unwrap_err().to_string();
-			assert!(err.contains(flag), "{err}");
+			assert!(err.contains(reported), "{flag}: {err}");
 		}
 
 		let cli = Cli::try_parse_from([
@@ -1056,7 +1068,7 @@ mod tests {
 	fn play_verb() {
 		let cli = Cli::try_parse_from([
 			"moq",
-			"--client-connect",
+			"--connect",
 			"https://relay.example.com/anon",
 			"--broadcast",
 			"room.hang",
@@ -1083,7 +1095,7 @@ mod tests {
 		for flag in [["--video-codec", "vp9"], ["--audio-codec", "aac"]] {
 			let cli = Cli::try_parse_from([
 				"moq",
-				"--client-connect",
+				"--connect",
 				"https://relay.example.com/anon",
 				"play",
 				flag[0],

@@ -650,7 +650,7 @@ pub unsafe extern "C" fn moq_client_set_versions(client: u32, versions: *const m
 			.map(|version| moq_net::Version::from_str(&version).map_err(Error::InvalidConfig))
 			.collect::<Result<Vec<_>, Error>>()?;
 
-		State::lock().client.get_mut(client)?.version = versions;
+		State::lock().client.get_mut(client)?.connect.version = versions;
 		Ok(())
 	})
 }
@@ -674,7 +674,7 @@ pub unsafe extern "C" fn moq_client_set_backend(client: u32, backend: *const c_c
 		};
 
 		let client = ffi::parse_id(client)?;
-		State::lock().client.get_mut(client)?.backend = backend;
+		State::lock().client.get_mut(client)?.connect.backend = backend;
 		Ok(())
 	})
 }
@@ -696,7 +696,7 @@ pub unsafe extern "C" fn moq_client_set_bind(client: u32, addr: *const c_char, a
 			.map_err(|err| Error::InvalidConfig(format!("invalid bind address {addr:?}: {err}")))?;
 
 		let client = ffi::parse_id(client)?;
-		State::lock().client.get_mut(client)?.bind = addr;
+		State::lock().client.get_mut(client)?.connect.bind = Some(addr);
 		Ok(())
 	})
 }
@@ -713,7 +713,7 @@ pub unsafe extern "C" fn moq_client_set_bind(client: u32, addr: *const c_char, a
 pub extern "C" fn moq_client_set_connect_timeout(client: u32, timeout_ms: u64) -> i32 {
 	ffi::enter(move || {
 		let client = ffi::parse_id(client)?;
-		State::lock().client.get_mut(client)?.timeout = Some(std::time::Duration::from_millis(timeout_ms));
+		State::lock().client.get_mut(client)?.connect.timeout = Some(std::time::Duration::from_millis(timeout_ms));
 		Ok(())
 	})
 }
@@ -729,7 +729,7 @@ pub extern "C" fn moq_client_set_connect_timeout(client: u32, timeout_ms: u64) -
 pub extern "C" fn moq_client_set_failover_delay(client: u32, delay_ms: u64) -> i32 {
 	ffi::enter(move || {
 		let client = ffi::parse_id(client)?;
-		State::lock().client.get_mut(client)?.failover_delay = Some(std::time::Duration::from_millis(delay_ms));
+		State::lock().client.get_mut(client)?.connect.race = Some(std::time::Duration::from_millis(delay_ms));
 		Ok(())
 	})
 }
@@ -748,7 +748,8 @@ pub extern "C" fn moq_client_set_failover_delay(client: u32, delay_ms: u64) -> i
 pub extern "C" fn moq_client_set_resolution_delay(client: u32, delay_ms: u64) -> i32 {
 	ffi::enter(move || {
 		let client = ffi::parse_id(client)?;
-		State::lock().client.get_mut(client)?.resolution_delay = Some(std::time::Duration::from_millis(delay_ms));
+		State::lock().client.get_mut(client)?.connect.resolution_delay =
+			Some(std::time::Duration::from_millis(delay_ms));
 		Ok(())
 	})
 }
@@ -763,7 +764,8 @@ pub extern "C" fn moq_client_set_resolution_delay(client: u32, delay_ms: u64) ->
 pub extern "C" fn moq_client_set_websocket_delay(client: u32, delay_ms: u64) -> i32 {
 	ffi::enter(move || {
 		let client = ffi::parse_id(client)?;
-		State::lock().client.get_mut(client)?.websocket.delay = Some(std::time::Duration::from_millis(delay_ms));
+		State::lock().client.get_mut(client)?.connect.websocket.delay =
+			Some(std::time::Duration::from_millis(delay_ms));
 		Ok(())
 	})
 }
@@ -778,7 +780,7 @@ pub extern "C" fn moq_client_set_websocket_delay(client: u32, delay_ms: u64) -> 
 pub extern "C" fn moq_client_set_websocket_enabled(client: u32, enabled: bool) -> i32 {
 	ffi::enter(move || {
 		let client = ffi::parse_id(client)?;
-		State::lock().client.get_mut(client)?.websocket.enabled = enabled;
+		State::lock().client.get_mut(client)?.connect.websocket.enabled = Some(enabled);
 		Ok(())
 	})
 }
@@ -793,7 +795,7 @@ pub extern "C" fn moq_client_set_websocket_enabled(client: u32, enabled: bool) -
 pub extern "C" fn moq_client_set_tls_disable_verify(client: u32, disable: bool) -> i32 {
 	ffi::enter(move || {
 		let client = ffi::parse_id(client)?;
-		State::lock().client.get_mut(client)?.tls.disable_verify = Some(disable);
+		State::lock().client.get_mut(client)?.connect.tls.insecure = Some(disable);
 		Ok(())
 	})
 }
@@ -809,7 +811,7 @@ pub extern "C" fn moq_client_set_tls_disable_verify(client: u32, disable: bool) 
 pub extern "C" fn moq_client_set_tls_system_roots(client: u32, enabled: bool) -> i32 {
 	ffi::enter(move || {
 		let client = ffi::parse_id(client)?;
-		State::lock().client.get_mut(client)?.tls.system_roots = Some(enabled);
+		State::lock().client.get_mut(client)?.connect.tls.system_roots = Some(enabled);
 		Ok(())
 	})
 }
@@ -828,7 +830,7 @@ pub unsafe extern "C" fn moq_client_set_tls_roots(client: u32, paths: *const moq
 	ffi::enter(move || {
 		let paths = unsafe { ffi::parse_strings(paths, count)? };
 		let client = ffi::parse_id(client)?;
-		State::lock().client.get_mut(client)?.tls.root = paths.into_iter().map(Into::into).collect();
+		State::lock().client.get_mut(client)?.connect.tls.root = paths.into_iter().map(Into::into).collect();
 		Ok(())
 	})
 }
@@ -857,7 +859,7 @@ pub unsafe extern "C" fn moq_client_set_tls_fingerprints(
 			moq_native::tls::parse_fingerprint(fingerprint).map_err(|err| Error::InvalidConfig(err.to_string()))?;
 		}
 		let client = ffi::parse_id(client)?;
-		State::lock().client.get_mut(client)?.tls.fingerprint = fingerprints;
+		State::lock().client.get_mut(client)?.connect.tls.fingerprint = fingerprints;
 		Ok(())
 	})
 }
@@ -877,7 +879,7 @@ pub unsafe extern "C" fn moq_client_set_tls_host_name(client: u32, name: *const 
 	ffi::enter(move || {
 		let name = unsafe { ffi::parse_str_optional(name, name_len)? }.map(str::to_string);
 		let client = ffi::parse_id(client)?;
-		State::lock().client.get_mut(client)?.tls.host_name = name;
+		State::lock().client.get_mut(client)?.connect.tls.host_name = name;
 		Ok(())
 	})
 }
@@ -896,7 +898,7 @@ pub unsafe extern "C" fn moq_client_set_tls_cert(client: u32, path: *const c_cha
 	ffi::enter(move || {
 		let path = unsafe { ffi::parse_str_optional(path, path_len)? }.map(Into::into);
 		let client = ffi::parse_id(client)?;
-		State::lock().client.get_mut(client)?.tls.cert = path;
+		State::lock().client.get_mut(client)?.connect.tls.cert = path;
 		Ok(())
 	})
 }
@@ -916,7 +918,7 @@ pub unsafe extern "C" fn moq_client_set_tls_key(client: u32, path: *const c_char
 	ffi::enter(move || {
 		let path = unsafe { ffi::parse_str_optional(path, path_len)? }.map(Into::into);
 		let client = ffi::parse_id(client)?;
-		State::lock().client.get_mut(client)?.tls.key = path;
+		State::lock().client.get_mut(client)?.connect.tls.key = path;
 		Ok(())
 	})
 }
@@ -930,7 +932,8 @@ pub unsafe extern "C" fn moq_client_set_tls_key(client: u32, path: *const c_char
 pub extern "C" fn moq_client_set_backoff_initial(client: u32, delay_ms: u64) -> i32 {
 	ffi::enter(move || {
 		let client = ffi::parse_id(client)?;
-		State::lock().client.get_mut(client)?.backoff.initial = Some(std::time::Duration::from_millis(delay_ms));
+		State::lock().client.get_mut(client)?.connect.backoff.initial =
+			Some(std::time::Duration::from_millis(delay_ms));
 		Ok(())
 	})
 }
@@ -944,7 +947,7 @@ pub extern "C" fn moq_client_set_backoff_initial(client: u32, delay_ms: u64) -> 
 pub extern "C" fn moq_client_set_backoff_multiplier(client: u32, multiplier: u32) -> i32 {
 	ffi::enter(move || {
 		let client = ffi::parse_id(client)?;
-		State::lock().client.get_mut(client)?.backoff.multiplier = Some(multiplier);
+		State::lock().client.get_mut(client)?.connect.backoff.multiplier = Some(multiplier);
 		Ok(())
 	})
 }
@@ -958,7 +961,7 @@ pub extern "C" fn moq_client_set_backoff_multiplier(client: u32, multiplier: u32
 pub extern "C" fn moq_client_set_backoff_max(client: u32, delay_ms: u64) -> i32 {
 	ffi::enter(move || {
 		let client = ffi::parse_id(client)?;
-		State::lock().client.get_mut(client)?.backoff.max = Some(std::time::Duration::from_millis(delay_ms));
+		State::lock().client.get_mut(client)?.connect.backoff.max = Some(std::time::Duration::from_millis(delay_ms));
 		Ok(())
 	})
 }
@@ -974,7 +977,8 @@ pub extern "C" fn moq_client_set_backoff_max(client: u32, delay_ms: u64) -> i32 
 pub extern "C" fn moq_client_set_backoff_timeout(client: u32, timeout_ms: u64) -> i32 {
 	ffi::enter(move || {
 		let client = ffi::parse_id(client)?;
-		State::lock().client.get_mut(client)?.backoff.timeout = Some(std::time::Duration::from_millis(timeout_ms));
+		State::lock().client.get_mut(client)?.connect.backoff.timeout =
+			Some(std::time::Duration::from_millis(timeout_ms));
 		Ok(())
 	})
 }
@@ -1117,7 +1121,7 @@ pub unsafe extern "C" fn moq_client_get_connect_timeout(client: u32, out: *mut u
 	ffi::enter(move || {
 		let out = unsafe { out.as_mut() }.ok_or(Error::InvalidPointer)?;
 		let client = ffi::parse_id(client)?;
-		*out = millis(State::lock().client.get_mut(client)?.resolved_connect_timeout());
+		*out = millis(State::lock().client.get_mut(client)?.connect.resolved_timeout());
 		Ok(())
 	})
 }
@@ -1134,7 +1138,7 @@ pub unsafe extern "C" fn moq_client_get_failover_delay(client: u32, out: *mut u6
 	ffi::enter(move || {
 		let out = unsafe { out.as_mut() }.ok_or(Error::InvalidPointer)?;
 		let client = ffi::parse_id(client)?;
-		*out = millis(State::lock().client.get_mut(client)?.resolved_failover_delay());
+		*out = millis(State::lock().client.get_mut(client)?.connect.resolved_race());
 		Ok(())
 	})
 }
@@ -1151,7 +1155,13 @@ pub unsafe extern "C" fn moq_client_get_resolution_delay(client: u32, out: *mut 
 	ffi::enter(move || {
 		let out = unsafe { out.as_mut() }.ok_or(Error::InvalidPointer)?;
 		let client = ffi::parse_id(client)?;
-		*out = millis(State::lock().client.get_mut(client)?.resolved_resolution_delay());
+		*out = millis(
+			State::lock()
+				.client
+				.get_mut(client)?
+				.connect
+				.resolved_resolution_delay(),
+		);
 		Ok(())
 	})
 }
@@ -1167,7 +1177,7 @@ pub unsafe extern "C" fn moq_client_get_backoff_initial(client: u32, out: *mut u
 	ffi::enter(move || {
 		let out = unsafe { out.as_mut() }.ok_or(Error::InvalidPointer)?;
 		let client = ffi::parse_id(client)?;
-		*out = millis(State::lock().client.get_mut(client)?.backoff.initial());
+		*out = millis(State::lock().client.get_mut(client)?.connect.backoff.initial());
 		Ok(())
 	})
 }
@@ -1183,7 +1193,7 @@ pub unsafe extern "C" fn moq_client_get_backoff_multiplier(client: u32, out: *mu
 	ffi::enter(move || {
 		let out = unsafe { out.as_mut() }.ok_or(Error::InvalidPointer)?;
 		let client = ffi::parse_id(client)?;
-		*out = State::lock().client.get_mut(client)?.backoff.multiplier();
+		*out = State::lock().client.get_mut(client)?.connect.backoff.multiplier();
 		Ok(())
 	})
 }
@@ -1199,7 +1209,7 @@ pub unsafe extern "C" fn moq_client_get_backoff_max(client: u32, out: *mut u64) 
 	ffi::enter(move || {
 		let out = unsafe { out.as_mut() }.ok_or(Error::InvalidPointer)?;
 		let client = ffi::parse_id(client)?;
-		*out = millis(State::lock().client.get_mut(client)?.backoff.max());
+		*out = millis(State::lock().client.get_mut(client)?.connect.backoff.max());
 		Ok(())
 	})
 }
@@ -1216,7 +1226,7 @@ pub unsafe extern "C" fn moq_client_get_backoff_timeout(client: u32, out: *mut u
 	ffi::enter(move || {
 		let out = unsafe { out.as_mut() }.ok_or(Error::InvalidPointer)?;
 		let client = ffi::parse_id(client)?;
-		*out = millis(State::lock().client.get_mut(client)?.backoff.timeout());
+		*out = millis(State::lock().client.get_mut(client)?.connect.backoff.timeout());
 		Ok(())
 	})
 }
@@ -1283,7 +1293,12 @@ pub unsafe extern "C" fn moq_client_get_websocket_enabled(client: u32, out: *mut
 	ffi::enter(move || {
 		let out = unsafe { out.as_mut() }.ok_or(Error::InvalidPointer)?;
 		let client = ffi::parse_id(client)?;
-		*out = State::lock().client.get_mut(client)?.websocket.enabled;
+		*out = State::lock()
+			.client
+			.get_mut(client)?
+			.connect
+			.websocket
+			.resolved_enabled();
 		Ok(())
 	})
 }
@@ -1300,8 +1315,9 @@ pub unsafe extern "C" fn moq_client_get_websocket_delay(client: u32, out: *mut u
 	ffi::enter(move || {
 		let out = unsafe { out.as_mut() }.ok_or(Error::InvalidPointer)?;
 		let client = ffi::parse_id(client)?;
-		let delay = State::lock().client.get_mut(client)?.websocket.delay;
-		*out = delay.map(millis).unwrap_or(0);
+		// Report the resolved default rather than 0, which would read as "no head start".
+		let delay = State::lock().client.get_mut(client)?.connect.websocket.resolved_delay();
+		*out = millis(delay);
 		Ok(())
 	})
 }

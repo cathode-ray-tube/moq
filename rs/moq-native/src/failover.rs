@@ -4,12 +4,12 @@
 //! silently broken (an unrouted AAAA, a blocked v4 path). Rather than dial one
 //! address and wait out the handshake timeout, a dial staggers attempts across
 //! every resolved address, alternating families, and takes the first connection
-//! to complete. The stagger is [`crate::ClientConfig::failover_delay`].
+//! to complete. The stagger is [`connect::Config::race`](crate::connect::Config::race).
 //!
 //! The addresses arrive from the DNS phase as they resolve, and in the order the
 //! platform's own resolver put them in, so a lookup still waiting on its AAAA
 //! record no longer holds up the first attempt. How long that first attempt
-//! holds back for the full answer is [`crate::ClientConfig::resolution_delay`].
+//! holds back for the full answer is [`crate::connect::Config::resolution_delay`].
 //!
 //! Nothing here needs calling: every client dial goes through it. The one type
 //! a consumer sees is [`Failure`], which the backend `Error` types carry when
@@ -192,7 +192,7 @@ fn collapse<E: Aggregate>(mut failures: Vec<Failure<E>>) -> E {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::client::DEFAULT_FAILOVER_DELAY;
+	use crate::connect::DEFAULT_RACE;
 	use std::sync::Arc;
 	use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -243,7 +243,7 @@ mod tests {
 		let counter = dials.clone();
 		let res: Result<&str, TestError> = race(
 			Candidates::fixed([addr("1.1.1.1:1"), addr("2.2.2.2:2")]),
-			DEFAULT_FAILOVER_DELAY,
+			DEFAULT_RACE,
 			move |_| {
 				counter.fetch_add(1, Ordering::SeqCst);
 				async { Ok("winner") }
@@ -259,7 +259,7 @@ mod tests {
 		let start = tokio::time::Instant::now();
 		let res: Result<&str, TestError> = race(
 			Candidates::fixed([addr("1.1.1.1:1"), addr("2.2.2.2:2")]),
-			DEFAULT_FAILOVER_DELAY,
+			DEFAULT_RACE,
 			|dest| async move {
 				if dest == addr("1.1.1.1:1") {
 					std::future::pending().await
@@ -270,11 +270,7 @@ mod tests {
 		)
 		.await;
 		assert_eq!(res, Ok("second"));
-		assert_eq!(
-			start.elapsed(),
-			DEFAULT_FAILOVER_DELAY,
-			"second dial waits out the stagger"
-		);
+		assert_eq!(start.elapsed(), DEFAULT_RACE, "second dial waits out the stagger");
 	}
 
 	#[tokio::test(start_paused = true)]
@@ -282,7 +278,7 @@ mod tests {
 		let start = tokio::time::Instant::now();
 		let res: Result<&str, TestError> = race(
 			Candidates::fixed([addr("1.1.1.1:1"), addr("2.2.2.2:2")]),
-			DEFAULT_FAILOVER_DELAY,
+			DEFAULT_RACE,
 			|dest| async move {
 				if dest == addr("1.1.1.1:1") {
 					Err(TestError::Dial("boom"))
@@ -355,11 +351,9 @@ mod tests {
 	/// produced (variant, source chain and all) instead of an aggregate of one.
 	#[tokio::test(start_paused = true)]
 	async fn a_lone_failure_is_returned_unwrapped() {
-		let res: Result<&str, TestError> = race(
-			Candidates::fixed([addr("1.1.1.1:1")]),
-			DEFAULT_FAILOVER_DELAY,
-			|_| async { Err(TestError::Dial("invalid peer certificate")) },
-		)
+		let res: Result<&str, TestError> = race(Candidates::fixed([addr("1.1.1.1:1")]), DEFAULT_RACE, |_| async {
+			Err(TestError::Dial("invalid peer certificate"))
+		})
 		.await;
 		assert_eq!(res, Err(TestError::Dial("invalid peer certificate")));
 	}
@@ -427,7 +421,7 @@ mod tests {
 	/// why instead.
 	#[tokio::test(start_paused = true)]
 	async fn an_empty_resolution_reports_why() {
-		let res: Result<&str, TestError> = race(Candidates::fixed([]), DEFAULT_FAILOVER_DELAY, |_| async {
+		let res: Result<&str, TestError> = race(Candidates::fixed([]), DEFAULT_RACE, |_| async {
 			unreachable!("dialed without an address")
 		})
 		.await;
@@ -445,7 +439,7 @@ mod tests {
 				(&[], Duration::from_secs(30)),
 				(&[addr("1.1.1.1:1")], Duration::from_millis(100)),
 			),
-			DEFAULT_FAILOVER_DELAY,
+			DEFAULT_RACE,
 			|_| async { Ok("winner") },
 		)
 		.await;
@@ -470,7 +464,7 @@ mod tests {
 				(&[addr("[2001:db8::1]:1"), addr("1.1.1.1:1")], Duration::from_secs(1)),
 				(&[addr("1.1.1.1:1")], Duration::ZERO),
 			),
-			DEFAULT_FAILOVER_DELAY,
+			DEFAULT_RACE,
 			|dest| async move {
 				match dest.is_ipv6() {
 					true => Ok("second"),

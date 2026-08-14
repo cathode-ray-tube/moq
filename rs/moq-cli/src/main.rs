@@ -38,13 +38,15 @@ static ALLOC: moq_native::jemalloc::tikv_jemallocator::Jemalloc = moq_native::je
 /// iroh endpoint so the rest of the code is feature-agnostic.
 #[derive(Clone)]
 struct Net {
+	/// The shared QUIC tuning, handed to whichever roles this process builds.
+	quic: moq_native::quic::Config,
 	#[cfg(feature = "iroh")]
 	iroh: Option<moq_native::iroh::Endpoint>,
 }
 
 impl Net {
-	fn client(&self, config: moq_native::ClientConfig) -> anyhow::Result<moq_native::Client> {
-		let client = config.init()?;
+	fn client(&self, config: moq_native::connect::Config) -> anyhow::Result<moq_native::Client> {
+		let client = config.init(self.quic.clone())?;
 		#[cfg(feature = "iroh")]
 		let client = match self.iroh.clone() {
 			Some(iroh) => client.with_iroh(iroh),
@@ -53,8 +55,8 @@ impl Net {
 		Ok(client)
 	}
 
-	fn server(&self, config: moq_native::ServerConfig) -> anyhow::Result<moq_native::Server> {
-		let server = config.init()?;
+	fn server(&self, config: moq_native::listen::Config) -> anyhow::Result<moq_native::Server> {
+		let server = config.init(self.quic.clone())?;
 		#[cfg(feature = "iroh")]
 		let server = match self.iroh.clone() {
 			Some(iroh) => server.with_iroh(iroh),
@@ -66,7 +68,7 @@ impl Net {
 
 /// Bind the MoQ listener and spawn everything that serves on it: ordinary
 /// clients, the LAN mesh when `--cluster-lan` is on, and the certificate
-/// endpoint for an explicit `--server-bind`. A no-op with no listener configured.
+/// endpoint for an explicit `--listen`. A no-op with no listener configured.
 ///
 async fn spawn_server(
 	tasks: &mut JoinSet<anyhow::Result<()>>,
@@ -180,8 +182,9 @@ async fn main() -> anyhow::Result<()> {
 	cli.moq.validate()?;
 
 	let net = Net {
+		quic: cli.moq.quic.clone(),
 		#[cfg(feature = "iroh")]
-		iroh: cli.moq.iroh.clone().bind(&cli.moq.client.quic).await?,
+		iroh: cli.moq.iroh.clone().bind(&cli.moq.quic).await?,
 	};
 
 	#[cfg(feature = "jemalloc")]
@@ -252,7 +255,7 @@ async fn spawn_moq(
 ) -> anyhow::Result<Option<moq_net::bandwidth::Consumer>> {
 	let mut bandwidth = None;
 
-	if let Some(url) = moq.client.connect.clone() {
+	if let Some(url) = moq.client.url.clone() {
 		let mut client = net.client(moq.client.clone())?;
 		if directions.publish {
 			client = client.with_publisher(origin.consume());

@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use futures::FutureExt;
 
-use crate::client::DEFAULT_RESOLUTION_DELAY;
+use crate::connect::DEFAULT_RESOLUTION_DELAY;
 
 /// Which of the two lookups a query is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
