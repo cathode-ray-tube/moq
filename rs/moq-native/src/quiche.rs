@@ -158,6 +158,13 @@ impl crate::failover::Aggregate for Error {
 	fn aggregate(failures: Vec<crate::failover::Failure<Self>>) -> Self {
 		Self::Failover(failures)
 	}
+
+	fn resolve(error: Option<std::io::Error>) -> Self {
+		match error {
+			Some(error) => Self::DnsLookup(error),
+			None => Self::NoDnsEntries,
+		}
+	}
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -208,6 +215,9 @@ pub(crate) struct QuicheClient {
 	pub host_name: Option<String>,
 	/// Stagger between Happy Eyeballs connection attempts (see [`crate::failover`]).
 	pub failover_delay: std::time::Duration,
+	/// How long the first candidate waits for the full DNS answer, RFC 8305's
+	/// Resolution Delay (see [`crate::ClientConfig::resolution_delay`]).
+	pub resolution_delay: std::time::Duration,
 	identity: Option<Arc<ClientIdentity>>,
 }
 
@@ -244,6 +254,7 @@ impl QuicheClient {
 			quic,
 			host_name: config.tls.host_name.clone(),
 			failover_delay: config.resolved_failover_delay(),
+			resolution_delay: config.resolved_resolution_delay(),
 			identity,
 		})
 	}
@@ -312,16 +323,12 @@ impl QuicheClient {
 		let local = socket.local_addr()?;
 		let dual_stack = crate::bind::udp_is_dual_stack(&socket);
 
-		// Resolve every DNS entry, adapted to the bound socket's reachability; the dial
-		// below races them Happy Eyeballs style so one broken family can't stall
-		// the connect.
-		let addrs = tokio::net::lookup_host((host.as_str(), port))
-			.await
-			.map_err(Error::DnsLookup)?;
-		let mut candidates = crate::failover::match_local(addrs, local, dual_stack);
-		if candidates.is_empty() {
-			return Err(Error::NoDnsEntries);
-		}
+		// Resolve, adapted to the bound socket's reachability; the dial below races
+		// the answers Happy Eyeballs style as they land, so neither a broken family
+		// nor a lookup still waiting on its AAAA record can stall the connect.
+		let target = url.host().ok_or(Error::InvalidDnsName)?;
+		let mut candidates =
+			crate::resolve::Candidates::resolve(target, port, self.resolution_delay).with_local(local, dual_stack);
 
 		// Each attempt binds its own socket, and a pinned non-zero source port only
 		// fits one socket at a time: an overlapping attempt would fail its bind with
@@ -330,10 +337,10 @@ impl QuicheClient {
 		// other's packets), so keep the preferred candidate only, the same single
 		// dial as before failover existed. `new` warns about this once.
 		if self.bind.port() != 0 {
-			candidates.truncate(1);
+			candidates = candidates.with_limit(1);
 		}
 
-		tracing::debug!(peer = %crate::connect::Endpoint(&url), ?candidates, "connecting via quiche");
+		tracing::debug!(peer = %crate::connect::Endpoint(&url), "connecting via quiche");
 
 		// Race only the QUIC handshake: the winner alone performs the WebTransport
 		// CONNECT below, so the server sees a single request no matter how many

@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime};
 use moq_mux::catalog::hang::Catalog;
 use moq_mux::timeline::Entry;
 
+use super::Upstream;
 use super::rendition::{Kind, Rendition};
 
 /// The `(kind, name)` identity of a rendition. Video and audio are separate axes, so a video
@@ -280,7 +281,10 @@ impl Producer {
 	/// Renditions are only servable when the catalog advertises the broadcast's timeline (its
 	/// root `timeline` section): without one there is nothing to render playlists from, so the
 	/// whole catalog is skipped with a warning.
-	pub fn sync(&self, source: &moq_mux::Source, catalog: &Catalog) {
+	///
+	/// `upstream` carries the broadcast the snapshot was read from, so each rendition serves media
+	/// from that same broadcast rather than whatever is at the path by the time it is asked.
+	pub fn sync(&self, upstream: &Upstream, catalog: &Catalog) {
 		let Some(section) = catalog.timeline.clone() else {
 			if !catalog.video.renditions.is_empty() || !catalog.audio.renditions.is_empty() {
 				tracing::warn!("catalog advertises no timeline; its renditions can't be served as HLS");
@@ -322,7 +326,7 @@ impl Producer {
 			if current.contains_key(&key) {
 				continue;
 			}
-			let rendition = Arc::new(Rendition::video(name.clone(), video, source, section.clone()));
+			let rendition = Arc::new(Rendition::video(name.clone(), video, upstream, section.clone()));
 			self.register(&rendition);
 			current.insert(key, rendition);
 		}
@@ -331,7 +335,7 @@ impl Producer {
 			if current.contains_key(&key) {
 				continue;
 			}
-			let rendition = Arc::new(Rendition::audio(name.clone(), audio, source, section.clone()));
+			let rendition = Arc::new(Rendition::audio(name.clone(), audio, upstream, section.clone()));
 			self.register(&rendition);
 			current.insert(key, rendition);
 		}

@@ -2313,6 +2313,12 @@ impl<S: crate::transport::poll::Session> TrackServe<S> {
 	/// immediately, so a late insert races the group stream (a group whose id isn't
 	/// in the map yet is dropped, stalling the track forever). The caller
 	/// deregisters `id` if the establish fails.
+	///
+	/// The subscription's bounds come straight from the demand aggregate. After a
+	/// route change a takeover boundary caps the *previous* segment's `end_group`;
+	/// the segment resuming the track keeps whatever start the subscribers asked for,
+	/// so a live-edge subscriber gets the live edge upstream rather than a replay of
+	/// the outage.
 	fn prepare_establish(
 		&self,
 		producer: &mut track::Producer,

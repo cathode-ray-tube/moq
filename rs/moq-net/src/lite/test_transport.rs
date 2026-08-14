@@ -459,6 +459,11 @@ pub struct ScriptedSession {
 	/// Per-stream scripts popped by `open_bi` in order; `None` shares `script`
 	/// across every stream.
 	queue: Option<Arc<Mutex<std::collections::VecDeque<Vec<u8>>>>>,
+	/// Set by [`Self::gated_open`]: parks `poll_open_bi` until the gate opens, standing in
+	/// for a peer that has granted no more concurrent streams.
+	open_gate: Option<kio::Consumer<bool>>,
+	/// Keeps the gate registration alive between `poll_open_bi` calls.
+	park: kio::Park,
 }
 
 impl ScriptedSession {
@@ -468,6 +473,8 @@ impl ScriptedSession {
 			eof: false,
 			script: Arc::new(Mutex::new(script)),
 			queue: None,
+			open_gate: None,
+			park: kio::Park::default(),
 		}
 	}
 
@@ -490,6 +497,17 @@ impl ScriptedSession {
 			eof: false,
 			script: Arc::new(Mutex::new(Vec::new())),
 			queue: Some(Arc::new(Mutex::new(scripts.into_iter().collect()))),
+			open_gate: None,
+			park: kio::Park::default(),
+		}
+	}
+
+	/// Answer each stream from `scripts`, but only once the gate opens: a peer that
+	/// replies normally and is simply out of stream credit until then.
+	pub fn gated_open(scripts: Vec<Vec<u8>>, gate: kio::Consumer<bool>) -> Self {
+		Self {
+			open_gate: Some(gate),
+			..Self::per_stream(scripts)
 		}
 	}
 }
@@ -507,7 +525,19 @@ impl poll::Session for ScriptedSession {
 		Poll::Pending
 	}
 
-	fn poll_open_bi(&mut self, _cx: &mut Context<'_>) -> Poll<Result<poll::BiStreams<Self>, Self::Error>> {
+	fn poll_open_bi(&mut self, cx: &mut Context<'_>) -> Poll<Result<poll::BiStreams<Self>, Self::Error>> {
+		if let Some(gate) = self.open_gate.clone() {
+			let waiter = self.park.hold(cx);
+			// A closed gate reads as open: the test dropped the producer, so nothing is
+			// holding the stream back anymore.
+			if gate
+				.poll(waiter, |open| if **open { Poll::Ready(()) } else { Poll::Pending })
+				.is_pending()
+			{
+				return Poll::Pending;
+			}
+		}
+
 		self.log.bi_opens.fetch_add(1, Ordering::Relaxed);
 		let script = match &self.queue {
 			Some(queue) => Arc::new(Mutex::new(queue.lock().unwrap().pop_front().unwrap_or_default())),

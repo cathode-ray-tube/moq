@@ -53,6 +53,9 @@ export class Connection implements Established {
 	// Module for distributing tracks.
 	#subscriber: Subscriber;
 
+	// What the peer declared about being solicited; see {@link Ietf.solicitFromSetup}.
+	#solicit: boolean | undefined;
+
 	// Just to avoid logging when `close()` is called.
 	#closed = false;
 
@@ -63,6 +66,7 @@ export class Connection implements Established {
 	 * @param control - The control/setup stream
 	 * @param maxRequestId - The initial max request ID
 	 * @param version - The negotiated protocol version
+	 * @param solicit - What the peer's SETUP declared (undefined when it declared nothing)
 	 *
 	 * @internal
 	 */
@@ -75,6 +79,7 @@ export class Connection implements Established {
 		client,
 		discovery = true,
 		publish,
+		solicit,
 	}: {
 		url: URL;
 		quic: WebTransport;
@@ -86,6 +91,11 @@ export class Connection implements Established {
 		discovery?: boolean;
 		/** The origin whose broadcasts are served to the peer. Omit to publish nothing. */
 		publish?: OriginConsumer;
+		/**
+		 * What the peer declared about being solicited. `undefined` means it declared
+		 * nothing, which is the one case where announcing at us unasked is not a bug.
+		 */
+		solicit?: boolean;
 	}) {
 		this.url = url;
 		this.discovery = discovery;
@@ -108,7 +118,8 @@ export class Connection implements Established {
 			});
 		}
 
-		this.#publisher = new Publisher(this.#quic, this.#session, publish);
+		this.#publisher = new Publisher(this.#quic, this.#session, publish, solicit ?? false);
+		this.#solicit = solicit;
 		this.#subscriber = new Subscriber(this.#session);
 
 		void this.#run();
@@ -138,7 +149,7 @@ export class Connection implements Established {
 
 	async #run(): Promise<void> {
 		try {
-			await Promise.all([this.#runBidis(), this.#runUnis()]);
+			await Promise.all([this.#runBidis(), this.#runUnis(), this.#publisher.runPublishNamespaces()]);
 		} catch (err) {
 			if (!this.#closed) {
 				console.error("fatal error running connection", err);
@@ -236,6 +247,26 @@ export class Connection implements Established {
 			// Subscriber handles incoming notifications
 			case PublishNamespace.id: {
 				const msg = await PublishNamespace.decode(stream.reader, this.#session.version);
+
+				// We always declare that advertisements to us must be solicited (MoQ
+				// Solicit), and writing the option at all proves the peer implements the
+				// extension, whichever value it chose. It also cannot have advertised
+				// before reading our SETUP, since our SETUP is what says whether
+				// advertising unasked is allowed. So this is a bug in the peer, and a
+				// silent one on both sides if we tolerate it.
+				//
+				// Draft-14/15 are exempt: they have no inline NAMESPACE, so a
+				// PUBLISH_NAMESPACE request is also how a peer answers our
+				// SUBSCRIBE_NAMESPACE there, and the message alone does not say which.
+				const legacy = this.#session.version === Version.DRAFT_14 || this.#session.version === Version.DRAFT_15;
+				if (this.#solicit !== undefined && !legacy) {
+					console.error(
+						`unsolicited publish_namespace from a peer that implements MoQ Solicit: broadcast=${msg.trackNamespace}`,
+					);
+					this.close();
+					break;
+				}
+
 				await this.#subscriber.runPublishNamespace(msg, stream);
 				break;
 			}

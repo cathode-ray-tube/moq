@@ -97,9 +97,16 @@ pub struct Options {
 	pub server_certificate_hashes: Vec<Vec<u8>>,
 }
 
+/// Advertise every version `moq-net` supports, so the peer picks one via ALPN.
+/// Without this the browser negotiates no subprotocol and the session has no
+/// version to start from.
+fn builder() -> web_transport_wasm::ClientBuilder {
+	web_transport_wasm::ClientBuilder::new().with_protocols(moq_net::ALPNS.iter().copied())
+}
+
 /// Open a browser WebTransport connection to `url`.
 pub async fn connect(url: Url, options: Options) -> Result<Session, Error> {
-	let client = web_transport_wasm::ClientBuilder::new();
+	let client = builder();
 	let client = match options.server_certificate_hashes.is_empty() {
 		true => client.with_system_roots(),
 		false => client.with_server_certificate_hashes(options.server_certificate_hashes),
@@ -214,7 +221,9 @@ impl wtt::poll::Session for Session {
 	}
 
 	fn protocol(&self) -> Option<&str> {
-		self.inner.protocol()
+		// The browser reports "" when no subprotocol was negotiated, which means the
+		// same thing as `None`: fall back to negotiating the version over SETUP.
+		self.inner.protocol().filter(|p| !p.is_empty())
 	}
 
 	fn close(&mut self, code: u32, reason: &str) {

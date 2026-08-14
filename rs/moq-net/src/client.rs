@@ -174,7 +174,7 @@ impl Client {
 					version: ietf::Version::Draft19,
 					path: self.setup_path.clone(),
 					peer_setup_stream: None,
-					peer_cluster: None,
+					peer_declared: None,
 				})?;
 
 				tracing::debug!(version = ?v, "connected");
@@ -200,7 +200,7 @@ impl Client {
 					version: ietf::Version::Draft18,
 					path: self.setup_path.clone(),
 					peer_setup_stream: None,
-					peer_cluster: None,
+					peer_declared: None,
 				})?;
 
 				tracing::debug!(version = ?v, "connected");
@@ -226,7 +226,7 @@ impl Client {
 					version: ietf::Version::Draft17,
 					path: self.setup_path.clone(),
 					peer_setup_stream: None,
-					peer_cluster: None,
+					peer_declared: None,
 				})?;
 
 				tracing::debug!(version = ?v, "connected");
@@ -374,6 +374,7 @@ impl Client {
 		if let Some(path) = &self.setup_path {
 			parameters.set_bytes(ietf::ParameterBytes::Path, path.clone().into_bytes());
 		}
+		ietf::solicit::into_setup(&mut parameters, ietf_encoding);
 		let parameters = parameters.encode_bytes(ietf_encoding)?;
 
 		let client = setup::Client {
@@ -410,11 +411,16 @@ impl Client {
 				(start.recv_bandwidth, start.driver, Some(start.connecting), start.goaway)
 			}
 			Version::Ietf(v) => {
-				// Decode the parameters to get the initial request ID.
+				// Decode the parameters to get the initial request ID and what the server
+				// requires of us.
 				let parameters = ietf::Parameters::decode(&mut server.parameters, v)?;
 				let request_id_max = parameters
 					.get_varint(ietf::ParameterVarInt::MaxRequestId)
 					.map(ietf::RequestId);
+				let peer_declared = ietf::peer::Peer {
+					solicit: ietf::solicit::from_setup(&parameters, v)?,
+					..Default::default()
+				};
 
 				let stream = stream.with_version(v);
 				// Draft 14-16: the path rode in the bidi SETUP above, not the uni one.
@@ -430,7 +436,7 @@ impl Client {
 					version: v,
 					path: None,
 					peer_setup_stream: None,
-					peer_cluster: None,
+					peer_declared: Some(peer_declared),
 				})?;
 				(None, protocol, None, goaway)
 			}
