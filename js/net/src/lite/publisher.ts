@@ -1,10 +1,11 @@
 import { type Dispose, type Getter, Signal } from "@moq/signals";
 import type * as broadcast from "../broadcast.ts";
-import { error, reason } from "../error.ts";
+import { error, reason, StreamCode, toTransport } from "../error.ts";
 import type * as group from "../group.ts";
+import { hooks } from "../internal.ts";
 import type { Consumer as OriginConsumer } from "../origin.ts";
 import * as Path from "../path.ts";
-import { type Stream, Writer } from "../stream.ts";
+import { type Reader, type Stream, Writer } from "../stream.ts";
 import { Timescale } from "../time.ts";
 import type * as track from "../track.ts";
 import { AnnounceInit, AnnounceOk, type AnnounceRequest, encodeAnnounceBroadcast } from "./announce.ts";
@@ -96,15 +97,11 @@ type FrameBounds = {
  *
  * The frame bounds qualify the start and end group only; every other group is served whole.
  * Which groups are served at all is the subscriber's read cursor (`startAt` / `endAt`),
- * applied when a group is popped rather than re-checked here: the serving loop prefetches,
- * so a group in hand has already left the buffer and rejecting it against a cap lowered in
- * the meantime would drop it for good, even if a later SUBSCRIBE_UPDATE raises the cap again.
+ * applied when a group is popped rather than re-checked here.
  *
- * Call this against the bounds the group was taken under, which is why the serving loop
- * snapshots it at the cursor handoff. Reading moved bounds here would map a group that now
- * matches neither boundary to the whole group and send frames the request excluded. Nothing
- * downstream trims those: a subscription's frame range is a wire request, deliberately
- * decoupled from the receiver's local read cursor (see `moq_net::Subscription::end`).
+ * The serving loop calls this synchronously after the pop, before any SUBSCRIBE_UPDATE can
+ * change `bounds`. Nothing downstream trims the frame range: it is a wire request,
+ * deliberately decoupled from the receiver's local read cursor.
  */
 function frameRange(bounds: FrameBounds, sequence: number): { start: number; end?: number } {
 	return {
@@ -127,6 +124,141 @@ type ServeGroup = {
 
 /** What serving fetched frames needs beyond the group and destination stream. */
 type ServeFetch = Omit<ServeGroup, "sub">;
+
+/** What the serving loop takes from the subscribe stream instead of serving a group. */
+type Control =
+	/** The peer re-stated the subscription: priority, ordering, latency, and both ranges. */
+	| { kind: "update"; update: SubscribeUpdate }
+	/** The peer FIN'd, or our own half went away. Either way there is nobody left to serve. */
+	| { kind: "done" }
+	/** The stream failed; the subscription goes down with it. */
+	| { kind: "error"; error: Error };
+
+type SubscriptionControlOptions = {
+	reader: Reader;
+	writer: Writer;
+	version: Version;
+	apply: (update: SubscribeUpdate) => void;
+};
+
+/**
+ * The subscribe stream's control half, decoded ahead of the serving loop.
+ *
+ * Decoding runs on its own and publishes each full subscription update immediately, so a
+ * blocked response write cannot delay re-ranking streams already in flight. It separately
+ * stores only the latest range state for the serving loop, which owns the local track cursor
+ * and frame bounds. That keeps a group pop and its frame-range snapshot one indivisible step.
+ *
+ * Reading ahead makes control-first ordering hold for a burst. Coalescing bounds memory while
+ * preserving the newest state decoded before the next group pop. The Rust publisher gets the
+ * same ordering from `poll_decode_maybe`, which decodes straight out of the reader's buffer;
+ * nothing here can decode synchronously, so it reads ahead instead.
+ */
+class SubscriptionControls {
+	#writer: Writer;
+	#update?: SubscribeUpdate;
+	// Sticky, first one wins: null once the stream is over, an Error once it failed.
+	#end?: Error | null;
+	#ended: Promise<Error | null>;
+	#resolveEnd!: (end: Error | null) => void;
+	#changed = new Signal(0);
+
+	/** Settles once decoding stops, so teardown can wait for it rather than leaving it running. */
+	readonly decoding: Promise<void>;
+
+	constructor({ reader, writer, version, apply }: SubscriptionControlOptions) {
+		this.#writer = writer;
+		this.#ended = new Promise((resolve) => {
+			this.#resolveEnd = resolve;
+		});
+		this.decoding = this.#decode(reader, version, apply);
+		// Our own half going away ends the loop too, and has to reach it the same way: the
+		// loop looks at nothing else.
+		void writer.closed.then(
+			() => this.#finish(null),
+			(err: unknown) => this.#finish(error(err)),
+		);
+	}
+
+	/** The next control to apply, or undefined while the peer is quiet. */
+	take(): Control | undefined {
+		const update = this.#update;
+		this.#update = undefined;
+		// An update decoded before the stream ended still applies before the sticky end.
+		if (update) return { kind: "update", update };
+		if (this.#end === undefined) return undefined;
+		return this.#end === null ? { kind: "done" } : { kind: "error", error: this.#end };
+	}
+
+	/** Calls `fn` once {@link take} may answer differently. */
+	changed(fn: () => void): Dispose {
+		return this.#changed.changed(fn);
+	}
+
+	/** Returns false when peer departure supersedes a blocked response write. */
+	async response(pending: Promise<void>): Promise<boolean> {
+		const result = await Promise.race([
+			pending.then(
+				() => ({ kind: "sent" }) as const,
+				(err: unknown) => ({ kind: "error", error: error(err) }) as const,
+			),
+			this.#ended.then((end) => ({ kind: "ended", end }) as const),
+		]);
+
+		if (result.kind === "sent") return true;
+		if (result.kind === "error") throw result.error;
+		// Promise.race leaves the blocked encode running, so reset the writable half too.
+		this.#writer.reset(result.end ?? toTransport(StreamCode.Cancel, "cancel"));
+		if (result.end) throw result.end;
+		return false;
+	}
+
+	#finish(end: Error | null) {
+		if (this.#end !== undefined) return;
+		this.#end = end;
+		this.#resolveEnd(end);
+		this.#changed.update((value) => value + 1);
+	}
+
+	async #decode(reader: Reader, version: Version, apply: (update: SubscribeUpdate) => void) {
+		try {
+			while (this.#end === undefined) {
+				const update = await SubscribeUpdate.decodeMaybe(reader, version);
+				if (!update) break;
+				apply(update);
+				this.#update = update;
+				this.#changed.update((value) => value + 1);
+			}
+		} catch (err: unknown) {
+			this.#finish(error(err));
+			return;
+		}
+		this.#finish(null);
+	}
+}
+
+// A microtask is too short: decoding one framed update crosses several awaits, each of which
+// can requeue behind the serving continuation. A task boundary lets the decoder finish whatever
+// the transport already delivered before the next group pop. Updates are rare, so groups do not
+// pay this scheduling cost on the normal path.
+const yieldToControls = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+// Register both readiness sources in the same turn after the caller observed neither ready.
+// The winner disposes both registrations, so an idle subscription accumulates nothing no
+// matter how many times it wakes.
+function waitForSubscription(controls: SubscriptionControls, subscriber: track.Subscriber): Promise<void> {
+	return new Promise((resolve) => {
+		let settled = false;
+		const dispose: Dispose[] = [];
+		const wake = () => {
+			if (settled) return;
+			settled = true;
+			for (const close of dispose) close();
+			resolve();
+		};
+		dispose.push(controls.changed(wake), hooks.groupChanged(subscriber, wake));
+	});
+}
 
 /**
  * Handles publishing broadcasts and managing their lifecycle.
@@ -329,19 +461,11 @@ export class Publisher {
 		if (startGroup !== undefined) track.startAt(startGroup);
 		track.endAt(msg.endGroup);
 
-		// Frame bounds qualify the start and end group only, and SUBSCRIBE_UPDATE can move
-		// them, so the serving loop reads them from here rather than closing over `msg`.
-		const bounds: FrameBounds = {
-			startGroup: msg.startGroup,
-			startFrame: msg.startFrame,
-			endGroup: msg.endGroup,
-			endFrame: msg.endFrame,
-		};
-
 		// The best-effort datagram loop, started once serving begins. It parks when the
 		// track finishes (recvDatagram returns undefined), so #runTrack alone ends the
 		// subscription; awaited during teardown so it doesn't outlive the subscription.
 		let datagrams = Promise.resolve();
+		let controls: SubscriptionControls | undefined;
 
 		try {
 			let timescale: Timescale = Timescale.MILLI;
@@ -372,54 +496,49 @@ export class Publisher {
 
 			console.debug(`publish ok: broadcast=${msg.broadcast} track=${track.name}`);
 
-			const serving = this.#runTrack(track, stream.writer, {
-				sub: msg.id,
-				broadcast: msg.broadcast,
-				timescale,
-				bounds,
-			});
-
 			// Serve datagrams concurrently with groups whenever the transport carries them
 			// (the writer exists iff so). No group fallback: otherwise they simply aren't sent.
 			if (this.#datagramWriter) {
 				datagrams = this.#runDatagrams(msg.id, track, timescale);
 			}
 
-			for (;;) {
-				const decode = SubscribeUpdate.decodeMaybe(stream.reader, this.version);
-
-				const result = await Promise.any([serving, decode]);
-				if (!result) break;
-
-				if (result instanceof SubscribeUpdate) {
-					console.debug(`subscribe update: broadcast=${msg.broadcast} track=${track.name}`);
+			controls = new SubscriptionControls({
+				reader: stream.reader,
+				writer: stream.writer,
+				version: this.version,
+				apply: (update) => {
 					track.update({
-						priority: result.priority,
-						ordered: result.ordered,
-						latencyMax: result.latencyMax,
-						startGroup: result.startGroup,
-						endGroup: result.endGroup,
+						priority: update.priority,
+						ordered: update.ordered,
+						latencyMax: update.latencyMax,
+						startGroup: update.startGroup,
+						endGroup: update.endGroup,
 					});
-					if (result.startGroup !== undefined) track.startAt(result.startGroup);
-					track.endAt(result.endGroup);
-					bounds.startGroup = result.startGroup;
-					bounds.startFrame = result.startFrame;
-					bounds.endGroup = result.endGroup;
-					bounds.endFrame = result.endFrame;
-				}
-			}
+				},
+			});
+			await this.#runTrack(track, stream.writer, controls, {
+				sub: msg.id,
+				broadcast: msg.broadcast,
+				timescale,
+				bounds: {
+					startGroup: msg.startGroup,
+					startFrame: msg.startFrame,
+					endGroup: msg.endGroup,
+					endFrame: msg.endFrame,
+				},
+			});
 
 			console.debug(`publish done: broadcast=${msg.broadcast} track=${track.name}`);
 			stream.close();
 			track.close();
-			// track.close ends the datagram loop; wait so it doesn't leak past teardown.
-			await datagrams;
+			// Closing the stream ends the decoder and track.close ends the datagram loop.
+			await Promise.all([datagrams, controls.decoding]);
 		} catch (err: unknown) {
 			const e = error(err);
 			console.warn(`publish error: broadcast=${msg.broadcast} track=${track.name} error=${reason(e)}`);
 			track.close(e);
 			stream.abort(e);
-			await datagrams;
+			await Promise.all([datagrams, controls?.decoding]);
 		}
 	}
 
@@ -480,6 +599,7 @@ export class Publisher {
 	async #runTrack(
 		track: track.Subscriber,
 		stream: Writer,
+		controls: SubscriptionControls,
 		serving: { sub: bigint; broadcast: Path.Valid; timescale: Timescale; bounds: FrameBounds },
 	) {
 		const { sub, broadcast, timescale, bounds } = serving;
@@ -496,94 +616,89 @@ export class Publisher {
 		// before the producer declared it.
 		const boundary = () => track.final() ?? (track.latest() ?? -1) + 1;
 
-		// Settles once the producer closes cleanly, so SUBSCRIBE_END can go out while
-		// groups parked above the subscription's cap stay servable (a SUBSCRIBE_UPDATE
-		// can still raise it; see the Rust publisher's Recv::Boundary). Rejects on abort,
-		// which the catch below turns into a reset.
-		const doneSentinel = Symbol("done");
-		const done = (async (): Promise<typeof doneSentinel> => {
-			const closed = await track.closed;
-			if (closed instanceof Error) throw closed;
-			return doneSentinel;
-		})();
-		// The loop can exit on the peer's FIN before an abort settles this; keep it quiet.
-		void done.catch(() => {});
+		// SUBSCRIBE_END names that boundary, which a cap can hold groups back from, so it goes
+		// out as soon as the producer finishes and the subscription keeps serving whatever a
+		// later cap raise releases (see the Rust publisher's Recv::Boundary).
+		const sendEnd = async (): Promise<boolean> => {
+			endSent = true;
+			if (emitRange) {
+				return controls.response(
+					encodeSubscribeResponse(stream, { end: new SubscribeEnd(boundary()) }, this.version),
+				);
+			}
+			return true;
+		};
 
 		// One ranking for the whole subscription, shared by every group it serves.
 		const priority = new Priority(track);
 
 		// Cancels groups still queued for a stream slot. Only the subscriber leaving counts:
-		// a track that ran out of groups still has to flush the ones already queued, and we
-		// FIN the subscribe stream ourselves below to say so.
+		// a track that ran out of groups still has to flush the ones already queued, and the
+		// caller FINs the subscribe stream to say so.
 		let finished = false;
 		let unsubscribe!: () => void;
 		const unsubscribed = new Promise<void>((resolve) => {
 			unsubscribe = resolve;
 		});
-		void stream.closed.then(
-			() => {
-				if (!finished) unsubscribe();
-			},
-			// A reset is always the peer.
-			() => unsubscribe(),
-		);
-
-		// Exactly-once serving, not the sequence cursor: on a relay, a burst can be
-		// ingested micro-reordered by the upstream leg, and a sequence cursor would
-		// permanently skip the older group even though it is cached and in demand.
-		// Staleness is the latency window's job (cache expiry), not arrival order's.
-		//
-		// One read cursor across iterations: a boundary emission must not spawn a
-		// second concurrent recvGroup against the same subscriber. Declared outside the
-		// try so the finally can observe whatever was in flight when the loop exited
-		// (closing a late group, swallowing the rejection from our own teardown abort).
-		//
-		// Snapshot the frame bounds as the cursor hands the group over, rather than reading
-		// them in the loop body, which can sit parked in a control-stream write long after the
-		// group left the buffer. Reading `bounds` there serves the group under a range it was
-		// never taken under.
-		//
-		// That narrows the window to the microtask between `recvGroup` removing the group and
-		// this callback, but does not close it: a SUBSCRIBE_UPDATE whose bytes are already
-		// buffered decodes without another transport read, so its continuation can still land
-		// in between. Closing it means handing the bounds back with the group, or the two
-		// loops not sharing mutable state at all.
-		const take = () =>
-			track
-				.recvGroup()
-				.then((group) => (group ? { group, range: frameRange(bounds, group.sequence) } : undefined));
-		let next = take();
 		try {
 			for (;;) {
-				const result = await Promise.race(endSent ? [next, stream.closed] : [next, stream.closed, done]);
-				if (result === doneSentinel) {
-					// The producer finished: declare the boundary now and keep serving
-					// whatever a later cap raise releases, until the peer FINs.
-					endSent = true;
-					if (emitRange) {
-						await encodeSubscribeResponse(stream, { end: new SubscribeEnd(boundary()) }, this.version);
+				// Control before data, matching the Rust publisher: every control decoded while
+				// the loop was parked applies to the next pop, never to one already made. This
+				// drain is synchronous, so nothing the decoder holds can land between the pop
+				// below and its frame range.
+				const control = controls.take();
+				if (control) {
+					switch (control.kind) {
+						case "done":
+							// The subscriber left. Its queued groups are pointless now, which
+							// the finally below acts on since `finished` stays false.
+							return;
+						case "error":
+							throw control.error;
+						case "update": {
+							const update = control.update;
+							console.debug(`subscribe update: broadcast=${broadcast} track=${track.name}`);
+							if (update.startGroup !== undefined) track.startAt(update.startGroup);
+							track.endAt(update.endGroup);
+							bounds.startGroup = update.startGroup;
+							bounds.startFrame = update.startFrame;
+							bounds.endGroup = update.endGroup;
+							bounds.endFrame = update.endFrame;
+							await yieldToControls();
+							continue;
+						}
 					}
-					continue;
 				}
 
-				if (!result) break;
-				const { group, range } = result;
-				next = take();
+				// Exactly-once arrival-order serving. This synchronous package-internal pop
+				// and frameRange call are the operation's linearization point.
+				const recv = hooks.tryRecvGroup(track);
+				switch (recv.kind) {
+					case "error":
+						throw recv.error;
+					case "idle":
+						await waitForSubscription(controls, track);
+						continue;
+					case "boundary":
+						// The producer finished but is still holding groups above the cap.
+						// Declare the boundary, then wait for an update to release them.
+						if (!endSent) {
+							if (!(await sendEnd())) return;
+							continue;
+						}
+						await waitForSubscription(controls, track);
+						continue;
+					case "done":
+						if (!endSent) {
+							if (!(await sendEnd())) return;
+							continue;
+						}
+						finished = true;
+						return;
+				}
 
-				// The floor is judged against the bounds as they stand now, deliberately unlike
-				// the rest of the frame range, which is the snapshot this group was taken under.
-				// Raising the floor is destructive: the read cursor shifts and closes every
-				// buffered group below it, so an in-hand group below the new floor must also go.
-				// When the new floor lands within this group, intersect it with the snapshotted
-				// start so neither a raised nor a subsequently lowered floor widens what is sent.
-				// Lowering the cap only parks its groups, which is why the cap does not reject here.
-				if (bounds.startGroup !== undefined && group.sequence < bounds.startGroup) {
-					group.close();
-					continue;
-				}
-				if (bounds.startGroup === group.sequence) {
-					range.start = Math.max(range.start, bounds.startFrame);
-				}
+				const group = recv.group;
+				const range = frameRange(bounds, group.sequence);
 
 				if (emitRange && !startSent) {
 					startSent = true;
@@ -591,7 +706,16 @@ export class Publisher {
 					// Arrival-order serving could later surface a straggler below the first
 					// group, so pin the floor to what was announced.
 					track.startAt(group.sequence);
-					await encodeSubscribeResponse(stream, { start: new SubscribeStart(group.sequence) }, this.version);
+					if (
+						!(await controls.response(
+							encodeSubscribeResponse(
+								stream,
+								{ start: new SubscribeStart(group.sequence) },
+								this.version,
+							),
+						))
+					)
+						return;
 				}
 
 				void this.#runGroup({
@@ -604,23 +728,8 @@ export class Publisher {
 					end: range.end,
 				});
 			}
-
-			if (emitRange && !endSent) {
-				await encodeSubscribeResponse(stream, { end: new SubscribeEnd(boundary()) }, this.version);
-			}
-
-			console.debug(`publish close: broadcast=${broadcast} track=${track.name}`);
-			finished = true;
-			track.close();
-			stream.close();
-		} catch (err: unknown) {
-			const e = error(err);
-			console.warn(`publish error: broadcast=${broadcast} track=${track.name} error=${reason(e)}`);
-			unsubscribe();
-			track.close(e);
-			stream.reset(e);
 		} finally {
-			next.then((taken) => taken?.group.close()).catch(() => {});
+			if (!finished) unsubscribe();
 			priority.close();
 		}
 	}

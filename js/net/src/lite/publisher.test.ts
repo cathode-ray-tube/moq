@@ -1,9 +1,10 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { Producer as GroupProducer } from "../group.ts";
 import { createMockTransportPair } from "../mock.ts";
 import { Producer as OriginProducer } from "../origin.ts";
 import * as Path from "../path.ts";
-import { Reader, Stream } from "../stream.ts";
+import { Reader, Stream, Writer } from "../stream.ts";
+import { Subscriber as TrackSubscriber } from "../track.ts";
 import { Fetch } from "./fetch.ts";
 import { Group as GroupMessage } from "./group.ts";
 import { randomOrigin } from "./origin.ts";
@@ -366,14 +367,17 @@ const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 // Wraps a writable so its writes park until `release()`, giving a test a window inside
 // whatever the publisher is writing while its other loops keep running. `parked` settles on
-// the first write attempt, held or not.
+// the first write attempt, held or not. Passing an error to `release` fails the held write
+// instead, which is how a test drives the publisher's error teardown from a known point.
 function gateWrites(target: WritableStream<Uint8Array>, hold: boolean) {
 	const writer = target.getWriter();
 
-	let release!: () => void;
-	const released = new Promise<void>((resolve) => {
-		release = resolve;
+	let release!: (err?: Error) => void;
+	const released = new Promise<void>((resolve, reject) => {
+		release = (err) => (err ? reject(err) : resolve());
 	});
+	// Nobody awaits this until a write parks on it, so a rejection would look unhandled.
+	released.catch(() => void 0);
 	if (!hold) release();
 
 	let parking!: () => void;
@@ -441,13 +445,17 @@ async function servedSubscription(
 		endGroup: options.endGroup,
 		endFrame: options.endFrame,
 	});
-	void publisher.runSubscribe(msg, server);
+	// Kept so a test can wait for the whole subscription to unwind, decoder included, rather
+	// than only for what reached the wire. It reports failures by tearing down, never by
+	// rejecting.
+	const serving = publisher.runSubscribe(msg, server);
 
 	const opened = pair.client.incomingUnidirectionalStreams.getReader();
 
 	return {
 		client,
 		track,
+		serving,
 		parked: gate.parked,
 		release: gate.release,
 		serve(sequence: number) {
@@ -537,107 +545,99 @@ test("lite draft-05: a straggler below the announced start group is not served",
 	}
 });
 
-// The serving loop prefetches the next group the moment it takes one, so a SUBSCRIBE_UPDATE
-// can lower the cap while a group is already in hand. Dropping it there would be permanent:
-// the group has left the buffer, so raising the cap again could never bring it back. The cap
-// gates what the read cursor hands out, and a group already handed out stays served.
-test("lite draft-05: a group taken before the cap dropped is still served", async () => {
-	const sub = await servedSubscription({ startGroup: 0, gated: true });
+// A group pop is the linearization point. Once the publisher reaches the SUBSCRIBE_START write,
+// the group and its range have already been decided, so an update queued during the write applies
+// to the next pop rather than reaching backward into this one.
+test("lite draft-05: a group popped before a cap update is still served", async () => {
+	const sub = await servedSubscription({ startGroup: 1, gated: true });
+	const ranges = spyOn(TrackSubscriber.prototype, "endAt");
 	try {
-		// Group 0 parks the loop inside its SUBSCRIBE_START write, prefetch already armed.
-		sub.serve(0);
+		sub.serve(1);
 		await sub.parked;
 
-		// So group 1 leaves the buffer here; only the parked loop still holds it.
-		sub.serve(1);
-		await flush();
-
-		// Cap the subscription at group 0, behind the loop's back.
 		await new SubscribeUpdate({ priority: 0, endGroup: 0 }).encode(sub.client.writer, Version.DRAFT_05);
-		while (sub.track.subscription.peek()?.endGroup !== 0) await sub.track.subscription.changed();
+		await flush();
+		// The full update is visible, but the parked serving loop still owns its local cursor.
+		expect(ranges).not.toHaveBeenCalled();
 
 		sub.release();
-
-		// Both reach the wire under a cap of 0, because group 1 was taken while it was still
-		// in range. Nothing raises the cap to rescue it, so the assertion stays sensitive to
-		// the window under test: had the prefetch not taken group 1, the cap would hold it in
-		// the buffer and the second read would go idle instead.
-		expect(await sub.servedSequence()).toBe(0);
 		expect(await sub.servedSequence()).toBe(1);
+		while (ranges.mock.calls.length === 0) await flush();
+		expect(ranges).toHaveBeenLastCalledWith(0);
 	} finally {
+		ranges.mockRestore();
+		sub.release();
 		await sub.close();
 	}
 });
 
-// The other end of the subscription is not symmetric. Raising the start floor is destructive
-// by design, since the read cursor shifts and closes every buffered group below it, so a group
-// already in hand has to go the same way: serving it would re-deliver below a floor the
-// subscriber just moved, which on a route splice is duplicate media.
-test("lite draft-06: a group taken before the floor rose past it is dropped", async () => {
+// No next read is armed while a subscription response is blocked. A buffered control therefore
+// applies before the next buffered group is popped, matching the Rust publisher's control-first
+// poll order.
+test("lite draft-06: a queued floor update applies before the next group pop", async () => {
 	const sub = await servedSubscription({ version: Version.DRAFT_06, startGroup: 0, gated: true });
+	const ranges = spyOn(TrackSubscriber.prototype, "startAt");
 	try {
-		// Same window as the cap test: group 0 parks the loop, so the prefetch takes group 1.
 		sub.serve(0);
 		await sub.parked;
 		sub.serve(1);
-		await flush();
 
-		// Skip ahead past group 1, which the loop is already holding.
 		await new SubscribeUpdate({ priority: 0, startGroup: 2 }).encode(sub.client.writer, Version.DRAFT_06);
-		while (sub.track.subscription.peek()?.startGroup !== 2) await sub.track.subscription.changed();
-
-		// Buffered while the loop is still parked, so it is taken under the raised floor.
 		sub.serve(2);
+		await flush();
+		expect(ranges).toHaveBeenCalledTimes(1);
+		expect(ranges).toHaveBeenLastCalledWith(0);
+
 		sub.release();
 
-		// Group 0 was already decided and stays in flight; group 1 must not follow it.
 		expect(await sub.servedSequence()).toBe(0);
 		expect(await sub.servedSequence()).toBe(2);
+		expect(ranges).toHaveBeenLastCalledWith(2);
 	} finally {
+		ranges.mockRestore();
+		sub.release();
 		await sub.close();
 	}
 });
 
-// Raising the floor into a group already in hand is just as destructive as raising it past
-// the group. The group stays servable, but its snapshotted frame range must be lifted to the
-// new floor so frames the subscriber discarded do not reach the wire.
-test("lite draft-06: a group taken before the floor rose into it starts at the raised frame", async () => {
+// The queued update raises the floor within the next buffered group. Control-first polling
+// applies the new frame start before popping the group, so excluded frames never reach the wire.
+test("lite draft-06: a queued frame floor applies before the next group pop", async () => {
 	const sub = await servedSubscription({
 		version: Version.DRAFT_06,
 		startGroup: 0,
 		frames: ["a", "b", "c"],
 		gated: true,
 	});
+	const ranges = spyOn(TrackSubscriber.prototype, "startAt");
 	try {
-		// Group 0 parks the loop, so the armed prefetch takes group 1 under the old floor.
 		sub.serve(0);
 		await sub.parked;
 		sub.serve(1);
-		await flush();
 
-		// Raise the floor into held group 1, excluding its first two frames.
 		await new SubscribeUpdate({ priority: 0, startGroup: 1, startFrame: 2 }).encode(
 			sub.client.writer,
 			Version.DRAFT_06,
 		);
-		while (sub.track.subscription.peek()?.startGroup !== 1) await sub.track.subscription.changed();
+		await flush();
+		expect(ranges).toHaveBeenCalledTimes(1);
+		expect(ranges).toHaveBeenLastCalledWith(0);
 
 		sub.release();
 
-		// Group 0 was already decided and stays in flight. Group 1 must honor the newer,
-		// destructive floor even though it was taken with a start frame of 0.
 		expect(await sub.servedGroup()).toEqual({ sequence: 0, frameStart: 0, payloads: ["a", "b", "c"] });
 		expect(await sub.servedGroup()).toEqual({ sequence: 1, frameStart: 2, payloads: ["c"] });
+		expect(ranges).toHaveBeenLastCalledWith(1);
 	} finally {
+		ranges.mockRestore();
+		sub.release();
 		await sub.close();
 	}
 });
 
-// Frame bounds have to travel with the group they were taken under. An update that moves the
-// cap off a group already in hand leaves it matching neither boundary, and mapping that to
-// the whole group would put frames the subscription excluded on the wire. Nothing downstream
-// trims them: a frame range is a wire request, not a receiver-side cursor.
-test("lite draft-06: a prefetched group keeps the frame bounds it was taken under", async () => {
+// The update and group are both ready when the write unblocks. Control is drained first, then
+// the group is popped and positioned synchronously under the new frame cap.
+test("lite draft-06: a queued frame update applies before the next group pop", async () => {
 	const sub = await servedSubscription({
 		version: Version.DRAFT_06,
 		startGroup: 0,
@@ -647,23 +647,239 @@ test("lite draft-06: a prefetched group keeps the frame bounds it was taken unde
 		gated: true,
 	});
 	try {
-		// Same window as above: group 0 parks the loop, so the armed prefetch takes group 1.
 		sub.serve(0);
 		await sub.parked;
 		sub.serve(1);
+		await new SubscribeUpdate({ priority: 0, endGroup: 1, endFrame: 0 }).encode(
+			sub.client.writer,
+			Version.DRAFT_06,
+		);
 		await flush();
-
-		// Move the cap off group 1, which the loop is already holding.
-		await new SubscribeUpdate({ priority: 0, endGroup: 0 }).encode(sub.client.writer, Version.DRAFT_06);
-		while (sub.track.subscription.peek()?.endGroup !== 0) await sub.track.subscription.changed();
 
 		sub.release();
 
-		// Group 0 was never the end group, so it goes whole either way.
 		expect(await sub.servedGroup()).toEqual({ sequence: 0, frameStart: 0, payloads: ["a", "b", "c"] });
-		// Group 1 was taken while it was the end group, capped at frame 1, so "c" stays off
-		// the wire even though the cap has since moved below it.
-		expect(await sub.servedGroup()).toEqual({ sequence: 1, frameStart: 0, payloads: ["a", "b"] });
+		expect(await sub.servedGroup()).toEqual({ sequence: 1, frameStart: 0, payloads: ["a"] });
+	} finally {
+		await sub.close();
+	}
+});
+
+// The inverse ordering is equally important. Once the group is popped, its range is fixed in
+// the same turn, so an update decoded while SUBSCRIBE_START is blocked only affects later groups.
+test("lite draft-06: a popped group keeps its frame bounds across a queued update", async () => {
+	const sub = await servedSubscription({
+		version: Version.DRAFT_06,
+		startGroup: 0,
+		endGroup: 0,
+		endFrame: 1,
+		frames: ["a", "b", "c"],
+		gated: true,
+	});
+	try {
+		sub.serve(0);
+		await sub.parked;
+		await new SubscribeUpdate({ priority: 0, endGroup: 0, endFrame: 2 }).encode(
+			sub.client.writer,
+			Version.DRAFT_06,
+		);
+		await flush();
+
+		sub.release();
+		expect(await sub.servedGroup()).toEqual({ sequence: 0, frameStart: 0, payloads: ["a", "b"] });
+	} finally {
+		await sub.close();
+	}
+});
+
+// Updates are full-state, so a burst buffered while the serving loop is parked only needs its
+// newest member. Keeping one pending update bounds memory without serving under stale bounds.
+test("lite draft-06: a burst of updates coalesces before the next group pop", async () => {
+	const sub = await servedSubscription({
+		version: Version.DRAFT_06,
+		startGroup: 0,
+		endGroup: 1,
+		endFrame: 2,
+		frames: ["a", "b", "c"],
+		gated: true,
+	});
+	try {
+		// Group 0 parks the loop inside its SUBSCRIBE_START write; group 1 buffers behind it.
+		sub.serve(0);
+		await sub.parked;
+		sub.serve(1);
+		const ranges = spyOn(TrackSubscriber.prototype, "endAt");
+
+		try {
+			// Two updates land back to back, the second superseding the first.
+			await new SubscribeUpdate({ priority: 0, endGroup: 1, endFrame: 1 }).encode(
+				sub.client.writer,
+				Version.DRAFT_06,
+			);
+			await new SubscribeUpdate({ priority: 0, endGroup: 1, endFrame: 0 }).encode(
+				sub.client.writer,
+				Version.DRAFT_06,
+			);
+			await flush();
+
+			sub.release();
+
+			// Group 0 was popped before either update and is not the end group either way.
+			expect(await sub.servedGroup()).toEqual({
+				sequence: 0,
+				frameStart: 0,
+				payloads: ["a", "b", "c"],
+			});
+			// Group 1 is popped under the latest state, with no application of the older one.
+			expect(await sub.servedGroup()).toEqual({ sequence: 1, frameStart: 0, payloads: ["a"] });
+			expect(ranges).toHaveBeenCalledTimes(1);
+			expect(ranges).toHaveBeenLastCalledWith(1);
+		} finally {
+			ranges.mockRestore();
+		}
+	} finally {
+		await sub.close();
+	}
+});
+
+// Applying one update can itself race the decoder's next message. The serving loop yields a task
+// before another pop so the decoder can finish the already-delivered update and tighten the cap.
+test("lite draft-06: a newer update wins before a buffered group backlog drains", async () => {
+	const sub = await servedSubscription({
+		version: Version.DRAFT_06,
+		startGroup: 0,
+		gated: true,
+	});
+	let second!: Promise<void>;
+	const endAt = TrackSubscriber.prototype.endAt;
+	const ranges = spyOn(TrackSubscriber.prototype, "endAt").mockImplementation(function (
+		this: TrackSubscriber,
+		endGroup,
+	) {
+		second ??= new SubscribeUpdate({ priority: 0, endGroup: 1 }).encode(sub.client.writer, Version.DRAFT_06);
+		return endAt.call(this, endGroup);
+	});
+
+	try {
+		// Group 0 parks the loop. Groups 1 and 2 are both readable when it wakes.
+		sub.serve(0);
+		await sub.parked;
+		sub.serve(1);
+		sub.serve(2);
+
+		// The first update wakes the serving loop. Applying it starts the second update,
+		// which caps the subscription before group 2.
+		await new SubscribeUpdate({ priority: 0, endGroup: 2 }).encode(sub.client.writer, Version.DRAFT_06);
+		await flush();
+		sub.release();
+
+		expect(await sub.servedSequence()).toBe(0);
+		expect(await sub.servedSequence()).toBe(1);
+		await second;
+		expect(await sub.servedSequence()).toBeUndefined();
+		expect(ranges).toHaveBeenCalledTimes(2);
+	} finally {
+		ranges.mockRestore();
+		await sub.close();
+	}
+});
+
+// Scheduling affects streams already in flight, so it cannot wait behind a response write.
+// The full update remains atomic to observers, while the local range cursor stays serialized.
+test("lite draft-06: scheduling updates apply while SUBSCRIBE_START is blocked", async () => {
+	const sub = await servedSubscription({ version: Version.DRAFT_06, startGroup: 0, gated: true });
+	const ranges = spyOn(TrackSubscriber.prototype, "endAt");
+	try {
+		sub.serve(0);
+		await sub.parked;
+
+		await new SubscribeUpdate({ priority: 9, ordered: true, endGroup: 5 }).encode(
+			sub.client.writer,
+			Version.DRAFT_06,
+		);
+		await flush();
+
+		expect(sub.track.subscription.peek()).toEqual({
+			priority: 9,
+			ordered: true,
+			latencyMax: 0,
+			startGroup: undefined,
+			endGroup: 5,
+		});
+		expect(ranges).not.toHaveBeenCalled();
+
+		sub.release();
+		expect(await sub.servedSequence()).toBe(0);
+		while (ranges.mock.calls.length === 0) await flush();
+		expect(ranges).toHaveBeenLastCalledWith(5);
+	} finally {
+		ranges.mockRestore();
+		sub.release();
+		await sub.close();
+	}
+});
+
+// A peer FIN is the subscriber leaving, which the loop takes ahead of any ready group: it stops
+// there rather than draining what is buffered, since nobody is reading the rest. Matches the Rust
+// publisher's TrackEnd::PeerFin, which drops the in-flight group machines instead of draining.
+test("lite draft-05: a peer FIN ends serving while the producer is still live", async () => {
+	const sub = await servedSubscription({ startGroup: 0 });
+	try {
+		sub.serve(0);
+		expect(await sub.servedSequence()).toBe(0);
+
+		// The subscriber unsubscribes. The producer doesn't know and keeps going.
+		sub.client.writer.close();
+		await flush();
+		sub.serve(1);
+
+		expect(await sub.servedSequence()).toBeUndefined();
+	} finally {
+		await sub.close();
+	}
+});
+
+// The two halves of a bidirectional stream close independently. A peer FIN cannot unblock a
+// response write by itself, so serving must race the write against decoded termination.
+test("lite draft-05: a peer FIN interrupts a blocked SUBSCRIBE_START", async () => {
+	const sub = await servedSubscription({ startGroup: 0, gated: true });
+	const resets = spyOn(Writer.prototype, "reset");
+	try {
+		sub.serve(0);
+		await sub.parked;
+
+		sub.client.writer.close();
+		const stopped = await Promise.race([
+			sub.serving.then(() => true),
+			new Promise<false>((resolve) => setTimeout(() => resolve(false), IDLE_MS)),
+		]);
+		expect(stopped).toBe(true);
+		expect(resets).toHaveBeenCalledTimes(1);
+	} finally {
+		resets.mockRestore();
+		// Also unwinds the old behavior when this regression fails.
+		sub.release();
+		await sub.close();
+	}
+});
+
+// runSubscribe waits on the decoder before it returns, so a subscription that dies mid-write
+// with a control still queued has to end the decoder too, or it never returns and the
+// subscription leaks.
+test("lite draft-05: teardown unwinds with an undelivered update queued", async () => {
+	const sub = await servedSubscription({ startGroup: 0, gated: true });
+	try {
+		// Group 0 parks the loop inside its SUBSCRIBE_START write.
+		sub.serve(0);
+		await sub.parked;
+
+		// The update decodes into the slot behind the parked loop, which never takes it
+		// because the write it is parked on fails.
+		await new SubscribeUpdate({ priority: 0, endGroup: 5 }).encode(sub.client.writer, Version.DRAFT_05);
+		await flush();
+
+		sub.release(new Error("write failed"));
+		await sub.serving;
 	} finally {
 		await sub.close();
 	}
