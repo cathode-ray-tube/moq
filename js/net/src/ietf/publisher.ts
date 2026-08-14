@@ -446,6 +446,16 @@ export class Publisher {
 		// The open PUBLISH_NAMESPACE request per advertised path.
 		const requests = new Map<Path.Valid, { path: Path.Valid; requestId: bigint; stream: Stream }>();
 
+		// The origin outlives the session and its signal never ends, so this loop needs the
+		// session's own ending to stop: without it a closed connection leaves the loop parked
+		// on a shared origin forever, waking on someone else's publish to fail on a dead
+		// transport. `runSubscribeNamespace` gets this from the stream the peer asked on; an
+		// unsolicited loop has no stream of its own, so the session is what it watches.
+		const closed = this.#quic.closed.then(
+			() => undefined,
+			() => undefined,
+		);
+
 		try {
 			// What the peer holds: keyed by path, valued by the routing front, so a republish
 			// diffs as withdraw-then-advertise rather than nothing.
@@ -520,8 +530,8 @@ export class Publisher {
 
 				// Wait for the next change, which has already fired if one landed above.
 				const next = await (retry
-					? Promise.race([changed, retryAfter(retry).then(() => broadcasts)])
-					: changed);
+					? Promise.race([changed, closed, retryAfter(retry).then(() => broadcasts)])
+					: Promise.race([changed, closed]));
 				dispose();
 				if (!next) break;
 			}

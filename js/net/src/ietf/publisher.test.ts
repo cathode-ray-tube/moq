@@ -373,3 +373,36 @@ test("re-announcing a path clears a refusal that forbade retrying", async () => 
 
 	origin.close();
 });
+
+/**
+ * The origin outlives the session and its signal never ends, so a closed connection
+ * reaches this loop through nothing it watches. Left unbounded it parks on the shared
+ * origin forever, waking on an unrelated publish to fail against a dead transport.
+ */
+test("closing the session ends the unsolicited announce loop", async () => {
+	const pair = createMockTransportPair(ALPN.DRAFT_19);
+	const { pub, origin } = publisher(pair.server);
+
+	origin.publish(Path.from("first"));
+
+	const loop = pub.runPublishNamespaces();
+
+	const one = await nextStream(pair.client);
+	if (!one) throw new Error("no PUBLISH_NAMESPACE for the first broadcast");
+	expect(await readPublishNamespace(one)).toBe(Path.from("first"));
+	await acceptPublishNamespace(one);
+
+	// The session ends. The origin is untouched: it is shared, and other sessions keep using it.
+	pair.server.close();
+
+	await Promise.race([
+		loop,
+		new Promise((_resolve, reject) =>
+			setTimeout(() => reject(new Error("the announce loop outlived its session")), STREAM_WAIT),
+		),
+	]);
+
+	// The origin really did survive the session, so publishing into it is still valid.
+	origin.publish(Path.from("second"));
+	origin.close();
+});

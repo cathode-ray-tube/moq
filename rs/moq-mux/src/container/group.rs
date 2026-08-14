@@ -117,12 +117,11 @@ mod tests {
 		let format = Hang::try_from(&cmaf).unwrap();
 
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		// Retention is a track property, so the fetch below still finds the group.
-		let info = moq_net::track::Info::default().with_latency_max(std::time::Duration::from_secs(1));
-		let track = broadcast.create_track("video", info).unwrap();
+		let track = broadcast.create_track("video", None).unwrap();
 		let consumer = broadcast.consume();
 
-		let mut media = crate::container::Producer::new(track, format);
+		// Buffer both samples into one moof+mdat, which is what this decodes.
+		let mut media = crate::container::Producer::new(track, format).with_buffer(std::time::Duration::from_secs(1));
 		for (timestamp_us, payload, keyframe) in [
 			(2_000_000, b"keyframe".as_slice(), true),
 			(2_020_000, b"delta".as_slice(), false),

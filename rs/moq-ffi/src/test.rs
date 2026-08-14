@@ -522,11 +522,10 @@ async fn fetch_media_group_decodes_multiple_cmaf_samples() {
 	let container = moq_mux::catalog::hang::Container::try_from(&catalog_container).unwrap();
 
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
-	// Retention is a track property, so the fetch below still finds the group.
-	let info = moq_net::track::Info::default().with_latency_max(Duration::from_secs(1));
-	let track = broadcast.create_track("video", info).unwrap();
+	let track = broadcast.create_track("video", None).unwrap();
 	let consumer = MoqBroadcastConsumer::new(broadcast.consume());
-	let mut media = moq_mux::container::Producer::new(track, container);
+	// Buffer both samples into one moof+mdat, which is what this decodes.
+	let mut media = moq_mux::container::Producer::new(track, container).with_buffer(Duration::from_secs(1));
 	for (timestamp_us, payload, keyframe) in [
 		(2_000_000, bytes::Bytes::from_static(b"keyframe"), true),
 		(2_020_000, bytes::Bytes::from_static(b"delta"), false),
