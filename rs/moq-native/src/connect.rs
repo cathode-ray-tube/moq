@@ -18,6 +18,13 @@ pub(crate) const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// [`Config::resolved_race`] has to answer in every build.
 pub(crate) const DEFAULT_RACE: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// How long the first candidate waits for the full DNS answer before settling for
+/// the IPv4-only one, unless overridden by `--connect-resolution-delay`. RFC 8305's
+/// recommended Resolution Delay.
+///
+/// Lives here for the same reason as [`DEFAULT_RACE`].
+pub(crate) const DEFAULT_RESOLUTION_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// One or more addresses for the same peer, tried in order until one connects.
 ///
 /// Most callers have a single URL and never name this type:
@@ -108,6 +115,15 @@ pub(crate) struct Legacy {
 	race: Option<std::time::Duration>,
 
 	#[arg(
+		id = "client-resolution-delay",
+		long = "client-resolution-delay",
+		env = "MOQ_CLIENT_RESOLUTION_DELAY",
+		value_parser = humantime::parse_duration,
+		hide = true,
+	)]
+	resolution_delay: Option<std::time::Duration>,
+
+	#[arg(
 		id = "client-reconnect",
 		long = "client-reconnect",
 		env = "MOQ_CLIENT_RECONNECT",
@@ -151,6 +167,9 @@ impl Legacy {
 		}
 		if self.race.is_some() {
 			used.push("--client-failover-delay -> --connect-race");
+		}
+		if self.resolution_delay.is_some() {
+			used.push("--client-resolution-delay -> --connect-resolution-delay");
 		}
 		if self.reconnect.is_some() {
 			used.push("--client-reconnect -> --connect-once (inverted)");
@@ -377,6 +396,22 @@ pub struct Config {
 	)]
 	pub race: Option<std::time::Duration>,
 
+	/// Delay before dialing an IPv4 address while the full DNS answer is outstanding.
+	///
+	/// A dial runs the usual all-families lookup alongside an IPv4-only one that
+	/// answers without waiting for the AAAA record, and starts on the first answer.
+	/// The full answer is authoritative, including which family to try first, so
+	/// this is how long the IPv4-only one waits for it before going ahead alone.
+	/// Defaults to 50ms; `0s` dials as soon as any address resolves.
+	#[serde(default, skip_serializing_if = "Option::is_none", with = "humantime_serde::option")]
+	#[arg(
+		id = "connect-resolution-delay",
+		long = "connect-resolution-delay",
+		env = "MOQ_CONNECT_RESOLUTION_DELAY",
+		value_parser = humantime::parse_duration,
+	)]
+	pub resolution_delay: Option<std::time::Duration>,
+
 	/// Maximum time for one [`crate::Client::connect`], covering the dial and the MoQ
 	/// handshake. Defaults to 30 seconds; set to 0 to wait forever.
 	///
@@ -490,6 +525,7 @@ impl Config {
 		resolved.backend = self.backend.clone().or(legacy.backend.clone());
 		resolved.timeout = self.timeout.or(legacy.timeout);
 		resolved.race = self.race.or(legacy.race);
+		resolved.resolution_delay = self.resolution_delay.or(legacy.resolution_delay);
 		// The two legacy spellings say "keep reconnecting", so they invert.
 		resolved.once = self
 			.once
@@ -546,6 +582,13 @@ impl Config {
 	/// default itself.
 	pub fn resolved_race(&self) -> std::time::Duration {
 		self.race.unwrap_or(DEFAULT_RACE)
+	}
+
+	/// The Resolution Delay a dial will actually use, resolving the default from
+	/// the [`resolution_delay`](Self::resolution_delay) override. Read by every
+	/// backend, like [`resolved_race`](Self::resolved_race).
+	pub fn resolved_resolution_delay(&self) -> std::time::Duration {
+		self.resolution_delay.unwrap_or(DEFAULT_RESOLUTION_DELAY)
 	}
 
 	/// The deadline one connection attempt will actually get, dial and handshake

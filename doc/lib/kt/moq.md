@@ -16,7 +16,7 @@ Full API reference: [javadoc.io/doc/dev.moq/moq](https://javadoc.io/doc/dev.moq/
 ```kotlin
 // build.gradle.kts
 dependencies {
-    implementation("dev.moq:moq:0.4.2")
+    implementation("dev.moq:moq:0.4.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
 }
 ```
@@ -173,7 +173,7 @@ video.finish()
 
 `autoEncoder` prefers a hardware encoder and falls back to software; `softwareEncoder`, `hardwareEncoder`, and `namedEncoder("videotoolbox")` pin the choice. The bindings compile VideoToolbox (macOS), Media Foundation (Windows), and openh264 (software, everywhere); the Linux hardware codecs are a libmoq-only build option. `setBitrate` retunes the live encoder without forcing a keyframe, cheap enough to drive from a congestion controller.
 
-The track is named after the codec (`.avc3` / `.hev1`) and its catalog rendition appears once the first keyframe is encoded, so subscribers discover it through the catalog rather than a name you pick. `cut()` starts a new group at the next frame, which is optional: the encoder keyframes every `gop` frames on its own, and each of those cuts a group.
+The track is named after the codec (`.avc3` / `.hev1`) and its catalog rendition is published immediately, read out of the encoder itself, so subscribers discover it through the catalog rather than a name you pick, and can find it before the first frame exists. `cut()` starts a new group at the next frame, which is optional: the encoder keyframes every `gop` frames on its own, and each of those cuts a group.
 
 ## Serve
 
@@ -238,6 +238,27 @@ dynamic.requestedGroups().collect { request ->
 ```
 
 Call `request.abort(code)` when the requested group cannot be produced. Fetch is currently a single-group operation and is supported by the moq-lite 05+ FETCH wire path.
+
+### Fetching media groups
+
+`fetchGroup` hands back raw payloads. `fetchMediaGroup` decodes the same group through the rendition's advertised container, so you get timestamped frames without opening a live subscription:
+
+```kotlin
+val (name, audio) = consumer.catalog().audio.entries.first()
+
+consumer.fetchMediaGroup(
+    name,
+    42uL,
+    audio.container,
+    FetchGroupOptions(priority = 10u),
+).use { group ->
+    group.frames().collect { frame ->
+        println("${frame.timestampUs}: ${frame.payload.size} bytes")
+    }
+}
+```
+
+`frames()` is a cancellation-aware `Flow`. A fetched media group is finite: it completes after the group's last decoded frame, unlike the live `subscribeMedia` stream. Latency-based group skipping does not apply, so you always get every frame in the group.
 
 ### On-demand raw tracks
 

@@ -30,10 +30,12 @@ pub struct Client {
 	pub(crate) reconnect: bool,
 	pub(crate) backoff: Backoff,
 	pub(crate) goaway: GoawayConfig,
-	/// The resolved Happy Eyeballs stagger, used by the `tcp://` dial here; the
+	/// The resolved Happy Eyeballs timings, used by the `tcp://` dial here; the
 	/// QUIC backends capture their own copy from the config.
 	#[cfg(feature = "tcp")]
 	failover_delay: std::time::Duration,
+	#[cfg(feature = "tcp")]
+	resolution_delay: std::time::Duration,
 	#[cfg(feature = "websocket")]
 	websocket: crate::websocket::Config,
 	/// Only the rustls-based dials read this. quiche builds its own TLS stack, and the
@@ -122,6 +124,8 @@ impl Client {
 		// Read before the struct literal below moves fields out of `config`.
 		#[cfg(feature = "tcp")]
 		let failover_delay = config.resolved_race();
+		#[cfg(feature = "tcp")]
+		let resolution_delay = config.resolved_resolution_delay();
 		let timeout = config.resolved_timeout();
 
 		Ok(Self {
@@ -142,6 +146,8 @@ impl Client {
 			goaway: config.goaway,
 			#[cfg(feature = "tcp")]
 			failover_delay,
+			#[cfg(feature = "tcp")]
+			resolution_delay,
 			#[cfg(feature = "websocket")]
 			websocket: config.websocket,
 			#[cfg(any(feature = "noq", feature = "quinn", feature = "websocket"))]
@@ -350,7 +356,8 @@ impl Client {
 		// QUIC, which can't speak it. Use only on a trusted network.
 		#[cfg(feature = "tcp")]
 		if url.scheme() == "tcp" {
-			let session = crate::tcp::connect(url, &self.versions.alpns(), self.failover_delay).await?;
+			let session =
+				crate::tcp::connect(url, &self.versions.alpns(), self.failover_delay, self.resolution_delay).await?;
 			return Ok(moq.connect(crate::transport::Async::new(session)).await?);
 		}
 
@@ -813,6 +820,42 @@ mod tests {
 	}
 
 	#[test]
+	fn test_toml_resolution_delay_survives_update_from() {
+		let toml = r#"
+			resolution_delay = "10ms"
+		"#;
+
+		let config: crate::connect::Config = toml::from_str(toml).unwrap();
+		assert_eq!(config.resolution_delay, Some(std::time::Duration::from_millis(10)));
+
+		// Simulate: TOML loaded, then CLI args re-applied (no --connect-resolution-delay flag).
+		let mut cli = Cli { config };
+		cli.update_from(["test"]);
+		assert_eq!(cli.config.resolution_delay, Some(std::time::Duration::from_millis(10)));
+	}
+
+	#[test]
+	fn test_cli_resolution_delay() {
+		let config = Cli::config_from(["test", "--connect-resolution-delay", "0s"]);
+		assert_eq!(config.resolution_delay, Some(std::time::Duration::ZERO));
+		assert_eq!(config.resolved_resolution_delay(), std::time::Duration::ZERO);
+	}
+
+	/// The released `--client-resolution-delay` spelling still lands on the field.
+	#[test]
+	fn test_cli_resolution_delay_legacy() {
+		let config = Cli::config_from(["test", "--client-resolution-delay", "10ms"]).resolved();
+		assert_eq!(config.resolution_delay, Some(std::time::Duration::from_millis(10)));
+	}
+
+	#[test]
+	fn resolution_delay_defaults_to_the_rfc_value() {
+		let config = Cli::config_from(["test"]);
+		assert_eq!(config.resolution_delay, None);
+		assert_eq!(config.resolved_resolution_delay(), std::time::Duration::from_millis(50));
+	}
+
+	#[test]
 	fn test_toml_fingerprint_survives_update_from() {
 		let toml = r#"
 			tls.fingerprint = ["abcd1234", "ef567890"]
@@ -1096,7 +1139,7 @@ mod tests {
 	))]
 	#[test]
 	fn iroh_only_client_does_not_require_a_tls_provider() {
-		ClientConfig::default().init().expect("iroh-only client");
+		crate::connect::Config::default().init().expect("iroh-only client");
 	}
 
 	#[test]

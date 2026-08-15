@@ -123,7 +123,7 @@ video.finish()
 
 `VideoEncoderKind.AUTO()` prefers a hardware encoder and falls back to software; `SOFTWARE()`, `HARDWARE()`, and `NAMED("videotoolbox")` pin the choice (each variant is a class, so call it). The bindings compile VideoToolbox (macOS), Media Foundation (Windows), and openh264 (software, everywhere); the Linux hardware codecs are a libmoq-only build option. `set_bitrate` retunes the live encoder without forcing a keyframe, cheap enough to drive from a congestion controller.
 
-The track is named after the codec (`.avc3` / `.hev1`) and its catalog rendition appears once the first keyframe is encoded, so subscribers discover it through the catalog rather than a name you pick. `cut()` starts a new group at the next frame, which is optional: the encoder keyframes every `gop` frames on its own, and each of those cuts a group.
+The track is named after the codec (`.avc3` / `.hev1`) and its catalog rendition is published immediately, read out of the encoder itself, so subscribers discover it through the catalog rather than a name you pick, and can find it before the first frame exists. `cut()` starts a new group at the next frame, which is optional: the encoder keyframes every `gop` frames on its own, and each of those cuts a group.
 
 `publish_media` fills the catalog by parsing the codec bitstream. For a video format you can pass a `VideoHint` to supply fields the stream can't reveal (such as `bitrate`), or to publish the catalog before the first keyframe:
 
@@ -233,6 +233,21 @@ async for request in dynamic:
 ```
 
 Call `request.abort(code)` when the requested group cannot be produced. Fetch is currently a single-group operation and is supported by the moq-lite 05+ FETCH wire path.
+
+### Fetching media groups
+
+`fetch_group` hands back raw payloads. `fetch_media_group` decodes the same group through the rendition's container, so you get timestamped frames without opening a live subscription:
+
+```python
+catalog = await broadcast_consumer.catalog()
+name, audio = next(iter(catalog.audio.items()))
+
+group = await broadcast_consumer.fetch_media_group(name, sequence=42, track=audio)
+async for frame in group:
+    print(frame.timestamp_us, len(frame.payload))
+```
+
+A fetched media group is finite: it ends after the group's last decoded frame, unlike the live `subscribe_media` stream. Latency-based group skipping does not apply, so you always get every frame in the group.
 
 ### Raw datagrams
 

@@ -94,14 +94,15 @@ async function acceptAlpn(
 	version: Ietf.IetfVersion,
 	wiring: SessionProps,
 ): Promise<Established> {
-	const controlStream = await exchangeSetup(transport, version, "moq-lite-js");
+	const { control, solicit } = await exchangeSetup(transport, version, "moq-lite-js");
 
 	return new Ietf.Connection({
 		...wiring,
 		client: false,
 		url,
 		quic: transport,
-		control: controlStream,
+		control,
+		solicit,
 		// v17+ uses NativeSession which manages its own request IDs; maxRequestId is unused.
 		maxRequestId: 0n,
 		version,
@@ -127,7 +128,7 @@ async function acceptSetup(
 		throw new Error(`unexpected client message type: 0x${clientCompat.toString(16)}`);
 	}
 
-	await Ietf.ClientSetup.decode(stream.reader, version);
+	const client = await Ietf.ClientSetup.decode(stream.reader, version);
 
 	await stream.writer.u53(Lite.StreamId.ServerCompat);
 
@@ -135,6 +136,7 @@ async function acceptSetup(
 	const params = new Ietf.SetupOptions();
 	params.setVarint(Ietf.SetupOption.MaxRequestId, 42069n);
 	params.setBytes(Ietf.SetupOption.Implementation, encoder.encode("moq-lite-js"));
+	Ietf.solicitIntoSetup(params);
 
 	const server = new Ietf.ServerSetup({ version, parameters: params });
 	await server.encode(stream.writer, version);
@@ -149,6 +151,7 @@ async function acceptSetup(
 		control: stream,
 		maxRequestId,
 		version,
+		solicit: Ietf.solicitFromSetup(client.parameters),
 	});
 }
 
@@ -191,6 +194,7 @@ async function acceptNegotiated(
 	const params = new Ietf.SetupOptions();
 	params.setVarint(Ietf.SetupOption.MaxRequestId, 42069n);
 	params.setBytes(Ietf.SetupOption.Implementation, encoder.encode("moq-lite-js"));
+	Ietf.solicitIntoSetup(params);
 
 	const server = new Ietf.ServerSetup({ version: selectedVersion, parameters: params });
 	await server.encode(stream.writer, setupVersion);
@@ -213,6 +217,7 @@ async function acceptNegotiated(
 			control: stream,
 			maxRequestId,
 			version: selectedVersion as Ietf.IetfVersion,
+			solicit: Ietf.solicitFromSetup(client.parameters),
 		});
 	} else {
 		throw new Error(`unsupported version: ${selectedVersion.toString(16)}`);

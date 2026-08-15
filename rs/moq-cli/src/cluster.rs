@@ -301,7 +301,7 @@ pub async fn serve(
 	server: moq_native::Server,
 	lan: Lan,
 	origin: moq_net::origin::Producer,
-	direction: crate::Direction,
+	directions: crate::Directions,
 	public: bool,
 ) -> anyhow::Result<()> {
 	let mut server = server.listen().await.context("failed to bind listeners")?;
@@ -333,10 +333,15 @@ pub async fn serve(
 			continue;
 		}
 
-		let request = match direction {
-			crate::Direction::Import => request.with_publisher(origin.consume()),
-			crate::Direction::Export => request.with_subscriber(origin.clone()),
-		};
+		// Both directions attach to the same session when the process runs both kinds
+		// of stage, which is how a relay peers with another relay.
+		let mut request = request;
+		if directions.publish {
+			request = request.with_publisher(origin.consume());
+		}
+		if directions.consume {
+			request = request.with_subscriber(origin.clone());
+		}
 		tasks.spawn(async move {
 			let err = match request.ok().await {
 				Ok(session) => session.closed().await.into(),
@@ -596,7 +601,16 @@ mod tests {
 		accept.origin = origin_b.clone();
 		// The mesh shares the listener with ordinary clients, so go through the
 		// same dispatch `--cluster-lan` installs rather than calling `accept`.
-		tokio::spawn(serve(server, accept, origin_b.clone(), crate::Direction::Import, false));
+		tokio::spawn(serve(
+			server,
+			accept,
+			origin_b.clone(),
+			crate::Directions {
+				publish: true,
+				consume: false,
+			},
+			false,
+		));
 
 		let mut dialer = lan("dialer-proof");
 		dialer.origin = origin_a.clone();
@@ -639,7 +653,16 @@ mod tests {
 		let (server, peer) = listener();
 		let mut accept = lan("the-real-proof");
 		accept.origin = origin_b.clone();
-		tokio::spawn(serve(server, accept, origin_b.clone(), crate::Direction::Import, false));
+		tokio::spawn(serve(
+			server,
+			accept,
+			origin_b.clone(),
+			crate::Directions {
+				publish: true,
+				consume: false,
+			},
+			false,
+		));
 
 		// A peer that reached the port but never saw a verifiable advertisement.
 		let mut dialer = lan("dialer-proof");
@@ -670,7 +693,16 @@ mod tests {
 		let mut accept = lan("the-real-proof");
 		accept.origin = origin.clone();
 		// `public: false` is what `--cluster-lan` passes with no `--listen`.
-		tokio::spawn(serve(server, accept, origin.clone(), crate::Direction::Import, false));
+		tokio::spawn(serve(
+			server,
+			accept,
+			origin.clone(),
+			crate::Directions {
+				publish: true,
+				consume: false,
+			},
+			false,
+		));
 
 		// An ordinary client: no mesh marker, no proof, just the advertised port.
 		let mut config = moq_native::connect::Config::default();

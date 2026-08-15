@@ -243,12 +243,23 @@ goaway.handover = "10s"
 # fails outright), and the first connection to complete wins. "0s" dials every
 # address at once. Defaults to 250ms, RFC 8305's Connection Attempt Delay.
 # race = "250ms"
+
+# Delay before dialing an IPv4 address while the full DNS answer is outstanding.
+# A dial runs the usual all-families lookup alongside an IPv4-only one that
+# answers without waiting for the AAAA record, and starts on the first answer, so
+# a slow or dropped AAAA query no longer delays it. The full answer is
+# authoritative, including which family to try first, so this is how long the
+# IPv4-only one waits for it before going ahead alone. "0s" dials as soon as any
+# address resolves. Defaults to 50ms, RFC 8305's Resolution Delay.
+# resolution_delay = "50ms"
 ```
 
 The connect timeout is also available as `--connect-timeout` or
-`MOQ_CONNECT_TIMEOUT`, and the address race as `--connect-race` or
-`MOQ_CONNECT_RACE`. The two compose: the race staggers the attempts within one
-dial, and the timeout bounds that dial as a whole.
+`MOQ_CONNECT_TIMEOUT`, the address race as `--connect-race` or
+`MOQ_CONNECT_RACE`, and the resolution delay as `--connect-resolution-delay` or
+`MOQ_CONNECT_RESOLUTION_DELAY`. They compose: the resolution delay picks which
+family goes first, the race staggers the attempts within one dial, and the
+timeout bounds that dial as a whole.
 
 Pinning the source port (a non-zero port in `--connect-bind`) disables address
 racing on the `quiche` backend, which binds a fresh socket per attempt and so

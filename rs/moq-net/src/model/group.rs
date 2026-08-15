@@ -867,6 +867,20 @@ impl Consumer {
 		}
 	}
 
+	/// Park `waiter` until the group closes (finish, abort, or eviction). Spliced
+	/// subscribers register on parked groups so an eviction wakes them; a group
+	/// that already closed cleanly can never abort, so no waiter is needed.
+	///
+	/// A spliced group reads as closed without registering anything: no single abort
+	/// empties it, so [`Self::is_aborted`] can never turn true and there is nothing
+	/// a wakeup would change.
+	pub(crate) fn poll_closed(&self, waiter: &kio::Waiter) -> Poll<()> {
+		match &self.inner {
+			ConsumerKind::Plain(plain) => plain.state.poll_closed(waiter),
+			ConsumerKind::Spliced(_) => Poll::Ready(()),
+		}
+	}
+
 	/// The parent track's timescale.
 	pub fn timescale(&self) -> Timescale {
 		self.track.timescale
