@@ -15,7 +15,7 @@ use crate::{
 	track::{Position, Subscription},
 };
 
-use super::{ConnectingProducer, RouteCost, Version};
+use super::{RouteCost, Version};
 
 use web_async::Lock;
 
@@ -193,10 +193,6 @@ impl<S: crate::transport::poll::Session> Subscriber<S> {
 						&mut run.routes,
 					)?;
 				}
-				// The first `initial_count` Active messages are the initial set; once
-				// they're all in, the caller drops its producer to mark this prefix
-				// connected.
-				run.initial_remaining = run.initial_remaining.saturating_sub(1);
 			}
 			lite::AnnounceBroadcast::Ended { suffix, .. } => {
 				let path = prefix.join(&suffix);
@@ -464,11 +460,6 @@ impl<S: crate::transport::poll::Session> Subscriber<S> {
 /// error ends it.
 pub(super) struct SubscriberDriver<S: crate::transport::poll::Session> {
 	subscriber: Subscriber<S>,
-	/// Our own clone of the connection-progress producer, dropped on the first
-	/// poll. Holding it until then keeps `Connecting` pending so `connect()`
-	/// drives the driver at least once, exactly like the old announce task; the
-	/// per-prefix clones then own the boundary.
-	connecting: Option<ConnectingProducer>,
 	/// One machine per permitted prefix. Only an error ends the session; a
 	/// prefix finishing cleanly (publisher FIN) just retires.
 	prefixes: Vec<AnnouncePrefix<S>>,
@@ -482,22 +473,17 @@ pub(super) struct SubscriberDriver<S: crate::transport::poll::Session> {
 }
 
 impl<S: crate::transport::poll::Session> SubscriberDriver<S> {
-	/// `connecting` is the connection-progress producer for this session (None for
-	/// versions with no initial-set boundary). Each prefix holds its own clone and
-	/// drops it once its initial set is in; with no prefixes it drops here, so the
-	/// session is connected now.
-	pub fn new(subscriber: Subscriber<S>, connecting: Option<ConnectingProducer>) -> Self {
+	pub fn new(subscriber: Subscriber<S>) -> Self {
 		let prefixes = subscriber
 			.origin
 			.allowed()
 			.map(|p| p.to_owned())
 			.collect::<Vec<PathOwned>>()
 			.into_iter()
-			.map(|prefix| AnnouncePrefix::new(subscriber.clone(), prefix, connecting.clone()))
+			.map(|prefix| AnnouncePrefix::new(subscriber.clone(), prefix))
 			.collect();
 
 		Self {
-			connecting,
 			prefixes,
 			uni: UniAccept::new(subscriber.clone()),
 			bandwidth: Some(RecvBandwidth::new(subscriber.clone())),
@@ -508,10 +494,6 @@ impl<S: crate::transport::poll::Session> SubscriberDriver<S> {
 	}
 
 	pub fn poll(&mut self, waiter: &kio::Waiter) -> Poll<Result<(), Error>> {
-		// Each prefix holds its own clone; with no prefixes, this drop is what
-		// marks the session connected.
-		self.connecting.take();
-
 		let mut i = 0;
 		while i < self.prefixes.len() {
 			match self.prefixes[i].poll(waiter) {
@@ -1079,9 +1061,6 @@ impl<S: crate::transport::poll::Session> ProbeStream<S> {
 struct AnnouncePrefix<S: crate::transport::poll::Session> {
 	subscriber: Subscriber<S>,
 	prefix: PathOwned,
-	// Dropped once this prefix's initial set is in (or on any exit), so a failed
-	// prefix can't hang connect().
-	connecting: Option<ConnectingProducer>,
 	state: PrefixState<S>,
 }
 
@@ -1096,7 +1075,6 @@ enum PrefixState<S: crate::transport::poll::Session> {
 	Cost {
 		stream: Stream<S, Version>,
 		responder_origin: Option<crate::Origin>,
-		initial_count: u64,
 	},
 	/// Lite01/02: reading the ANNOUNCE_INIT set.
 	ReadInit { stream: Stream<S, Version>, run: PrefixRun },
@@ -1111,10 +1089,6 @@ struct PrefixRun {
 	/// it comes from the connect config or the peer's SETUP, neither of which
 	/// changes for the life of the session.
 	link_cost: u64,
-	/// The first `initial_count` Active messages are the initial set; once
-	/// they're all in, the connecting producer drops to mark this prefix
-	/// connected.
-	initial_remaining: u64,
 	routes: HashMap<PathOwned, AnnouncedRoute>,
 	// Lite06+: announce ids. Each received `active` implicitly assigns the next
 	// per-stream ordinal; `ended`/`restart` reference it instead of repeating the
@@ -1126,11 +1100,10 @@ struct PrefixRun {
 }
 
 impl<S: crate::transport::poll::Session> AnnouncePrefix<S> {
-	fn new(subscriber: Subscriber<S>, prefix: PathOwned, connecting: Option<ConnectingProducer>) -> Self {
+	fn new(subscriber: Subscriber<S>, prefix: PathOwned) -> Self {
 		Self {
 			subscriber,
 			prefix,
-			connecting,
 			state: PrefixState::Open,
 		}
 	}
@@ -1169,15 +1142,16 @@ impl<S: crate::transport::poll::Session> AnnouncePrefix<S> {
 						false => PrefixState::Cost {
 							stream,
 							responder_origin: None,
-							initial_count: 0,
 						},
 					};
 				}
 				PrefixState::ReadOk { stream } => {
-					// Lite05+: the publisher reports its own origin id (which we stamp onto
-					// every received Announce's hop chain, since it no longer does so
-					// itself) plus the count of initial active announces that follow
-					// immediately.
+					// Lite05+: the publisher reports its own origin id, which we stamp onto
+					// every received Announce's hop chain since it no longer does so itself.
+					// Its `active` count marks where the initial set ends; nothing here needs
+					// that boundary, so it is read and dropped. Callers that must not race an
+					// announcement use `origin::Consumer::announced_broadcast`, which waits
+					// for the path itself.
 					let ok = ready!(stream.reader.poll_decode::<lite::AnnounceOk>(&mut cx))?;
 					// A peer may legally report id 0 (no identity). When the caller assigned
 					// it one, stand that in so the route isn't loop-blind.
@@ -1191,7 +1165,6 @@ impl<S: crate::transport::poll::Session> AnnouncePrefix<S> {
 					self.state = PrefixState::Cost {
 						stream,
 						responder_origin: Some(origin),
-						initial_count: ok.active,
 					};
 				}
 				PrefixState::Cost { .. } => {
@@ -1199,41 +1172,26 @@ impl<S: crate::transport::poll::Session> AnnouncePrefix<S> {
 					let PrefixState::Cost {
 						stream,
 						responder_origin,
-						initial_count,
 					} = std::mem::replace(&mut self.state, PrefixState::Open)
 					else {
 						unreachable!()
 					};
 
-					let mut run = PrefixRun {
+					let run = PrefixRun {
 						responder_origin,
 						link_cost,
-						initial_remaining: 0,
 						routes: HashMap::new(),
 						next_announce_id: 0,
 						announced_by_id: HashMap::new(),
 					};
 
-					// Release the producer once this prefix's initial set is in. Lite01/02
-					// deliver it via ANNOUNCE_INIT (the ReadInit state); Lite05 delivers
-					// `initial_count` Announce::Active counted in the run loop; Lite03/04
-					// have no boundary.
-					match self.subscriber.version {
-						Version::Lite01 | Version::Lite02 => {
-							self.state = PrefixState::ReadInit { stream, run };
-						}
-						_ if self.subscriber.version.has_announce_ok() => {
-							if initial_count == 0 {
-								self.connecting.take();
-							}
-							run.initial_remaining = initial_count;
-							self.state = PrefixState::Run { stream, run };
-						}
-						_ => {
-							self.connecting.take();
-							self.state = PrefixState::Run { stream, run };
-						}
-					}
+					// Lite01/02 send the initial set as one ANNOUNCE_INIT message, so they
+					// read that before the update stream. Every other version streams it as
+					// ordinary announces.
+					self.state = match self.subscriber.version {
+						Version::Lite01 | Version::Lite02 => PrefixState::ReadInit { stream, run },
+						_ => PrefixState::Run { stream, run },
+					};
 				}
 				PrefixState::ReadInit { stream, run } => {
 					let msg = ready!(stream.reader.poll_decode::<lite::AnnounceInit>(&mut cx))?;
@@ -1251,7 +1209,6 @@ impl<S: crate::transport::poll::Session> AnnouncePrefix<S> {
 							&mut run.routes,
 						)?;
 					}
-					self.connecting.take();
 					let PrefixState::ReadInit { stream, run } = std::mem::replace(&mut self.state, PrefixState::Open)
 					else {
 						unreachable!()
@@ -1273,9 +1230,6 @@ impl<S: crate::transport::poll::Session> AnnouncePrefix<S> {
 							return Poll::Ready(Ok(()));
 						};
 						self.subscriber.handle_announce(&self.prefix, announce, run)?;
-						if run.initial_remaining == 0 {
-							self.connecting.take();
-						}
 					}
 				}
 			}

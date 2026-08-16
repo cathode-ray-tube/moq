@@ -9,13 +9,11 @@ use crate::{
 use std::task::{Context, Poll, ready};
 
 use super::{
-	Connecting, DataType, PeerSetup, Publisher, PublisherConfig, Setup, Subscriber, SubscriberConfig, SubscriberDriver,
-	Version,
+	DataType, PeerSetup, Publisher, PublisherConfig, Setup, Subscriber, SubscriberConfig, SubscriberDriver, Version,
 };
 
 pub(crate) struct SessionStart {
 	pub recv_bandwidth: Option<bandwidth::Consumer>,
-	pub connecting: Connecting,
 	pub driver: MaybeSendBox<'static, Result<(), Error>>,
 	/// The session-side GOAWAY halves, stored on the public [`crate::Session`].
 	pub goaway: crate::goaway::Handle,
@@ -88,10 +86,7 @@ pub struct Config<S: crate::transport::poll::Session> {
 
 /// Start a lite session.
 ///
-/// Returns the receive-bandwidth consumer (if any) and a [`Connecting`] handle that
-/// becomes ready once the initial announce set has been inserted into the subscribe
-/// origin, letting `connect()` block past the startup race. It is ready immediately
-/// when there is nothing to wait on (a version without an initial-set boundary).
+/// Returns the receive-bandwidth consumer (if any) plus the driver that runs the session.
 pub fn start<S: crate::transport::poll::Session>(config: Config<S>) -> Result<SessionStart, Error> {
 	let Config {
 		mut session,
@@ -116,18 +111,6 @@ pub fn start<S: crate::transport::poll::Session>(config: Config<S>) -> Result<Se
 		_ => Some(recv_bw),
 	};
 
-	// Connection-progress tracker. Only block on the initial set for versions with an
-	// initial-set boundary (AnnounceInit for Lite01/02, AnnounceOk for Lite05+). For other
-	// versions we drop the producer here, which closes the channel and makes
-	// `Connecting::ready` resolve immediately. An empty subscribe origin also resolves
-	// immediately because the subscriber arms with a prefix count of zero.
-	let (connecting_producer, connecting) = Connecting::new();
-	let sub_connecting = if matches!(version, Version::Lite01 | Version::Lite02) || version.has_announce_ok() {
-		Some(connecting_producer)
-	} else {
-		None
-	};
-
 	// Declare our origin (hop) id in SETUP so the peer can serve our
 	// subscriptions from a route that does not flow through us. Taken from the
 	// caller's real handles before the empty-half defaulting below, since those
@@ -146,8 +129,7 @@ pub fn start<S: crate::transport::poll::Session>(config: Config<S>) -> Result<Se
 	// and GROUP streams are accepted regardless of which halves the caller wired.
 	// An unset half gets an empty origin: an empty publish origin announces nothing
 	// (and answers the peer's announce-interest with an empty set), and an empty
-	// subscribe origin issues no ANNOUNCE_PLEASE (zero prefixes, so `run_announce`
-	// drops `connecting` at once and `connect()` still unblocks).
+	// subscribe origin issues no ANNOUNCE_PLEASE.
 	let publish = publish.unwrap_or_else(|| origin::Producer::empty(Origin::random()).consume());
 	let subscribe = subscribe.unwrap_or_else(|| origin::Producer::empty(Origin::random()));
 
@@ -203,7 +185,7 @@ pub fn start<S: crate::transport::poll::Session>(config: Config<S>) -> Result<Se
 		goaway: Some(SendGoaway::new(session.clone(), goaway, version)),
 		session_stream: setup_stream,
 		publisher,
-		subscriber: SubscriberDriver::new(subscriber, sub_connecting),
+		subscriber: SubscriberDriver::new(subscriber),
 	};
 
 	// The async block only owns the state; all the logic is in `Driver::poll`.
@@ -232,7 +214,6 @@ pub fn start<S: crate::transport::poll::Session>(config: Config<S>) -> Result<Se
 
 	Ok(SessionStart {
 		recv_bandwidth: recv_bw_consumer,
-		connecting,
 		driver,
 		goaway: goaway_handle,
 	})

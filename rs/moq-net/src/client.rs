@@ -284,19 +284,13 @@ impl Client {
 					peer_setup: None,
 				})?;
 
-				// Block until the initial announce set has landed (Lite05+ reports it
-				// via AnnounceOk + N), so a `request_broadcast()` for a live path resolves
-				// immediately instead of racing announcement gossip.
-				let (session, mut driver) = Session::new(
+				return Ok(Session::new(
 					session,
 					version.into(),
 					start.recv_bandwidth,
 					start.driver,
 					start.goaway,
-				);
-				driver.wait_ready(|waiter| start.connecting.poll_ready(waiter)).await;
-
-				return Ok((session, driver));
+				));
 			}
 			Some(ALPN_LITE_04) => {
 				self.versions
@@ -314,17 +308,13 @@ impl Client {
 					peer_setup: None,
 				})?;
 
-				// Lite04 has no initial-set boundary, so this resolves immediately.
-				let (session, mut driver) = Session::new(
+				return Ok(Session::new(
 					session,
 					lite::Version::Lite04.into(),
 					start.recv_bandwidth,
 					start.driver,
 					start.goaway,
-				);
-				driver.wait_ready(|waiter| start.connecting.poll_ready(waiter)).await;
-
-				return Ok((session, driver));
+				));
 			}
 			Some(ALPN_LITE_03) => {
 				self.versions
@@ -343,17 +333,13 @@ impl Client {
 					peer_setup: None,
 				})?;
 
-				// Lite03 has no initial-set boundary, so this resolves immediately.
-				let (session, mut driver) = Session::new(
+				return Ok(Session::new(
 					session,
 					lite::Version::Lite03.into(),
 					start.recv_bandwidth,
 					start.driver,
 					start.goaway,
-				);
-				driver.wait_ready(|waiter| start.connecting.poll_ready(waiter)).await;
-
-				return Ok((session, driver));
+				));
 			}
 			Some(ALPN_LITE) | None => {
 				let supported = self.versions.filter(&NEGOTIATED.into()).ok_or(Error::Version)?;
@@ -392,7 +378,7 @@ impl Client {
 			.copied()
 			.ok_or(Error::Version)?;
 
-		let (recv_bw, protocol, connecting, goaway) = match version {
+		let (recv_bw, protocol, goaway) = match version {
 			Version::Lite(v) => {
 				let stream = stream.with_version(v);
 				let start = lite::start(lite::Config {
@@ -408,7 +394,7 @@ impl Client {
 					peer_setup: None,
 				})?;
 
-				(start.recv_bandwidth, start.driver, Some(start.connecting), start.goaway)
+				(start.recv_bandwidth, start.driver, start.goaway)
 			}
 			Version::Ietf(v) => {
 				// Decode the parameters to get the initial request ID and what the server
@@ -438,18 +424,11 @@ impl Client {
 					peer_setup_stream: None,
 					peer_declared: Some(peer_declared),
 				})?;
-				(None, protocol, None, goaway)
+				(None, protocol, goaway)
 			}
 		};
 
-		let (session, mut driver) = Session::new(session, version, recv_bw, protocol, goaway);
-		if let Some(connecting) = connecting {
-			// Block until the initial announce set has landed (for versions that
-			// report one); resolves immediately otherwise.
-			driver.wait_ready(|waiter| connecting.poll_ready(waiter)).await;
-		}
-
-		Ok((session, driver))
+		Ok(Session::new(session, version, recv_bw, protocol, goaway))
 	}
 }
 
@@ -698,7 +677,10 @@ mod tests {
 			.into(),
 		);
 
-		let _connection = client.connect(fake.clone()).await.unwrap();
+		// `connect` returns as soon as the handshake completes and never polls the driver,
+		// so the session makes no progress (and never closes) unless we drive it here.
+		let (_session, driver) = client.connect(fake.clone()).await.unwrap();
+		let _driver = tokio::spawn(driver);
 
 		// Verify the client setup was encoded using Draft14 framing (ALPN_LITE fallback path).
 		let mut setup_bytes = Bytes::from(fake.control_writes());
@@ -723,6 +705,32 @@ mod tests {
 		// Session closes encode through the session registry, so compare against that one:
 		// `Error::Version.to_code()` is the local table's value and would never match.
 		assert_ne!(code, SessionError::Version.to_code(), "SessionInfo failed to decode");
+	}
+
+	/// `connect` must not depend on the peer answering. A peer that opens the announce
+	/// stream and then says nothing (or promises a count it never delivers) used to hold
+	/// `connect` for the life of the session, since it waited for the initial announce
+	/// set. Resolving a path you need is `announced_broadcast`'s job, which waits for
+	/// that path rather than for the peer to finish talking.
+	#[tokio::test(start_paused = true)]
+	async fn connect_does_not_wait_for_the_peer_to_announce() {
+		// Serves bidi streams, so the announce stream opens, and never answers on them.
+		let gate = kio::Producer::new(true);
+		let transport = crate::lite::test_transport::SinkSession::gated_bi(gate.consume())
+			.with_protocol(crate::version::ALPN_LITE_05);
+
+		// A subscribe origin is what makes the client open an announce stream at all.
+		let origin = crate::origin::Info::new(crate::Origin::new(1).unwrap()).produce();
+		let client = Client::new()
+			.with_versions([Version::Lite(lite::Version::Lite05)].into())
+			.with_subscriber(origin);
+
+		// Paused time auto-advances while every task is idle, so a `connect` that waits
+		// on the silent peer trips this rather than hanging the suite.
+		tokio::time::timeout(std::time::Duration::from_secs(30), client.connect(transport))
+			.await
+			.expect("connect waited on a peer that never announced")
+			.expect("connect failed");
 	}
 
 	#[tokio::test(start_paused = true)]

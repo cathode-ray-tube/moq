@@ -25,7 +25,7 @@ function findEscaping(base: Moq.Path.Valid, catalog: Catalog.Root): string | und
 	];
 
 	for (const [name, config] of renditions) {
-		if (config.broadcast && Path.resolve(base, config.broadcast) === undefined) return name;
+		if (config.broadcast && Path.tryResolve(base, config.broadcast) === undefined) return name;
 	}
 
 	return undefined;
@@ -298,7 +298,7 @@ export class Broadcast {
 		if (!rel) return effect.get(this.out.active);
 
 		const base = effect.get(this.in.name);
-		const resolved = Path.resolve(base, rel);
+		const resolved = Path.tryResolve(base, rel);
 		if (resolved === undefined) {
 			console.warn("ignoring rendition: broadcast reference escapes the root", base, rel);
 			return undefined;

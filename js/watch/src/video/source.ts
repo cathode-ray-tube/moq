@@ -2,6 +2,7 @@ import type * as Catalog from "@moq/hang/catalog";
 import type * as Moq from "@moq/net";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 import type { Broadcast } from "../broadcast";
+import { supportCacheKey } from "./config";
 
 /**
  * A function that checks if a video configuration can be played.
@@ -9,6 +10,10 @@ import type { Broadcast } from "../broadcast";
  * `Decoder.supported` is the WebCodecs probe used by `<moq-watch>`.
  */
 export type Supported = (config: Catalog.VideoConfig) => Promise<boolean>;
+
+type CacheableSupported = Supported & {
+	[supportCacheKey]?: (config: Catalog.VideoConfig) => string;
+};
 
 /** A video source error that prevents choosing a usable rendition. */
 export type SourceError = "unsupported";
@@ -97,7 +102,7 @@ function byPixels(target: number): RenditionFilter {
 			return [rest[0].name];
 		}
 
-		// No entries had resolution metadata — return all names unranked.
+		// No entries had resolution metadata, so return all names unranked.
 		return entries.map(([name]) => name);
 	};
 }
@@ -138,7 +143,7 @@ function byDimensions(width?: number, height?: number): RenditionFilter {
 			return [rest[0].name];
 		}
 
-		// No entries had resolution metadata — return all names unranked.
+		// No entries had resolution metadata, so return all names unranked.
 		return entries.map(([name]) => name);
 	};
 }
@@ -175,7 +180,7 @@ function byBitrate(target: number): RenditionFilter {
 			return [rest[0].name];
 		}
 
-		// No entries had bitrate metadata — return all names unranked.
+		// No entries had bitrate metadata, so return all names unranked.
 		return entries.map(([name]) => name);
 	};
 }
@@ -208,6 +213,18 @@ function bestRendition(entries: [string, Catalog.VideoConfig][]): string {
 	return best[0];
 }
 
+/** Return unstalled renditions, or the lowest bitrate or resolution when every option is stalled. */
+function selectableRenditions(renditions: Record<string, Catalog.VideoConfig>): Record<string, Catalog.VideoConfig> {
+	const active = Object.entries(renditions).filter(([, config]) => !config.stalled);
+	if (active.length > 0) return Object.fromEntries(active);
+
+	const entries = Object.entries(renditions);
+	if (entries.length === 0) return {};
+	const byRate = byBitrate(0)(entries);
+	const lowest = byRate.length === 1 ? byRate[0] : byDimensions(0, 0)(entries)[0];
+	return { [lowest]: renditions[lowest] };
+}
+
 /**
  * Source handles catalog extraction, support checking, and rendition selection
  * for video playback. The Decoder consumes whichever rendition it picks.
@@ -225,6 +242,7 @@ export class Source {
 	readonly out = readonlys(this.#out);
 
 	#signals = new Effect();
+	#supportCache = new WeakMap<Supported, Map<string, { key: string; supported: boolean }>>();
 
 	constructor(props?: Inputs<SourceInput>) {
 		this.in = {
@@ -258,6 +276,15 @@ export class Source {
 
 		const renditions = effect.get(this.#out.catalog)?.renditions ?? {};
 		this.#out.error.set(undefined);
+		let cache = this.#supportCache.get(supported);
+		if (!cache) {
+			cache = new Map();
+			this.#supportCache.set(supported, cache);
+		}
+		const names = new Set(Object.keys(renditions));
+		for (const name of cache.keys()) {
+			if (!names.has(name)) cache.delete(name);
+		}
 
 		effect.spawn(async () => {
 			const available: Record<string, Catalog.VideoConfig> = {};
@@ -268,14 +295,29 @@ export class Source {
 			const cancelled = effect.cancel.then(() => undefined);
 
 			for (const [name, config] of Object.entries(renditions)) {
+				const cacheKey = (supported as CacheableSupported)[supportCacheKey];
+				const key = cacheKey ? cacheKey(config) : JSON.stringify(config);
+				const cached = cache.get(name);
 				let isSupported: boolean | undefined = false;
-				try {
-					isSupported = await Promise.race([supported(config), cancelled]);
-				} catch (err) {
-					console.warn(
-						`[Source] video rendition ${name} (${config.codec}) support probe failed; treating as unsupported`,
-						err,
-					);
+				if (cached?.key === key) {
+					isSupported = cached.supported;
+				} else {
+					let failed = false;
+					try {
+						isSupported = await Promise.race([supported(config), cancelled]);
+					} catch (err) {
+						failed = true;
+						console.warn(
+							`[Source] video rendition ${name} (${config.codec}) support probe failed; treating as unsupported`,
+							err,
+						);
+					}
+					if (!failed && isSupported !== undefined) {
+						cache.set(name, {
+							key: cacheKey ? cacheKey(config) : JSON.stringify(config),
+							supported: isSupported,
+						});
+					}
 				}
 
 				// Torn down: stop probing and publish nothing, since the rerun redoes this.
@@ -296,12 +338,12 @@ export class Source {
 	}
 
 	#runSelected(effect: Effect): void {
-		const available = effect.get(this.#out.available);
+		const available = selectableRenditions(effect.get(this.#out.available));
 		if (Object.keys(available).length === 0) return;
 
 		const target = effect.get(this.in.target);
 
-		// Manual selection by name — skip all ABR logic.
+		// Manual selection by name skips all ABR logic.
 		if (target?.name && target.name in available) {
 			const config = available[target.name];
 			effect.set(this.#out.track, target.name);
@@ -354,7 +396,7 @@ export class Source {
 			filters.push(byBitrate(target.bitrate));
 		}
 
-		// No filters — pick the best rendition by quality.
+		// With no filters, pick the best rendition by quality.
 		if (filters.length === 0) {
 			return bestRendition(entries);
 		}

@@ -38,13 +38,13 @@ function withoutWarnings<T>(fn: () => T): T {
 
 describe("relativeBroadcast", () => {
 	it("resolves a legal reference against the origin", () => {
-		const { source, owner } = broadcast("a/b", ["a/b", "a/source", "a/b/sub"]);
+		const { source, owner } = broadcast("a/b", ["a/b", "a/source", "a/sub"]);
 		const effect = new Effect();
 		try {
-			expect(source.relativeBroadcast(effect, "../source")).toBeDefined();
+			expect(source.relativeBroadcast(effect, "./source")).toBeDefined();
 			expect(source.relativeBroadcast(effect, "sub")).toBeDefined();
 			// Nothing routes an unpublished sibling, so the reference stays pending.
-			expect(source.relativeBroadcast(effect, "../missing")).toBeUndefined();
+			expect(source.relativeBroadcast(effect, "./missing")).toBeUndefined();
 		} finally {
 			effect.close();
 			source.close();
@@ -59,11 +59,11 @@ describe("relativeBroadcast", () => {
 			// Clamping would subscribe to an unrelated `x` instead of dropping the rendition;
 			// `x` is published, so a defined result here would prove the clamp bug.
 			withoutWarnings(() => {
-				expect(source.relativeBroadcast(effect, "../../../x")).toBeUndefined();
-				expect(source.relativeBroadcast(effect, "../../../..")).toBeUndefined();
+				expect(source.relativeBroadcast(effect, "../../x")).toBeUndefined();
+				expect(source.relativeBroadcast(effect, "../..")).toBeUndefined();
 			});
 			// Popping to exactly the root stops at it, and the root still names a broadcast.
-			expect(source.relativeBroadcast(effect, "../..")).toBeDefined();
+			expect(source.relativeBroadcast(effect, "..")).toBeDefined();
 		} finally {
 			effect.close();
 			source.close();
@@ -96,8 +96,8 @@ describe("relativeBroadcast", () => {
 		// and serving the rest would hide a publisher bug behind a track that never fills.
 		const { source, owner } = manual({
 			good: rendition(),
-			sibling: rendition("../source"),
-			bad: rendition("../../../x"),
+			sibling: rendition("./source"),
+			bad: rendition("../../x"),
 		});
 
 		const error = console.error;
@@ -120,7 +120,7 @@ describe("relativeBroadcast", () => {
 			format: "vtt",
 			role: "subtitle",
 			container: { kind: "legacy" },
-			broadcast: "../../../x",
+			broadcast: "../../x",
 		} as Catalog.TextConfig;
 		const { source, owner } = manualCatalog({
 			video: { renditions: { good: rendition() } },
@@ -142,8 +142,8 @@ describe("relativeBroadcast", () => {
 	it("accepts a catalog whose references stay within the root", async () => {
 		const { source, owner } = manual({
 			good: rendition(),
-			sibling: rendition("../source"),
-			root: rendition("../.."),
+			sibling: rendition("./source"),
+			root: rendition(".."),
 		});
 
 		try {
@@ -166,7 +166,7 @@ describe("relativeBroadcast", () => {
 			expect(own).toBeDefined();
 			expect(source.relativeBroadcast(effect, undefined)).toBe(own);
 			expect(source.relativeBroadcast(effect, "")).toBe(own);
-			expect(source.relativeBroadcast(effect, "../b")).toBe(own);
+			expect(source.relativeBroadcast(effect, "./b")).toBe(own);
 		} finally {
 			effect.close();
 			source.close();
