@@ -58,6 +58,11 @@ certificate, and Unix sockets add optional peer-credential gating.
 # is configured below.
 bind = "[::]:443"
 
+# MoQ versions accepted by QUIC, WebTransport, and WebSocket listeners.
+# TCP and Unix stream listeners also accept moq-lite-05 because it carries
+# their request path in SETUP. Omit to accept every supported version.
+version = ["moq-transport-16"]
+
 # Plaintext qmux over TCP (no TLS, carries no peer identity). Trusted networks
 # only; a non-loopback bind logs a warning. Requires the `tcp` build feature.
 [listen.tcp]
@@ -96,11 +101,14 @@ generate = ["localhost", "127.0.0.1"]
 # Optional: root CAs to accept for mTLS peer authentication.
 # Clients that present a cert signed by one of these CAs are granted
 # full access (publish/subscribe/cluster). Intended for relay clustering.
-# Supported by the quinn and noq backends.
 root = ["/path/to/peer-ca.pem"]
 ```
 
-For production, use certificates from Let's Encrypt or another CA.
+For production, use certificates from Let's Encrypt or another CA. The Quinn
+and Noq backends watch certificate, key, and root CA files and reload them for
+new connections. Existing connections keep the identity established by their
+original handshake. The Quiche backend reloads outbound client roots but
+requires a relay restart after rotating its inbound TLS files.
 
 ### \[web.http]
 
@@ -142,7 +150,13 @@ listen = "0.0.0.0:443"
 # TLS certificates (can be the same as listen.tls)
 cert = "cert.pem"
 key = "key.pem"
+
+# Optional root CAs for HTTPS/WSS client certificate authentication.
+root = ["/path/to/peer-ca.pem"]
 ```
+
+HTTPS/WSS certificate, key, and root CA files are watched and reloaded for new
+connections. A failed reload retains the last valid configuration.
 
 ### \[auth]
 
@@ -182,12 +196,14 @@ node = "us-west.example.com:4443"
 mesh = true
 
 # Optional. Fetch the peer list from an HTTP(S) endpoint or local file (a JSON
-# array of hostnames) and reconcile it at runtime, no restart needed.
+# array of peer URLs) and reconcile it at runtime, replacing sessions when URL
+# configuration such as ?cost= or ?jwt= changes.
 connect_api = "https://api.example.com/cluster/connect"
 
 # JWT for outbound cluster dials (alternative to mTLS), applied to any peer
-# whose URL has no inline ?jwt=. Required to authenticate gossip / connect_api
-# discovered peers; for static `connect` peers, prefer an inline ?jwt=.
+# whose URL has no inline ?jwt=. An inline token works for static and
+# connect_api-discovered peers. Gossip must use this shared token or mTLS because
+# the advertised cluster.node URL is public.
 token = "cluster.jwt"
 
 [cluster.lan]
@@ -253,6 +269,10 @@ goaway.handover = "10s"
 # address resolves. Defaults to 50ms, RFC 8305's Resolution Delay.
 # resolution_delay = "50ms"
 ```
+
+Custom client root files are watched and reloaded for new outbound connections.
+If a changed file is temporarily missing, empty, or invalid, the relay retains
+the last valid roots.
 
 The connect timeout is also available as `--connect-timeout` or
 `MOQ_CONNECT_TIMEOUT`, the address race as `--connect-race` or

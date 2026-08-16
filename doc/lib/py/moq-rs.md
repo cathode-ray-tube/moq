@@ -137,6 +137,8 @@ video = broadcast.publish_media(
 
 A value the stream later detects fills only a gap the hint left, so a detected value always wins. Audio formats resolve entirely from their init bytes, so they take no hint.
 
+Each catalog `Video` has a `stalled` boolean. A true value recommends temporarily avoiding that rendition, but the track remains directly usable. Existing catalogs default it to false.
+
 Properties that apply to every video rendition are updated together. Omitted fields clear the corresponding catalog property, and rotation is normalized to the nearest clockwise quarter turn:
 
 ```python
@@ -336,6 +338,8 @@ broadcast = await client.announced_broadcast("live/cam1")
 # handler if the origin has one, else raises. Does not wait for a future announce.
 broadcast = await client.request_broadcast("live/cam1")
 ```
+
+Announcements arrive over the session after it connects, so `request_broadcast` on its own races them: right after connecting it can raise for a broadcast that is live. Await `announced_broadcast(path)` first when you know the path you want; `request_broadcast` is for a path a dynamic handler serves, or one you already know is announced.
 
 Each broadcast carries a `Route`: `route.hops` is the chain of relay origin ids (as `list[int]`) the broadcast passed through to reach you, oldest first, and `route.cost` is the publisher's advertised preference (lower wins). The route is dynamic; `await broadcast.route_changed()` returns the current route first, then blocks for each change (e.g. an upstream failover), and returns `None` once the broadcast ends. A publisher advertises its own route with `producer.set_route(moq.Route(hops=[], cost=10))`, for example a standby transcoder that lowers its cost to 0 once it is warm.
 

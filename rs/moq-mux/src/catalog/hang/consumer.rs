@@ -97,7 +97,7 @@ fn check_resolvable<E: CatalogExt>(base: &PathOwned, catalog: &Catalog<E>) -> Re
 			continue;
 		};
 
-		if base.resolve(rel).is_none() {
+		if base.try_resolve(rel).is_none() {
 			tracing::error!(rendition, %rel, catalog = %base, "rejecting catalog: broadcast reference escapes the root");
 			return Err(crate::Error::EscapingBroadcast(rel.to_string()));
 		}
@@ -242,12 +242,13 @@ mod test {
 	}
 
 	/// A reference that stops at or below the root names a broadcast, so the catalog stands.
+	/// `a/pub` resolves against `a`, so `..` is what lands on the root itself.
 	#[tokio::test]
 	async fn accepts_references_within_the_root() {
 		let catalog = publish(vec![
 			("here", opus()),
-			("sibling", referencing("../source")),
-			("root", referencing("../..")),
+			("sibling", referencing("./source")),
+			("root", referencing("..")),
 		])
 		.expect("catalog should be accepted")
 		.expect("catalog should decode");

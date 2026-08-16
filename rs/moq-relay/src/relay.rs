@@ -87,6 +87,7 @@ impl Relay {
 		config.resolve();
 
 		let mtls_enabled = !config.listen.tls.root.is_empty();
+		let server_versions = config.listen.versions();
 
 		#[allow(unused_mut)]
 		let mut server = config.listen.init(config.quic.clone())?;
@@ -139,8 +140,9 @@ impl Relay {
 		let drain_timeout = config.drain_timeout.unwrap_or(DEFAULT_DRAIN_TIMEOUT);
 		let (shutdown_trigger, shutdown) = Shutdown::new(drain_timeout);
 		// Create a web server too. mTLS for HTTPS is opt-in via `--web-https-root`.
-		let web =
-			Web::new(auth.clone(), cluster.clone(), server.certificates(), config.web).with_shutdown(shutdown.clone());
+		let web = Web::new(auth.clone(), cluster.clone(), server.certificates(), config.web)
+			.with_shutdown(shutdown.clone())
+			.with_versions(server_versions);
 
 		// Internal (ops) listener (plain HTTP, opt-in via `--internal-listen`) for
 		// /metrics + /health + /nodes, separate from the customer-facing web server. No-op
