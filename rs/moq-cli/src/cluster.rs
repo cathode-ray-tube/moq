@@ -298,13 +298,12 @@ fn split_credential(request: &str) -> (&str, Option<&str>) {
 /// [`moq_native::Server::serve_publish`] and its sibling already do the ordinary
 /// half, so this exists only to interleave the two.
 pub async fn serve(
-	server: moq_native::Server,
+	mut server: moq_native::Listener,
 	lan: Lan,
 	origin: moq_net::origin::Producer,
 	directions: crate::Directions,
-	public: bool,
+	public_quic: bool,
 ) -> anyhow::Result<()> {
-	let mut server = server.listen().await.context("failed to bind listeners")?;
 	let mut tasks = tokio::task::JoinSet::new();
 
 	while let Some(request) = server.accept().await {
@@ -327,7 +326,7 @@ pub async fn serve(
 		// asked to serve viewers, and the membership proof gates the mesh path
 		// alone. Attaching an unauthenticated stranger to the origin here would
 		// hand them exactly what the secret is meant to withhold.
-		if !public {
+		if !is_public_transport(request.transport(), public_quic) {
 			tracing::debug!(path = %request.path(), "refusing a non-peer request on the LAN mesh listener");
 			request.close(404).await.ok();
 			continue;
@@ -424,6 +423,16 @@ impl Args {
 			.map(mdns::Secret::load)
 			.transpose()
 			.context("invalid --cluster-lan-secret")
+	}
+}
+
+/// Whether ordinary clients may use this transport on the shared LAN server.
+fn is_public_transport(transport: moq_native::Transport, public_quic: bool) -> bool {
+	match transport {
+		// Stream listeners exist only when explicitly configured, while the LAN mesh
+		// can add its own QUIC listener that must remain private.
+		moq_native::Transport::Tcp | moq_native::Transport::Unix => true,
+		_ => public_quic,
 	}
 }
 
@@ -597,6 +606,7 @@ mod tests {
 			.expect("failed to create broadcast");
 
 		let (server, peer) = listener();
+		let server = server.listen().await.expect("listen");
 		let mut accept = lan("listener-proof");
 		accept.origin = origin_b.clone();
 		// The mesh shares the listener with ordinary clients, so go through the
@@ -651,6 +661,7 @@ mod tests {
 			.expect("failed to create broadcast");
 
 		let (server, peer) = listener();
+		let server = server.listen().await.expect("listen");
 		let mut accept = lan("the-real-proof");
 		accept.origin = origin_b.clone();
 		tokio::spawn(serve(
@@ -690,9 +701,10 @@ mod tests {
 			.expect("failed to create broadcast");
 
 		let (server, peer) = listener();
+		let server = server.listen().await.expect("listen");
 		let mut accept = lan("the-real-proof");
 		accept.origin = origin.clone();
-		// `public: false` is what `--cluster-lan` passes with no `--listen`.
+		// `public_quic: false` is what `--cluster-lan` passes with no `--listen`.
 		tokio::spawn(serve(
 			server,
 			accept,
@@ -725,5 +737,13 @@ mod tests {
 			"a mesh-only listener must not serve broadcasts to an unauthenticated client"
 		);
 		drop(connection);
+	}
+
+	#[test]
+	fn explicit_stream_listeners_are_public_without_exposing_mesh_quic() {
+		assert!(is_public_transport(moq_native::Transport::Tcp, false));
+		assert!(is_public_transport(moq_native::Transport::Unix, false));
+		assert!(!is_public_transport(moq_native::Transport::Quic, false));
+		assert!(is_public_transport(moq_native::Transport::Quic, true));
 	}
 }
