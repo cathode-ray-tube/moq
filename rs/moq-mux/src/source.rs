@@ -116,18 +116,23 @@ impl Source {
 	}
 
 	/// Remove renditions whose broadcast reference escapes above the origin root.
+	///
+	/// Every section carrying renditions must be listed here; one left out silently exempts
+	/// its renditions from the containment check, exactly as on the consumer side.
 	pub(crate) fn retain_valid<E: crate::catalog::hang::CatalogExt>(
 		&self,
 		catalog: &mut crate::catalog::hang::Catalog<E>,
 	) {
 		self.retain_valid_references("video", &mut catalog.video.renditions);
 		self.retain_valid_references("audio", &mut catalog.audio.renditions);
+		self.retain_valid_references("text", &mut catalog.text.renditions);
 	}
 
 	/// Remove media renditions whose broadcast reference escapes above the origin root.
 	pub(crate) fn retain_valid_media(&self, catalog: &mut hang::Catalog) {
 		self.retain_valid_references("video", &mut catalog.video.renditions);
 		self.retain_valid_references("audio", &mut catalog.audio.renditions);
+		self.retain_valid_references("text", &mut catalog.text.renditions);
 	}
 
 	fn retain_valid_references<C: BroadcastConfig>(
@@ -197,6 +202,12 @@ impl BroadcastConfig for hang::catalog::VideoConfig {
 }
 
 impl BroadcastConfig for hang::catalog::AudioConfig {
+	fn broadcast(&self) -> Option<&moq_net::PathRelativeOwned> {
+		self.broadcast.as_ref()
+	}
+}
+
+impl BroadcastConfig for hang::catalog::TextConfig {
 	fn broadcast(&self) -> Option<&moq_net::PathRelativeOwned> {
 		self.broadcast.as_ref()
 	}
@@ -360,6 +371,28 @@ mod tests {
 
 		assert!(!catalog.video.renditions.contains_key("escaped"));
 		assert!(catalog.video.renditions.contains_key("sibling"));
+	}
+
+	/// The filter covers every section carrying renditions, not just the media ones. Text
+	/// is the section that only exists on one side of the containment check by default, so
+	/// it is the one that silently goes unchecked when the two sides drift.
+	#[test]
+	fn escaping_text_rendition_is_removed() {
+		let origin = Origin::random().produce();
+		let source = Source::new(origin.consume(), "a/pub");
+
+		let mut escaped = hang::catalog::TextConfig::new(hang::catalog::TextFormat::Vtt);
+		escaped.broadcast = Some(PathRelative::new("../../source").to_owned());
+		let mut sibling = escaped.clone();
+		sibling.broadcast = Some(PathRelative::new("./source").to_owned());
+
+		let mut catalog = hang::Catalog::default();
+		catalog.text.renditions.insert("escaped".to_string(), escaped);
+		catalog.text.renditions.insert("sibling".to_string(), sibling);
+		source.retain_valid_media(&mut catalog);
+
+		assert!(!catalog.text.renditions.contains_key("escaped"));
+		assert!(catalog.text.renditions.contains_key("sibling"));
 	}
 
 	#[tokio::test]
