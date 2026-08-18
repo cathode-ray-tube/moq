@@ -648,6 +648,10 @@ impl Cluster {
 	/// (required when `config.connect` is non-empty), and
 	/// [`with_stats`](Self::with_stats) to enable metrics publishing.
 	///
+	/// Must be called within a tokio runtime: the origin's lifecycle driver is
+	/// spawned here, so the origin serves sessions whether or not
+	/// [`start`](Self::start) (the mesh half) is ever called.
+	///
 	/// Errors if `config.id` is set but invalid: it must be non-zero and below
 	/// 2^62 (the wire varint limit). An unset id picks a fresh random origin.
 	pub fn new(config: ClusterConfig) -> anyhow::Result<Self> {
@@ -666,7 +670,7 @@ impl Cluster {
 			);
 		}
 		let info = origin::Info::new(id);
-		let origin = info.clone().produce();
+		let origin = moq_tokio::origin::spawn(info.clone());
 		let nodes = crate::nodes::Nodes::new(origin.clone());
 		tracing::info!(origin_id = %origin.id(), configured = config.id.is_some(), "cluster initialized");
 		Ok(Cluster {
@@ -695,7 +699,7 @@ impl Cluster {
 			.clone()
 			.with_pool(cache.pool)
 			.with_cache_duration(cache.duration);
-		self.origin = self.info.clone().produce();
+		self.origin = moq_tokio::origin::spawn(self.info.clone());
 		self.nodes = self.nodes.with_origin(self.origin.clone());
 		self
 	}
@@ -1678,8 +1682,8 @@ mod tests {
 		assert!(take_cost(&mut url).is_err());
 	}
 
-	#[test]
-	fn cluster_tier_defaults_to_unprefixed() {
+	#[tokio::test]
+	async fn cluster_tier_defaults_to_unprefixed() {
 		let cluster = Cluster::new(ClusterConfig::default()).expect("cluster");
 		assert_eq!(cluster.cluster_tier(), Tier::default());
 
@@ -2091,8 +2095,8 @@ mod tests {
 
 	/// A valid `cluster.id` is used verbatim as the relay's origin id, giving the
 	/// node a stable identity across restarts.
-	#[test]
-	fn cluster_id_sets_origin() {
+	#[tokio::test]
+	async fn cluster_id_sets_origin() {
 		let cluster = Cluster::new(ClusterConfig {
 			id: Some(42),
 			..Default::default()
@@ -2182,8 +2186,8 @@ mod tests {
 
 	/// The legacy `--cluster-mesh <url>` form (now a boolean) is honored for
 	/// backwards compatibility: it enables gossip and supplies the node URL.
-	#[test]
-	fn legacy_mesh_url_enables_gossip_as_node() {
+	#[tokio::test]
+	async fn legacy_mesh_url_enables_gossip_as_node() {
 		let cluster = Cluster::new(ClusterConfig {
 			mesh: Some("rendezvous.example.com:4443".to_string()),
 			..Default::default()
@@ -2359,8 +2363,8 @@ mod tests {
 
 	/// A legacy mesh URL that disagrees with an explicit `--cluster-node` is a
 	/// conflict, not a silent pick.
-	#[test]
-	fn legacy_mesh_url_conflicting_with_node_errors() {
+	#[tokio::test]
+	async fn legacy_mesh_url_conflicting_with_node_errors() {
 		let cluster = Cluster::new(ClusterConfig {
 			mesh: Some("a.example.com:4443".to_string()),
 			node: Some("b.example.com:4443".to_string()),
