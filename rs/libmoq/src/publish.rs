@@ -81,19 +81,22 @@ impl Publish {
 		Ok(())
 	}
 
-	pub fn media(&mut self, broadcast: Id, format: &str, init: &[u8]) -> Result<Id, Error> {
+	pub fn media(&mut self, broadcast: Id, format: &str, init: &[u8], label: Option<&str>) -> Result<Id, Error> {
 		let (broadcast, catalog) = self.broadcasts.get(broadcast).ok_or(Error::BroadcastNotFound)?;
+
+		let mut media_init = import::Init::new(format, init.to_vec());
+		media_init.label = label.map(str::to_string);
 
 		// A container may publish several tracks; a single codec fills one reserved
 		// track. Try the container first so a codec format doesn't reserve a stray
 		// track on the way to being recognized.
-		let media = match import::Container::new(broadcast.clone(), catalog.reserve(), format, init) {
+		let media = match import::Container::new(broadcast.clone(), catalog.reserve(), &media_init) {
 			Ok(container) => Media::Container(container),
 			Err(moq_mux::Error::UnknownFormat(_)) => {
 				let mut broadcast = broadcast.clone();
 				let name = broadcast.unique_name(&format!(".{format}"));
 				let request = broadcast.reserve_track(name)?;
-				match import::Track::new(request, catalog.reserve(), import::Init::new(format, init.to_vec())) {
+				match import::Track::new(request, catalog.reserve(), media_init) {
 					Ok(track) => Media::Track(Box::new(track)),
 					Err(moq_mux::Error::UnknownFormat(_)) => return Err(Error::UnknownFormat(format.to_string())),
 					Err(err) => return Err(err.into()),

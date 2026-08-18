@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Propagate rendition labels through single-track media imports.
+- `From<hang::catalog::VideoConfig> for catalog::VideoHint`, a total conversion for a caller that
+  already has a whole rendition. Replaces the per-field copy in `moq-video`, which dropped the label.
+
+### Changed
+
+- `import::Container::new` and `import::ContainerStream::new` take an `import::Init` instead of a
+  format and buffer, and reject the single-rendition `label` and `video` fields rather than
+  dropping them.
+- An audio format rejects an `import::Init` video hint instead of dropping it.
+- `catalog::VideoHint::label` is no longer public. `import::Init::label` is the single source of a
+  rendition label, matching the hang draft, which classifies it as a common rendition field.
+
 ## [0.9.7](https://github.com/moq-dev/moq/compare/moq-mux-v0.9.6...moq-mux-v0.9.7) - 2026-08-14
 
 ### Added

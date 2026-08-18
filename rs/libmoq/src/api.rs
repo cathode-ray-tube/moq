@@ -101,6 +101,30 @@ pub(crate) fn borrow_container(container: &hang::catalog::Container) -> moq_cont
 	}
 }
 
+/// Configuration for [moq_publish_media].
+///
+/// `format` is required. Zero the struct and set only the fields the selected
+/// codec or container needs. New optional fields are appended so existing
+/// initializers keep their meaning.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct moq_media_config {
+	/// Codec or container format, NOT NULL terminated.
+	pub format: *const c_char,
+	/// Length of `format` in bytes.
+	pub format_len: usize,
+
+	/// Codec or container initialization bytes, or NULL when none are needed.
+	pub init: *const u8,
+	/// Length of `init` in bytes.
+	pub init_len: usize,
+
+	/// Human-readable rendition name for track pickers, or NULL if not used.
+	pub label: *const c_char,
+	/// Length of `label` in bytes.
+	pub label_len: usize,
+}
+
 /// Information about a video rendition in the catalog.
 #[repr(C)]
 #[allow(non_camel_case_types)]
@@ -128,6 +152,11 @@ pub struct moq_video_config {
 
 	/// How the track's frames are wrapped.
 	pub container: moq_container,
+
+	/// Human-readable rendition name for track pickers, or NULL if not used.
+	pub label: *const c_char,
+	/// Length of `label` in bytes.
+	pub label_len: usize,
 }
 
 /// Catalog properties shared by every video rendition.
@@ -183,6 +212,11 @@ pub struct moq_audio_config {
 
 	/// How the track's frames are wrapped.
 	pub container: moq_container,
+
+	/// Human-readable rendition name for track pickers, or NULL if not used.
+	pub label: *const c_char,
+	/// Length of `label` in bytes.
+	pub label_len: usize,
 }
 
 /// Options for a JSON snapshot track (lossy latest-value mode).
@@ -1186,27 +1220,32 @@ pub extern "C" fn moq_publish_finish(broadcast: u32) -> i32 {
 /// Create a new media track for a broadcast
 ///
 /// All frames in [moq_publish_media_frame] must be written in decode order.
-/// The `format` controls the encoding, both of `init` and frame payloads.
+/// [moq_media_config::format] controls the encoding, both of
+/// [moq_media_config::init] and frame payloads.
+///
+/// [moq_media_config::label] is an optional human-readable name stored in the
+/// audio or video catalog configuration. The track name is generated from the
+/// format and remains an internal identifier. It names one rendition, so a
+/// container format (fmp4, mkv, ts, flv), which publishes and describes its own
+/// tracks, rejects a label rather than ignoring it.
 ///
 /// Returns a non-zero handle to the track on success, or a negative code on failure.
 ///
 /// # Safety
-/// - The caller must ensure that format is a valid pointer to format_len bytes of data.
-/// - The caller must ensure that init is a valid pointer to init_size bytes of data.
+/// - `config` must be NULL, or point to an aligned, readable
+///   [moq_media_config]. Every non-NULL pointer inside it must be valid for its
+///   paired length, and all of them must stay alive for the duration of this
+///   call. A NULL config is rejected with an ordinary error.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moq_publish_media(
-	broadcast: u32,
-	format: *const c_char,
-	format_len: usize,
-	init: *const u8,
-	init_size: usize,
-) -> i32 {
+pub unsafe extern "C" fn moq_publish_media(broadcast: u32, config: *const moq_media_config) -> i32 {
 	ffi::enter(move || {
 		let broadcast = ffi::parse_id(broadcast)?;
-		let format = unsafe { ffi::parse_str(format, format_len)? };
-		let init = unsafe { ffi::parse_slice(init, init_size)? };
+		let config = unsafe { config.as_ref() }.ok_or(Error::InvalidPointer)?;
+		let format = unsafe { ffi::parse_str(config.format, config.format_len)? };
+		let init = unsafe { ffi::parse_slice(config.init, config.init_len)? };
+		let label = unsafe { ffi::parse_str_optional(config.label, config.label_len)? };
 
-		State::lock().publish.media(broadcast, format, init)
+		State::lock().publish.media(broadcast, format, init, label)
 	})
 }
 
@@ -1319,6 +1358,7 @@ pub unsafe extern "C" fn moq_publish_video_properties(broadcast: u32, properties
 ///
 /// The struct fields are read as inputs:
 /// - `name` / `codec` are required (NOT NULL terminated) string slices.
+/// - `label` may be NULL to omit the human-readable rendition name.
 /// - `description` may be NULL to omit it.
 /// - `coded_width` / `coded_height` may be zero to omit them.
 /// - `container` describes how the frames written to the track are wrapped. A
@@ -1338,10 +1378,12 @@ pub unsafe extern "C" fn moq_publish_video_config(broadcast: u32, config: *const
 		let config = unsafe { config.as_ref() }.ok_or(Error::InvalidPointer)?;
 
 		let name = unsafe { ffi::parse_str(config.name, config.name_len)? };
+		let label = unsafe { ffi::parse_str_optional(config.label, config.label_len)? };
 		let codec = unsafe { ffi::parse_str(config.codec, config.codec_len)? };
 		let codec = hang::catalog::VideoCodec::from_str(codec).map_err(Error::Hang)?;
 
 		let mut video = hang::catalog::VideoConfig::new(codec);
+		video.label = label.map(str::to_string);
 		if !config.description.is_null() {
 			let description = unsafe { ffi::parse_slice(config.description, config.description_len)? };
 			video.description = Some(bytes::Bytes::copy_from_slice(description));
@@ -1364,6 +1406,7 @@ pub unsafe extern "C" fn moq_publish_video_config(broadcast: u32, config: *const
 ///
 /// The struct fields are read as inputs:
 /// - `name` / `codec` are required (NOT NULL terminated) string slices.
+/// - `label` may be NULL to omit the human-readable rendition name.
 /// - `sample_rate` / `channel_count` are required.
 /// - `description` may be NULL to omit it.
 /// - `container` describes how the frames written to the track are wrapped, the
@@ -1381,10 +1424,12 @@ pub unsafe extern "C" fn moq_publish_audio_config(broadcast: u32, config: *const
 		let config = unsafe { config.as_ref() }.ok_or(Error::InvalidPointer)?;
 
 		let name = unsafe { ffi::parse_str(config.name, config.name_len)? };
+		let label = unsafe { ffi::parse_str_optional(config.label, config.label_len)? };
 		let codec = unsafe { ffi::parse_str(config.codec, config.codec_len)? };
 		let codec = hang::catalog::AudioCodec::from_str(codec).map_err(Error::Hang)?;
 
 		let mut audio = hang::catalog::AudioConfig::new(codec, config.sample_rate, config.channel_count);
+		audio.label = label.map(str::to_string);
 		audio.container = unsafe { parse_container(&config.container)? };
 		if !config.description.is_null() {
 			let description = unsafe { ffi::parse_slice(config.description, config.description_len)? };

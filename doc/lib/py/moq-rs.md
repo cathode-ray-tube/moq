@@ -87,7 +87,7 @@ except moq.Error as err:
 
 ```python
 broadcast = client.create_broadcast("my-stream")
-audio = broadcast.publish_media("opus", opus_init_bytes)
+audio = broadcast.publish_media("opus", opus_init_bytes, label="English")
 
 # Audio has no keyframes, so `cut` is what gives it group boundaries. Once per
 # frame is the lowest latency; a segment cadence suits HLS/DASH.
@@ -98,6 +98,11 @@ broadcast.finish()
 ```
 
 Supported codec formats include `opus`, `avc3`, `hev1`, `av01`, `vp09`, and others. See [`hang`](/lib/rs/crate/hang) for the full list.
+The optional `label` is presentation metadata for a track picker. The transport
+track name remains generated from the format and labels do not need to be unique.
+It names one rendition, so a container format (`fmp4`, `mkv`, `ts`, `flv`) raises
+rather than ignoring it: those describe their own tracks. `video` raises on a
+container or an audio format for the same reason.
 
 ### Publishing raw media
 

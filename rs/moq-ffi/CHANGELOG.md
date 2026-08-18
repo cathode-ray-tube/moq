@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Publish and consume human-readable audio and video rendition labels.
+
+### Changed
+
+- `publish_media` and `publish_media_stream` reject a `MoqInit` label or video hint on a container
+  format, and an audio format rejects a video hint, instead of silently dropping either.
+
 ## [0.3.11](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.10...moq-ffi-v0.3.11) - 2026-08-14
 
 ### Added
