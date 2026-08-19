@@ -2305,6 +2305,14 @@ impl Read for Feed {
 
 #[cfg(test)]
 mod test {
+
+	/// A drift budget no test timeline comes close to, so the reader sees every group.
+	///
+	/// The media track's full retention window, so a reader started after importing can
+	/// still read every retained group. These tests import a whole file first, which the default
+	/// [`Latency::REAL_TIME`](crate::Latency::REAL_TIME) budget collapses to the live
+	/// edge: completeness has to be asked for.
+	const RECORDING_LATENCY: std::time::Duration = std::time::Duration::from_secs(30);
 	use mpeg2ts::es::StreamType;
 
 	use super::SectionReassembler;
@@ -2638,8 +2646,13 @@ mod test {
 		// track name while it is still registered.
 		let name = catalog.snapshot().mpegts.tracks.keys().next().unwrap().clone();
 		import.finish().unwrap();
-		let track = consumer.track(&name).unwrap().subscribe(None).await.unwrap();
-		let mut reader = Consumer::new(track, Container::Legacy).with_latency(Latency::REAL_TIME);
+		let track = consumer
+			.track(&name)
+			.unwrap()
+			.subscribe(moq_net::track::Subscription::default().with_latency(Latency::max(RECORDING_LATENCY)))
+			.await
+			.unwrap();
+		let mut reader = Consumer::new(track, Container::Legacy);
 		let frame = tokio::time::timeout(std::time::Duration::from_secs(1), reader.read())
 			.await
 			.expect("cue read timed out")
@@ -2870,7 +2883,12 @@ mod test {
 			.next()
 			.expect("an audio track")
 			.clone();
-		let track = consumer.track(&name).unwrap().subscribe(None).await.unwrap();
+		let track = consumer
+			.track(&name)
+			.unwrap()
+			.subscribe(moq_net::track::Subscription::default().with_latency(Latency::max(RECORDING_LATENCY)))
+			.await
+			.unwrap();
 		let mut reader = crate::container::Consumer::new(track, crate::catalog::hang::Container::Legacy);
 		let mut frames = Vec::new();
 		while let Ok(Ok(Some(frame))) = tokio::time::timeout(std::time::Duration::from_millis(50), reader.read()).await
@@ -3678,7 +3696,7 @@ mod test {
 		let track = consumer
 			.track(hang::catalog::Catalog::DEFAULT_NAME)
 			.unwrap()
-			.subscribe(None)
+			.subscribe(moq_net::track::Subscription::default().with_latency(Latency::max(RECORDING_LATENCY)))
 			.await
 			.unwrap();
 		let mut reader = crate::container::Consumer::new(track, crate::catalog::hang::Container::Legacy);
@@ -3935,8 +3953,13 @@ mod test {
 		import.finish().unwrap();
 
 		let name = catalog.snapshot().mpegts.tracks.keys().next().unwrap().clone();
-		let track = consumer.track(&name).unwrap().subscribe(None).await.unwrap();
-		let mut reader = Consumer::new(track, Container::Legacy).with_latency(Latency::REAL_TIME);
+		let track = consumer
+			.track(&name)
+			.unwrap()
+			.subscribe(moq_net::track::Subscription::default().with_latency(Latency::max(RECORDING_LATENCY)))
+			.await
+			.unwrap();
+		let mut reader = Consumer::new(track, Container::Legacy);
 		let frame = tokio::time::timeout(std::time::Duration::from_secs(1), reader.read())
 			.await
 			.expect("cue read timed out")
@@ -4080,8 +4103,13 @@ mod test {
 		assert_eq!(verbatim.stream_id, Some(0xC0), "recorded the PES stream_id");
 		assert_eq!(track.pid, DATA_PID, "recorded the original PID");
 
-		let track = consumer.track(name.as_str()).unwrap().subscribe(None).await.unwrap();
-		let mut reader = Consumer::new(track, Container::Legacy).with_latency(Latency::REAL_TIME);
+		let track = consumer
+			.track(name.as_str())
+			.unwrap()
+			.subscribe(moq_net::track::Subscription::default().with_latency(Latency::max(RECORDING_LATENCY)))
+			.await
+			.unwrap();
+		let mut reader = Consumer::new(track, Container::Legacy);
 		let frame = tokio::time::timeout(std::time::Duration::from_secs(1), reader.read())
 			.await
 			.expect("verbatim read timed out")

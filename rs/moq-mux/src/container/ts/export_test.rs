@@ -60,12 +60,22 @@ fn length_prefixed(nals: &[&[u8]]) -> Bytes {
 /// finished, retained tracks; that means it never reaches a hard end-of-stream,
 /// so we pull until a `next()` blocks (`Pending`, surfaced as a timeout under
 /// paused time) or the stream ends.
+/// A drift budget no test timeline comes close to, so the exporter reads every group.
+///
+/// The media track's full retention window, so an exporter started after publishing
+/// can still read every retained group. These tests write a whole broadcast up front
+/// and only then export it, which the
+/// exporter's default [`Latency::REAL_TIME`](crate::Latency::REAL_TIME) collapses to the
+/// live edge: completeness has to be asked for, exactly as a real recorder does.
+const RECORDING_LATENCY: std::time::Duration = std::time::Duration::from_secs(30);
+
 async fn drain(consumer: moq_net::broadcast::Consumer) -> BytesMut {
 	drain_with(Export::new(crate::source::announced(&consumer)).await.unwrap()).await
 }
 
 /// `drain` for an exporter built with an explicit catalog extension.
-async fn drain_with<E: tscat::Catalog>(mut exporter: Export<E>) -> BytesMut {
+async fn drain_with<E: tscat::Catalog>(exporter: Export<E>) -> BytesMut {
+	let mut exporter = exporter.with_latency(crate::Latency::max(RECORDING_LATENCY));
 	let mut out = BytesMut::new();
 	// `while let Ok` stops on the first timeout (`Pending`: no more output).
 	while let Ok(res) = tokio::time::timeout(std::time::Duration::from_secs(1), exporter.next()).await {
@@ -638,7 +648,12 @@ async fn export_scte35_roundtrip() {
 	assert_eq!(verbatim, 1, "round-trip lost the SCTE-35 track");
 	let name = scte_track(&snapshot).expect("a scte35 track");
 
-	let track = consumer2.track(&name).unwrap().subscribe(None).await.unwrap();
+	let track = consumer2
+		.track(&name)
+		.unwrap()
+		.subscribe(moq_net::track::Subscription::default().with_latency(crate::Latency::max(RECORDING_LATENCY)))
+		.await
+		.unwrap();
 	let mut scte_reader = crate::container::Consumer::new(track, HangContainer::Legacy);
 	let frame = scte_reader
 		.read()
@@ -733,7 +748,12 @@ async fn export_pes_verbatim_roundtrip() {
 	assert_eq!(verbatim.stream_id, Some(STREAM_ID), "PES stream_id preserved");
 	let name = name.clone();
 
-	let track = consumer2.track(&name).unwrap().subscribe(None).await.unwrap();
+	let track = consumer2
+		.track(&name)
+		.unwrap()
+		.subscribe(moq_net::track::Subscription::default().with_latency(crate::Latency::max(RECORDING_LATENCY)))
+		.await
+		.unwrap();
 	let mut reader = crate::container::Consumer::new(track, HangContainer::Legacy);
 	let frame = reader
 		.read()
@@ -801,7 +821,12 @@ async fn scte35_without_video_export_is_rejected() {
 
 /// Subscribe to a track and read every retained frame payload it holds.
 async fn read_frames(consumer: &moq_net::broadcast::Consumer, name: &str) -> Vec<Vec<u8>> {
-	let track = consumer.track(name).unwrap().subscribe(None).await.unwrap();
+	let track = consumer
+		.track(name)
+		.unwrap()
+		.subscribe(moq_net::track::Subscription::default().with_latency(crate::Latency::max(RECORDING_LATENCY)))
+		.await
+		.unwrap();
 	let mut reader = crate::container::Consumer::new(track, HangContainer::Legacy);
 	let mut frames = Vec::new();
 	while let Ok(res) = tokio::time::timeout(std::time::Duration::from_millis(50), reader.read()).await {
@@ -1117,7 +1142,12 @@ fn scte_track(snap: &crate::catalog::hang::Catalog<tscat::Ext>) -> Option<String
 
 /// Subscribe to a cue track and read every retained `splice_info_section` it holds.
 async fn read_cues(consumer: &moq_net::broadcast::Consumer, name: &str) -> Vec<(Vec<u8>, Timestamp)> {
-	let track = consumer.track(name).unwrap().subscribe(None).await.unwrap();
+	let track = consumer
+		.track(name)
+		.unwrap()
+		.subscribe(moq_net::track::Subscription::default().with_latency(crate::Latency::max(RECORDING_LATENCY)))
+		.await
+		.unwrap();
 	let mut reader = crate::container::Consumer::new(track, HangContainer::Legacy);
 	let mut cues = Vec::new();
 	while let Ok(res) = tokio::time::timeout(std::time::Duration::from_millis(50), reader.read()).await {
@@ -2430,9 +2460,12 @@ async fn repointed_si_entry_resubscribes() {
 		producer.cut(None).unwrap();
 	};
 
+	// Writes both GOPs up front and only then reads, so it needs a replay window:
+	// the real-time default would take the live edge and skip the first.
 	let mut exporter = Export::with_ts(crate::source::announced(&consumer), crate::catalog::CatalogFormat::Hang)
 		.await
-		.unwrap();
+		.unwrap()
+		.with_latency(crate::Latency::max(RECORDING_LATENCY));
 	let mut before = BytesMut::new();
 	write_key(&mut producer, 0);
 	write_key(&mut producer, 1);
