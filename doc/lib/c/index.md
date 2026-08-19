@@ -245,6 +245,12 @@ if (moq_consume_video_stalled(catalog, index, &stalled) < 0) {
 }
 ```
 
+## Cross-broadcast renditions
+
+A catalog rendition may name a *different* broadcast than the one whose catalog you subscribed to, so a transcode output at `live/hd` can describe a track that actually lives in `live/source`. `moq_consume_video` and `moq_consume_audio` take a catalog snapshot and a rendition index, so they follow that reference for you and subscribe wherever the track really is. Nothing to pass.
+
+Only a rendition that actually names another broadcast needs an origin to fetch it from, and the origin used is the one the broadcast came from: `moq_origin_request` or `moq_origin_consume_announced`. A rendition with no reference is served by the broadcast you already hold, so it works the same either way. A referenced broadcast that exists but has not been announced yet is reported as unroutable rather than waited for, so wait for its announcement first if you may be racing it.
+
 ## Raw media
 
 The `moq_publish_audio` / `moq_publish_video` / `moq_publish_container` calls carry already-encoded frames, for a caller that brings its own codec. The `moq_encode_*` calls carry uncompressed media instead and run the codec inside libmoq, so a C application can publish pixels and PCM without linking one.

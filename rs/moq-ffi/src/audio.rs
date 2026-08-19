@@ -255,13 +255,20 @@ impl MoqBroadcastConsumer {
 	/// the catalog (see
 	/// [`MoqCatalogConsumer::next`](crate::consumer::MoqCatalogConsumer::next));
 	/// the codec is inferred from it. Only Opus is currently supported.
+	///
+	/// A rendition whose [`broadcast`](crate::media::MoqAudio::broadcast) names another broadcast
+	/// is subscribed there, so `name` is always read from the broadcast the catalog points at.
 	pub async fn decode_audio(
 		&self,
 		name: String,
 		catalog_audio: crate::media::MoqAudio,
 		output: MoqAudioDecoderOutput,
 	) -> Result<Arc<MoqAudioConsumer>, MoqError> {
+		// Reject the codec before resolving: resolving reaches the origin, which can invoke a
+		// dynamic handler and open an upstream subscription we would immediately drop.
+		let reference = catalog_audio.broadcast.clone();
 		let cfg = audio_config(catalog_audio)?;
+		let broadcast = self.resolve_inner(reference.as_deref()).await?;
 
 		let mut config = moq_audio::decode::Config::default();
 		config.format = output.format.into();
@@ -272,7 +279,7 @@ impl MoqBroadcastConsumer {
 			.map(|ms| moq_mux::Latency::max(Duration::from_millis(ms)))
 			.unwrap_or_default();
 
-		let consumer = moq_audio::decode::Consumer::new(self.inner(), &cfg, name, config).await?;
+		let consumer = moq_audio::decode::Consumer::new(&broadcast, &cfg, name, config).await?;
 
 		Ok(Arc::new(MoqAudioConsumer {
 			task: Task::new(ConsumerInner { consumer }),
@@ -288,6 +295,7 @@ mod tests {
 	fn catalog_audio(codec: &str) -> MoqAudio {
 		MoqAudio {
 			label: None,
+			broadcast: None,
 			codec: codec.to_string(),
 			description: None,
 			sample_rate: 48_000,
