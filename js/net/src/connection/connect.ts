@@ -1,4 +1,5 @@
 import Session, { type Version as QmuxVersion } from "@moq/qmux";
+import { error, fromClose } from "../error.ts";
 import * as Ietf from "../ietf/index.ts";
 import * as Lite from "../lite/index.ts";
 import type { Consumer as OriginConsumer, Producer as OriginProducer } from "../origin.ts";
@@ -11,6 +12,10 @@ import { exchangeSetup } from "./handshake.ts";
 
 // Default head start for WebTransport before attempting the WebSocket fallback.
 const DEFAULT_WEBSOCKET_DELAY_MS = 500;
+
+// RESET_STREAM and CONNECTION_CLOSE are separate transport notifications. Give the latter
+// time to surface its authoritative code without letting a reset-only peer stall SETUP forever.
+const SETUP_CLOSE_GRACE_MS = 100;
 
 /** Tuning for the WebSocket fallback used when WebTransport is unavailable or loses the connect race. */
 export interface WebSocketOptions {
@@ -224,6 +229,35 @@ async function connectInner(url: URL, props: ConnectProps | undefined, abort: Pr
 }
 
 async function connectTransport(url: URL, session: WebTransport, wiring: SessionProps): Promise<Established> {
+	const closed = session.closed.then(fromClose, error);
+	const terminal = closed.then((cause) => {
+		throw cause ?? new Error("session closed during SETUP");
+	});
+
+	try {
+		return await Promise.race([terminal, negotiate(url, session, wiring)]);
+	} catch (cause) {
+		// A session shutdown can reject its SETUP stream before `closed` publishes the
+		// peer's close code. Wait briefly without closing locally, since a local clean close
+		// could overwrite that code. A reset-only peer is cleaned up after the grace period.
+		const pending = Symbol("session close pending");
+		const final = await Promise.race([
+			closed,
+			new Promise<typeof pending>((resolve) => setTimeout(() => resolve(pending), SETUP_CLOSE_GRACE_MS)),
+		]);
+		if (final !== pending) {
+			if (final) throw final;
+			throw cause;
+		}
+
+		session.close();
+		throw cause;
+	}
+}
+
+// Negotiate the MoQ protocol over an established transport. The caller races this against
+// the session closing so a close code is not lost behind a failed or stalled SETUP stream.
+async function negotiate(url: URL, session: WebTransport, wiring: SessionProps): Promise<Established> {
 	// qmux Session exposes the negotiated protocol directly (as "" when there is none);
 	// native WebTransport doesn't have a standard .protocol property yet.
 	const protocol: string | undefined = (session as { protocol?: string }).protocol || undefined;

@@ -4,12 +4,18 @@
  * @module
  */
 
+/** The nominal brand for session termination codes. */
+declare const SESSION_CODE: unique symbol;
+
+/** A code from the session termination registry. */
+export type SessionCode = number & { readonly [SESSION_CODE]: true };
+
 /**
  * Codes a peer sends when terminating the session, mirroring the Rust `SessionError`.
  *
- * Specified by moq-lite, which reuses moq-transport's codes unchanged; 64 and up are the
- * application's. {@link StreamCode} is the other registry, and the two are disjoint, so the
- * same integer means different things in each.
+ * Specified by moq-lite, which reuses moq-transport's codes unchanged. Call `SessionCode(code)`
+ * to construct an application code in the 64+ range. {@link StreamCode} is the other registry,
+ * and the two are disjoint, so the same integer means different things in each.
  *
  * Codes 32-63 are reserved rather than assigned. An implementation may send one for a
  * condition with no code here, but the draft gives it no meaning, so treat anything not
@@ -17,86 +23,122 @@
  *
  * @public
  */
-export const SessionCode = {
-	/** Ending the session normally, with no error. */
-	Cancel: 0x0,
-	/** Something went wrong that isn't worth a dedicated code. */
-	Internal: 0x1,
-	/** The credentials don't grant the requested path or operation. Retrying will fail again. */
-	Unauthorized: 0x2,
-	/** A protocol rule was broken; the session is unusable. */
-	ProtocolViolation: 0x3,
-	/** A key-value pair was malformed or repeated more than allowed. */
-	KeyValueFormatting: 0x6,
-	/** The peer did not close within the GOAWAY drain deadline. */
-	GoawayTimeout: 0x10,
-	/** A control message took too long. */
-	Timeout: 0x11,
-	/** No version could be negotiated. */
-	Version: 0x15,
-} as const;
+export const SessionCode = Object.freeze(
+	Object.assign((code: number): SessionCode => applicationCode(code) as SessionCode, {
+		/** Ending the session normally, with no error. */
+		Cancel: 0x0 as SessionCode,
+		/** Something went wrong that isn't worth a dedicated code. */
+		Internal: 0x1 as SessionCode,
+		/** The credentials don't grant the requested path or operation. Retrying will fail again. */
+		Unauthorized: 0x2 as SessionCode,
+		/** A protocol rule was broken; the session is unusable. */
+		ProtocolViolation: 0x3 as SessionCode,
+		/** A key-value pair was malformed or repeated more than allowed. */
+		KeyValueFormatting: 0x6 as SessionCode,
+		/** The peer did not close within the GOAWAY drain deadline. */
+		GoawayTimeout: 0x10 as SessionCode,
+		/** A control message took too long. */
+		Timeout: 0x11 as SessionCode,
+		/** No version could be negotiated. */
+		Version: 0x15 as SessionCode,
+	} as const),
+);
 
-/** A session termination code. See {@link SessionCode}. */
-export type SessionCode = (typeof SessionCode)[keyof typeof SessionCode];
+/** The nominal brand for stream reset codes. */
+declare const STREAM_CODE: unique symbol;
+
+/** A code from the stream reset registry. */
+export type StreamCode = number & { readonly [STREAM_CODE]: true };
 
 /**
  * Codes a peer sends when resetting a stream, mirroring the Rust `StreamError`.
  *
  * The counterpart to {@link SessionCode}, and a disjoint space: a stream reset of 0 is
- * {@link StreamCode.Internal}, not a cancellation ({@link StreamCode.Cancel} is 1).
+ * {@link StreamCode.Internal}, not a cancellation ({@link StreamCode.Cancel} is 1). Call
+ * `StreamCode(code)` to construct an application code in the 64+ range.
  *
  * Codes 32-63 are reserved rather than assigned, same as {@link SessionCode}.
  *
  * @public
  */
-export const StreamCode = {
-	/** Something went wrong that isn't worth a dedicated code. */
-	Internal: 0x0,
-	/** The sender is done with this stream, not failing. A routine unsubscribe. */
-	Cancel: 0x1,
-	/** The content missed its delivery deadline. */
-	DeliveryTimeout: 0x2,
-	/** The session ended, taking this stream with it. */
-	SessionClosed: 0x3,
-	/** The session is going away (a GOAWAY was received). */
-	GoingAway: 0x4,
-	/** The reader fell too far behind and content was dropped to catch up. */
-	TooFarBehind: 0x5,
-	/** The track's content could not be parsed. */
-	MalformedTrack: 0x12,
-} as const;
+export const StreamCode = Object.freeze(
+	Object.assign((code: number): StreamCode => applicationCode(code) as StreamCode, {
+		/** Something went wrong that isn't worth a dedicated code. */
+		Internal: 0x0 as StreamCode,
+		/** The sender is done with this stream, not failing. A routine unsubscribe. */
+		Cancel: 0x1 as StreamCode,
+		/** The content missed its delivery deadline. */
+		DeliveryTimeout: 0x2 as StreamCode,
+		/** The session ended, taking this stream with it. */
+		SessionClosed: 0x3 as StreamCode,
+		/** The session is going away (a GOAWAY was received). */
+		GoingAway: 0x4 as StreamCode,
+		/** The reader fell too far behind and content was dropped to catch up. */
+		TooFarBehind: 0x5 as StreamCode,
+		/** The track's content could not be parsed. */
+		MalformedTrack: 0x12 as StreamCode,
+	} as const),
+);
 
-/** A stream reset code. See {@link StreamCode}. */
-export type StreamCode = (typeof StreamCode)[keyof typeof StreamCode];
+function applicationCode(code: number): number {
+	if (!Number.isInteger(code) || code < 64 || code > 0xffffffff) {
+		throw new RangeError(`invalid application error code: ${code}`);
+	}
+	return code;
+}
 
 /**
- * An error the peer reported by resetting a stream or closing the session, carrying the
- * code it sent.
+ * An error the peer reported by closing the session, carrying its {@link SessionCode}.
  *
- * Which registry {@link code} belongs to depends on what failed: a stream read or write
- * rejects with a {@link StreamCode}, while a session close carries a {@link SessionCode}.
- * The two spaces are disjoint, so read it against the right one. This surfaces on every
- * transport, so branch on {@link code} rather than feature-detecting `WebTransportError`,
- * which a non-browser runtime never defines and the WebSocket fallback never throws.
+ * This surfaces on every transport, so catch this type rather than feature-detecting
+ * `WebTransportError`, which a non-browser runtime never defines and the WebSocket fallback
+ * never throws.
+ *
+ * ```ts
+ * const err = await connection.closed;
+ * if (err instanceof SessionError && err.code === SessionCode.Unauthorized) {
+ *   console.warn("server rejected the session");
+ * }
+ * ```
+ *
+ * @public
+ */
+export class SessionError extends Error {
+	/** The session code the peer sent, verbatim. */
+	readonly code: SessionCode;
+
+	constructor(code: SessionCode, options?: { cause?: unknown; reason?: string }) {
+		super(options?.reason ? `remote error: ${code} (${options.reason})` : `remote error: ${code}`, options);
+		this.name = "SessionError";
+		this.code = code;
+	}
+}
+
+/**
+ * An error the peer reported by resetting a stream, carrying its {@link StreamCode}.
+ *
+ * This surfaces on every transport, so catch this type rather than feature-detecting
+ * `WebTransportError`, which a non-browser runtime never defines and the WebSocket fallback
+ * never throws.
  *
  * ```ts
  * try {
  *   frame = await group.readFrame();
  * } catch (err) {
- *   if (err instanceof RemoteError && err.code === StreamCode.Cancel) return;
+ *   if (err instanceof StreamError && err.code === StreamCode.Cancel) return;
  *   throw err;
  * }
  * ```
  *
  * @public
  */
-export class RemoteError extends Error {
-	/** The code the peer sent, verbatim. */
-	readonly code: number;
+export class StreamError extends Error {
+	/** The stream code the peer sent, verbatim. */
+	readonly code: StreamCode;
 
-	constructor(code: number, options?: { cause?: unknown; reason?: string }) {
+	constructor(code: StreamCode, options?: { cause?: unknown; reason?: string }) {
 		super(options?.reason ? `remote error: ${code} (${options.reason})` : `remote error: ${code}`, options);
-		this.name = "RemoteError";
+		this.name = "StreamError";
 		this.code = code;
 	}
 }
@@ -120,17 +162,17 @@ export class ProtocolViolation extends Error {
 /** The WebTransport-shaped fields a stream reset code arrives in. */
 type StreamErrorLike = { source?: unknown; streamErrorCode?: unknown };
 
-function streamCode(err: unknown): number | undefined {
+function streamCode(err: unknown): StreamCode | undefined {
 	if (typeof err !== "object" || err === null) return undefined;
 
 	const { source, streamErrorCode } = err as StreamErrorLike;
 	if (source !== "stream" || typeof streamErrorCode !== "number") return undefined;
 
-	return streamErrorCode;
+	return streamErrorCode as StreamCode;
 }
 
 /**
- * Decode a transport failure into a {@link RemoteError} error when it carries a stream reset code,
+ * Decode a transport failure into a {@link StreamError} when it carries a stream reset code,
  * otherwise pass it through.
  *
  * Native WebTransport rejects with a `WebTransportError`; the WebSocket fallback mints an error
@@ -142,7 +184,7 @@ function streamCode(err: unknown): number | undefined {
 export function fromTransport(err: unknown): Error {
 	const code = streamCode(err);
 	if (code === undefined) return error(err);
-	return new RemoteError(code, { cause: err });
+	return new StreamError(code, { cause: err });
 }
 
 const legacyWebTransportErrors = new WeakSet<object>();
@@ -161,7 +203,7 @@ const legacyWebTransportErrors = new WeakSet<object>();
  *
  * @internal
  */
-export function toTransport(code: number, message: string): Error {
+export function toTransport(code: StreamCode, message: string): Error {
 	const Native = (globalThis as { WebTransportError?: typeof WebTransportError }).WebTransportError;
 	if (Native) {
 		const Legacy = Native as unknown as new (init: { message: string; streamErrorCode: number }) => Error;
@@ -182,14 +224,14 @@ export function toTransport(code: number, message: string): Error {
 
 /**
  * Decode a session close into its terminal error: `null` for a clean close
- * ({@link SessionCode.Cancel}), otherwise a {@link RemoteError} carrying the peer's code.
+ * ({@link SessionCode.Cancel}), otherwise a {@link SessionError} carrying the peer's code.
  *
  * @internal Applied to the transport's `closed` info so the code survives to the application.
  */
-export function fromClose(info: WebTransportCloseInfo): RemoteError | null {
-	const code = info.closeCode ?? SessionCode.Cancel;
+export function fromClose(info: WebTransportCloseInfo): SessionError | null {
+	const code = (info.closeCode ?? SessionCode.Cancel) as SessionCode;
 	if (code === SessionCode.Cancel) return null;
-	return new RemoteError(code, { reason: info.reason });
+	return new SessionError(code, { reason: info.reason });
 }
 
 /**

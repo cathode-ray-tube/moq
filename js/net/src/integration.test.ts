@@ -3,7 +3,7 @@ import type { Getter } from "@moq/signals";
 import * as Announce from "./announced.ts";
 import type { Consumer as BroadcastConsumer, Producer as BroadcastProducer } from "./broadcast.ts";
 import { accept, connect, Reload } from "./connection/index.ts";
-import { RemoteError } from "./error.ts";
+import { StreamCode, StreamError } from "./error.ts";
 import * as Ietf from "./ietf/index.ts";
 import * as Lite from "./lite/index.ts";
 import { createMockTransportPair } from "./mock.ts";
@@ -492,8 +492,8 @@ test("integration: a group reset carries the peer's code to the subscriber", asy
 		() => undefined,
 		(e: unknown) => e,
 	);
-	expect(err).toBeInstanceOf(RemoteError);
-	expect((err as RemoteError).code).toBe(2);
+	expect(err).toBeInstanceOf(StreamError);
+	expect((err as StreamError).code).toBe(StreamCode.DeliveryTimeout);
 
 	broadcast.close();
 	remote.close();
