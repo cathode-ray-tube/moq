@@ -22,6 +22,7 @@ type Wasm = typeof import("@moq/wasm");
 type Session = import("@moq/wasm").Session;
 type Broadcast = import("@moq/wasm").Broadcast;
 type Track = import("@moq/wasm").Track;
+type Group = import("@moq/wasm").Group;
 
 /** One relay the suite runs against, and the version it must negotiate. */
 export interface RelayFixture {
@@ -211,26 +212,51 @@ async function consume(session: Session, path: string): Promise<Broadcast> {
  */
 async function expectGroups(track: Track, count: number): Promise<void> {
 	let previous: bigint | undefined;
+	let read = 0;
 
-	for (let i = 0; i < count; i++) {
-		const group = await track.recvGroup();
-		if (!group) throw new Error(`track ended after ${i} groups, want ${count}`);
+	// A skip is legal (see `isOld`), so bound the attempts rather than the skips: a
+	// subscription that never delivers a whole group fails here instead of looping.
+	for (let attempt = 0; read < count; attempt++) {
+		if (attempt >= count * 4) throw new Error(`read ${read} whole groups in ${attempt} attempts, want ${count}`);
+
+		let group: Group | undefined;
 		try {
-			if (previous !== undefined && group.sequence !== previous + 1n) {
-				throw new Error(`group ${i}: sequence is ${group.sequence}, want ${previous + 1n}`);
+			group = await track.recvGroup();
+			if (!group) throw new Error(`track ended after ${read} groups, want ${count}`);
+
+			// Forward, not consecutive: a skipped group leaves a gap in the sequence.
+			if (previous !== undefined && group.sequence <= previous) {
+				throw new Error(`group ${read}: sequence is ${group.sequence}, want greater than ${previous}`);
 			}
 			previous = group.sequence;
 
 			for (const [j, want] of FIXTURE.entries()) {
 				const frame = await group.readFrame();
-				if (!frame) throw new Error(`group ${i}: ended after ${j} frames, want ${FIXTURE.length}`);
-				expectBytes(frame, want, `group ${i} frame ${j}`);
+				if (!frame) throw new Error(`group ${read}: ended after ${j} frames, want ${FIXTURE.length}`);
+				expectBytes(frame, want, `group ${read} frame ${j}`);
 			}
-			if (await group.readFrame()) throw new Error(`group ${i}: got more than ${FIXTURE.length} frames`);
+			if (await group.readFrame()) throw new Error(`group ${read}: got more than ${FIXTURE.length} frames`);
+			read++;
+		} catch (err) {
+			if (!isOld(err)) throw err;
 		} finally {
-			group.free();
+			group?.free();
 		}
 	}
+}
+
+/**
+ * Whether the live edge passed this group before it was delivered whole.
+ *
+ * The subscription's budget is the default `Latency::REAL_TIME`, which drops a group
+ * the edge has moved past rather than delivering it late, so the publisher writing one
+ * every {@link GROUP_INTERVAL_MS} can legitimately retire a group the reader is still
+ * on. Treating that as a case failure asserts a guarantee real-time delivery does not
+ * make, and loses the race on a loaded runner. What has to hold is that a group which
+ * *is* delivered arrives in order and whole, which the checks above still cover.
+ */
+function isOld(err: unknown): boolean {
+	return err instanceof Error && err.message === "old";
 }
 
 function expectBytes(got: Uint8Array, want: Uint8Array, where: string): void {
