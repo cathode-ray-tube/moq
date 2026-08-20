@@ -169,6 +169,11 @@ pub enum Error {
 	#[error("connection ID length ({0}) exceeds maximum of 20")]
 	QuicLbCidTooLong(usize),
 
+	/// Both QUIC-LB and reuseport steering want to own the connection ID, and
+	/// each reads back only its own encoding.
+	#[error("QUIC-LB connection IDs cannot be combined with per-core workers")]
+	ShardWithQuicLb,
+
 	/// The mTLS client verifier could not be built from the configured roots.
 	#[error("failed to build client certificate verifier")]
 	ClientVerifier(#[source] rustls::server::VerifierBuilderError),
@@ -256,7 +261,7 @@ pub(crate) struct NoqClient {
 
 impl NoqClient {
 	pub fn new(config: &connect::Config, quic: &crate::quic::Config) -> Result<Self> {
-		let socket = crate::bind::udp(config.resolved_bind()).map_err(Error::BindSocket)?;
+		let socket = crate::bind::udp(crate::bind::Udp::new(config.resolved_bind())).map_err(Error::BindSocket)?;
 		let dual_stack = crate::bind::udp_is_dual_stack(&socket);
 
 		let mut transport = noq::TransportConfig::default();
@@ -472,7 +477,7 @@ pub(crate) struct NoqServer {
 }
 
 impl NoqServer {
-	pub fn new(config: listen::Config, quic: &crate::quic::Config) -> Result<Self> {
+	pub fn new(config: listen::Config, quic: &crate::quic::Config, shard: Option<listen::Shard>) -> Result<Self> {
 		let mut transport = noq::TransportConfig::default();
 		let quic = quic.resolve();
 		apply_transport(&mut transport, &quic);
@@ -532,7 +537,17 @@ impl NoqServer {
 
 		// Configure connection ID generator with server ID if provided
 		let mut endpoint_config = noq::EndpointConfig::default();
-		if let Some(server_id) = config.lb_id {
+		if let Some(shard) = shard {
+			if config.lb_id.is_some() {
+				return Err(Error::ShardWithQuicLb);
+			}
+			tracing::debug!(
+				index = shard.index(),
+				count = shard.count(),
+				"encoding the shard in connection IDs"
+			);
+			endpoint_config.cid_generator(Arc::new(move || Box::new(ShardIdGenerator::new(shard))));
+		} else if let Some(server_id) = config.lb_id {
 			let nonce_len = config.lb_nonce.unwrap_or(8);
 			if nonce_len < 4 {
 				return Err(Error::QuicLbNonceTooSmall);
@@ -553,7 +568,7 @@ impl NoqServer {
 			}));
 		}
 
-		let socket = crate::bind::udp(listen).map_err(Error::BindSocket)?;
+		let socket = crate::steer::bind(listen, shard).map_err(Error::BindSocket)?;
 
 		// Create the generic QUIC endpoint.
 		let quic = noq::Endpoint::new(endpoint_config, Some(tls), socket, runtime).map_err(Error::CreateEndpoint)?;
@@ -649,6 +664,41 @@ pub(crate) async fn accept(
 			Ok((session, None, identity))
 		}
 		_ => Err(Error::UnsupportedAlpn(alpn)),
+	}
+}
+
+// ── ShardIdGenerator ────────────────────────────────────────────────
+
+/// Connection IDs whose first byte names the reuseport member that owns them,
+/// so the group's steering filter can route later packets back to it.
+struct ShardIdGenerator {
+	shard: crate::listen::Shard,
+}
+
+impl ShardIdGenerator {
+	/// Only the first byte is spoken for; the rest stays random.
+	const LEN: usize = 8;
+
+	fn new(shard: crate::listen::Shard) -> Self {
+		Self { shard }
+	}
+}
+
+impl noq::ConnectionIdGenerator for ShardIdGenerator {
+	fn generate_cid(&mut self) -> noq::ConnectionId {
+		use rand::RngExt;
+		let mut cid = Vec::with_capacity(Self::LEN);
+		cid.push(crate::steer::cid_prefix(self.shard));
+		cid.extend(rand::rng().random_iter::<u8>().take(Self::LEN - 1));
+		noq::ConnectionId::new(cid.as_slice())
+	}
+
+	fn cid_len(&self) -> usize {
+		Self::LEN
+	}
+
+	fn cid_lifetime(&self) -> Option<Duration> {
+		None
 	}
 }
 

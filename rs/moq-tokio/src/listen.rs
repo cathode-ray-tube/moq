@@ -123,6 +123,41 @@ pub struct Config {
 	pub quic: Option<crate::quic::Config>,
 }
 
+/// One server's slot in a group of sockets sharing a port via `SO_REUSEPORT`.
+///
+/// Every member binds the same address and the kernel spreads inbound datagrams
+/// across the group, so N servers on N threads can serve one port without a
+/// shared socket between them.
+///
+/// Crate-private on purpose. The kernel identifies a member by its *position*,
+/// so a shard is only meaningful as part of a group that was bound once, in
+/// index order, and is never resized. [`crate::worker::Workers`] is what holds
+/// that invariant; a shard a caller could mint, clone, or bind twice would break
+/// steering with no error to show for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Shard {
+	index: u16,
+	count: u16,
+}
+
+impl Shard {
+	/// Slot `index` of a group of `count` sockets, or `None` if that slot does not
+	/// exist (`count` of zero, or an `index` at or past the end).
+	pub(crate) fn new(index: u16, count: u16) -> Option<Self> {
+		(index < count).then_some(Self { index, count })
+	}
+
+	/// This member's position in the group, from zero.
+	pub(crate) fn index(self) -> u16 {
+		self.index
+	}
+
+	/// How many sockets share the port.
+	pub(crate) fn count(self) -> u16 {
+		self.count
+	}
+}
+
 /// The `--server-*` flags from before the accept side was named `listen`.
 ///
 /// They carry their original env vars, which is why these are separate args rather
@@ -353,6 +388,43 @@ mod tests {
 
 		let config = config_from(["test", "--listen-quic-lb-id", "ab", "--listen-quic-lb-nonce", "8"]);
 		assert!(config.validate().is_ok());
+	}
+
+	/// A slot has to exist in the group it names.
+	#[test]
+	fn shard_slots_are_bounded() {
+		assert_eq!(Shard::new(0, 1).map(|shard| shard.count()), Some(1));
+		assert_eq!(Shard::new(3, 4).map(|shard| shard.index()), Some(3));
+		assert!(Shard::new(4, 4).is_none());
+		assert!(Shard::new(0, 0).is_none());
+	}
+
+	/// A stream-only server opens no QUIC listener even with a bind configured,
+	/// which is what lets a worker group hold that address instead.
+	#[tokio::test]
+	async fn init_streams_leaves_quic_alone() {
+		let config = Config {
+			bind: Some("127.0.0.1:0".to_string()),
+			..Default::default()
+		};
+
+		let server = config.init_streams().unwrap();
+		assert!(matches!(server.local_addr(), Err(crate::Error::NoBackend(_))));
+	}
+
+	/// The default constructor still binds QUIC when nothing else is configured,
+	/// which is the behavior `init_streams` had to be a separate call to avoid
+	/// changing.
+	#[tokio::test]
+	async fn init_still_defaults_to_quic() {
+		let mut config = Config {
+			bind: Some("127.0.0.1:0".to_string()),
+			..Default::default()
+		};
+		config.tls.generate = vec!["localhost".to_string()];
+
+		let server = config.init(Default::default()).unwrap();
+		assert!(server.local_addr().is_ok());
 	}
 
 	/// The canonical spellings, which is what `--help` teaches.

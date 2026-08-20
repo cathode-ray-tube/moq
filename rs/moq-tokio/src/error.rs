@@ -95,6 +95,50 @@ pub enum Error {
 	#[error("--listen-quic-lb-nonce needs --listen-quic-lb-id")]
 	LbNonceWithoutId,
 
+	/// A worker group was asked for more members than the connection ID's one-byte
+	/// steering prefix can name.
+	#[error("QUIC workers cannot exceed {max}; {count} were requested")]
+	WorkerCount {
+		/// What was asked for.
+		count: u16,
+		/// The ceiling, set by the byte the steering filter reads.
+		max: u16,
+	},
+
+	/// A worker group was asked to generate its own certificate, which would give
+	/// every member a different one.
+	#[error("QUIC workers cannot generate certificates; configure a certificate and key instead")]
+	WorkerTlsGenerate,
+
+	/// A worker group was pointed at an ephemeral port, so each member bound a
+	/// port of its own instead of sharing one.
+	#[error("QUIC workers need an explicit non-zero listen port; worker {index} bound {addr} instead of {first}")]
+	WorkerPortMismatch {
+		/// The member that disagreed.
+		index: u16,
+		/// What it bound.
+		addr: std::net::SocketAddr,
+		/// What the first member bound, which the rest must match.
+		first: std::net::SocketAddr,
+	},
+
+	/// The worker group's listen address did not resolve.
+	///
+	/// Resolved once for the whole group, so a DNS answer that rotates between
+	/// queries cannot hand members different addresses.
+	#[error("QUIC workers failed to resolve the listen address")]
+	WorkerResolve(#[source] Arc<std::io::Error>),
+
+	/// A worker thread could not be spawned, or died before it finished binding.
+	#[error("QUIC worker {index} failed to start")]
+	WorkerStart {
+		/// The member that failed.
+		index: u16,
+		/// Why, when the thread got far enough to say.
+		#[source]
+		source: Arc<std::io::Error>,
+	},
+
 	/// The server's WebTransport response carried a status outside the valid HTTP range.
 	#[error("invalid status code")]
 	InvalidStatusCode,

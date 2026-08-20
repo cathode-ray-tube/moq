@@ -96,6 +96,11 @@ pub enum Error {
 	#[error("failed to get local address")]
 	NoLocalAddr,
 
+	/// This backend cannot encode the owning worker in its connection IDs, so a
+	/// reuseport group built on it would have no way to steer packets back.
+	#[error("the quiche backend cannot serve per-core workers; use the quinn backend")]
+	ShardUnsupported,
+
 	/// The server was given neither a certificate pair nor hostnames to generate one from.
 	#[error("--tls-cert and --tls-key are required with the quiche backend")]
 	CertRequired,
@@ -322,7 +327,7 @@ impl QuicheClient {
 		// Bind the first attempt now so candidate selection uses the socket's actual
 		// family and dual-stack state. Later attempts bind their own ephemeral
 		// sockets because each quiche connection must own its socket.
-		let socket = crate::bind::udp(self.bind)?;
+		let socket = crate::bind::udp(crate::bind::Udp::new(self.bind))?;
 		let local = socket.local_addr()?;
 		let dual_stack = crate::bind::udp_is_dual_stack(&socket);
 
@@ -359,7 +364,7 @@ impl QuicheClient {
 			async move {
 				let socket = match socket {
 					Some(socket) => socket,
-					None => crate::bind::udp(this.bind)?,
+					None => crate::bind::udp(crate::bind::Udp::new(this.bind))?,
 				};
 				let builder = this.builder(socket, alpns, &verification, roots, &host)?;
 				let conn = builder
@@ -557,16 +562,24 @@ pub(crate) struct QuicheServer {
 }
 
 impl QuicheServer {
-	pub fn new(config: listen::Config, quic: &crate::quic::Config) -> Result<Self> {
+	pub fn new(config: listen::Config, quic: &crate::quic::Config, shard: Option<listen::Shard>) -> Result<Self> {
 		if config.lb_id.is_some() {
 			tracing::warn!("QUIC-LB is not supported with the quiche backend; ignoring server ID");
+		}
+
+		// Refused rather than degraded: without connection-ID steering the kernel
+		// falls back to hashing addresses, and a client that changes address lands
+		// on a worker that has never seen its connection. `web-transport-quiche`
+		// exposes no connection ID hook to encode the owner with.
+		if shard.is_some() {
+			return Err(Error::ShardUnsupported);
 		}
 
 		let quic = quic.resolve();
 
 		let listen =
 			crate::util::resolve(config.bind.as_deref(), crate::server::DEFAULT_BIND).map_err(Error::ResolveBind)?;
-		let socket = crate::bind::udp(listen)?;
+		let socket = crate::bind::udp(crate::bind::Udp::new(listen))?;
 
 		let (chain, key) = if !config.tls.generate.is_empty() {
 			generate_quiche_cert(&config.tls.generate)?

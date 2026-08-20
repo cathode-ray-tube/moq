@@ -45,6 +45,54 @@ Logging configuration.
 level = "info"
 ```
 
+### \[runtime]
+
+How the relay lays its QUIC work out over threads. By default one work-stealing
+runtime serves every connection off one UDP socket.
+
+```toml
+[runtime]
+# Serve QUIC from this many single-threaded workers instead of the shared
+# runtime. Each worker is a thread with its own socket on the listen address
+# (SO_REUSEPORT), and a connection is handled start to finish by one worker, so
+# its packets never cross threads. Everything else (HTTP, WebSocket, tcp/unix,
+# clustering) stays on the shared runtime. Omit to keep QUIC there too.
+#
+# Packets are steered to their worker by connection ID, not by address, so a
+# client that migrates (a NAT rebinding, a network change) stays with the worker
+# that owns its connection.
+#
+# Linux only. Needs a backend whose connection IDs can name the owning worker,
+# so listen.backend must be quinn (the default) or noq; quiche refuses to start.
+# Cannot be combined with listen.quic_lb_id, which wants the same bytes of the
+# connection ID.
+#
+# The listen address needs an explicit non-zero port: an ephemeral bind gives
+# each worker a port of its own instead of a shared one.
+#
+# Incompatible with listen.tls.generate, since each worker would generate a
+# certificate of its own. Point at real certificate files instead. Each worker
+# loads and watches those files itself, so a rotation is not atomic across the
+# group: for as long as the reloads take, two workers can be serving different
+# certificates. See https://github.com/moq-dev/moq/issues/2924.
+workers = 8
+
+# Pin each worker to a CPU core. Default: true.
+pin = true
+```
+
+The shared runtime is still there for everything that is not QUIC, and it still
+sizes its thread pool to the machine. Set `TOKIO_WORKER_THREADS` in the
+environment to bound it, so the workers are not competing with a full second
+pool for the same cores.
+
+Load is not perfectly even across workers. A connection is assigned to a worker
+by the kernel's hash of its first packet and stays there for life, so worker
+load carries the binomial spread of that assignment: with ~100 connections on 4
+workers, expect the busiest to carry 1.1-1.6x the idlest. Size `workers`
+expecting somewhat less than one full core of capacity per worker; the spread
+narrows as connection counts grow.
+
 ### \[listen]
 
 QUIC/WebTransport server settings. Optionally add plaintext qmux stream
