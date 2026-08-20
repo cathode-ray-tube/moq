@@ -4935,6 +4935,7 @@ dependencies = [
  "humantime",
  "humantime-serde",
  "jsonwebtoken",
+ "libc",
  "moq-net",
  "moq-stats",
  "moq-token",
