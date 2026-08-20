@@ -1207,10 +1207,10 @@ fn publish_track_invalid_broadcast() {
 	let info = moq_track_info {
 		priority: 1,
 		ordered: true,
-		latency_max_ms: 0,
-		latency_max_valid: false,
+		max_age_ms: 0,
+		max_age_present: false,
 		timescale: 0,
-		timescale_valid: false,
+		timescale_present: false,
 	};
 	assert!(unsafe { moq_publish_track(0, name.as_ptr() as *const c_char, name.len(), &info) } < 0);
 	assert!(moq_publish_track_group(9999) < 0);
@@ -1222,11 +1222,11 @@ fn publish_track_invalid_broadcast() {
 	let subscription = moq_subscription {
 		priority: 1,
 		ordered: true,
-		latency_max_ms: 0,
+		max_age_ms: 0,
 		group_start: 0,
-		group_start_valid: false,
+		group_start_present: false,
 		group_end: 0,
-		group_end_valid: false,
+		group_end_present: false,
 	};
 	assert!(unsafe { moq_consume_track_update(9999, &subscription) } < 0);
 }
@@ -1239,10 +1239,10 @@ fn publish_track_with_info_rejects_invalid_timescale() {
 	let info = moq_track_info {
 		priority: 0,
 		ordered: false,
-		latency_max_ms: 0,
-		latency_max_valid: false,
+		max_age_ms: 0,
+		max_age_present: false,
 		timescale: 0,
-		timescale_valid: true,
+		timescale_present: true,
 	};
 
 	assert!(unsafe { moq_publish_track(broadcast, name.as_ptr() as *const c_char, name.len(), &info) } < 0);
@@ -1254,10 +1254,10 @@ fn raw_track_options_preserve_ordering_priority() {
 	let mut info = moq_track_info {
 		priority: 0,
 		ordered: false,
-		latency_max_ms: 0,
-		latency_max_valid: false,
+		max_age_ms: 0,
+		max_age_present: false,
 		timescale: 0,
-		timescale_valid: false,
+		timescale_present: false,
 	};
 
 	assert!(!moq_net::track::Info::try_from(&info).unwrap().ordered);
@@ -1267,11 +1267,11 @@ fn raw_track_options_preserve_ordering_priority() {
 	let mut subscription = moq_subscription {
 		priority: 0,
 		ordered: false,
-		latency_max_ms: 0,
+		max_age_ms: 0,
 		group_start: 0,
-		group_start_valid: false,
+		group_start_present: false,
 		group_end: 0,
-		group_end_valid: false,
+		group_end_present: false,
 	};
 
 	assert!(!moq_net::track::Subscription::from(&subscription).ordered);
@@ -1304,11 +1304,11 @@ fn raw_track_publish_consume() {
 	let subscription = moq_subscription {
 		priority: 0,
 		ordered: false,
-		latency_max_ms: 1_000,
+		max_age_ms: 1_000,
 		group_start: 0,
-		group_start_valid: false,
+		group_start_present: false,
 		group_end: 0,
-		group_end_valid: false,
+		group_end_present: false,
 	};
 	let consumer = id(unsafe {
 		moq_consume_track(
@@ -1486,10 +1486,10 @@ fn raw_track_subscription_options_and_update() {
 	let info = moq_track_info {
 		priority: 3,
 		ordered: false,
-		latency_max_ms: 1_000,
-		latency_max_valid: true,
+		max_age_ms: 1_000,
+		max_age_present: true,
 		timescale: 1_000_000,
-		timescale_valid: true,
+		timescale_present: true,
 	};
 	let track =
 		id(unsafe { moq_publish_track(broadcast, track_name.as_ptr() as *const c_char, track_name.len(), &info) });
@@ -1508,11 +1508,11 @@ fn raw_track_subscription_options_and_update() {
 	let subscription = moq_subscription {
 		priority: 5,
 		ordered: true,
-		latency_max_ms: 25,
+		max_age_ms: 25,
 		group_start: 1,
-		group_start_valid: true,
+		group_start_present: true,
 		group_end: 1,
-		group_end_valid: true,
+		group_end_present: true,
 	};
 	let consumer = id(unsafe {
 		moq_consume_track(
@@ -2396,7 +2396,7 @@ fn video_raw_publish_consume() {
 	let catalog_task = id(unsafe { moq_consume_catalog(consume, Some(channel_callback), catalog_cb.ptr) });
 	let catalog_id = id(catalog_cb.recv());
 
-	let decoder = moq_video_decoder_output { latency_max_ms: 10_000 };
+	let decoder = moq_video_decoder_output { max_age_ms: 10_000 };
 	let frame_cb = Callback::new();
 	let consumer = id(unsafe { moq_decode_video(catalog_id, 0, &decoder, Some(channel_callback), frame_cb.ptr) });
 
@@ -2759,7 +2759,7 @@ fn video_raw_decode() {
 	let catalog_id = id(catalog_cb.recv());
 
 	// Subscribe + decode before publishing frames so the keyframe group is delivered.
-	let output = moq_video_decoder_output { latency_max_ms: 10_000 };
+	let output = moq_video_decoder_output { max_age_ms: 10_000 };
 	let frame_cb = Callback::new();
 	let consumer = id(unsafe { moq_decode_video(catalog_id, 0, &output, Some(channel_callback), frame_cb.ptr) });
 

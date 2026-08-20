@@ -475,8 +475,8 @@ class BroadcastConsumer:
         bitstream, or a :class:`Container` directly. Pass a bare container for the
         dynamic flow, where you subscribe before the catalog exists.
         ``subscription`` tunes delivery priority, group ordering priority, group
-        range, and the latency budget; omit for defaults. Raise
-        :attr:`Subscription.latency_max_ms` to buffer instead of skipping a
+        range, and the max age; omit for defaults. Raise
+        :attr:`Subscription.max_age_ms` to buffer instead of skipping a
         stalled group.
         """
         container = track if isinstance(track, Container) else track.container
@@ -511,10 +511,12 @@ class BroadcastConsumer:
         ``catalog_audio`` comes from the catalog (e.g.
         ``await broadcast.catalog()`` followed by
         ``catalog.audio[name]``). Only Opus tracks are currently supported.
-        Use ``output.latency_max_ms`` to
+        Use ``output.max_age_ms`` to
         control how aggressively stalled groups get skipped. That's
         the congestion-control knob. (Named ``_max`` to leave room for
-        a future ``latency_min_ms`` jitter-buffer floor.)
+        a future ``min_buffer_ms`` jitter-buffer floor, which is a
+        distinct knob: this one bounds how stale a group may be, that
+        one how much to hold before presenting.)
         """
         return AudioConsumer(await self._inner.decode_audio(name, catalog_audio, output))
 

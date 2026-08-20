@@ -33,6 +33,4 @@ pub mod timeline;
 
 pub use clock::Clock;
 pub use error::*;
-/// Re-export of [`moq_net::Latency`], the drift budget every consumer-side knob here takes.
-pub use moq_net::Latency;
 pub use source::Source;
