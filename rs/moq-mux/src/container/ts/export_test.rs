@@ -652,7 +652,10 @@ async fn export_pcr_wraps_below_the_reserve_at_start() {
 	}
 	producer.finish().unwrap();
 
-	let mut exporter = Export::new(crate::source::announced(&consumer)).await.unwrap();
+	let mut exporter = Export::new(crate::source::announced(&consumer))
+		.await
+		.unwrap()
+		.with_max_age(RECORDING_MAX_AGE);
 	let frames = drain_frames(&mut exporter).await;
 
 	// Each PCR is its own single-packet frame, stamped at its slot boundary so the
@@ -2865,11 +2868,16 @@ async fn si_revision_after_final_media_frame_is_flushed() {
 	let mut exporter = Export::with_ts(crate::source::announced(&consumer), crate::catalog::CatalogFormat::Hang)
 		.await
 		.unwrap();
-	let first = tokio::time::timeout(Duration::from_secs(1), exporter.next())
-		.await
-		.expect("the only media frame")
-		.unwrap()
-		.unwrap();
+	let first = loop {
+		let frame = tokio::time::timeout(Duration::from_secs(1), exporter.next())
+			.await
+			.expect("the only media frame")
+			.unwrap()
+			.unwrap();
+		if !is_pcr_frame(&frame) {
+			break frame;
+		}
+	};
 	let contains = |haystack: &[u8], needle: &[u8]| haystack.windows(needle.len()).any(|w| w == needle);
 	assert!(contains(&first.payload, &sdt_v1), "v1 rode the media frame (control)");
 
