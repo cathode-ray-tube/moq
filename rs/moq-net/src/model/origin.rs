@@ -371,6 +371,31 @@ struct OriginBroadcast {
 	announced: bool,
 }
 
+/// How long a relay waits before re-parenting onto a source reached through a
+/// session.
+///
+/// Re-parenting is the one move that can cycle: relays that each decide to pull
+/// from the next leave the broadcast with no source at all. A truthful hop chain
+/// makes that impossible, because the loop would be visible in the chain and
+/// dropped. What defeats the chain is simultaneity: relays deciding inside one
+/// propagation window all read chains and costs that predate every one of those
+/// decisions, so no advertisement yet contains the loop they are about to form.
+///
+/// Costs make it worse rather than causing it. A relay reports its own cost, and
+/// a report still in flight can be lower than what its sender would say now, so a
+/// ring of relays can each rank a stale neighbour below themselves. Rising costs
+/// are the whole hazard: if costs only fell, a stale value would only ever make a
+/// peer look worse than it is, which is safe.
+///
+/// So a relay sits on the decision instead of acting on it, and re-evaluates when
+/// the wait expires. The wait is not there to stagger the relays, which a uniform
+/// delay cannot do; it is there to outlast the propagation of the very costs it is
+/// deciding on, so the re-evaluation runs on current numbers and usually no longer
+/// wants to move. That makes the sizing rule simply "longer than an announcement
+/// takes to cross the mesh", which this clears by a wide margin in any topology
+/// where relays talk to each other at all.
+pub(crate) const HANDOVER_HOLD: Duration = Duration::from_millis(500);
+
 /// Ordering key used to pick the active route among broadcasts at the same path.
 ///
 /// Lower wins. Shorter hop chains sort first (routing prefers the shortest path);
@@ -413,14 +438,22 @@ fn fnv_key(name: &Path, origins: impl IntoIterator<Item = Origin>) -> u64 {
 }
 
 /// Full ordering key for an attached route: announced routes first (an actively
-/// published source beats an offline one), then the marginal cost of pulling via
-/// the route, then the [`route_key`] hop ordering, and finally the newest source
-/// to attach. Lower wins.
+/// published source beats an offline one), then the [`broadcast::Cost`] of pulling
+/// via the route, then the [`route_key`] hop ordering, and finally the newest
+/// source to attach. Lower wins.
 ///
-/// Hop length stays the tie-break below cost, so peers that never carry a cost
-/// (pre-lite-06, or a plain local publish) rank exactly as they did before route
-/// cost existed, and equal-cost warm copies resolve to the closest one, which
-/// bounds same-datacenter chains to a single hop.
+/// Cost is a pair, so this is really two comparisons: the warm cost, then the cold
+/// one. The second matters exactly when the first ties, which is what happens once
+/// two relays both carry the broadcast and both advertise zero. Their cold costs
+/// then say which of them sits closer to the publisher, and the subscriber takes
+/// that one.
+///
+/// Hop length stays the tie-break below both, and it is measuring the same thing
+/// the cold cost measures, just without the prices: how far away the content is.
+/// So the cold cost is strictly the better answer and goes first. Peers that never
+/// carry a cost (pre-lite-06, or a plain local publish) share one cold value, so
+/// they tie there and rank exactly as they did before route cost existed, on hop
+/// length, which bounds same-datacenter chains to a single hop.
 ///
 /// Recency is the last word, so it only separates routes that are identical in
 /// every advertised respect: same hop chain, same cost. That is a publisher
@@ -430,7 +463,7 @@ fn fnv_key(name: &Path, origins: impl IntoIterator<Item = Origin>) -> u64 {
 /// retires the corpse. Local attach order never leaks into cluster convergence:
 /// routes it can reorder are indistinguishable downstream, since what is
 /// forwarded is the chain and cost, which are equal by construction here.
-fn route_order(name: &Path, route: &FrontRoute) -> (bool, u64, usize, u64, Reverse<u64>) {
+fn route_order(name: &Path, route: &FrontRoute) -> (bool, broadcast::Cost, usize, u64, Reverse<u64>) {
 	let (len, hash) = route_key(name, &route.route.hops);
 	(!route.route.announce, route.route.cost, len, hash, Reverse(route.id))
 }
@@ -602,7 +635,16 @@ impl ExclusionGuard {
 		if s.closed {
 			return None;
 		}
-		*s.excluded.entry(peer).or_default() += 1;
+		let count = {
+			let count = s.excluded.entry(peer).or_default();
+			*count += 1;
+			*count
+		};
+		// A first registration can taint the active route; the front task owns
+		// the reselect (see `FrontState::excluded_changed`).
+		if count == 1 {
+			s.excluded_changed = true;
+		}
 		drop(s);
 		Some(Arc::new(Self {
 			state: state.clone(),
@@ -616,7 +658,12 @@ impl Drop for ExclusionGuard {
 		let Ok(mut state) = self.state.write() else { return };
 		if let std::collections::hash_map::Entry::Occupied(mut entry) = state.excluded.entry(self.peer) {
 			match entry.get() {
-				1 => drop(entry.remove()),
+				1 => {
+					entry.remove();
+					// The last reader leaving can free a better route; the
+					// front task owns the reselect.
+					state.excluded_changed = true;
+				}
 				n => *entry.get_mut() = n - 1,
 			}
 		}
@@ -1453,6 +1500,35 @@ struct FrontRoute {
 	source: broadcast::Consumer,
 }
 
+/// What a held re-parent is keyed by: the relay it would adopt.
+///
+/// An anonymous relay ([`Origin::UNKNOWN`]) identifies nothing, so its route id
+/// stands in: another anonymous route is another relay until proven otherwise,
+/// and a reconnecting anonymous relay restarts its wait, which is the price of
+/// withholding an identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldKey {
+	/// The target's announcing relay, when it declared an identity.
+	Relay(Origin),
+	/// The target route itself, when its relay is anonymous.
+	Route(u64),
+}
+
+/// How [`FrontState::pick`] steers around routes tainted for a current reader.
+#[derive(Clone, Copy)]
+enum Steer {
+	/// No steering: the caller pins one requester to one source.
+	Ignore,
+	/// Prefer clean routes, falling back only when none exist. An offline clean
+	/// standby is worth trying for a track; one that refuses falls back through
+	/// the caller's skip set.
+	Clean,
+	/// Prefer clean routes only where that preserves an announced route. The
+	/// pick drives the front's advert, and steering it onto an offline standby
+	/// would retract the path (see [`FrontState::prefer_untainted`]).
+	KeepAnnounced,
+}
+
 /// Shared state behind a [`Front`]: the attached sources and which one is active.
 struct FrontState {
 	/// Absolute path of the broadcast, mixed into the route tie-break hash.
@@ -1467,6 +1543,15 @@ struct FrontState {
 	/// the same rule the session layer applies to a restart whose first hop
 	/// changed.
 	publisher: Option<Origin>,
+	/// The re-parent currently held down: which relay it targets and when the
+	/// wait started. Keyed to the target relay, so a candidate flapping between
+	/// two routes to the same relay (a reconnect under a fresh route id
+	/// included) cannot restart the wait, while a candidate from any other
+	/// relay starts its own wait instead of inheriting an aged timer it was
+	/// never held by. See [`HANDOVER_HOLD`]; the front task sleeps on the
+	/// deadline.
+	pending: Option<(HoldKey, web_async::time::Instant)>,
+
 	/// Attach counter, handed to each [`FrontRoute`] so [`route_order`] can break
 	/// an exact tie toward the newest source.
 	next_route: u64,
@@ -1484,6 +1569,12 @@ struct FrontState {
 	/// it ever subscribes. That reflection is otherwise indistinguishable from a rival
 	/// publisher, and this is what tells [`attach_source`] apart.
 	excluded: HashMap<Origin, usize>,
+	/// Set when `excluded` gained or lost a peer without a reselect. The guards
+	/// register and release under locks that cannot re-run selection or sync
+	/// the front, so the front task observes this flag and does both: a peer
+	/// starting to read can taint the active route out from under it, and one
+	/// leaving can free a better route.
+	excluded_changed: bool,
 	/// The source tracks are dispatched to. Backups park until promoted.
 	active: Option<u64>,
 	/// Terminal: no more sources may attach and every poller stops. Set
@@ -1494,16 +1585,14 @@ struct FrontState {
 
 impl FrontState {
 	/// The one selection primitive every picker goes through: the best route by
-	/// [`route_order`] among those surviving `keep`. With `untainted`, the pick
-	/// also steers away from routes that flow through a peer currently reading
-	/// the shared front, unless that leaves nothing (see
-	/// [`Self::prefer_untainted`]); it is off for [`Self::dispatch`], which pins
-	/// one requester to one source rather than serving the shared front.
-	fn pick(&self, keep: impl Fn(&FrontRoute) -> bool, untainted: bool) -> Option<u64> {
+	/// [`route_order`] among those surviving `keep`, steering around tainted
+	/// routes per `steer` (see [`Steer`] and [`Self::prefer_untainted`]).
+	fn pick(&self, keep: impl Fn(&FrontRoute) -> bool, steer: Steer) -> Option<u64> {
 		let candidates: Vec<&FrontRoute> = self.routes.iter().filter(|r| keep(r)).collect();
-		let candidates = match untainted {
-			true => self.prefer_untainted(&candidates),
-			false => candidates,
+		let candidates = match steer {
+			Steer::Ignore => candidates,
+			Steer::Clean => self.prefer_untainted(&candidates, false),
+			Steer::KeepAnnounced => self.prefer_untainted(&candidates, true),
 		};
 		candidates
 			.into_iter()
@@ -1514,9 +1603,10 @@ impl FrontState {
 	/// The source new track requests should dispatch to: live first, then lowest
 	/// cost, then shortest hop chain with a deterministic hash tie-break and the
 	/// newest source last, skipping routes that flow through a peer currently
-	/// reading the front while any other route remains.
+	/// reading the front while an announced alternative remains. This choice
+	/// drives the front's advert, so it never trades the announcement away.
 	fn best_route(&self) -> Option<u64> {
-		self.pick(|_| true, true)
+		self.pick(|_| true, Steer::KeepAnnounced)
 	}
 
 	/// The source a subscription from `exclude` should dispatch to: the best
@@ -1524,9 +1614,14 @@ impl FrontState {
 	/// selection a session uses to pick what it announces to that peer, and the
 	/// two being one computation is the loop-freedom invariant: chains stay
 	/// truthful, so any would-be cycle surfaces the requester's own origin in
-	/// the candidate chain and is filtered here, at any cycle length.
+	/// the candidate chain and is filtered here, at any cycle length. Taints are
+	/// ignored: this pins one requester to one source rather than serving the
+	/// shared front.
 	fn dispatch(&self, exclude: Option<Origin>) -> Option<u64> {
-		self.pick(|r| exclude.is_none_or(|origin| !r.route.hops.contains(&origin)), false)
+		self.pick(
+			|r| exclude.is_none_or(|origin| !r.route.hops.contains(&origin)),
+			Steer::Ignore,
+		)
 	}
 
 	/// Whether `route` flows back through a peer this front is exposed to, so serving
@@ -1540,15 +1635,26 @@ impl FrontState {
 	}
 
 	/// Narrow `candidates` to the routes clean for every peer currently reading the
-	/// shared front, unless that would leave nothing.
+	/// shared front, unless that would leave nothing, or (with `keep_announced`)
+	/// cost the front its announcement.
 	///
 	/// Keeping the front off a tainted route is what makes the resolve-time
 	/// split-horizon check hold for the life of a subscription rather than just at
-	/// request time. Falling back when every route is tainted is deliberate: the
-	/// alternative is starving readers the route is perfectly good for, and a peer
-	/// whose only path runs back through itself has nothing to be served from
-	/// anyway. It re-resolves to [`Error::Unroutable`] on its next request.
-	fn prefer_untainted<'a>(&self, candidates: &[&'a FrontRoute]) -> Vec<&'a FrontRoute> {
+	/// request time. The taint-wide fallback is deliberate: when every route is
+	/// tainted, the alternative is starving readers the route is perfectly good
+	/// for, and a peer whose only path runs back through itself has nothing to be
+	/// served from anyway; it re-resolves to [`Error::Unroutable`] on its next
+	/// request.
+	///
+	/// `keep_announced` adds a second fallback for the pick that drives the
+	/// front's advert ([`Self::best_route`]): when every clean route is an offline
+	/// standby, steering the advert onto one would retract the path, and the
+	/// retraction drops the very advertisement whose guard made the route look
+	/// tainted, re-running this selection with the taint gone and oscillating the
+	/// announcement. Per-track dispatch ([`Self::serve_route`]) leaves it off: an
+	/// offline standby is worth trying for a track, and one that refuses falls
+	/// back through the caller's skip set instead.
+	fn prefer_untainted<'a>(&self, candidates: &[&'a FrontRoute], keep_announced: bool) -> Vec<&'a FrontRoute> {
 		if self.excluded.is_empty() {
 			return candidates.to_vec();
 		}
@@ -1557,9 +1663,13 @@ impl FrontState {
 			.copied()
 			.filter(|r| !self.taints_a_reader(&r.route))
 			.collect();
-		match clean.is_empty() {
-			true => candidates.to_vec(),
-			false => clean,
+		let keeps = match keep_announced && candidates.iter().any(|r| r.route.announce) {
+			true => clean.iter().any(|r| r.route.announce),
+			false => !clean.is_empty(),
+		};
+		match keeps {
+			true => clean,
+			false => candidates.to_vec(),
 		}
 	}
 
@@ -1579,7 +1689,7 @@ impl FrontState {
 		{
 			return Some(active);
 		}
-		self.pick(|r| !skip(r.id), true)
+		self.pick(|r| !skip(r.id), Steer::Clean)
 	}
 
 	/// Re-pick the active source after the table changed. Serve tasks watch
@@ -1592,14 +1702,150 @@ impl FrontState {
 	/// re-parenting onto each other at once leaves the broadcast with no
 	/// upstream at all. That hazard only exists when both sides are actively
 	/// carrying, so the gate is scoped to exactly that: while `carrying` (the
-	/// front has live demand), a cheaper route whose announcing relay is itself
-	/// carrying (it advertised zero from a chain of two or more hops; a chain of
-	/// one is the original publisher, which can never adopt a route to its own
-	/// broadcast) displaces an announced incumbent only when
-	/// [`Self::handover_allowed`] says so. Every other cheaper route, e.g. a
+	/// front has live demand), a better route whose announcing relay is itself
+	/// carrying (it advertised a zero warm cost from a chain of two or more
+	/// hops; a chain of one is the original publisher, which can never adopt a
+	/// route to its own broadcast) displaces an announced incumbent only when
+	/// [`Self::handover_allowed`] says so. Every other better route, e.g. a
 	/// forwarder path or an upstream that repriced itself down, is taken
 	/// immediately.
-	fn reselect(&mut self, carrying: bool) {
+	#[cfg(test)]
+	fn reselect_now(&mut self, carrying: bool) {
+		self.active = self.reselect_target(carrying);
+		self.pending = None;
+	}
+
+	/// Re-pick the active source after the table changed, holding a warm-sibling
+	/// adoption down for
+	/// [`HANDOVER_HOLD`] first. Returns the deadline while one is waiting, which
+	/// the front task sleeps on so the hold is re-evaluated when it expires.
+	///
+	/// Only the adoption is held down, because only the adoption can cycle. Every
+	/// other move (a cheaper upstream, a failover, losing the incumbent) applies
+	/// at once, so ordinary recovery keeps its current latency.
+	///
+	/// The point of the wait is not to stagger the relays, which a uniform delay
+	/// cannot do. It is that the stale advertisement that motivated the adoption
+	/// is refreshed while we wait, so the re-evaluation at expiry runs on current
+	/// costs and usually no longer wants to move at all.
+	fn reselect(&mut self, carrying: bool, now: web_async::time::Instant) -> Option<web_async::time::Instant> {
+		let target = self.reselect_target(carrying);
+
+		// What can cycle is re-parenting onto a source reached through a session,
+		// since only something we can depend on can depend on us back. Demand is
+		// deliberately not part of that test: an idle front still records the choice,
+		// and nothing re-runs the selection when demand arrives, so a selection made
+		// while idle is simply a cycle that starts later. Nor is hop count, since a
+		// peer that does not speak the cluster extension is announced as one hop
+		// however deep the chain behind it really is. Only a local publish, which
+		// reaches no session at all, is structurally unable to close a loop.
+		//
+		// Three exemptions. Losing the incumbent has to apply at once, or the front
+		// strands itself with nothing to serve from at all. An incumbent that taints
+		// a reader is the same: `serve_route` already refuses it, so keeping it
+		// active would only leave `routes_snapshot` advertising a chain the front
+		// does not serve from. An incumbent that stopped announcing is the same
+		// kind of repair: keeping it active keeps it first in `routes_snapshot`,
+		// which retracts the whole path for the hold window while a live route
+		// sits in the table. None of the three is one end of a mutual adoption,
+		// which needs both sides to be live parents worth adopting.
+		//
+		// A drain is deliberately NOT exempt. It reads like an emergency, but a
+		// GOAWAY keeps working for many seconds, so waiting costs a little
+		// optimality rather than any availability, and a correlated drain is exactly
+		// when several relays re-parent at once off prices that have not landed yet.
+		// The exemptions also compose: if the drain does become a death, the
+		// route leaves the table and the lost-incumbent path applies
+		// immediately, so the wait is bounded by the session it is waiting on.
+		let held = target != self.active
+			&& self.active.is_some_and(|id| {
+				self.routes
+					.iter()
+					.find(|r| r.id == id)
+					.is_some_and(|r| r.route.announce && !self.taints_a_reader(&r.route))
+			}) && target.is_some_and(|id| {
+			let last = |id: u64| {
+				self.routes
+					.iter()
+					.find(|r| r.id == id)
+					.and_then(|r| r.route.hops.iter().last().copied())
+			};
+			// A fresh session from the relay we already depend on is not a new edge,
+			// so it cannot close a loop that the current route does not already
+			// close. Holding it would strand the front on a corpse until the
+			// transport finally timed it out, which is what the recency order in
+			// `route_order` exists to prevent. Only a declared identity proves
+			// "same relay": an anonymous hop matches nothing, so a move between
+			// two anonymous relays is held like any other.
+			last(id).is_some() && !same_identity(last(id), self.active.and_then(last))
+		});
+
+		if !held {
+			self.active = target;
+			self.pending = None;
+			return None;
+		}
+
+		let target = target.expect("a held target is always Some");
+		// Timed from when we first wanted to re-parent onto this relay, not from
+		// when we first wanted this candidate route: a peer that reconnects
+		// under a fresh route id would otherwise restart the wait on every
+		// session and postpone the move forever. A candidate from a different
+		// relay starts its own wait, so a newcomer arriving after an earlier
+		// candidate's deadline is held too, rather than adopted off a timer it
+		// never aged against. At expiry we apply whichever candidate wins then,
+		// which is the re-read the hold exists for.
+		let key = self.hold_key(target);
+		let since = match self.pending {
+			Some((held, since)) if held == key => since,
+			_ => now,
+		};
+
+		let deadline = self.hold_deadline(since);
+		match deadline.is_some_and(|at| now >= at) {
+			true => {
+				self.active = Some(target);
+				self.pending = None;
+				None
+			}
+			false => {
+				self.pending = Some((key, since));
+				deadline
+			}
+		}
+	}
+
+	/// The identity a hold on adopting route `id` is keyed by (see [`HoldKey`]).
+	fn hold_key(&self, id: u64) -> HoldKey {
+		let relay = self
+			.routes
+			.iter()
+			.find(|r| r.id == id)
+			.and_then(|r| r.route.hops.iter().last().copied());
+		match relay {
+			Some(relay) if relay != Origin::UNKNOWN => HoldKey::Relay(relay),
+			_ => HoldKey::Route(id),
+		}
+	}
+
+	/// When a hold started at `since` comes due: [`HANDOVER_HOLD`] plus a spread of
+	/// up to half as much again, fixed per relay and broadcast.
+	///
+	/// The hold works by outlasting propagation, so it does not need the spread to
+	/// be correct. The spread is there so a datacenter re-evaluating the same
+	/// broadcast does not do it on a single instant, and it reuses the key the
+	/// handover order already computes, so it costs nothing and stays put across
+	/// restarts. Added rather than subtracted, so the floor is still
+	/// [`HANDOVER_HOLD`].
+	fn hold_deadline(&self, since: web_async::time::Instant) -> Option<web_async::time::Instant> {
+		let spread = (HANDOVER_HOLD / 2).as_millis() as u64;
+		let key = fnv_key(&self.path.as_path(), [self.self_origin]);
+		since.checked_add(HANDOVER_HOLD + Duration::from_millis(key % spread.max(1)))
+	}
+
+	/// The source [`Self::reselect`] would pick, before the hold-down: the best
+	/// route, unless the handover gate keeps the incumbent.
+	fn reselect_target(&self, carrying: bool) -> Option<u64> {
 		let best = self.best_route();
 		if carrying
 			&& let (Some(best_id), Some(cur_id)) = (best, self.active)
@@ -1607,34 +1853,63 @@ impl FrontState {
 			&& let Some(candidate) = self.routes.iter().find(|r| r.id == best_id)
 			&& let Some(incumbent) = self.routes.iter().find(|r| r.id == cur_id)
 			&& incumbent.route.announce
-			&& candidate.route.cost < incumbent.route.cost
-			&& candidate.route.advertised == 0
+			// An incumbent flowing through a peer that reads this front is one
+			// `serve_route` refuses anyway, so keeping it only makes the advert
+			// disagree with dispatch. Same reasoning as the hold's exemption.
+			&& !self.taints_a_reader(&incumbent.route)
+			&& candidate.route.advertised.warm == 0
 			&& candidate.route.hops.len() >= 2
-			&& !self.handover_allowed(&candidate.route)
+			&& !self.handover_allowed(&candidate.route, &incumbent.route)
 		{
-			// We won the key comparison: keep our source and let the peer come to us.
-			return;
+			// We outrank the peer: keep our source and let it come to us.
+			return self.active;
 		}
-		self.active = best;
+		best
 	}
 
-	/// Whether re-parenting onto `route` is allowed while actively carrying: the
-	/// announcing peer (the chain's last hop) must hash strictly below our own
-	/// origin for this broadcast name.
+	/// Whether re-parenting onto `candidate` is allowed while actively carrying:
+	/// the announcing relay's rank must be strictly lower than our own.
 	///
-	/// Both sides compute the same two keys (the hash is build-stable and the
-	/// inputs are shared), so the comparison resolves the same way everywhere:
-	/// the lower-keyed node keeps its source, the higher-keyed one re-parents.
-	/// A strict total order has no cycles, so mutual pulls cannot happen. Mixing
-	/// the broadcast name in spreads ownership across a region's relays instead
-	/// of funneling every broadcast onto the lowest-keyed one. A route with no
-	/// hops is a local publish and always allowed.
-	fn handover_allowed(&self, route: &broadcast::Route) -> bool {
+	/// A relay's rank is `(cold cost, hash of its origin for this broadcast)`: the
+	/// cold cost of the route it serves from, which is exactly what it advertises,
+	/// and the hash only to break a tie between equally-rooted relays. Both sides
+	/// compute the same two ranks from the same inputs (the hash is build-stable),
+	/// so the comparison resolves the same way everywhere.
+	///
+	/// That makes adoption descend a total order, which is what stops two relays
+	/// adopting each other: taking a parent adds this link's price to our own cold
+	/// cost, so once the move lands we rank above the relay we adopted. The cold
+	/// cost is what carries the topology signal here, since the warm costs of two
+	/// carrying relays are both zero by construction. Mixing the broadcast name
+	/// into the hash spreads ownership across a region's relays instead of
+	/// funneling every broadcast onto the lowest-hashed one.
+	///
+	/// The order is only shared while the costs behind it are. A relay reports its
+	/// own cold cost, and a report still crossing the mesh can be lower than what
+	/// that relay would say now, so during a reprice two relays can rank each other
+	/// from different numbers and both decide to move. [`HANDOVER_HOLD`] is what
+	/// covers that window; the hash half needs no such care, since it is computed
+	/// rather than reported and so is never in flight.
+	///
+	/// Two cases are not a new parent at all and are always allowed: a route with
+	/// no hops (a local publish), and a route from the relay we already serve from,
+	/// which is that session reconnecting. Only a declared identity proves the
+	/// latter: an anonymous relay matches nothing, so it takes the rank
+	/// comparison like any other, where the 0 it declared is what both sides
+	/// hash. Two fully anonymous relays therefore rank equal and neither moves,
+	/// which is the cluster draft's rule that equal ids cannot be ordered.
+	fn handover_allowed(&self, candidate: &broadcast::Route, incumbent: &broadcast::Route) -> bool {
 		let name = self.path.as_path();
-		match route.hops.iter().last() {
-			Some(peer) => fnv_key(&name, [*peer]) < fnv_key(&name, [self.self_origin]),
-			None => true,
+		let Some(peer) = candidate.hops.iter().last().copied() else {
+			return true;
+		};
+		if same_identity(incumbent.hops.iter().last().copied(), Some(peer)) {
+			return true;
 		}
+
+		let theirs = (candidate.advertised.cold, fnv_key(&name, [peer]));
+		let ours = (incumbent.cost.cold, fnv_key(&name, [self.self_origin]));
+		theirs < ours
 	}
 
 	/// Every attached route in preference order with the active one first,
@@ -1692,7 +1967,7 @@ fn detach_source(state: &kio::Producer<FrontState>, broadcast: &broadcast::Produ
 			return;
 		};
 		s.routes.remove(pos);
-		s.reselect(carrying);
+		s.reselect(carrying, web_async::time::Instant::now());
 		if s.routes.is_empty() && !s.closed {
 			// Last one out: close now. The front task observes `closed` and
 			// finishes the teardown (unpublish).
@@ -1880,7 +2155,7 @@ async fn run_source(task: SourceTask) {
 					// A different first hop is new content: this source can no
 					// longer feed the front it attached to. Detach and re-attach.
 					//
-					// Plain equality, not `same_publisher`: within one source
+					// Plain equality, not `same_identity`: within one source
 					// handle the session layer already guarantees continuity (it
 					// replaces the handle when identity breaks, UNKNOWN restarts
 					// included), so this only catches a caller moving a live
@@ -1906,7 +2181,7 @@ async fn run_source(task: SourceTask) {
 							continue;
 						}
 						entry.route = update;
-						s.reselect(carrying);
+						s.reselect(carrying, web_async::time::Instant::now());
 					}
 					// Toggle the ingress announce guard on a live/offline transition.
 					sync_announce(&mut announce, announced, &ingress);
@@ -1949,15 +2224,16 @@ struct AttachContext<'a> {
 	tasks: &'a Tasks,
 }
 
-/// Whether two sources carry the same content and may therefore splice.
+/// Whether two hop entries prove the same endpoint.
 ///
 /// [`Origin::UNKNOWN`] identifies nothing: it is what a peer that declared no
 /// identity, or that does not speak the hops extension at all, contributes as a
-/// first hop. Two such sources are not interchangeable even though their first
-/// hops compare equal, so splicing them would cut one publisher's subscribers
-/// over to an unrelated publisher's content. Every other id compares normally,
-/// including `None` for a locally produced broadcast with no hops.
-fn same_publisher(a: Option<Origin>, b: Option<Origin>) -> bool {
+/// hop. Two such entries never match. As first hops, splicing the sources they
+/// name would cut one publisher's subscribers over to an unrelated publisher's
+/// content; as last hops, two anonymous relays would pass for one relay
+/// reconnecting and skip the handover safeguards. Every other id compares
+/// normally, including `None` for a locally produced broadcast with no hops.
+fn same_identity(a: Option<Origin>, b: Option<Origin>) -> bool {
 	if a == Some(Origin::UNKNOWN) || b == Some(Origin::UNKNOWN) {
 		return false;
 	}
@@ -2015,7 +2291,7 @@ fn attach_source(
 				// create a fresh one below; its own task finishes the teardown,
 				// finding the leaf slot already taken.
 				s.closed = true;
-			} else if same_publisher(s.publisher, publisher) {
+			} else if same_identity(s.publisher, publisher) {
 				let id = s.next_route;
 				s.next_route += 1;
 				s.routes.push(FrontRoute {
@@ -2023,7 +2299,7 @@ fn attach_source(
 					route: route.clone(),
 					source: source.clone(),
 				});
-				s.reselect(carrying);
+				s.reselect(carrying, web_async::time::Instant::now());
 				joined = Some(id);
 			} else if !may_take_over || !route.announce || s.taints_a_reader(&route) {
 				return Attach::Parked(existing.state.clone());
@@ -2056,11 +2332,13 @@ fn attach_source(
 	});
 	let _ = broadcast.clone().set_route(route.clone());
 	let state = kio::Producer::new(FrontState {
+		pending: None,
 		path: ctx.full.clone(),
 		self_origin: ctx.origin.id,
 		publisher,
 		next_route: 1,
 		excluded: HashMap::new(),
+		excluded_changed: false,
 		routes: vec![FrontRoute {
 			id: 0,
 			route,
@@ -2115,8 +2393,13 @@ async fn run_front(
 ) {
 	enum Step {
 		Serve(Arc<str>, super::resume::Producer),
+		/// A held-down adoption came due, or the exclusion table changed:
+		/// re-run the selection on current costs and taints.
+		Reselect,
 		Closed,
 	}
+
+	let mut deadline = kio::time::Deadline::new();
 
 	loop {
 		let step = {
@@ -2126,10 +2409,27 @@ async fn run_front(
 				}
 				// The close is set synchronously by the detach that empties the
 				// table or by a takeover; this task only finishes the teardown.
-				match state.poll(waiter, |s| if s.closed { Poll::Ready(()) } else { Poll::Pending }) {
-					Poll::Ready(_) => Poll::Ready(Step::Closed),
-					Poll::Pending => Poll::Pending,
+				// An exclusion change rides the same poll: the guards cannot
+				// reselect under their own locks, so this task does it for them.
+				match state.poll(waiter, |s| match s.closed || s.excluded_changed {
+					true => Poll::Ready(()),
+					false => Poll::Pending,
+				}) {
+					// `Err` is the channel itself dying, which also ends the front.
+					Poll::Ready(Ok(s)) if !s.closed => return Poll::Ready(Step::Reselect),
+					Poll::Ready(_) => return Poll::Ready(Step::Closed),
+					Poll::Pending => {}
 				}
+
+				// Re-armed on every poll rather than once per turn: a source task
+				// arms the hold under the state lock, and that write wakes this
+				// closure without leaving the wait. Setting the instant it already
+				// holds is a no-op, so the countdown is not restarted.
+				deadline.set({
+					let s = state.read();
+					s.pending.and_then(|(_, since)| s.hold_deadline(since))
+				});
+				deadline.poll(waiter).map(|_| Step::Reselect)
 			})
 			.await
 		};
@@ -2139,6 +2439,19 @@ async fn run_front(
 				// Serve tasks self-terminate when the track completes or the
 				// front closes.
 				tasks.push(serve_track(state.clone(), name, resume));
+			}
+			Step::Reselect => {
+				// The costs or taints behind the table may have changed while
+				// the table itself did not: re-run the selection so a due hold
+				// either applies now or is dropped as no longer wanted, and a
+				// fresh taint moves the front off a route it can no longer
+				// serve from.
+				let carrying = broadcast.demand().is_used();
+				if let Ok(mut s) = state.write() {
+					s.excluded_changed = false;
+					s.reselect(carrying, web_async::time::Instant::now());
+				}
+				sync_front(&state, &broadcast, &node);
 			}
 			Step::Closed => break,
 		}
@@ -3491,6 +3804,7 @@ mod tests {
 			publisher: routes.first().and_then(|r| r.hops.iter().next().copied()),
 			next_route: routes.len() as u64,
 			excluded: HashMap::new(),
+			excluded_changed: false,
 			routes: routes
 				.into_iter()
 				.enumerate()
@@ -3502,14 +3816,44 @@ mod tests {
 				.collect(),
 			active: Some(0),
 			closed: false,
+			pending: None,
 		}
 	}
 
-	/// A route as a warm sibling would announce it: zero cost, chain ending at
-	/// the announcing peer.
-	fn sibling_route(peer: Origin) -> broadcast::Route {
-		let hops = OriginList::try_from(vec![Origin::new(90).unwrap(), peer]).unwrap();
-		announce().with_hops(hops)
+	/// What the sibling links in these tests cost, so a warm sibling always looks
+	/// cheaper than the `upstream_route(10)` incumbent on warm cost alone. The gate
+	/// then turns on the cold rank, which is what the tests are about.
+	const SIBLING_LINK: u64 = 1;
+
+	/// A route as a warm relay would announce it: warm cost discounted to zero with
+	/// `cold` still flowing, charged `link` on arrival. `hops` is the chain it
+	/// advertised, which ends at the announcing relay; 0 is an anonymous hop.
+	fn warm_route(hops: &[u64], cold: u64, link: u64) -> broadcast::Route {
+		let hops = hops
+			.iter()
+			.map(|id| Origin::new(*id).unwrap_or(Origin::UNKNOWN))
+			.collect::<Vec<_>>();
+		let advertised = broadcast::Cost { warm: 0, cold };
+		let mut route = announce()
+			.with_hops(OriginList::try_from(hops).unwrap())
+			.with_cost(advertised.charged(link));
+		route.advertised = advertised;
+		route
+	}
+
+	/// A route as a relay that is *not* carrying announces it: its accumulated cost
+	/// forwarded undiscounted, so it is a plain forwarder rather than a warm sibling
+	/// and never trips the adoption hold-down.
+	fn forwarder_route(hops: OriginList, cost: u64) -> broadcast::Route {
+		let advertised = broadcast::Cost::new(cost);
+		let mut route = announce().with_hops(hops).with_cost(advertised);
+		route.advertised = advertised;
+		route
+	}
+
+	/// A warm relay one hop past the publisher, on the standard test link.
+	fn sibling_route(peer: Origin, cold: u64) -> broadcast::Route {
+		warm_route(&[90, peer.id()], cold, SIBLING_LINK)
 	}
 
 	/// A route as the upstream announces it: priced, one hop.
@@ -3518,9 +3862,10 @@ mod tests {
 		announce().with_hops(hops).with_cost(cost)
 	}
 
-	/// While carrying, a strictly cheaper route from a peer that hashes above us
-	/// must not displace the incumbent; the same table re-parents freely once
-	/// idle, or when the peer hashes below us.
+	/// Equally-rooted relays (the same cold cost) fall through to the hash: while
+	/// carrying, a warm peer that hashes above us must not displace the incumbent,
+	/// while the same table re-parents freely once idle, or when the peer hashes
+	/// below us.
 	#[test]
 	fn test_carrying_gate_keys() {
 		let peer = Origin::new(3).unwrap();
@@ -3528,24 +3873,438 @@ mod tests {
 		// We lose the key comparison: stay put while carrying, migrate when idle.
 		let mut lost = front_state(
 			origin_keyed("test", peer, false),
-			vec![upstream_route(10), sibling_route(peer)],
+			vec![upstream_route(10), sibling_route(peer, 10)],
 		);
-		lost.reselect(true);
+		lost.reselect_now(true);
 		assert_eq!(
 			lost.active,
 			Some(0),
 			"carrying front re-parented onto a higher-keyed peer"
 		);
-		lost.reselect(false);
+		lost.reselect_now(false);
 		assert_eq!(lost.active, Some(1), "idle front must take the cheaper route");
 
 		// We win the key comparison: re-parent even while carrying.
 		let mut won = front_state(
 			origin_keyed("test", peer, true),
-			vec![upstream_route(10), sibling_route(peer)],
+			vec![upstream_route(10), sibling_route(peer, 10)],
 		);
-		won.reselect(true);
+		won.reselect_now(true);
 		assert_eq!(won.active, Some(1), "carrying front must follow a lower-keyed peer");
+	}
+
+	/// The gate's reconnect exemption needs a declared identity too: an anonymous
+	/// warm sibling is not "the relay we already serve from" just because the
+	/// incumbent's relay is anonymous as well. The rank then decides on the
+	/// declared ids, so two fully anonymous sides tie and neither moves (the
+	/// cluster draft's "equal Hop IDs cannot be ordered").
+	#[test]
+	fn test_carrying_gate_anonymous_is_not_a_reconnect() {
+		let anon_hops = || OriginList::try_from(vec![Origin::new(90).unwrap(), Origin::UNKNOWN]).unwrap();
+		let incumbent = || forwarder_route(anon_hops(), 10);
+		let candidate = || warm_route(&[90, 0], 10, SIBLING_LINK);
+
+		// Equal cold roots fall through to the hash of the declared ids, ours
+		// against the candidate's 0. Keyed to lose, we must stay put.
+		let mut state = front_state(
+			origin_keyed("test", Origin::UNKNOWN, false),
+			vec![incumbent(), candidate()],
+		);
+		state.reselect_now(true);
+		assert_eq!(
+			state.active,
+			Some(0),
+			"an anonymous sibling must take the rank, not the reconnect exemption"
+		);
+
+		// Both sides anonymous: the ranks tie exactly, and a tie never moves.
+		let mut state = front_state(Origin::UNKNOWN, vec![incumbent(), candidate()]);
+		state.reselect_now(true);
+		assert_eq!(state.active, Some(0), "two anonymous relays cannot be ordered");
+	}
+
+	/// The hold-down exists for this: three carrying relays in a ring, each holding
+	/// a stale, cheaper cold cost from the next one while its own upstream has just
+	/// worsened. Every one of them prefers its neighbour, so acting at once would
+	/// leave the broadcast with no source at all.
+	///
+	/// The gate cannot catch it, because each relay is comparing a cost the peer
+	/// *reported* against its own current one, and all three reports are in flight.
+	/// Holding the adoption is what buys time for them to land.
+	#[test]
+	fn test_handover_hold_blocks_the_stale_ring() {
+		let ids = [1u64, 2, 3];
+		let now = web_async::time::Instant::now();
+
+		let moved: Vec<bool> = (0..3)
+			.map(|i| {
+				let next = ids[(i + 1) % 3];
+				let mut view = front_state(
+					Origin::new(ids[i]).unwrap(),
+					// Our own upstream has worsened to cold 10; the advertisement we
+					// still hold from the next relay says cold 1.
+					vec![upstream_route(10), warm_route(&[90, next], 1, 1)],
+				);
+				view.reselect(true, now);
+				view.active == Some(1)
+			})
+			.collect();
+
+		assert!(
+			!moved.iter().all(|m| *m),
+			"all three relays adopted at once, leaving no source: {moved:?}"
+		);
+		assert!(
+			moved.iter().all(|m| !*m),
+			"the hold must defer every adoption, not just some"
+		);
+	}
+
+	/// The same ring, built out of relays forwarding their accumulated cost rather
+	/// than warm copies advertising zero. The handover gate never inspects these at
+	/// all, so the hold is the only thing standing between them and a cycle.
+	#[test]
+	fn test_handover_hold_blocks_a_forwarder_ring() {
+		let ids = [1u64, 2, 3];
+		let now = web_async::time::Instant::now();
+
+		let moved: Vec<bool> = (0..3)
+			.map(|i| {
+				let next = Origin::new(ids[(i + 1) % 3]).unwrap();
+				let hops = OriginList::try_from(vec![Origin::new(90).unwrap(), next]).unwrap();
+				let mut view = front_state(
+					Origin::new(ids[i]).unwrap(),
+					vec![upstream_route(10), forwarder_route(hops, 1)],
+				);
+				view.reselect(true, now);
+				view.active == Some(1)
+			})
+			.collect();
+
+		assert!(
+			moved.iter().all(|m| !*m),
+			"every adoption in the ring must be held: {moved:?}"
+		);
+	}
+
+	/// The hold defers the adoption; it does not cancel it. Once the deadline has
+	/// passed and the candidate is still preferred, the handover happens.
+	#[test]
+	fn test_handover_hold_expires() {
+		let peer = Origin::new(3).unwrap();
+		let start = web_async::time::Instant::now();
+		let mut state = front_state(
+			origin_keyed("test", peer, false),
+			vec![upstream_route(10), sibling_route(peer, 4)],
+		);
+
+		let deadline = state.reselect(true, start).expect("the hold must report a deadline");
+		assert_eq!(state.active, Some(0), "the adoption must not apply immediately");
+		assert!(
+			deadline >= start.checked_add(HANDOVER_HOLD).unwrap()
+				&& deadline < start.checked_add(HANDOVER_HOLD + HANDOVER_HOLD / 2).unwrap(),
+			"the spread must sit above the floor and below half again"
+		);
+
+		// Re-running inside the window keeps waiting from the original start, so
+		// unrelated table churn cannot postpone the handover indefinitely.
+		let mid = start.checked_add(HANDOVER_HOLD / 2).unwrap();
+		assert_eq!(state.reselect(true, mid), Some(deadline), "the deadline must not move");
+		assert_eq!(
+			state.active,
+			Some(0),
+			"the hold must survive a re-run inside the window"
+		);
+
+		assert_eq!(
+			state.reselect(true, deadline),
+			None,
+			"an applied hold clears the deadline"
+		);
+		assert_eq!(state.active, Some(1), "the handover must happen once the hold expires");
+	}
+
+	/// The spread is fixed per relay and broadcast, so a relay picks the same
+	/// deadline every time rather than re-rolling it and drifting.
+	#[test]
+	fn test_handover_hold_spread_is_stable() {
+		let peer = Origin::new(3).unwrap();
+		let now = web_async::time::Instant::now();
+		let build = || {
+			front_state(
+				origin_keyed("test", peer, false),
+				vec![upstream_route(10), sibling_route(peer, 4)],
+			)
+		};
+		assert_eq!(build().hold_deadline(now), build().hold_deadline(now));
+
+		// Different relays land on different instants, which is the point.
+		let a = front_state(Origin::new(11).unwrap(), vec![upstream_route(10)]);
+		let b = front_state(Origin::new(12).unwrap(), vec![upstream_route(10)]);
+		assert_ne!(a.hold_deadline(now), b.hold_deadline(now));
+	}
+
+	/// A drain is held like any other move. It reads like an emergency, but a GOAWAY
+	/// keeps serving for many seconds, so the wait costs optimality rather than
+	/// availability, and a fleet draining together is precisely when several relays
+	/// re-parent at once off prices that have not landed yet.
+	#[test]
+	fn test_handover_hold_covers_a_drain() {
+		let peer = Origin::new(3).unwrap();
+		let now = web_async::time::Instant::now();
+		let mut state = front_state(
+			origin_keyed("test", peer, false),
+			vec![upstream_route(broadcast::DRAIN_COST), sibling_route(peer, 4)],
+		);
+
+		assert!(state.reselect(true, now).is_some(), "a drain must still arm the hold");
+		assert_eq!(state.active, Some(0), "leaving a drain must not apply yet");
+
+		// If the drain becomes a death the route leaves the table, and the
+		// lost-incumbent exemption applies at once: the wait is bounded by the
+		// session it is waiting on.
+		state.routes.retain(|r| r.id != 0);
+		assert_eq!(state.reselect(true, now), None);
+		assert_eq!(state.active, Some(1), "a drain that dies must fail over immediately");
+	}
+
+	/// The hold covers re-parenting onto anything reached through a session. Only
+	/// moves that cannot close a loop, and repairs that must not wait, are exempt.
+	#[test]
+	fn test_handover_hold_ignores_moves_that_cannot_cycle() {
+		let peer = Origin::new(3).unwrap();
+		let now = web_async::time::Instant::now();
+		let keyed = || origin_keyed("test", peer, false);
+
+		// A local publish reaches no session, so nothing can depend on us through it.
+		let mut state = front_state(keyed(), vec![upstream_route(10), announce()]);
+		assert_eq!(state.reselect(true, now), None);
+		assert_eq!(state.active, Some(1), "a local publish must be immediate");
+
+		// A fresh session from the relay we already depend on is not a new edge, so
+		// it cannot close a loop the current route does not already close.
+		let mut state = front_state(keyed(), vec![sibling_route(peer, 4), sibling_route(peer, 4)]);
+		assert_eq!(state.reselect(true, now), None);
+		assert_eq!(state.active, Some(1), "a reconnect must be immediate");
+
+		// Losing the incumbent entirely: never held, or the front strands itself.
+		let mut state = front_state(keyed(), vec![upstream_route(10), sibling_route(peer, 4)]);
+		state.routes.retain(|r| r.id != 0);
+		assert_eq!(state.reselect(true, now), None);
+		assert_eq!(state.active, Some(1), "a lost incumbent must be replaced immediately");
+	}
+
+	/// An incumbent that stopped announcing is a repair target, not one end of a
+	/// mutual adoption. Holding the move would keep the unannounced route first
+	/// in `routes_snapshot`, retracting the whole path for the hold window while
+	/// a live route sits in the table.
+	#[test]
+	fn test_handover_hold_exempts_an_unannounced_incumbent() {
+		let peer = Origin::new(3).unwrap();
+		let now = web_async::time::Instant::now();
+		let offline = upstream_route(10).with_announce(false);
+		let mut state = front_state(origin_keyed("test", peer, false), vec![offline, sibling_route(peer, 4)]);
+
+		assert_eq!(
+			state.reselect(true, now),
+			None,
+			"leaving an offline incumbent must not wait"
+		);
+		assert_eq!(state.active, Some(1), "the live route must take over immediately");
+	}
+
+	/// An anonymous relay identifies nothing (lite: "a Hop ID of 0 never matches
+	/// anything"), so a move between two anonymous last hops is never "that
+	/// session reconnecting": it is held like any other re-parent.
+	#[test]
+	fn test_handover_hold_covers_anonymous_relays() {
+		let now = web_async::time::Instant::now();
+		let anon = |cold: u64| warm_route(&[90, 0], cold, SIBLING_LINK);
+		let mut state = front_state(Origin::new(7).unwrap(), vec![anon(10), anon(1)]);
+
+		assert!(
+			state.reselect(true, now).is_some(),
+			"two anonymous relays must be held, not exempted as a reconnect"
+		);
+		assert_eq!(state.active, Some(0), "the re-parent must not apply yet");
+	}
+
+	/// The hold's clock belongs to the relay being adopted. A candidate from a
+	/// different relay must age its own hold: inheriting one that already
+	/// expired against an earlier candidate would apply the newcomer with no
+	/// hold at all, and two relays could cross-adopt through exactly that gap.
+	#[test]
+	fn test_handover_hold_is_keyed_to_the_target() {
+		let start = web_async::time::Instant::now();
+		let relay_b = OriginList::try_from(vec![Origin::new(90).unwrap(), Origin::new(3).unwrap()]).unwrap();
+		let relay_c = OriginList::try_from(vec![Origin::new(90).unwrap(), Origin::new(4).unwrap()]).unwrap();
+
+		let mut state = front_state(
+			Origin::new(7).unwrap(),
+			vec![upstream_route(10), forwarder_route(relay_b, 5)],
+		);
+		let deadline = state.reselect(true, start).expect("the hold must arm");
+		assert_eq!(state.active, Some(0));
+
+		// B reconnects under a fresh route id: the same relay, so the clock
+		// keeps running rather than restarting on every session.
+		let source = state.routes[1].source.clone();
+		let route = state.routes[1].route.clone();
+		state.routes.remove(1);
+		state.routes.push(FrontRoute {
+			id: 2,
+			route,
+			source: source.clone(),
+		});
+		let mid = start.checked_add(HANDOVER_HOLD / 2).unwrap();
+		assert_eq!(
+			state.reselect(true, mid),
+			Some(deadline),
+			"a reconnect must continue the same hold"
+		);
+
+		// C shows up after B's deadline passed: a different relay, so it starts
+		// its own hold instead of landing instantly on B's expired one.
+		let late = deadline.checked_add(HANDOVER_HOLD).unwrap();
+		state.routes.push(FrontRoute {
+			id: 3,
+			route: forwarder_route(relay_c, 1),
+			source,
+		});
+		let renewed = state.reselect(true, late).expect("a new target must arm a new hold");
+		assert!(renewed > late, "the newcomer must wait out its own hold");
+		assert_eq!(state.active, Some(0), "the newcomer must not be adopted unheld");
+
+		// The renewed hold still expires: the move happens, just held.
+		assert_eq!(state.reselect(true, renewed), None);
+		assert_eq!(state.active, Some(3));
+	}
+
+	/// Demand is deliberately not part of the hold. An idle front still records the
+	/// choice, nothing re-runs the selection when demand arrives, and `serve_route`
+	/// then dispatches down it, so a selection made while idle is a cycle that
+	/// starts later rather than one that cannot happen.
+	#[test]
+	fn test_handover_hold_covers_an_idle_front() {
+		let peer = Origin::new(3).unwrap();
+		let now = web_async::time::Instant::now();
+		let mut state = front_state(
+			origin_keyed("test", peer, false),
+			vec![upstream_route(10), sibling_route(peer, 4)],
+		);
+
+		assert!(state.reselect(false, now).is_some(), "an idle front must still hold");
+		assert_eq!(state.active, Some(0), "the idle re-parent must not apply yet");
+	}
+
+	/// Hop count cannot stand in for provenance: a peer that does not speak the
+	/// cluster extension is announced as a single hop however deep the chain behind
+	/// it really is (see `ietf::subscriber::session_route`), so a one-hop target is
+	/// not necessarily a publisher that never re-parents.
+	#[test]
+	fn test_handover_hold_covers_an_opaque_one_hop_peer() {
+		let peer = Origin::new(3).unwrap();
+		let now = web_async::time::Instant::now();
+		let opaque = announce()
+			.with_hops(OriginList::try_from(vec![peer]).unwrap())
+			.with_cost(broadcast::Cost::UNKNOWN.charged(1));
+		let mut state = front_state(origin_keyed("test", peer, false), vec![upstream_route(10), opaque]);
+
+		assert!(
+			state.reselect(true, now).is_some(),
+			"an opaque one-hop peer must be held"
+		);
+		assert_eq!(state.active, Some(0), "the re-parent must not apply yet");
+	}
+
+	/// Neither the gate nor the hold may keep an incumbent that flows through a peer
+	/// reading this front. `serve_route` refuses to serve from such a route, so
+	/// retaining it as `active` would leave `routes_snapshot` advertising (and
+	/// discounting) a chain the front does not actually serve from. Advertising one
+	/// path while dispatching down another is what lets a subscription cycle past
+	/// the hop-chain check, since the chain a peer inspects is no longer the chain
+	/// its bytes take.
+	#[test]
+	fn test_a_tainted_incumbent_is_never_retained() {
+		let reader = Origin::new(5).unwrap();
+		let clean_peer = Origin::new(3).unwrap();
+		let now = web_async::time::Instant::now();
+
+		// The incumbent runs through the reader and is cheaply rooted, so we outrank
+		// the clean alternative and would otherwise both veto and hold the move.
+		let mut state = front_state(
+			origin_keyed("test", clean_peer, false),
+			vec![
+				warm_route(&[90, reader.id()], 1, 1),
+				warm_route(&[90, clean_peer.id()], 4, 1),
+			],
+		);
+		state.excluded.insert(reader, 1);
+
+		assert_eq!(state.best_route(), Some(1), "the clean route must win selection");
+		assert_eq!(
+			state.reselect(true, now),
+			None,
+			"a tainted incumbent must not arm the hold"
+		);
+		assert_eq!(state.active, Some(1), "the tainted incumbent must not be retained");
+		assert_eq!(
+			state.serve_route(|_| false),
+			state.active,
+			"what we serve from and what we advertise as serving must agree"
+		);
+		assert_eq!(
+			state.routes_snapshot().first().map(|r| r.hops.clone()),
+			state
+				.routes
+				.iter()
+				.find(|r| Some(r.id) == state.active)
+				.map(|r| r.route.hops.clone()),
+			"the advertised serving chain must be the active one"
+		);
+	}
+
+	/// The taint steer may pick only among routes that serve: a clean offline
+	/// standby must not beat an announced route, or the steer retracts the path
+	/// and drops the very advertisement whose guard created the taint.
+	#[test]
+	fn test_taint_steer_keeps_the_announcement() {
+		let reader = Origin::new(5).unwrap();
+		let mut state = front_state(
+			Origin::new(7).unwrap(),
+			vec![
+				warm_route(&[90, reader.id()], 1, 1),
+				upstream_route(10).with_announce(false),
+			],
+		);
+		state.excluded.insert(reader, 1);
+		assert_eq!(
+			state.best_route(),
+			Some(0),
+			"an offline standby must not win the advert"
+		);
+
+		// Per-track dispatch still tries the clean standby first, so the reader
+		// is not handed its own bytes while the standby can serve; a track it
+		// refuses falls back through the skip set, the documented last resort.
+		assert_eq!(
+			state.serve_route(|_| false),
+			Some(1),
+			"a track must try the clean standby first"
+		);
+		assert_eq!(
+			state.serve_route(|id| id == 1),
+			Some(0),
+			"a track the standby refuses falls back to the tainted route"
+		);
+
+		// An announced clean route wins the advert too.
+		state.routes[1].route = upstream_route(10);
+		assert_eq!(
+			state.best_route(),
+			Some(1),
+			"an announced clean route must win the steer"
+		);
 	}
 
 	/// The simultaneous-activation race: two relays that each pulled the same
@@ -3557,10 +4316,10 @@ mod tests {
 		let a = Origin::new(1).unwrap();
 		let b = Origin::new(2).unwrap();
 
-		let mut a_view = front_state(a, vec![upstream_route(10), sibling_route(b)]);
-		let mut b_view = front_state(b, vec![upstream_route(10), sibling_route(a)]);
-		a_view.reselect(true);
-		b_view.reselect(true);
+		let mut a_view = front_state(a, vec![upstream_route(10), sibling_route(b, 10)]);
+		let mut b_view = front_state(b, vec![upstream_route(10), sibling_route(a, 10)]);
+		a_view.reselect_now(true);
+		b_view.reselect_now(true);
 
 		let a_moved = a_view.active == Some(1);
 		let b_moved = b_view.active == Some(1);
@@ -3568,6 +4327,165 @@ mod tests {
 			a_moved != b_moved,
 			"exactly one side must re-parent (a: {a_moved}, b: {b_moved})"
 		);
+	}
+
+	/// The asymmetric case the cold cost exists for. Two relays both carry the
+	/// broadcast, so both advertise a zero warm cost and the hash would decide at
+	/// random. The peer's upstream is genuinely cheaper than ours, so it must
+	/// become the aggregation point either way the hash falls.
+	#[test]
+	fn test_carrying_gate_follows_the_cheaper_root() {
+		let peer = Origin::new(3).unwrap();
+
+		for above in [false, true] {
+			let mut state = front_state(
+				origin_keyed("test", peer, above),
+				vec![upstream_route(10), sibling_route(peer, 4)],
+			);
+			state.reselect_now(true);
+			assert_eq!(
+				state.active,
+				Some(1),
+				"a cheaper-rooted warm peer must win the hash comparison too (above: {above})"
+			);
+		}
+	}
+
+	/// The converse, which is what stops the aggregation tree from inverting: a
+	/// warm peer rooted further from the publisher than we are never attracts us,
+	/// however the hash falls. It is the peer that has to come to us.
+	#[test]
+	fn test_carrying_gate_rejects_the_pricier_root() {
+		let peer = Origin::new(3).unwrap();
+
+		for above in [false, true] {
+			let mut state = front_state(
+				origin_keyed("test", peer, above),
+				vec![upstream_route(4), sibling_route(peer, 10)],
+			);
+			state.reselect_now(true);
+			assert_eq!(
+				state.active,
+				Some(0),
+				"a pricier-rooted warm peer must never displace us (above: {above})"
+			);
+		}
+	}
+
+	/// Adoption strictly descends the rank, which is what forbids a cycle: taking a
+	/// parent charges this link onto our own cold cost, so afterwards we advertise
+	/// strictly above the relay we adopted and can never attract it back.
+	#[test]
+	fn test_carrying_gate_descends() {
+		let peer = Origin::new(3).unwrap();
+		let mut state = front_state(
+			origin_keyed("test", peer, false),
+			vec![upstream_route(10), sibling_route(peer, 4)],
+		);
+		state.reselect_now(true);
+
+		let adopted = state.routes.iter().find(|r| Some(r.id) == state.active).unwrap();
+		assert_eq!(
+			adopted.route.cost.cold,
+			4 + SIBLING_LINK,
+			"our cold cost must include the link to the parent we adopted"
+		);
+		assert!(
+			adopted.route.cost.cold > adopted.route.advertised.cold,
+			"a relay must always rank above the parent it adopted"
+		);
+	}
+
+	/// Losing the parent reverts to our own cold upstream rather than stranding the
+	/// front on a route that no longer exists.
+	#[test]
+	fn test_carrying_gate_reverts_when_the_parent_goes() {
+		let peer = Origin::new(3).unwrap();
+		let mut state = front_state(
+			origin_keyed("test", peer, false),
+			vec![upstream_route(10), sibling_route(peer, 4)],
+		);
+		state.reselect_now(true);
+		assert_eq!(state.active, Some(1));
+
+		state.routes.retain(|route| route.id != 1);
+		state.reselect_now(true);
+		assert_eq!(state.active, Some(0), "the cold upstream was not restored");
+	}
+
+	/// A peer whose wire cannot express a cold cost (pre-lite-06, or the MoQ Cluster
+	/// extension) advertises [`broadcast::Cost::UNKNOWN`]. Two such peers tie there
+	/// and fall through to the hash, which is exactly how they behaved before cold
+	/// cost existed.
+	#[test]
+	fn test_carrying_gate_unknown_cold_falls_back_to_the_hash() {
+		let a = Origin::new(1).unwrap();
+		let b = Origin::new(2).unwrap();
+		let unknown = broadcast::Cost::UNKNOWN.cold;
+
+		let mut a_view = front_state(a, vec![upstream_route(unknown), sibling_route(b, unknown)]);
+		let mut b_view = front_state(b, vec![upstream_route(unknown), sibling_route(a, unknown)]);
+		a_view.reselect_now(true);
+		b_view.reselect_now(true);
+
+		assert_ne!(
+			a_view.active == Some(1),
+			b_view.active == Some(1),
+			"unknown-cold peers must still elect exactly one root"
+		);
+	}
+
+	/// An unknown cold cost must rank last, not read as the publisher's own zero.
+	/// A peer on a wire that cannot express one would otherwise outrank every relay
+	/// that can, and a mixed-version mesh would drag its aggregation point onto the
+	/// peer that told us the least.
+	#[test]
+	fn test_carrying_gate_unknown_cold_ranks_last() {
+		let peer = Origin::new(3).unwrap();
+		let unknown = broadcast::Cost::UNKNOWN.cold;
+
+		for above in [false, true] {
+			let mut state = front_state(
+				origin_keyed("test", peer, above),
+				vec![upstream_route(4), sibling_route(peer, unknown)],
+			);
+			state.reselect_now(true);
+			assert_eq!(
+				state.active,
+				Some(0),
+				"an unknown cold path must not outrank a known one (above: {above})"
+			);
+		}
+	}
+
+	/// Warm cost stays the primary metric, but where it ties the cold cost breaks
+	/// the tie before hop count.
+	///
+	/// The two tie-breaks answer the same question, "how far away is this content",
+	/// and the cold cost answers it in the operator's own prices while hop count
+	/// only counts relays. Putting the priced answer first is what stops an
+	/// expensive two-link path from outranking a cheap three-link one.
+	#[test]
+	fn test_equal_warm_cost_prefers_the_cheaper_root() {
+		// Two warm relays, each one link away, so the warm comparison ties. The one
+		// rooted nearer the publisher advertises the *longer* chain, since it sits
+		// deeper in an aggregation tree, which is exactly the case hop count reads
+		// backwards: a chain is only a guess at how far the content is, and the cold
+		// cost is that same distance actually priced.
+		let shallow = warm_route(&[90, 4], 5, 1);
+		let deep = warm_route(&[90, 91, 3], 1, 1);
+		assert_eq!(
+			shallow.cost.warm, deep.cost.warm,
+			"the candidates must tie on warm cost"
+		);
+		assert!(
+			shallow.hops.len() < deep.hops.len(),
+			"hop count must favor the wrong one"
+		);
+
+		let mut state = front_state(Origin::new(7).unwrap(), vec![shallow, deep]);
+		state.reselect_now(true);
+		assert_eq!(state.active, Some(1), "hop count bypassed the cheaper-rooted warm copy");
 	}
 
 	/// The gate is scoped to warm siblings: a cheaper route via a relay that is
@@ -3580,10 +4498,10 @@ mod tests {
 		let lost = origin_keyed("test", peer, false);
 
 		// A cheaper forwarder path: the relay advertised its accumulated cost.
-		let mut forwarder = sibling_route(peer).with_cost(4);
-		forwarder.advertised = 4;
+		let mut forwarder = sibling_route(peer, 10).with_cost(4);
+		forwarder.advertised = broadcast::Cost::new(4);
 		let mut state = front_state(lost, vec![upstream_route(10), forwarder]);
-		state.reselect(true);
+		state.reselect_now(true);
 		assert_eq!(
 			state.active,
 			Some(1),
@@ -3593,7 +4511,7 @@ mod tests {
 		// Directly from the original publisher: single-hop chain, advertised zero.
 		let direct = announce().with_hops(OriginList::try_from(vec![peer]).unwrap());
 		let mut state = front_state(lost, vec![upstream_route(10), direct]);
-		state.reselect(true);
+		state.reselect_now(true);
 		assert_eq!(
 			state.active,
 			Some(1),
@@ -3604,8 +4522,8 @@ mod tests {
 		// strictly-cheaper test does not apply and recency decides. Loosening that
 		// test to `<=` would hold a carrying front on the dead session until the
 		// transport timed it out, which is the whole point of the recency order.
-		let mut state = front_state(lost, vec![sibling_route(peer), sibling_route(peer)]);
-		state.reselect(true);
+		let mut state = front_state(lost, vec![sibling_route(peer, 10), sibling_route(peer, 10)]);
+		state.reselect_now(true);
 		assert_eq!(
 			state.active,
 			Some(1),
@@ -3621,9 +4539,9 @@ mod tests {
 		let unannounced = upstream_route(10).with_announce(false);
 		let mut state = front_state(
 			origin_keyed("test", peer, false),
-			vec![unannounced, sibling_route(peer)],
+			vec![unannounced, sibling_route(peer, 10)],
 		);
-		state.reselect(true);
+		state.reselect_now(true);
 		assert_eq!(
 			state.active,
 			Some(1),
@@ -3691,7 +4609,7 @@ mod tests {
 
 		// Unpriced, the opaque route wins on cost even though it is the longer path.
 		let mut state = front_state(us, vec![direct(), opaque(1)]);
-		state.reselect(false);
+		state.reselect_now(false);
 		assert_eq!(
 			state.active,
 			Some(1),
@@ -3700,7 +4618,7 @@ mod tests {
 
 		// Priced to reflect what it hides, the real path wins again.
 		let mut state = front_state(us, vec![direct(), opaque(16)]);
-		state.reselect(false);
+		state.reselect_now(false);
 		assert_eq!(
 			state.active,
 			Some(0),
@@ -3710,6 +4628,13 @@ mod tests {
 
 	/// Let the spawned origin tasks (source watchers, front dispatch) run. The
 	/// tests pause tokio time, so this advances the clock instantly.
+	/// Wait out a held re-parent (see [`HANDOVER_HOLD`]) and let the front task's
+	/// deadline fire, for tests whose subject is which route wins rather than when.
+	async fn settle_handover() {
+		tokio::time::advance(HANDOVER_HOLD * 2).await;
+		settle().await;
+	}
+
 	async fn settle() {
 		tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
 	}
@@ -4681,7 +5606,7 @@ mod tests {
 		assert_eq!(watch.route_changed().await.unwrap().hops, hops_a);
 
 		let mut source_b = origin
-			.create_broadcast("test", announce().with_hops(hops_b.clone()))
+			.create_broadcast("test", forwarder_route(hops_b.clone(), 1))
 			.unwrap();
 		let mut dynamic_b = source_b.dynamic();
 		settle().await;
@@ -4704,7 +5629,15 @@ mod tests {
 			.set_route(announce().with_hops(hops_a.clone()).with_cost(10))
 			.unwrap();
 		settle().await;
-		assert_eq!(watch.route_changed().await.unwrap().hops, hops_b);
+
+		// Re-parenting onto another relay while serving is held down first: the
+		// advert follows A's new cost, but the front is still served by A. Only the
+		// front task's deadline wakes it out of that, which is what the advance
+		// exercises.
+		assert_eq!(watch.route().hops, hops_a, "the handover must wait out the hold");
+		tokio::time::advance(HANDOVER_HOLD * 2).await;
+		settle().await;
+		assert_eq!(watch.route().hops, hops_b, "the hold must expire into the handover");
 		announced.assert_next_wait();
 
 		let mut producer_b = accept_track(&mut dynamic_b, "video").await;
@@ -4724,7 +5657,7 @@ mod tests {
 		settle().await;
 		let advertised = watch.route_changed().await.unwrap();
 		assert_eq!(advertised.hops, hops_b);
-		assert_eq!(advertised.cost, 5);
+		assert_eq!(advertised.cost, broadcast::Cost::new(5));
 		announced.assert_next_wait();
 	}
 
@@ -5176,7 +6109,7 @@ mod tests {
 		announced.assert_next_some("test");
 		let face = consumer.get_broadcast("test").unwrap();
 		assert!(face.route().announce);
-		assert_eq!(face.route().cost, 10);
+		assert_eq!(face.route().cost, broadcast::Cost::new(10));
 
 		// The announced source leaving falls back to the offline one: the path
 		// unannounces but stays routable.
@@ -5207,6 +6140,7 @@ mod tests {
 			.create_broadcast("test", announce().with_hops(hops_b.clone()))
 			.unwrap();
 		settle().await;
+		settle_handover().await;
 		announced.assert_next_wait();
 		let current = origin.consume().get_broadcast("test").unwrap();
 		assert!(current.is_clone(&face), "the broadcast identity must not change");
@@ -5595,6 +6529,128 @@ mod tests {
 		let scoped = consumer.clone().excluding(peer);
 		let pinned = scoped.request_broadcast("test").await.unwrap();
 		let subscribing = pinned.track("video").unwrap().subscribe(None);
+		let _producer_b = accept_track(&mut dynamic_b, "video").await;
+		settle().await;
+		subscribing.await.unwrap();
+		dynamic_a.assert_no_request();
+	}
+
+	/// A peer starting to read is itself the event that taints routes: the
+	/// exclusion guard registers when the front is advertised to them, and
+	/// nothing else may churn for a long time afterwards. The registration must
+	/// re-run selection on its own, moving the front (and what it advertises)
+	/// off a route that now flows through a reader; the release must re-run it
+	/// too, freeing the better route again.
+	#[tokio::test]
+	async fn test_reader_taint_triggers_reselect() {
+		tokio::time::pause();
+
+		let origin = Origin::random().produce();
+		let consumer = origin.consume();
+
+		let publisher = Origin::new(1).unwrap();
+		let peer = Origin::new(5).unwrap();
+		let via_peer = OriginList::try_from(vec![publisher, peer]).unwrap();
+		let clean = OriginList::try_from(vec![publisher]).unwrap();
+
+		// The via-peer route is cheaper, so it is the active source.
+		let _source_a = origin
+			.create_broadcast("test", announce().with_hops(via_peer.clone()))
+			.unwrap();
+		settle().await;
+		let _source_b = origin
+			.create_broadcast("test", announce().with_hops(clean.clone()).with_cost(5))
+			.unwrap();
+		settle().await;
+		settle().await;
+
+		let mut broadcast = consumer.request_broadcast("test").await.unwrap();
+		assert_eq!(broadcast.route_changed().await.unwrap().hops, via_peer);
+
+		// The peer opens its announce stream: advertising the path to them is
+		// what registers the exclusion, and that alone must move the front.
+		let scoped = consumer.clone().excluding(peer);
+		let mut announced = scoped.announced();
+		let reading = announced.assert_next_some("test");
+		settle().await;
+		settle().await;
+		assert_eq!(
+			broadcast
+				.route_changed()
+				.now_or_never()
+				.expect("registering a reader must reselect the front off the tainted route")
+				.unwrap()
+				.hops,
+			clean
+		);
+
+		// The reader leaving releases the taint, and the release must re-run
+		// selection too: the cheaper route comes back, held like any re-parent.
+		drop(reading);
+		drop(announced);
+		// The release reselect arms the hold; then wait it out.
+		settle().await;
+		settle_handover().await;
+		assert_eq!(
+			broadcast
+				.route_changed()
+				.now_or_never()
+				.expect("releasing the last reader must reselect the front")
+				.unwrap()
+				.hops,
+			via_peer
+		);
+	}
+
+	/// The steer away from a tainted route must never cost the front its
+	/// announcement. The only clean route here is an offline standby; moving onto
+	/// it would retract the path, dropping the advertisement whose guard created
+	/// the taint, and then re-announce with the taint gone, forever.
+	#[tokio::test]
+	async fn test_reader_taint_does_not_retract_the_announcement() {
+		tokio::time::pause();
+
+		let origin = Origin::random().produce();
+		let consumer = origin.consume();
+
+		let publisher = Origin::new(1).unwrap();
+		let peer = Origin::new(5).unwrap();
+		let via_peer = OriginList::try_from(vec![publisher, peer]).unwrap();
+		let clean = OriginList::try_from(vec![publisher]).unwrap();
+
+		let source_a = origin
+			.create_broadcast("test", announce().with_hops(via_peer.clone()))
+			.unwrap();
+		let mut dynamic_a = source_a.dynamic();
+		settle().await;
+		// The clean alternative is an offline standby: joinable, never announced.
+		let source_b = origin
+			.create_broadcast("test", broadcast::Route::new().with_hops(clean).with_cost(5))
+			.unwrap();
+		let mut dynamic_b = source_b.dynamic();
+		settle().await;
+		settle().await;
+
+		let mut broadcast = consumer.request_broadcast("test").await.unwrap();
+		assert_eq!(broadcast.route_changed().await.unwrap().hops, via_peer);
+
+		// Advertising to the peer registers the exclusion, tainting the active
+		// route. With no announced alternative, the front must stay put and the
+		// announcement must hold steady.
+		let scoped = consumer.clone().excluding(peer);
+		let mut announced = scoped.announced();
+		let _reading = announced.assert_next_some("test");
+		settle().await;
+		settle().await;
+		assert!(
+			broadcast.route_changed().now_or_never().is_none(),
+			"the front must not steer onto an offline standby"
+		);
+		announced.assert_next_wait();
+
+		// Data still avoids the reader: a track on the shared front dispatches
+		// to the clean standby, not the tainted advertised route.
+		let subscribing = broadcast.track("video").unwrap().subscribe(None);
 		let _producer_b = accept_track(&mut dynamic_b, "video").await;
 		settle().await;
 		subscribing.await.unwrap();
@@ -6117,7 +7173,7 @@ mod tests {
 		// hash-random) out of this test: the front takes the cheaper route outright
 		// unless the exclusion stops it.
 		let mut tainted = announce().with_hops(via_peer.clone()).with_cost(0);
-		tainted.advertised = 1;
+		tainted.advertised = broadcast::Cost::new(1);
 		let mut source_tainted = origin.create_broadcast("test", tainted).unwrap();
 		let mut dynamic_tainted = source_tainted.dynamic();
 		settle().await;
@@ -6134,9 +7190,10 @@ mod tests {
 		drop(scoped);
 		settle().await;
 		let mut bumped = announce().with_hops(via_peer).with_cost(1);
-		bumped.advertised = 1;
+		bumped.advertised = broadcast::Cost::new(1);
 		source_tainted.set_route(bumped).unwrap();
 		settle().await;
+		settle_handover().await;
 		let plain = consumer.request_broadcast("test").await.unwrap();
 		let _plain_track = plain.track("video").unwrap().subscribe(None);
 		settle().await;
@@ -6313,13 +7370,16 @@ mod tests {
 		// the given order.
 		async fn winner(first: &[u64], second: &[u64]) -> OriginList {
 			let origin = Origin::random().produce();
+			// Equal-cost forwarders: the ordering is what this test is about, so neither
+			// route is a warm sibling and the adoption hold-down never applies.
 			let _a = origin
-				.create_broadcast("test", announce().with_hops(hops(first)))
+				.create_broadcast("test", forwarder_route(hops(first), 1))
 				.unwrap();
 			let _b = origin
-				.create_broadcast("test", announce().with_hops(hops(second)))
+				.create_broadcast("test", forwarder_route(hops(second), 1))
 				.unwrap();
 			settle().await;
+			settle_handover().await;
 			origin.consume().get_broadcast("test").unwrap().route().hops
 		}
 
@@ -7762,18 +8822,29 @@ mod tests {
 		settle().await;
 
 		let mut broadcast = consumer.get_broadcast("drainer").unwrap();
-		assert_eq!(broadcast.route().cost, 0, "the cheaper source serves first");
+		assert_eq!(
+			broadcast.route().cost,
+			broadcast::Cost::default(),
+			"the cheaper source serves first"
+		);
 
 		// What the subscriber does when its peer sends a GOAWAY.
 		let mut draining = source_a.dynamic();
 		draining.drain();
 		settle().await;
 
+		// A GOAWAY keeps serving for many seconds, so the migration waits out the
+		// re-parent hold like any other move rather than racing off stale prices.
+		settle_handover().await;
 		let migrated = broadcast.route_changed().await.unwrap();
-		assert_eq!(migrated.cost, 10, "draining must hand over to the live source");
+		assert_eq!(
+			migrated.cost,
+			broadcast::Cost::new(10),
+			"draining must hand over to the live source"
+		);
 		assert_ne!(
 			migrated.cost,
-			broadcast::DRAIN_COST,
+			broadcast::Cost::DRAIN,
 			"the draining source must not stay active"
 		);
 	}
@@ -7798,7 +8869,7 @@ mod tests {
 		settle().await;
 
 		let broadcast = consumer.get_broadcast("lonely").expect("the path stays routable");
-		assert_eq!(broadcast.route().cost, broadcast::DRAIN_COST);
+		assert_eq!(broadcast.route().cost, broadcast::Cost::DRAIN);
 	}
 
 	/// Run `scenario` on its own thread with a current_thread runtime and fail

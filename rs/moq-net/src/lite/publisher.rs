@@ -42,7 +42,7 @@ struct WatchedRoute {
 #[derive(Clone)]
 struct SentRoute {
 	hops: OriginList,
-	cost: lite::RouteCost,
+	cost: crate::broadcast::Cost,
 	/// Whether this is the route we actually serve from (the table's first
 	/// entry) rather than a standby selected because the serving chain flows
 	/// through the peer. Only a serving advertisement carries the demand
@@ -759,7 +759,7 @@ impl AnnounceRun {
 					if !sent.serving {
 						continue;
 					}
-					if sent.cost != lite::RouteCost(0) {
+					if sent.cost.warm != 0 {
 						if let Poll::Ready(Ok(())) = entry.demand.poll_used(waiter) {
 							break 'turn Op::Route(suffix.clone(), Ok(()));
 						}
@@ -1057,12 +1057,12 @@ fn outgoing_cost(
 	demand: &crate::broadcast::Demand,
 	route: &crate::broadcast::Route,
 	serving: bool,
-) -> lite::RouteCost {
+) -> crate::broadcast::Cost {
 	if !version.has_route_cost() {
-		return lite::RouteCost::default();
+		return crate::broadcast::Cost::UNKNOWN;
 	}
 
-	lite::RouteCost(crate::broadcast::outgoing_cost(demand, route, serving))
+	crate::broadcast::outgoing_cost(demand, route, serving)
 }
 
 /// Serves one TRACK stream: resolve the track, answer with its TRACK_INFO, FIN.
@@ -1779,6 +1779,12 @@ mod announce_test {
 	/// The broadcast's cold cost: what the route advertises without demand.
 	const COLD: u64 = 7;
 
+	/// What the harness route advertises with no demand, and with it: the carrying
+	/// discount zeroes the warm half only, so the cold path keeps flowing and peers
+	/// can still rank this relay against another warm one.
+	const COLD_COST: crate::broadcast::Cost = crate::broadcast::Cost::new(COLD);
+	const WARM_COST: crate::broadcast::Cost = crate::broadcast::Cost { warm: 0, cold: COLD };
+
 	/// The original publisher stamped on every harness route: content identity is
 	/// keyed on the first hop, so a route change that should ride through as a
 	/// restart must keep it.
@@ -1890,11 +1896,11 @@ mod announce_test {
 					lite::AnnounceBroadcast::Active { cost: first, .. },
 					lite::AnnounceBroadcast::Restart { cost: second, .. },
 				] => {
-					assert_eq!(*first, lite::RouteCost(COLD));
-					assert_eq!(*second, lite::RouteCost(0));
+					assert_eq!(*first, COLD_COST);
+					assert_eq!(*second, WARM_COST);
 				}
 				// The viewer may already be attached when the announce is built.
-				[lite::AnnounceBroadcast::Active { cost, .. }] => assert_eq!(*cost, lite::RouteCost(0)),
+				[lite::AnnounceBroadcast::Active { cost, .. }] => assert_eq!(*cost, WARM_COST),
 				other => panic!("expected {name} to announce, got {other:?}"),
 			}
 
@@ -1940,9 +1946,9 @@ mod announce_test {
 
 		let mut wire = Wire { writes, cursor: 0 };
 		assert_eq!(wire.take_ok().active, 1, "expected one initial announce");
-		let expected = if demand { 0 } else { COLD };
+		let expected = if demand { WARM_COST } else { COLD_COST };
 		match wire.take_announces().as_slice() {
-			[lite::AnnounceBroadcast::Active { cost, .. }] => assert_eq!(*cost, lite::RouteCost(expected)),
+			[lite::AnnounceBroadcast::Active { cost, .. }] => assert_eq!(*cost, expected),
 			other => panic!("expected the initial announce, got {other:?}"),
 		}
 
@@ -2003,7 +2009,7 @@ mod announce_test {
 		// t=10s: past the fresh deadline, so the restore finally lands.
 		tokio::time::sleep(Duration::from_secs(4)).await;
 		match h.wire.take_announces().as_slice() {
-			[lite::AnnounceBroadcast::Restart { id: 0, cost, .. }] => assert_eq!(*cost, lite::RouteCost(COLD)),
+			[lite::AnnounceBroadcast::Restart { id: 0, cost, .. }] => assert_eq!(*cost, COLD_COST),
 			other => panic!("expected the restore on the fresh deadline, got {other:?}"),
 		}
 	}
@@ -2030,14 +2036,14 @@ mod announce_test {
 
 		// t=6s: only the first has expired.
 		match h.wire.take_announces().as_slice() {
-			[lite::AnnounceBroadcast::Restart { id: 0, cost, .. }] => assert_eq!(*cost, lite::RouteCost(COLD)),
+			[lite::AnnounceBroadcast::Restart { id: 0, cost, .. }] => assert_eq!(*cost, COLD_COST),
 			other => panic!("expected only the first restore, got {other:?}"),
 		}
 
 		// t=8s: now the second's own deadline has passed.
 		tokio::time::sleep(Duration::from_secs(2)).await;
 		match h.wire.take_announces().as_slice() {
-			[lite::AnnounceBroadcast::Restart { id: 1, cost, .. }] => assert_eq!(*cost, lite::RouteCost(COLD)),
+			[lite::AnnounceBroadcast::Restart { id: 1, cost, .. }] => assert_eq!(*cost, COLD_COST),
 			other => panic!("expected the second restore, got {other:?}"),
 		}
 	}
@@ -2051,7 +2057,7 @@ mod announce_test {
 		tokio::time::sleep(Duration::from_secs(6)).await;
 
 		match h.wire.take_announces().as_slice() {
-			[lite::AnnounceBroadcast::Restart { id: 0, cost, .. }] => assert_eq!(*cost, lite::RouteCost(COLD)),
+			[lite::AnnounceBroadcast::Restart { id: 0, cost, .. }] => assert_eq!(*cost, COLD_COST),
 			other => panic!("expected one cold-cost restart, got {other:?}"),
 		}
 
@@ -2093,7 +2099,7 @@ mod announce_test {
 				},
 			] => {
 				assert_eq!(sent, &hops);
-				assert_eq!(*cost, lite::RouteCost(COLD));
+				assert_eq!(*cost, COLD_COST);
 			}
 			other => panic!("expected the failover restart, got {other:?}"),
 		}
@@ -2113,7 +2119,7 @@ mod announce_test {
 		settle().await;
 
 		match h.wire.take_announces().as_slice() {
-			[lite::AnnounceBroadcast::Restart { id: 0, cost, .. }] => assert_eq!(*cost, lite::RouteCost(0)),
+			[lite::AnnounceBroadcast::Restart { id: 0, cost, .. }] => assert_eq!(*cost, WARM_COST),
 			other => panic!("expected the warm restart, got {other:?}"),
 		}
 	}
@@ -2191,7 +2197,7 @@ mod announce_test {
 		match wire.take_announces().as_slice() {
 			[lite::AnnounceBroadcast::Active { hops, cost, .. }] => {
 				assert_eq!(hops, &tainted);
-				assert_eq!(*cost, lite::RouteCost(0));
+				assert_eq!(*cost, crate::broadcast::Cost::default());
 			}
 			other => panic!("expected the active route, got {other:?}"),
 		}
@@ -2203,7 +2209,7 @@ mod announce_test {
 		match wire.take_announces().as_slice() {
 			[lite::AnnounceBroadcast::Active { hops, cost, .. }] => {
 				assert_eq!(hops, &pub_hops());
-				assert_eq!(*cost, lite::RouteCost(COLD));
+				assert_eq!(*cost, COLD_COST);
 			}
 			other => panic!("expected the standby route, got {other:?}"),
 		}
@@ -2251,7 +2257,7 @@ mod announce_test {
 		match wire.take_announces().as_slice() {
 			[lite::AnnounceBroadcast::Active { hops, cost, .. }] => {
 				assert_eq!(hops, &pub_hops());
-				assert_eq!(*cost, lite::RouteCost(COLD));
+				assert_eq!(*cost, COLD_COST);
 			}
 			other => panic!("expected the standby announce, got {other:?}"),
 		}
@@ -2340,7 +2346,7 @@ mod announce_test {
 		let demand = consumer.demand();
 
 		let cost = outgoing_cost(Version::Lite06Wip, &demand, &route, false);
-		assert_eq!(cost, lite::RouteCost(broadcast::MAX_COST));
+		assert_eq!(cost, broadcast::Cost::new(broadcast::MAX_COST));
 
 		let mut buf = Vec::new();
 		cost.encode(&mut buf, Version::Lite06Wip)
@@ -2371,25 +2377,26 @@ mod announce_test {
 		assert!(demand.is_used(), "the consumed track should register demand");
 
 		let cost = outgoing_cost(Version::Lite06Wip, &demand, &route, true);
-		assert_eq!(cost, lite::RouteCost(broadcast::DRAIN_COST));
+		assert_eq!(cost, broadcast::Cost::DRAIN);
 
 		// A drain that arrived over the wire propagates through a carrying relay:
 		// the upstream's ceiling plus our link price saturates back to the
 		// ceiling, which pierces this hop's discount too. Without that, each
 		// carrying hop would re-mask the drain as cost 0.
-		let forwarded = lite::RouteCost(broadcast::DRAIN_COST).charged(5).0;
+		let forwarded = broadcast::Cost::DRAIN.charged(5);
 		producer
 			.set_route(broadcast::Route::announced().with_cost(forwarded))
 			.unwrap();
 		let route = consumer.route();
 		let cost = outgoing_cost(Version::Lite06Wip, &demand, &route, true);
-		assert_eq!(cost, lite::RouteCost(broadcast::DRAIN_COST));
+		assert_eq!(cost, broadcast::Cost::DRAIN);
 
-		// A healthy serving route with demand still gets the carrying discount.
+		// A healthy serving route with demand still gets the carrying discount, on
+		// the warm half only: the cold path is what a peer ranks us by.
 		producer.set_route(broadcast::Route::announced().with_cost(7)).unwrap();
 		let route = consumer.route();
 		let cost = outgoing_cost(Version::Lite06Wip, &demand, &route, true);
-		assert_eq!(cost, lite::RouteCost(0));
+		assert_eq!(cost, broadcast::Cost { warm: 0, cold: 7 });
 	}
 }
 

@@ -55,6 +55,21 @@ Price is per direction. Pulling from a metered origin can cost far more than pus
 
 The cost a relay advertises is the *marginal* cost of pulling the broadcast through it. A relay actively carrying a broadcast (a subscriber is pulling it) re-announces it at cost 0: its upstream fetch is already paid for, so a sibling should pull the warm copy over a free intra-DC link instead of opening a second metered fetch. When the last subscriber leaves, the cost decays back after a short grace period. Standby publishers (e.g. a transcoder pool) can seed a large cost so they are only selected when nothing cheaper exists, and the winner's cost drops to 0 once it starts working.
 
+That discount is what makes the cluster share one copy, but it also erases something. Once several relays are all carrying the broadcast they *all* advertise 0, so asking "what does this cost you?" gets the same answer everywhere and can no longer say which of them ought to be the one doing the pulling.
+
+So `moq-lite-06` announcements carry two prices instead of one:
+
+- **warm**: what pulling costs right now, given which relays already have it. Zero at any relay that is carrying. This is the number routing minimizes, and it is what consolidates the fleet onto one copy.
+- **cold**: what the same route would cost if no relay had it. It ignores the discounts entirely, so it does not collapse, and it keeps saying how far each relay sits from the publisher.
+
+The first picks where a relay fetches from. The second picks which relay does the fetching: a carrying relay hands its subscribers over to another carrying relay only when that one's cold price is lower, so the relay nearest the publisher becomes the aggregation point and the rest consolidate onto it. Relays equally far from the publisher tie there and fall back to a hash of the broadcast path, which spreads ownership across the fleet instead of funneling every broadcast onto one of them.
+
+Both matter. Without the warm price every relay opens its own fetch and the backbone carries N copies. Without the cold price the relays that are already carrying cannot be told apart, so the aggregation point lands wherever a coin flip puts it, which can leave a relay one cheap link from the publisher pulling through a relay several expensive links away.
+
+A relay waits about half a second before moving onto another relay, and re-checks when the wait is up. Prices are reported, not observed, so a report still crossing the mesh can be cheaper than what its sender would say now, and while prices are rising a ring of relays could otherwise each defer to a stale neighbour and all let go at once, leaving nobody pulling. The wait outlasts that propagation, so the re-check runs on current prices, and it carries a small per-relay spread so a whole PoP does not reconsider on the same instant. Some moves never wait: reconnecting to the peer you were already pulling from (recognized by its declared identity, so a relay that withheld one waits like anything else), and repairs, meaning replacing a route that has vanished or stopped announcing, which would otherwise keep the relay on a dead source while a live one sits in the table. Leaving a *draining* route does wait, because a relay that received a GOAWAY keeps serving until its handover window closes, and a fleet draining together is exactly when relays re-parent off prices that have not landed. If the drain turns into a disconnection the route vanishes, and that case is immediate, so the wait is never longer than the session it is waiting on. Only trading a working upstream for a better one waits, and that includes a relay with no viewers, whose choice is simply the one it will pull down when a viewer arrives.
+
+`moq-transport` has nowhere to carry the cold price, so those routes keep the older coin-flip behavior.
+
 ## Auto-discovery
 
 Listing every peer by hand can get tedious in larger clusters. Tell the relay its own URL with `cluster.node`, then enable gossip with `cluster.mesh`; connected peers will discover and dial it back automatically:

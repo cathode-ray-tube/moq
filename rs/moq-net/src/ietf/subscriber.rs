@@ -269,7 +269,9 @@ impl<S: crate::transport::poll::Session> Subscriber<S> {
 			.expect("an empty hop chain has room for one entry");
 		broadcast::Route::new()
 			.with_hops(hops)
-			.with_cost(cluster::link_cost(self.cost, peer))
+			// A peer with no Cluster extension advertises no cost at all, so its cold
+			// path is unknown rather than free.
+			.with_cost(broadcast::Cost::UNKNOWN.charged(cluster::link_cost(self.cost, peer)))
 			.with_announce(true)
 	}
 
@@ -479,7 +481,7 @@ impl<S: crate::transport::poll::Session> Subscriber<S> {
 						continue;
 					};
 
-					tracing::debug!(%path, hops = advert.route.hops.len(), cost = advert.route.cost, "namespace");
+					tracing::debug!(%path, hops = advert.route.hops.len(), cost = ?advert.route.cost, "namespace");
 					if live.contains(&path) {
 						// A repeat replaces the advertisement atomically; nothing is torn
 						// down merely because an update arrived.
@@ -738,7 +740,7 @@ impl<S: crate::transport::poll::Session> Subscriber<S> {
 				continue;
 			};
 
-			tracing::debug!(%path, hops = advert.route.hops.len(), cost = advert.route.cost, "publish_namespace update");
+			tracing::debug!(%path, hops = advert.route.hops.len(), cost = ?advert.route.cost, "publish_namespace update");
 			match *attached {
 				true => self.update_announce(path.clone(), advert)?,
 				// Re-attach: a clean path replaced the reflected one we detached from.
@@ -946,7 +948,7 @@ impl<S: crate::transport::poll::Session> Subscriber<S> {
 		// per-source task only ever moves a route in this direction, so there is
 		// no race between the two.
 		if self.going_away.is_set() {
-			route.cost = broadcast::DRAIN_COST;
+			route.cost = broadcast::Cost::DRAIN;
 		}
 
 		// A different original publisher means a distinct broadcast has taken over this
@@ -1934,7 +1936,7 @@ mod tests {
 
 		let advertised = subscriber.route(Some(&advert), &peer).expect("route");
 		assert_eq!(
-			advertised.route.cost, 7,
+			advertised.route.cost.warm, 7,
 			"the link's price is added to the advertised cost"
 		);
 		assert_eq!(advertised.route.hops, hop_path(&[7, 9]).hops().clone());
@@ -1950,7 +1952,7 @@ mod tests {
 		let broadcast = consumer.get_broadcast("room/host").unwrap();
 		let hops: Vec<_> = broadcast.routes()[0].hops.iter().map(|h| h.id()).collect();
 		assert_eq!(hops, vec![7, 9]);
-		assert_eq!(broadcast.routes()[0].cost, 7);
+		assert_eq!(broadcast.routes()[0].cost.warm, 7);
 	}
 
 	/// An advertisement whose path already contains our own Hop ID looped back:
@@ -1990,14 +1992,14 @@ mod tests {
 			hops: hop_path(&[7, 9]),
 			cost: 2,
 		};
-		assert_eq!(subscriber.route(Some(&advert), &peer).unwrap().route.cost, 3);
+		assert_eq!(subscriber.route(Some(&advert), &peer).unwrap().route.cost.warm, 3);
 
 		// Zero is meaningful and distinct from absent: a free link adds nothing.
 		let free = cluster::Peer {
 			origin: Some(crate::Origin::new(9).unwrap()),
 			cost: Some(0),
 		};
-		assert_eq!(subscriber.route(Some(&advert), &free).unwrap().route.cost, 2);
+		assert_eq!(subscriber.route(Some(&advert), &free).unwrap().route.cost.warm, 2);
 	}
 
 	/// A namespace stream that ends with advertisements still live detaches them, so
@@ -2227,19 +2229,22 @@ mod tests {
 		let peer = cluster::Peer::default();
 
 		// Nothing priced this direction, so it ranks by hop count.
-		assert_eq!(unpriced.route(None, &peer).unwrap().route.cost, cluster::DEFAULT_COST);
+		assert_eq!(
+			unpriced.route(None, &peer).unwrap().route.cost.warm,
+			cluster::DEFAULT_COST
+		);
 
 		// A peer that declared its egress price is charged it, extension or not.
 		let priced_peer = cluster::Peer {
 			origin: None,
 			cost: Some(4),
 		};
-		assert_eq!(unpriced.route(None, &priced_peer).unwrap().route.cost, 4);
+		assert_eq!(unpriced.route(None, &priced_peer).unwrap().route.cost.warm, 4);
 
 		// Local policy still wins over what the peer declared.
 		let (mut priced, _origin) = cluster_subscriber(crate::Origin::new(1).unwrap());
 		priced.cost = Some(6);
-		assert_eq!(priced.route(None, &priced_peer).unwrap().route.cost, 6);
+		assert_eq!(priced.route(None, &priced_peer).unwrap().route.cost.warm, 6);
 	}
 
 	/// An update replaces the advertisement in place: the route moves, the refcount does
@@ -2278,7 +2283,7 @@ mod tests {
 		let broadcast = consumer.get_broadcast("room/host").unwrap();
 		let hops: Vec<_> = broadcast.routes()[0].hops.iter().map(|h| h.id()).collect();
 		assert_eq!(hops, vec![7, 11]);
-		assert_eq!(broadcast.routes()[0].cost, 2);
+		assert_eq!(broadcast.routes()[0].cost.warm, 2);
 		assert!(!original.is_closed(), "the source survived the update");
 
 		// One advertisement, so one unannounce detaches it. If the update had bumped the
@@ -2381,7 +2386,14 @@ mod tests {
 		let broadcast = consumer.get_broadcast("room/host").unwrap();
 		let routes = broadcast.routes();
 		assert_eq!(routes.len(), 1, "the update replaced the route, it did not add one");
-		assert_eq!(routes[0].cost, 1);
+		assert_eq!(
+			routes[0].cost,
+			crate::broadcast::Cost {
+				warm: 1,
+				..crate::broadcast::Cost::UNKNOWN
+			},
+			"the repriced warm cost arrives; the Cluster extension has nowhere to carry a cold cost, so it stays unknown rather than reading as the publisher's own zero"
+		);
 
 		// One advertisement, so one unannounce detaches it.
 		subscriber.stop_announce(path, Detach::Graceful).unwrap();
