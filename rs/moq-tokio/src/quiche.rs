@@ -379,14 +379,13 @@ impl QuicheClient {
 		})
 		.await?;
 
-		let mut request = web_transport_quiche::proto::ConnectRequest::new(url.clone());
-		for alpn in versions.alpns() {
-			request = request.with_protocol(alpn.to_string());
-		}
-
 		match url.scheme() {
 			"https" => {
 				// WebTransport over HTTP/3
+				let mut request = web_transport_quiche::proto::ConnectRequest::new(url.clone());
+				for alpn in versions.alpns() {
+					request = request.with_protocol(alpn.to_string());
+				}
 				let session = web_transport_quiche::Connection::connect(conn, request)
 					.await
 					.map_err(map_client_error)?;
@@ -394,6 +393,9 @@ impl QuicheClient {
 			}
 			"moqt" | "moql" => {
 				// Raw QUIC mode
+				let alpn = conn.alpn().ok_or(Error::MissingAlpn)?;
+				std::str::from_utf8(&alpn)?;
+
 				Ok(web_transport_quiche::Connection::raw(conn))
 			}
 			_ => unreachable!("unsupported URL scheme: {}", url.scheme()),

@@ -38,6 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `moq_publish_media` rejects a label on a container format (fmp4, mkv, ts, flv) instead of
   silently dropping it.
 
+## [0.5.9](https://github.com/moq-dev/moq/compare/libmoq-v0.5.8...libmoq-v0.5.9) - 2026-08-20
+
+### Added
+
+- *(video)* give the bindings the NVIDIA codecs, and warn when Auto falls to software ([#2950](https://github.com/moq-dev/moq/pull/2950))
+- *(hang)* signal stalled video renditions ([#2865](https://github.com/moq-dev/moq/pull/2865))
+
 ## [0.5.8](https://github.com/moq-dev/moq/compare/libmoq-v0.5.7...libmoq-v0.5.8) - 2026-08-14
 
 ### Added

@@ -443,9 +443,10 @@ impl<S: crate::transport::poll::Session> Request<S> {
 				version,
 				client_setup,
 			} => {
-				// We report send bitrate; a server never advertises a request Path or Role.
+				// We report what the transport actually measures; a server never
+				// advertises a request Path or Role.
 				let our_setup = lite::Setup {
-					probe: lite::ProbeLevel::Report,
+					probe: lite::ProbeLevel::detect(&session),
 					path: None,
 					role: None,
 					// The dialing side prices the link; we charge what its SETUP declared.

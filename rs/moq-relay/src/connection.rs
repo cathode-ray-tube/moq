@@ -156,22 +156,13 @@ impl Connection {
 
 		// The credential (JWT `exp` or client cert `notAfter`) is only checked at
 		// connect time, so hold the session open no longer than the credential is
-		// valid; without an expiry, wait for the session to close. Either way, a
+		// valid. Without an expiry, wait for the session to close. Either way, a
 		// relay shutdown drains the session with a GOAWAY instead of cutting it off.
-		let expiry = async {
-			match token.expires {
-				Some(expires) => {
-					let remaining = expires.duration_since(std::time::SystemTime::now()).unwrap_or_default();
-					tokio::time::sleep(remaining).await
-				}
-				None => std::future::pending().await,
-			}
-		};
 		let mut shutdown = self.shutdown.clone();
 
 		tokio::select! {
 			err = session.closed() => Err(err.into()),
-			_ = expiry => {
+			_ = token.expired() => {
 				tracing::info!("credential expired, closing session");
 				session.abort(moq_net::Error::Unauthorized);
 				Ok(())
