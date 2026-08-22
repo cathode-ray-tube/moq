@@ -2,11 +2,13 @@ import { type Dispose, type Getter, Signal } from "@moq/signals";
 import type * as broadcast from "../broadcast.ts";
 import { error, reason } from "../error.ts";
 import type * as group from "../group.ts";
+import { hooks } from "../internal.ts";
 import type { Consumer as OriginConsumer } from "../origin.ts";
 import * as Path from "../path.ts";
 import { type Stream, Writer } from "../stream.ts";
 import type { Timescale } from "../time.ts";
 import { withTimeout } from "../util/timeout.ts";
+import * as Varint from "../varint.ts";
 import type { Session } from "./adapter.ts";
 import * as Cluster from "./cluster.ts";
 import { Frame, Group as GroupMessage } from "./object.ts";
@@ -154,7 +156,14 @@ export class Publisher {
 			return;
 		}
 
-		const track = broadcast.subscribe(msg.trackName, { priority: fromWire(msg.subscriberPriority) });
+		const track = broadcast.subscribe(msg.trackName, {
+			priority: fromWire(msg.subscriberPriority),
+			// moq-transport has no subscriber latency parameter. Keep everything the
+			// producer retained and let the receiving subscriber enforce its own budget.
+			// Keep the sentinel encodable if this demand crosses a Lite hop before the
+			// producer's retention bound is known.
+			maxAge: Varint.MAX_U53,
+		});
 
 		try {
 			// Declaring the timescale is what opts the track into timestamps; every object
@@ -266,15 +275,23 @@ export class Publisher {
 				},
 			});
 
-			await header.encode(stream, this.#session.version);
-
 			try {
-				for (;;) {
-					const frame = await Promise.race([group.readFrame(), stream.closed]);
-					if (!frame) break;
+				await hooks.guardGroup(group, header.encode(stream, this.#session.version));
 
-					const obj = new Frame({ payload: frame.payload, timestamp: frame.timestamp });
-					await obj.encode(stream, header.flags, timescale, this.#session.version);
+				for (;;) {
+					const read = await Promise.race([hooks.readGroupFrame(group), stream.closed]);
+					if (!read) break;
+
+					try {
+						const obj = new Frame({ payload: read.frame.payload, timestamp: read.frame.timestamp });
+						await hooks.guardGroup(
+							group,
+							obj.encode(stream, header.flags, timescale, this.#session.version),
+							read.position,
+						);
+					} finally {
+						read.complete();
+					}
 				}
 
 				stream.close();

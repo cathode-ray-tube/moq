@@ -262,6 +262,19 @@ function waitForSubscription(controls: SubscriptionControls, subscriber: track.S
 }
 
 /**
+ * The budget to serve a peer with, given what its wire could tell us.
+ *
+ * A version without the field decodes as `0`, which is indistinguishable from a peer
+ * genuinely asking for the live edge. Serving that as real time would discard backlog
+ * a legacy subscriber never declined, so fall back to a window wide enough not to drop
+ * and leave enforcement to the receiver, as the IETF path does for the same reason.
+ */
+function servingMaxAge(version: Version, requested: number | undefined): number {
+	const carriesMaxAge = version !== Version.DRAFT_01 && version !== Version.DRAFT_02;
+	return carriesMaxAge ? (requested ?? 0) : Number.MAX_SAFE_INTEGER;
+}
+
+/**
  * Handles publishing broadcasts and managing their lifecycle.
  *
  * @internal
@@ -454,7 +467,7 @@ export class Publisher {
 		const track = broadcast.subscribe(msg.track, {
 			priority: msg.priority,
 			ordered: msg.ordered,
-			maxAge: msg.maxAge,
+			maxAge: servingMaxAge(this.version, msg.maxAge),
 			startGroup: msg.startGroup,
 			endGroup: msg.endGroup,
 		});
@@ -511,7 +524,7 @@ export class Publisher {
 					track.update({
 						priority: update.priority,
 						ordered: update.ordered,
-						maxAge: update.maxAge,
+						maxAge: servingMaxAge(this.version, update.maxAge),
 						startGroup: update.startGroup,
 						endGroup: update.endGroup,
 					});
@@ -887,8 +900,13 @@ export class Publisher {
 				// follows it too rather than keeping a stale rank until it finishes.
 				priority.add(stream, group.sequence);
 
-				await stream.u53(0); // stream type
-				await msg.encode(stream, this.version);
+				await hooks.guardGroup(
+					group,
+					(async () => {
+						await stream.u53(0); // stream type
+						await msg.encode(stream, this.version);
+					})(),
+				);
 
 				// Lite05+ prefixes every frame with a zigzag-delta timestamp at the track's
 				// advertised timescale; older drafts omit it.
@@ -899,8 +917,8 @@ export class Publisher {
 				let reached = startFrame === 0;
 
 				for (;;) {
-					const frame = await Promise.race([group.readFrameSequence(), stream.closed]);
-					if (!frame) {
+					const read = await Promise.race([hooks.readGroupFrame(group), stream.closed]);
+					if (!read) {
 						// The group ended before the frame the subscriber asked to start
 						// at, so this publisher can't serve the range at all. FINning here
 						// would claim an empty group under that index; reset so it reads
@@ -909,21 +927,25 @@ export class Publisher {
 						break;
 					}
 
-					// Frames below the requested start were excluded, and the receiver
-					// numbers what it gets from `startFrame`.
-					if (frame.sequence < startFrame) continue;
-					if (endFrame !== undefined && frame.sequence > endFrame) break;
-					reached = true;
+					try {
+						// Frames below the requested start were excluded, and the receiver
+						// numbers what it gets from `startFrame`.
+						if (read.sequence < startFrame) continue;
+						if (endFrame !== undefined && read.sequence > endFrame) break;
+						reached = true;
 
-					if (timestamps) {
-						// Convert each frame to the track's advertised timescale.
-						const ts = BigInt(Math.round(frame.timestamp.as(timescale)));
-						await stream.u62(zigzag(ts - prevTs));
-						prevTs = ts;
+						if (timestamps) {
+							// Convert each frame to the track's advertised timescale.
+							const ts = BigInt(Math.round(read.frame.timestamp.as(timescale)));
+							await hooks.guardGroup(group, stream.u62(zigzag(ts - prevTs)), read.position);
+							prevTs = ts;
+						}
+
+						await hooks.guardGroup(group, stream.u53(read.frame.payload.byteLength), read.position);
+						await hooks.guardGroup(group, stream.write(read.frame.payload), read.position);
+					} finally {
+						read.complete();
 					}
-
-					await stream.u53(frame.payload.byteLength);
-					await stream.write(frame.payload);
 				}
 
 				stream.close();
