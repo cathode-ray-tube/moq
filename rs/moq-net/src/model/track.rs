@@ -18,6 +18,14 @@ use crate::{broadcast, cache, frame, group, stats};
 
 use super::{Datagram, Requests};
 
+use std::sync::Arc;
+
+use crate::payload::{
+    AsyncPayloadProcessor,
+    PayloadContext,
+};
+
+
 pub use super::subscription::Subscription;
 
 use std::{
@@ -866,6 +874,8 @@ pub struct Producer {
 	// one subscription on tag and closed when the last producer clone drops. Empty
 	// (no-op) for an untagged broadcast.
 	stats: stats::Scope,
+
+	async_payload_processor: Option<Arc<dyn AsyncPayloadProcessor>>,
 }
 
 impl Producer {
@@ -2677,6 +2687,7 @@ impl Request {
 			prev_subscription: None,
 			alive: self.alive,
 			stats: self.stats,
+			async_payload_processor: None,
 		}
 	}
 
