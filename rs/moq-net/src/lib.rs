@@ -89,6 +89,7 @@ mod util;
 mod version;
 
 pub mod stats;
+pub mod payload;
 
 pub use client::*;
 pub use coding::{BoundsExceeded, DecodeError, EncodeError, VarInt};
@@ -109,3 +110,10 @@ pub use web_transport_trait;
 
 // Re-export the kio crate, since it appears in the public API (e.g. poll_* waiters).
 pub use kio;
+
+pub use payload::{
+    AsyncPayloadProcessor,
+    PayloadContext,
+    PayloadError,
+    PayloadFuture,
+};
