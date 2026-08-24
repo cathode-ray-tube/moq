@@ -165,6 +165,15 @@ impl<S: crate::transport::poll::RecvStream, V> Reader<S, V> {
 		self.stream.stop(StreamError::from(err).to_code());
 	}
 
+	/// Abort the stream with a raw application code.
+	///
+	/// [`Self::abort`] encodes the moq-lite error space. A protocol with its own registry
+	/// of stream reset codes has to name one directly, since the two spaces do not agree
+	/// on what a given number means.
+	pub fn stop(&mut self, code: u32) {
+		self.stream.stop(code);
+	}
+
 	/// Cast the reader to a different version, used during version negotiation.
 	pub fn with_version<V2>(self, version: V2) -> Reader<S, V2> {
 		Reader {

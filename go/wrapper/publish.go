@@ -189,10 +189,9 @@ func (b *BroadcastProducer) EncodeAudio(name string, input AudioEncoderInput, ou
 // EncodeVideo publishes a raw-video track with an in-process H.264/H.265
 // encoder.
 //
-// The track is named after the codec (.avc3 / .hev1) and its catalog rendition
-// is published immediately, read out of the encoder itself, so subscribers
-// discover it through the catalog rather than a name you pick, and can find it
-// before the first frame exists.
+// Set output.Track to choose the track name; otherwise one is derived from the
+// codec (.avc3 / .hev1). The catalog rendition is published immediately so
+// subscribers can discover it before the first frame exists.
 func (b *BroadcastProducer) EncodeVideo(input VideoEncoderInput, output VideoEncoderOutput) (*VideoProducer, error) {
 	inner, err := b.inner.EncodeVideo(input, output)
 	if err != nil {
@@ -590,6 +589,28 @@ type AudioProducer struct {
 	inner *ffi.MoqAudioProducer
 }
 
+// Name returns the audio track's name.
+func (a *AudioProducer) Name() (string, error) {
+	return a.inner.Name()
+}
+
+// Used blocks until the audio track has at least one active subscriber. See
+// MediaProducer.Used regarding cancellation.
+func (a *AudioProducer) Used(ctx context.Context) error {
+	return runErr(ctx, nil, a.inner.Used)
+}
+
+// Unused blocks until the audio track has no active subscribers. See
+// MediaProducer.Used regarding cancellation.
+func (a *AudioProducer) Unused(ctx context.Context) error {
+	return runErr(ctx, nil, a.inner.Unused)
+}
+
+// ResetEpoch re-anchors the timeline to the next frame after an idle gap.
+func (a *AudioProducer) ResetEpoch() error {
+	return a.inner.ResetEpoch()
+}
+
 // Write pushes one frame of PCM in the configured input format.
 func (a *AudioProducer) Write(frame AudioFrame) error {
 	return a.inner.Write(frame)
@@ -604,6 +625,23 @@ func (a *AudioProducer) Finish() error {
 // the way out.
 type VideoProducer struct {
 	inner *ffi.MoqVideoProducer
+}
+
+// Name returns the video track's name.
+func (v *VideoProducer) Name() (string, error) {
+	return v.inner.Name()
+}
+
+// Used blocks until the video track has at least one active subscriber. See
+// MediaProducer.Used regarding cancellation.
+func (v *VideoProducer) Used(ctx context.Context) error {
+	return runErr(ctx, nil, v.inner.Used)
+}
+
+// Unused blocks until the video track has no active subscribers. See
+// MediaProducer.Used regarding cancellation.
+func (v *VideoProducer) Unused(ctx context.Context) error {
+	return runErr(ctx, nil, v.inner.Unused)
 }
 
 // Write encodes and publishes one frame in the configured input format. A

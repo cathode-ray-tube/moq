@@ -297,6 +297,8 @@ impl ElementImpl for MoqSink {
 			caps.merge(gst::Caps::builder("audio/x-opus").build());
 			// Subtitles: one decoded UTF-8 cue per buffer, as demuxers emit timed text.
 			caps.merge(gst::Caps::builder("text/x-raw").field("format", "utf8").build());
+			// Opaque application data: published byte for byte, so there is no structural field to pin.
+			caps.merge(gst::Caps::builder("application/octet-stream").build());
 
 			let sink =
 				gst::PadTemplate::new("sink_%u", gst::PadDirection::Sink, gst::PadPresence::Request, &caps).unwrap();
@@ -436,6 +438,7 @@ impl MoqSink {
 		let pts = buffer.pts();
 		// Only subtitles use this: a cue needs an explicit end, unlike a media frame.
 		let duration = buffer.duration();
+		let current_running_time = self.obj().current_running_time();
 		let map = buffer.map_readable().map_err(|_| {
 			gst::error!(CAT, "failed to map buffer on pad {}", pad.name());
 			gst::FlowError::Error
@@ -467,9 +470,22 @@ impl MoqSink {
 			return Ok(gst::FlowSuccess::Ok); // drop quietly; the pad already reported its failure
 		}
 
-		let no_segment = media.push_buffer(data, pts, duration);
+		let result = media.push_buffer(data, pts, duration, current_running_time);
 		drop(guard);
 		drop(activity);
+		let no_segment = match result {
+			Ok(no_segment) => no_segment,
+			Err(err) => {
+				// Bus sync handlers run inline and may read a property that locks `state` again.
+				gst::element_error!(
+					self.obj(),
+					gst::StreamError::Format,
+					("could not timestamp buffer on pad {}", pad.name()),
+					["{err}"]
+				);
+				return Err(gst::FlowError::Error);
+			}
+		};
 
 		if no_segment {
 			gst::element_warning!(

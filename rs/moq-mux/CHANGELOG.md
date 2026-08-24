@@ -41,6 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An audio format rejects an `import::Init` video hint instead of dropping it.
 - `catalog::VideoHint::label` is no longer public. `import::Init::label` is the single source of a
   rendition label, matching the hang draft, which classifies it as a common rendition field.
+## [0.9.9](https://github.com/moq-dev/moq/compare/moq-mux-v0.9.8...moq-mux-v0.9.9) - 2026-08-24
+
+### Fixed
+
+- *(audio)* drain Opus lookahead on finish ([#3008](https://github.com/moq-dev/moq/pull/3008))
+- *(moq-cli)* pace the TS stdout export on each frame's timestamp ([#3006](https://github.com/moq-dev/moq/pull/3006))
+- *(moq-mux)* map containers onto MSF packaging one to one ([#2987](https://github.com/moq-dev/moq/pull/2987))
+- *(moq-mux)* emit the TS PCR as a uniform grid, not the per-unit decode clock ([#2967](https://github.com/moq-dev/moq/pull/2967))
 
 ## [0.9.8](https://github.com/moq-dev/moq/compare/moq-mux-v0.9.7...moq-mux-v0.9.8) - 2026-08-20
 

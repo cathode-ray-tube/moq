@@ -2,7 +2,10 @@ use super::origin::*;
 use super::producer::*;
 use super::server::MoqServer;
 use super::session::MoqClient;
-use crate::audio::{MoqAudioDecoderOutput, MoqAudioSampleFormat};
+use crate::audio::{
+	MoqAudioCodec, MoqAudioDecoderOutput, MoqAudioEncoderInput, MoqAudioEncoderOutput, MoqAudioFrame,
+	MoqAudioSampleFormat,
+};
 use crate::consumer::MoqBroadcastConsumer;
 use crate::consumer::MoqFetchGroupOptions;
 use crate::consumer::MoqRouteWatch;
@@ -16,6 +19,36 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+
+#[tokio::test]
+async fn detached_cancels_inner_on_drop() {
+	struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+	impl Drop for DropSignal {
+		fn drop(&mut self) {
+			let _ = self.0.take().unwrap().send(());
+		}
+	}
+
+	let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+	let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+	let outer = tokio::spawn(crate::ffi::detached(async move {
+		let _drop = DropSignal(Some(dropped_tx));
+		started_tx.send(()).unwrap();
+		std::future::pending::<Result<(), MoqError>>().await
+	}));
+
+	tokio::time::timeout(TIMEOUT, started_rx)
+		.await
+		.expect("timed out waiting for detached task to start")
+		.unwrap();
+	outer.abort();
+	assert!(outer.await.unwrap_err().is_cancelled());
+	tokio::time::timeout(TIMEOUT, dropped_rx)
+		.await
+		.expect("timed out waiting for detached task to be dropped")
+		.unwrap();
+}
 
 /// A bare [`MoqAudioInit`] with a format and its init bytes.
 fn audio_init(format: MoqAudioFormat, data: Vec<u8>) -> MoqAudioInit {
@@ -145,6 +178,102 @@ async fn raw_track_activity() {
 		.await
 		.expect("timed out waiting for raw track to become unused")
 		.unwrap();
+}
+
+#[tokio::test]
+async fn raw_audio_activity() {
+	const SAMPLE_RATE: u32 = 48_000;
+	const FRAME_DURATION_MS: u32 = 20;
+	const FRAME_SAMPLES: usize = (SAMPLE_RATE * FRAME_DURATION_MS / 1_000) as usize;
+	const FIRST_TIMESTAMP_US: u64 = 1_000_000;
+	const RESUMED_TIMESTAMP_US: u64 = 2_000_000;
+
+	let broadcast = MoqBroadcastProducer::new().unwrap();
+	let consumer = broadcast.consume().unwrap();
+	let catalog_consumer = consumer.subscribe_catalog().await.unwrap();
+	let audio = broadcast
+		.encode_audio(
+			"microphone".into(),
+			MoqAudioEncoderInput {
+				format: MoqAudioSampleFormat::F32,
+				sample_rate: SAMPLE_RATE,
+				channels: 1,
+			},
+			MoqAudioEncoderOutput {
+				codec: MoqAudioCodec::Opus,
+				sample_rate: None,
+				channels: None,
+				bitrate: None,
+				frame_duration_ms: FRAME_DURATION_MS,
+			},
+		)
+		.unwrap();
+	assert_eq!(audio.name().unwrap(), "microphone");
+
+	let catalog = tokio::time::timeout(TIMEOUT, catalog_consumer.next())
+		.await
+		.expect("timed out waiting for raw audio catalog")
+		.unwrap()
+		.expect("expected a raw audio catalog");
+	let container = catalog.audio.get("microphone").unwrap().container.clone();
+	let subscription = consumer
+		.subscribe_media("microphone".into(), container.clone(), None)
+		.await
+		.unwrap();
+	tokio::time::timeout(TIMEOUT, audio.used())
+		.await
+		.expect("timed out waiting for raw audio to become used")
+		.unwrap();
+	audio
+		.write(MoqAudioFrame {
+			timestamp_us: FIRST_TIMESTAMP_US,
+			data: vec![0; FRAME_SAMPLES * std::mem::size_of::<f32>()],
+		})
+		.unwrap();
+	let first = tokio::time::timeout(TIMEOUT, subscription.next())
+		.await
+		.expect("timed out waiting for raw audio frame")
+		.unwrap()
+		.expect("expected a raw audio frame");
+	assert_eq!(first.timestamp_us, FIRST_TIMESTAMP_US);
+
+	drop(subscription);
+	tokio::time::timeout(TIMEOUT, audio.unused())
+		.await
+		.expect("timed out waiting for raw audio to become unused")
+		.unwrap();
+
+	let subscription = consumer
+		.subscribe_media("microphone".into(), container, None)
+		.await
+		.unwrap();
+	tokio::time::timeout(TIMEOUT, audio.used())
+		.await
+		.expect("timed out waiting for raw audio to become used again")
+		.unwrap();
+	audio.reset_epoch().unwrap();
+	audio
+		.write(MoqAudioFrame {
+			timestamp_us: RESUMED_TIMESTAMP_US,
+			data: vec![0; FRAME_SAMPLES * std::mem::size_of::<f32>()],
+		})
+		.unwrap();
+	let mut resumed = tokio::time::timeout(TIMEOUT, subscription.next())
+		.await
+		.expect("timed out waiting for resumed raw audio frame")
+		.unwrap()
+		.expect("expected a resumed raw audio frame");
+	if resumed.timestamp_us == first.timestamp_us {
+		resumed = tokio::time::timeout(TIMEOUT, subscription.next())
+			.await
+			.expect("timed out waiting for re-anchored raw audio frame")
+			.unwrap()
+			.expect("expected a re-anchored raw audio frame");
+	}
+	assert_eq!(resumed.timestamp_us, RESUMED_TIMESTAMP_US);
+
+	audio.finish().unwrap();
+	broadcast.finish().unwrap();
 }
 
 #[tokio::test]
@@ -1263,7 +1392,7 @@ async fn video_publish_consume() {
 	broadcast.finish().unwrap();
 }
 
-/// The raw-video publish path: hand mid-gray RGBA to `publish_video` and check
+/// The raw-video publish path: hand mid-gray RGBA to `encode_video` and check
 /// that the encoder's own output reaches a subscriber, described by a catalog
 /// rendition the importer built from the encoded keyframe.
 #[cfg(feature = "video")]
@@ -1284,6 +1413,7 @@ async fn video_raw_publish_consume() {
 			},
 			MoqVideoEncoderOutput {
 				codec: MoqVideoCodec::H264,
+				track: Some("camera".into()),
 				bitrate: None,
 				gop: None,
 				// Software so the test is deterministic everywhere: `Auto` would
@@ -1292,9 +1422,21 @@ async fn video_raw_publish_consume() {
 			},
 		)
 		.unwrap();
+	assert_eq!(video.name().unwrap(), "camera");
+	let local_consumer = broadcast.consume().unwrap();
+	let demand_consumer = local_consumer.subscribe_track("camera".into(), None).await.unwrap();
+	tokio::time::timeout(TIMEOUT, video.used())
+		.await
+		.expect("timed out waiting for video demand")
+		.unwrap();
+	drop(demand_consumer);
+	tokio::time::timeout(TIMEOUT, video.unused())
+		.await
+		.expect("timed out waiting for video demand to clear")
+		.unwrap();
 
-	// The catalog rendition only exists once the importer has parsed the codec
-	// config out of an encoded keyframe, so write before subscribing.
+	// Seed the track before subscribing so the consumer below has encoded media
+	// waiting at the live edge as soon as it joins.
 	video.cut().unwrap();
 	let rgba = vec![0x80u8; 320 * 240 * 4];
 	for i in 0..5u64 {
@@ -1324,7 +1466,7 @@ async fn video_raw_publish_consume() {
 
 	assert_eq!(catalog.video.len(), 1);
 	let (track_name, rendition) = catalog.video.iter().next().unwrap();
-	assert!(track_name.ends_with(".avc3"), "track name: {track_name}");
+	assert_eq!(track_name, "camera");
 	assert!(
 		rendition.codec.starts_with("avc3."),
 		"codec should be avc3, got {}",
@@ -1387,6 +1529,7 @@ async fn video_raw_publish_from_many_threads() {
 			},
 			MoqVideoEncoderOutput {
 				codec: MoqVideoCodec::H264,
+				track: None,
 				// An explicit ceiling so the retunes below stay under the rate the
 				// encoder opened at, which openh264 requires.
 				bitrate: Some(1_000_000),
@@ -1461,6 +1604,7 @@ async fn video_raw_publish_rejects_bad_frames() {
 	};
 	let output = || MoqVideoEncoderOutput {
 		codec: MoqVideoCodec::H264,
+		track: None,
 		bitrate: None,
 		gop: None,
 		kind: MoqVideoEncoderKind::Software,

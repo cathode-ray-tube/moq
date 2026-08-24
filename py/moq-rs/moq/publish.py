@@ -409,6 +409,23 @@ class AudioProducer:
     def __init__(self, inner: MoqAudioProducer) -> None:
         self._inner = inner
 
+    @property
+    def name(self) -> str:
+        """The audio track name."""
+        return self._inner.name()
+
+    async def used(self) -> None:
+        """Wait until this audio track has at least one active subscriber."""
+        await self._inner.used()
+
+    async def unused(self) -> None:
+        """Wait until this audio track has no active subscribers."""
+        await self._inner.unused()
+
+    def reset_epoch(self) -> None:
+        """Re-anchor the timeline to the next frame after an idle gap."""
+        self._inner.reset_epoch()
+
     def write(self, frame: AudioFrame) -> None:
         """Push one frame of PCM in the configured input format."""
         self._inner.write(frame)
@@ -428,6 +445,19 @@ class VideoProducer:
 
     def __init__(self, inner: MoqVideoProducer) -> None:
         self._inner = inner
+
+    @property
+    def name(self) -> str:
+        """The video track name."""
+        return self._inner.name()
+
+    async def used(self) -> None:
+        """Wait until this video track has at least one active subscriber."""
+        await self._inner.used()
+
+    async def unused(self) -> None:
+        """Wait until this video track has no active subscribers."""
+        await self._inner.unused()
 
     def write(self, frame: VideoFrame) -> None:
         """Encode and publish one frame in the configured input format.
@@ -617,10 +647,10 @@ class BroadcastProducer:
     ) -> VideoProducer:
         """Publish a raw-video track with an in-process H.264/H.265 encoder.
 
-        The track is named after the codec (``.avc3`` / ``.hev1``) and its
-        catalog rendition is published immediately, read out of the encoder
-        itself, so subscribers discover it through the catalog rather than a
-        name you pick, and can find it before the first frame exists.
+        Set ``output.track`` to choose the track name; otherwise one is derived
+        from the codec (``.avc3`` / ``.hev1``). The catalog rendition is
+        published immediately so subscribers can discover it before the first
+        frame exists.
         """
         return VideoProducer(self._inner.encode_video(input, output))
 

@@ -117,6 +117,7 @@ video = broadcast.encode_video(
     ),
     moq.VideoEncoderOutput(
         codec=moq.VideoCodec.H264,
+        track="camera",
         kind=moq.VideoEncoderKind.AUTO(),
     ),
 )
@@ -127,7 +128,9 @@ video.finish()
 
 `VideoEncoderKind.AUTO()` prefers a hardware encoder and falls back to software; `SOFTWARE()`, `HARDWARE()`, and `NAMED("videotoolbox")` pin the choice (each variant is a class, so call it). The bindings compile VideoToolbox (macOS), Media Foundation (Windows), NVENC (Linux, NVIDIA), and openh264 (software, everywhere). A hardware encoder that is compiled in but can't open, because there is no GPU or because its driver libraries aren't on the loader path, logs a warning naming the reason and falls through to software, so a host that quietly encodes on the CPU says so. `set_bitrate` retunes the live encoder without forcing a keyframe, cheap enough to drive from a congestion controller.
 
-The track is named after the codec (`.avc3` / `.hev1`) and its catalog rendition is published immediately, read out of the encoder itself, so subscribers discover it through the catalog rather than a name you pick, and can find it before the first frame exists. `cut()` starts a new group at the next frame, which is optional: the encoder keyframes every `gop` frames on its own, and each of those cuts a group.
+Set `track` to choose the track name; omit it to derive one from the codec (`.avc3` / `.hev1`). The catalog rendition is published immediately so subscribers can discover it before the first frame exists. `await video.used()` and `await video.unused()` monitor subscriber demand. Call `cut()` before the first frame after an idle gap so the resumed stream starts with a keyframe in a new group.
+
+Raw audio takes an explicit track name at publish time. Read it back through `audio.name`; `await audio.used()` and `await audio.unused()` monitor subscriber demand so capture and encoding can stay idle when nobody is listening. Call `audio.reset_epoch()` before the first frame after resuming so its timestamp preserves the idle gap.
 
 `decode_video` and `decode_audio` are the mirrors: they run the codec inside the bindings on the way in, so a subscriber gets pixels and PCM without linking one. Video frames arrive as tightly-packed I420 and carry the size they actually decoded to, since `resize` is only best effort:
 

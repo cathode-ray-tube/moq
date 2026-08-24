@@ -26,7 +26,10 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  UNIFFI_BINDGEN_GO_TAG: v0.7.1+v0.31.0
+  # A fork until NordSecurity ships a uniffi 0.32 generator; see flake.nix.
+  # The revision is the commit behind v0.8.0+v0.32.0.
+  UNIFFI_BINDGEN_GO_REPO: https://github.com/kixelated/uniffi-bindgen-go
+  UNIFFI_BINDGEN_GO_REV: 4f79e52bd8f518e5fa4d7acff9e586aee21e12a0
 
 jobs:
   parse-version:
@@ -82,7 +85,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           # Don't let untrusted PR builds populate caches reused by trusted runs.
           save-if: ${{ github.event_name != 'pull_request' }}
@@ -127,7 +130,7 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           # Don't let untrusted PR builds populate caches reused by trusted runs.
           save-if: ${{ github.event_name != 'pull_request' }}
@@ -135,8 +138,8 @@ jobs:
       - name: Install uniffi-bindgen-go
         run: |
           cargo install --locked uniffi-bindgen-go \
-            --git https://github.com/NordSecurity/uniffi-bindgen-go \
-            --tag "$UNIFFI_BINDGEN_GO_TAG"
+            --git "$UNIFFI_BINDGEN_GO_REPO" \
+            --rev "$UNIFFI_BINDGEN_GO_REV"
 
       - name: Generate bindings
         env:

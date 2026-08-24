@@ -35,6 +35,20 @@ use super::rate::{Control, Policy};
 #[cfg(feature = "capture")]
 const DEFAULT_FRAMERATE: u32 = 30;
 
+/// Convert the probed rendition into the importer hint published before the first frame.
+fn rendition_hint(rendition: hang::catalog::VideoConfig) -> moq_mux::catalog::VideoHint {
+	let mut hint = moq_mux::catalog::VideoHint::default();
+	hint.codec = Some(rendition.codec);
+	hint.coded_width = rendition.coded_width;
+	hint.coded_height = rendition.coded_height;
+	hint.display_aspect_width = rendition.display_aspect_width;
+	hint.display_aspect_height = rendition.display_aspect_height;
+	hint.framerate = rendition.framerate;
+	hint.bitrate = rendition.bitrate;
+	hint.optimize_for_latency = rendition.optimize_for_latency;
+	hint
+}
+
 /// Per-codec splitter + importer pair. Each codec frames its packets and resolves
 /// its catalog rendition differently, so the producer holds one of these.
 enum Codecs<E: CatalogExt> {
@@ -79,21 +93,37 @@ impl<E: CatalogExt> Producer<E> {
 		catalog: moq_mux::catalog::Producer<E>,
 		rendition: hang::catalog::VideoConfig,
 	) -> Result<Self, Error> {
+		let suffix = match &rendition.codec {
+			hang::catalog::VideoCodec::H264(_) => ".avc3",
+			hang::catalog::VideoCodec::H265(_) => ".hev1",
+			other => {
+				return Err(Error::Codec(anyhow::anyhow!(
+					"{other} is not a codec this producer can publish"
+				)));
+			}
+		};
+		let track = broadcast.unique_track(suffix, catalog.track_info())?;
+		Self::with_track(track, catalog, rendition)
+	}
+
+	/// Publish `rendition` on an existing track, registering it in `catalog`.
+	///
+	/// Use this when the caller owns the track name. [`new`](Self::new) derives a
+	/// unique name from the codec instead.
+	pub fn with_track(
+		track: moq_net::track::Producer,
+		catalog: moq_mux::catalog::Producer<E>,
+		rendition: hang::catalog::VideoConfig,
+	) -> Result<Self, Error> {
 		let codecs = match &rendition.codec {
-			hang::catalog::VideoCodec::H264(_) => {
-				let track = broadcast.unique_track(".avc3", catalog.track_info())?;
-				Codecs::H264 {
-					split: moq_mux::codec::h264::Split::new(),
-					import: moq_mux::codec::h264::Import::new(track, catalog.reserve(), rendition.into())?,
-				}
-			}
-			hang::catalog::VideoCodec::H265(_) => {
-				let track = broadcast.unique_track(".hev1", catalog.track_info())?;
-				Codecs::H265 {
-					split: moq_mux::codec::h265::Split::new(),
-					import: moq_mux::codec::h265::Import::new(track, catalog.reserve(), rendition.into())?,
-				}
-			}
+			hang::catalog::VideoCodec::H264(_) => Codecs::H264 {
+				split: moq_mux::codec::h264::Split::new(),
+				import: moq_mux::codec::h264::Import::new(track, catalog.reserve(), rendition_hint(rendition))?,
+			},
+			hang::catalog::VideoCodec::H265(_) => Codecs::H265 {
+				split: moq_mux::codec::h265::Split::new(),
+				import: moq_mux::codec::h265::Import::new(track, catalog.reserve(), rendition_hint(rendition))?,
+			},
 			// Unreachable via `Config::probe`, which only encodes what `Codec` covers.
 			other => {
 				return Err(Error::Codec(anyhow::anyhow!(

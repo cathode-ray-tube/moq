@@ -150,8 +150,46 @@ pub struct MoqAudioProducer {
 	inner: std::sync::Mutex<Option<moq_audio::encode::Producer<moq_mux::catalog::hang::Extra>>>,
 }
 
+impl MoqAudioProducer {
+	fn demand(&self) -> Result<moq_net::track::Demand, MoqError> {
+		let guard = self.inner.lock().unwrap();
+		let producer = guard.as_ref().ok_or(MoqError::Closed)?;
+		Ok(producer.track().demand())
+	}
+}
+
 #[uniffi::export]
 impl MoqAudioProducer {
+	/// Return the name of this audio track.
+	pub fn name(&self) -> Result<String, MoqError> {
+		let _guard = crate::ffi::enter();
+		Ok(self.demand()?.name().to_string())
+	}
+
+	/// Wait until this audio track has at least one active consumer.
+	pub async fn used(&self) -> Result<(), MoqError> {
+		let demand = self.demand()?;
+		crate::ffi::detached(async move { demand.used().await }).await
+	}
+
+	/// Wait until this audio track has no active consumers.
+	pub async fn unused(&self) -> Result<(), MoqError> {
+		let demand = self.demand()?;
+		crate::ffi::detached(async move { demand.unused().await }).await
+	}
+
+	/// Re-anchor the timeline to the next frame's timestamp.
+	///
+	/// Call this before writing after an idle gap so the gap remains visible in
+	/// the audio PTS instead of being compressed out by the running sample count.
+	pub fn reset_epoch(&self) -> Result<(), MoqError> {
+		let _guard = crate::ffi::RUNTIME.enter();
+		let mut guard = self.inner.lock().unwrap();
+		let producer = guard.as_mut().ok_or(MoqError::Closed)?;
+		producer.reset_epoch();
+		Ok(())
+	}
+
 	pub fn write(&self, frame: MoqAudioFrame) -> Result<(), MoqError> {
 		let _guard = crate::ffi::RUNTIME.enter();
 		let frame = moq_audio::Frame::try_from(frame)?;
@@ -243,7 +281,13 @@ impl MoqAudioConsumer {
 
 fn audio_config(catalog_audio: crate::media::MoqAudio) -> Result<hang::catalog::AudioConfig, MoqError> {
 	let codec = catalog_audio.codec.parse().map_err(|_| MoqError::Unsupported)?;
-	if !matches!(&codec, hang::catalog::AudioCodec::Opus) {
+	// What moq-audio's decoder opens. It rejects the rest itself, so this is only
+	// here to report an unusable rendition as a plain Unsupported rather than a
+	// wrapped codec error.
+	if !matches!(
+		&codec,
+		hang::catalog::AudioCodec::Opus | hang::catalog::AudioCodec::AAC(_)
+	) {
 		return Err(MoqError::Unsupported);
 	}
 
@@ -260,7 +304,7 @@ impl MoqBroadcastConsumer {
 	/// Subscribe to an audio track. `catalog_audio_config` comes from
 	/// the catalog (see
 	/// [`MoqCatalogConsumer::next`](crate::consumer::MoqCatalogConsumer::next));
-	/// the codec is inferred from it. Only Opus is currently supported.
+	/// the codec is inferred from it. Only Opus and AAC-LC are supported.
 	///
 	/// A rendition whose [`broadcast`](crate::media::MoqAudio::broadcast) names another broadcast
 	/// is subscribed there, so `name` is always read from the broadcast the catalog points at.
@@ -315,8 +359,15 @@ mod tests {
 	}
 
 	#[test]
-	fn audio_config_rejects_non_opus_codec() {
-		let error = audio_config(catalog_audio("mp4a.40.2")).unwrap_err();
+	fn audio_config_accepts_aac() {
+		let config = audio_config(catalog_audio("mp4a.40.2")).unwrap();
+		assert!(matches!(config.codec, hang::catalog::AudioCodec::AAC(_)));
+	}
+
+	#[test]
+	fn audio_config_rejects_a_codec_the_decoder_lacks() {
+		// In the catalog, and decodable in a browser, but not by moq-audio.
+		let error = audio_config(catalog_audio("flac")).unwrap_err();
 		assert!(matches!(error, MoqError::Unsupported));
 	}
 

@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `encode::Producer` carries a rendition's `label` into the catalog. It copied the config into hints
   field by field and had no case for the new field.
+## [0.0.19](https://github.com/moq-dev/moq/compare/moq-video-v0.0.18...moq-video-v0.0.19) - 2026-08-24
+
+### Added
+
+- *(moq-ffi)* expose raw video track demand ([#3013](https://github.com/moq-dev/moq/pull/3013))
 
 ## [0.0.18](https://github.com/moq-dev/moq/compare/moq-video-v0.0.17...moq-video-v0.0.18) - 2026-08-20
 
