@@ -326,13 +326,12 @@ There's a 1-byte STREAM_TYPE at the beginning of each stream.
 
 ### Announce
 A subscriber can open an Announce Stream to discover broadcasts matching a prefix.
-By default only live broadcasts are announced; the subscriber can opt into ended broadcasts too, e.g. to enumerate available recordings (see [ANNOUNCE_REQUEST](#announce-request)).
 
 The subscriber creates the stream with an ANNOUNCE_REQUEST message.
 The publisher replies with a single ANNOUNCE_OK message followed by announcements for any matching broadcasts and any future changes:
 
 - ANNOUNCE_START: a matching broadcast is available.
-- ANNOUNCE_END: a previously started broadcast is no longer available.
+- ANNOUNCE_END: a previously started broadcast is no longer advertised.
 - ANNOUNCE_UPDATE: a previously started advertisement was atomically replaced.
 
 ANNOUNCE_OK carries metadata that applies to every announcement on the stream: the publisher's own `Hop ID` (the implicit trailing entry of every announcement's path) and the number of initial announcements, which lets the subscriber deliver the initial set as a batch (see [ANNOUNCE_OK](#announce-ok)).
@@ -734,17 +733,11 @@ A subscriber sends an ANNOUNCE_REQUEST message to indicate it wants to receive a
 ANNOUNCE_REQUEST Message {
   Message Length (i)
   Broadcast Path Prefix (s),
-  Ended (i),
 }
 ~~~
 
 **Broadcast Path Prefix**:
 Indicate interest for any broadcasts with a path that starts with this prefix.
-
-**Ended**:
-Whether ended broadcasts match this request (see `Ended` in [ANNOUNCE_START](#announce-start)).
-When 0, only live broadcasts are announced; when 1, ended broadcasts are announced too, e.g. to enumerate available recordings.
-Values other than 0 and 1 are a protocol violation.
 
 The publisher MUST respond with an ANNOUNCE_OK message followed by ANNOUNCE_START messages for any matching and available broadcasts, followed by ANNOUNCE_START, ANNOUNCE_END, and ANNOUNCE_UPDATE messages for any future updates, subject to [Routing](#routing).
 Implementations SHOULD consider reasonable limits on the number of matching broadcasts to prevent resource exhaustion.
@@ -788,7 +781,6 @@ ANNOUNCE_START Message {
   Message Length (i)
   Broadcast Path Suffix (s),
   Epoch (i),
-  Ended (i),
   Hop Count (i),
   Hop ID (i) ...,
   Warm Route Cost (i),
@@ -808,14 +800,6 @@ Each new generation MUST use a non-zero Epoch greater than every Epoch still obs
 RECOMMENDED construction: wall-clock milliseconds shifted left 16 bits with the low 16 bits random, clamped to at least one more than the highest observable Epoch; the timestamp preserves ordering across restarts without persisted state, the random bits make accidental collisions improbable, and the clamp covers same-millisecond generations, clock rollback, and skew.
 A violation is not fatal: receivers keep no high-water mark, so an erroneously high Epoch suppresses newer generations only while its advertisement remains available.
 A value of 0 means unspecified: identity falls back to the first entry of the path (see [Routing](#routing)), e.g. when bridging from an endpoint that does not assign Epochs.
-
-**Ended**:
-Whether the broadcast has ended (1) or is live (0).
-An ended broadcast is complete or static content, such as a recording: the publisher MUST reset a new Subscribe Stream for it, and subscribers read its groups via FETCH instead.
-A broadcast ending does not disturb subscriptions already in flight: they conclude normally with SUBSCRIBE_END.
-`Ended` describes the content; retracting the advertisement itself is ANNOUNCE_END, and an ended broadcast may stay advertised indefinitely.
-Ended broadcasts are only advertised on Announce Streams that requested them (see [ANNOUNCE_REQUEST](#announce-request)); on other streams, a broadcast that ends but remains available is retracted with ANNOUNCE_END.
-Values other than 0 and 1 are a protocol violation.
 
 **Hop Count**:
 The number of Hop ID entries that follow, NOT including the publisher's own `Hop ID` from ANNOUNCE_OK.
@@ -876,6 +860,9 @@ The exemptions also compose: should the drain become a disconnection, the route 
 ## ANNOUNCE_END {#announce-end}
 A publisher sends an ANNOUNCE_END message to retract a previously started broadcast, referencing its Announce ID.
 The id is retired and MUST NOT be referenced again.
+Retraction claims nothing about the content: a broadcast that ends but remains readable retracts too, and serves its stored groups over FETCH.
+Retraction does not disturb subscriptions already in flight, which conclude normally with SUBSCRIBE_END.
+How a subscriber learns the path and epoch of stored content is out of band, e.g. an application catalog.
 
 ~~~
 ANNOUNCE_END Message {
@@ -901,11 +888,11 @@ The Hop ID list MAY differ from the original (e.g. after a relay failover or ups
 
 The `Epoch` determines what the update means (see [ANNOUNCE_START](#announce-start)):
 
-- Unchanged (non-zero): the same content over a different route, or a changed `Ended` flag or Route Cost.
+- Unchanged (non-zero): the same content over a different route, or a changed Route Cost.
   Cached TRACK_INFO stays valid (see [Track](#track-stream)) and the subscriber MAY resume in-flight subscriptions at a group boundary.
 - Changed: a different generation occupies the path.
   Cached TRACK_INFO MUST be discarded and existing subscriptions do not carry over.
-  A publisher SHOULD only move to a lower Epoch when the higher generation is gone entirely, e.g. a live broadcast vanished and only an older recording remains.
+  A publisher SHOULD only move to a lower Epoch when the higher generation is gone entirely, e.g. the newer publisher vanished and an older redundant one remains.
 - Both 0: the first entry of the reconstructed path decides instead, a preserved non-zero entry meaning a route change and a changed or zero entry a replacement (0 proves nothing shared).
   The first entry only identifies the publisher, so a restart with new content is indistinguishable from a route change; assigning Epochs is what makes it detectable.
 
@@ -915,7 +902,6 @@ ANNOUNCE_UPDATE Message {
   Message Length (i)
   Announce ID (i),
   Epoch (i),
-  Ended (i),
   Hop Count (i),
   Hop ID (i) ...,
   Warm Route Cost (i),
@@ -930,10 +916,9 @@ Set to 0x2 to indicate an ANNOUNCE_UPDATE message.
 The ordinal implicitly assigned by a prior ANNOUNCE_START on this stream.
 Referencing an id that was never assigned, or one already retired by an ANNOUNCE_END, is a protocol violation.
 
-**Epoch**, **Ended**, **Hop Count**, **Hop ID**, **Warm Route Cost**, and **Cold Route Cost**:
+**Epoch**, **Hop Count**, **Hop ID**, **Warm Route Cost**, and **Cold Route Cost**:
 As defined for [ANNOUNCE_START](#announce-start).
 An update whose only change is a Route Cost is valid: it is how a relay advertises that it started or stopped actively carrying the broadcast.
-An update whose only change is the `Ended` flag is likewise valid: it is how a live broadcast ends into a recording without retiring its Announce ID.
 
 
 ## SUBSCRIBE
@@ -1345,7 +1330,7 @@ The `Message Length` describes the payload size on the wire.
 - ANNOUNCE_END and ANNOUNCE_UPDATE reference the Announce ID instead of repeating the broadcast path.
 - Replaced the duplicate-`active` restart idiom with ANNOUNCE_UPDATE; a second ANNOUNCE_START for an already-available path is now a protocol violation.
 - Added an `Epoch` to ANNOUNCE_START and ANNOUNCE_UPDATE: a per-path content generation minted by the original publisher and forwarded unchanged, 0 meaning unspecified. The highest Epoch wins (non-zero outranks 0) and replacement is decided by value rather than arrival order; equal non-zero Epochs splice, and the first entry of the path remains the identity only when both are 0. That fallback identity requires a non-zero first entry: 0 identifies nothing, so it never proves continuity, and publishers SHOULD assign themselves a Hop ID (a random per-session value suffices).
-- Added an `Ended` flag to ANNOUNCE_START and ANNOUNCE_UPDATE, and as an opt-in filter on ANNOUNCE_REQUEST: ended broadcasts reject SUBSCRIBE, are read via FETCH, and are only announced to subscribers that asked for them.
+- Stated the ended-broadcast lifecycle without a flag: a broadcast that ends but remains readable is retracted with ANNOUNCE_END, which never disturbs in-flight subscriptions, and its stored groups are read over FETCH, discovered out of band.
 - Added an `Epoch` to SUBSCRIBE, FETCH, and TRACK (0 = current, mismatch = reset) and the resolved `Epoch` to TRACK_INFO, so metadata and groups always come from the same generation and requests cannot race a replacement.
 - Added `Warm Route Cost` and `Cold Route Cost` fields to ANNOUNCE_START and ANNOUNCE_UPDATE: the same path priced against two cache states. Warm is the accumulated cost of the transfers a subscription via this advertisement would newly cause, and is what route selection minimizes; Cold prices the path as if nothing along it were carrying, and breaks a Warm tie before path length, with the most recently received advertisement below that. Only Warm takes the actively-carrying discount, so Cold still ranks two relays that both advertise 0, and a relay adopts another carrying relay only when that relay's `(Cold cost, hash)` rank is strictly lower. A wire that cannot express Cold is read as the saturation ceiling, not as 0.
 - Added a SETUP `Cost` parameter (0x4) declaring what subscribing from the sender costs, added by the receiver to every announcement that sender forwards. Both endpoints send their own, so the two directions are priced independently, and a receiver MAY charge a locally configured value instead. Unpriced directions default to 1, degrading to shortest-path routing.
