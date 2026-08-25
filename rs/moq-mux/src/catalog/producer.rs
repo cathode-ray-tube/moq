@@ -258,6 +258,7 @@ impl<E: CatalogExt> Producer<E> {
 		let hangz = moq_json::snapshot::Producer::new(hangz_track, json_config);
 
 		let timeline = crate::timeline::Producer::new(broadcast, crate::timeline::Config::default());
+		#[allow(clippy::arc_with_non_send_sync)]
 		let catalog_timeline = Arc::new(Mutex::new(CatalogTimeline {
 			recorder: timeline.track(hang::Catalog::DEFAULT_NAME),
 			last_sequence: None,
@@ -333,6 +334,7 @@ impl<E: CatalogExt> Producer<E> {
 	/// Call it before any track enrolls (the timeline's own track doesn't exist until then, so
 	/// this replaces it wholesale); afterwards the pacing is fixed for the broadcast, since the
 	/// catalog has advertised what it promises.
+	#[allow(clippy::arc_with_non_send_sync)]
 	pub fn with_timeline(mut self, broadcast: &moq_net::broadcast::Producer, config: crate::timeline::Config) -> Self {
 		self.timeline = crate::timeline::Producer::new(broadcast, config);
 		self.outputs.catalog_timeline = Arc::new(Mutex::new(CatalogTimeline {

@@ -625,14 +625,17 @@ A broadcast with no timeline has no segments and cannot be recorded this way.
 A recording is a set of objects under a common prefix:
 
 ~~~
+<prefix>/.complete
 <prefix>/.timeline
 <prefix>/<track>/.track
 <prefix>/<track>/<segment>
 ~~~
 
+The common prefix is application-defined and is not interpreted by this format.
+
 `<track>` is the track's name with every byte outside `A-Z a-z 0-9 _ -` percent-encoded as `%` followed by two uppercase hexadecimal digits.
 For example, `catalog.json` becomes `catalog%2Ejson`.
-An encoded name therefore never contains `/` and never begins with `.`, so a track can neither collide with the reserved `.timeline` name nor address anything outside the prefix.
+An encoded name therefore never contains `/` and never begins with `.`, so a track can neither collide with the reserved `.complete` and `.timeline` names nor address anything outside the prefix.
 
 `.track` stores the immutable properties of its parent track ({{recording-track}}).
 The name is reserved within an encoded track directory and cannot collide with a decimal segment number.
@@ -733,8 +736,9 @@ A group that arrives after its segment object has been written is not recorded.
 A writer SHOULD wait for the segment to be complete rather than write early, and MAY bound that wait so a track that has stopped without closing cannot stall the recording indefinitely.
 This is a deliberate trade: addressing content by segment is what makes a segment retrievable in one request, and it costs the ability to append a late group to an object already written.
 
-A writer SHOULD record the broadcast's final state on a clean end, so a reader can distinguish an ended recording from one whose writer died.
-Once ended, every object in the recording is immutable.
+On a clean end, the writer MUST make the final track objects, segment objects, and timeline durable before creating an empty `.complete` object as its last write.
+It MUST NOT create `.complete` when finalization fails.
+The marker is immutable; its presence distinguishes a clean end, while its absence means the recording is live or was interrupted.
 
 ## Retention {#recording-retention}
 A recording has one of two retention modes:
@@ -754,10 +758,10 @@ Relay cache eviction does not change the recording timeline.
 Reading segment N of track T is: resolve T's object name from N, GET it, and parse the groups.
 Nothing on that path reads media the consumer did not ask for, and nothing requires a second request.
 
-Segment objects and track objects are immutable and SHOULD be served with long-lived caching.
+Segment objects, track objects, and `.complete` are immutable and SHOULD be served with long-lived caching.
 `.timeline` changes while the recording is live and SHOULD be served with a short lifetime and an entity validator.
-All objects in an unbounded recording become immutable once the recording has ended.
-A bounded recording's timeline can continue to change while retention is active.
+An unbounded recording's timeline becomes immutable when `.complete` exists.
+A bounded recording's timeline can continue to change while retention is active, even after `.complete` exists.
 
 A reader MAY serve moq-lite FETCH from a recording.
 Given a group, the timeline record whose range covers it names the segment; the object's group headers locate the group within it; and its frames are the FETCH response body unchanged.
