@@ -58,6 +58,67 @@ struct Reservations {
 	published: bool,
 }
 
+/// The built-in catalog's enrollment in the broadcast timeline.
+struct CatalogTimeline {
+	recorder: crate::timeline::Recorder,
+	last_sequence: Option<u64>,
+}
+
+impl CatalogTimeline {
+	/// Report a newly published plaintext catalog group once.
+	fn record(&mut self, track: &moq_net::track::Producer) {
+		let Some(sequence) = track.latest() else {
+			return;
+		};
+		if self.last_sequence == Some(sequence) {
+			return;
+		}
+
+		self.last_sequence = Some(sequence);
+		self.recorder.record(sequence, moq_net::Timestamp::now(), true);
+	}
+}
+
+/// The catalog tracks and the timeline enrollment updated with them.
+struct Outputs<E: CatalogExt> {
+	hang: moq_json::snapshot::Producer<Catalog<E>>,
+	hang_track: moq_net::track::Producer,
+	hangz: moq_json::snapshot::Producer<Catalog<E>>,
+	msf_track: moq_net::track::Producer,
+	catalog_timeline: Arc<Mutex<CatalogTimeline>>,
+}
+
+impl<E: CatalogExt> Clone for Outputs<E> {
+	fn clone(&self) -> Self {
+		Self {
+			hang: self.hang.clone(),
+			hang_track: self.hang_track.clone(),
+			hangz: self.hangz.clone(),
+			msf_track: self.msf_track.clone(),
+			catalog_timeline: self.catalog_timeline.clone(),
+		}
+	}
+}
+
+impl<E: CatalogExt> Outputs<E> {
+	/// Emit the catalog to hang, compressed hang, MSF, and the broadcast timeline.
+	fn emit(&mut self, catalog: &Catalog<E>) -> crate::Result<()> {
+		// One snapshot per group while deltas are disabled; the `.z` track carries the identical catalog.
+		self.hang.update(catalog)?;
+		self.catalog_timeline.lock().unwrap().record(&self.hang_track);
+		self.hangz.update(catalog)?;
+
+		// The MSF catalog is derived from our own types, so a serialize failure means an extension broke
+		// the shape; report it like any other JSON failure rather than panicking.
+		let msf = to_msf(&catalog.media()).to_json().map_err(moq_json::Error::from)?;
+		let mut group = self.msf_track.append_group()?;
+		group.write_frame(moq_net::Timestamp::now(), msf)?;
+		group.finish()?;
+
+		Ok(())
+	}
+}
+
 /// Produces both a hang and MSF catalog track for a broadcast.
 ///
 /// Generic over the application extension `E` (defaulting to `()` for none). The catalog is a
@@ -74,9 +135,7 @@ struct Reservations {
 /// group (deltas disabled). This routes catalog publishing through the JSON merge-patch helper
 /// so deltas can be enabled later without changing the wire format used today.
 pub struct Producer<E: CatalogExt = ()> {
-	hang: moq_json::snapshot::Producer<Catalog<E>>,
-	hangz: moq_json::snapshot::Producer<Catalog<E>>,
-	msf_track: moq_net::track::Producer,
+	outputs: Outputs<E>,
 
 	current: Arc<Mutex<State<E>>>,
 
@@ -89,7 +148,6 @@ pub struct Producer<E: CatalogExt = ()> {
 	/// onto, and the track those segment records are published on. See
 	/// [`timeline`](Self::timeline).
 	timeline: crate::timeline::Producer,
-
 	/// Retention override for the media tracks minted under this catalog, or `None` to keep
 	/// hang's default. Fixed at construction, so every clone and every
 	/// [`Reserved`](super::Reserved) mints tracks under one policy. See
@@ -101,9 +159,7 @@ pub struct Producer<E: CatalogExt = ()> {
 impl<E: CatalogExt> Clone for Producer<E> {
 	fn clone(&self) -> Self {
 		Self {
-			hang: self.hang.clone(),
-			hangz: self.hangz.clone(),
-			msf_track: self.msf_track.clone(),
+			outputs: self.outputs.clone(),
 			current: self.current.clone(),
 			clock: self.clock,
 			timeline: self.timeline.clone(),
@@ -194,28 +250,39 @@ impl<E: CatalogExt> Producer<E> {
 		// Disable deltas for now to stay byte-compatible with consumers that only read snapshots.
 		let mut json_config = moq_json::snapshot::ProducerConfig::default();
 		json_config.delta_ratio = 0;
-		let hang = moq_json::snapshot::Producer::new(hang_track, json_config.clone());
+		let hang = moq_json::snapshot::Producer::new(hang_track.clone(), json_config.clone());
 
 		// The `.z` track carries the same catalog, DEFLATE-compressed. Deltas stay off for parity
 		// with the plaintext track; only the per-group compression differs.
 		json_config.compression = true;
 		let hangz = moq_json::snapshot::Producer::new(hangz_track, json_config);
 
+		let timeline = crate::timeline::Producer::new(broadcast, crate::timeline::Config::default());
+		#[allow(clippy::arc_with_non_send_sync)]
+		let catalog_timeline = Arc::new(Mutex::new(CatalogTimeline {
+			recorder: timeline.track(hang::Catalog::DEFAULT_NAME),
+			last_sequence: None,
+		}));
+
 		// The contents are `Send + Sync` natively; on wasm moq-net's handles are
 		// `Rc`-backed, so clippy sees a pointlessly atomic `Arc`. Keeping one type for
 		// both targets is worth the unused atomics on the single-threaded one.
 		#[allow(clippy::arc_with_non_send_sync)]
 		Ok(Self {
-			hang,
-			hangz,
-			msf_track,
+			outputs: Outputs {
+				hang,
+				hang_track,
+				hangz,
+				msf_track,
+				catalog_timeline,
+			},
 			current: Arc::new(Mutex::new(State {
 				catalog: config.catalog,
 				owned: BTreeSet::new(),
 				reservations: Reservations::default(),
 			})),
 			clock: crate::Clock::new(),
-			timeline: crate::timeline::Producer::new(broadcast, crate::timeline::Config::default()),
+			timeline,
 			max_age: config.max_age,
 		})
 	}
@@ -252,9 +319,7 @@ impl<E: CatalogExt> Producer<E> {
 	pub fn lock(&mut self) -> Guard<'_, E> {
 		Guard {
 			state: take(&self.current),
-			hang: &mut self.hang,
-			hangz: &mut self.hangz,
-			msf_track: &mut self.msf_track,
+			outputs: &mut self.outputs,
 			updated: false,
 		}
 	}
@@ -269,8 +334,13 @@ impl<E: CatalogExt> Producer<E> {
 	/// Call it before any track enrolls (the timeline's own track doesn't exist until then, so
 	/// this replaces it wholesale); afterwards the pacing is fixed for the broadcast, since the
 	/// catalog has advertised what it promises.
+	#[allow(clippy::arc_with_non_send_sync)]
 	pub fn with_timeline(mut self, broadcast: &moq_net::broadcast::Producer, config: crate::timeline::Config) -> Self {
 		self.timeline = crate::timeline::Producer::new(broadcast, config);
+		self.outputs.catalog_timeline = Arc::new(Mutex::new(CatalogTimeline {
+			recorder: self.timeline.track(hang::Catalog::DEFAULT_NAME),
+			last_sequence: None,
+		}));
 		self
 	}
 
@@ -336,7 +406,7 @@ impl<E: CatalogExt> Producer<E> {
 			r.published = true;
 			state.catalog.clone()
 		};
-		if let Err(err) = emit(&mut self.hang, &mut self.hangz, &mut self.msf_track, &catalog) {
+		if let Err(err) = self.outputs.emit(&catalog) {
 			tracing::warn!(%err, "failed to publish the catalog");
 		}
 	}
@@ -363,7 +433,7 @@ impl<E: CatalogExt> Producer<E> {
 	/// that isn't built through a [`container::Producer`](crate::container::Producer) (an fMP4
 	/// passthrough writing groups by hand).
 	pub fn enroll(&mut self, track: &str) -> crate::Result<crate::timeline::Recorder> {
-		let recorder = self.timeline.track(track)?;
+		let recorder = self.timeline.pacing_track(track)?;
 
 		let section = self.timeline.section();
 		let mut catalog = self.lock();
@@ -388,14 +458,14 @@ impl<E: CatalogExt> Producer<E> {
 
 	/// Create a consumer for this catalog, receiving updates as they're published.
 	pub fn consume(&self) -> Result<Consumer<E>, moq_net::Error> {
-		Ok(Consumer::new(self.hang.consume()))
+		Ok(Consumer::new(self.outputs.hang.consume()))
 	}
 
 	/// Finish publishing to this catalog.
 	pub fn finish(&mut self) -> crate::Result<()> {
-		self.hang.finish()?;
-		self.hangz.finish()?;
-		self.msf_track.finish()?;
+		self.outputs.hang.finish()?;
+		self.outputs.hangz.finish()?;
+		self.outputs.msf_track.finish()?;
 		self.timeline.finish()?;
 		Ok(())
 	}
@@ -411,9 +481,7 @@ impl<E: CatalogExt> Producer<E> {
 /// logs a warning; call [`commit`](Self::commit) instead to handle the error.
 pub struct Guard<'a, E: CatalogExt = ()> {
 	state: MutexGuard<'a, State<E>>,
-	hang: &'a mut moq_json::snapshot::Producer<Catalog<E>>,
-	hangz: &'a mut moq_json::snapshot::Producer<Catalog<E>>,
-	msf_track: &'a mut moq_net::track::Producer,
+	outputs: &'a mut Outputs<E>,
 	updated: bool,
 }
 
@@ -445,7 +513,7 @@ impl<E: CatalogExt> Guard<'_, E> {
 			r.published = true;
 		}
 
-		emit(self.hang, self.hangz, self.msf_track, &self.state.catalog)
+		self.outputs.emit(&self.state.catalog)
 	}
 
 	/// Release a name taken by [`Producer::acquire`], along with the entry it owns.
@@ -510,28 +578,6 @@ impl<E: CatalogExt> Drop for Guard<'_, E> {
 			tracing::warn!(%err, "failed to publish the catalog on guard drop");
 		}
 	}
-}
-
-/// Emit the catalog to all tracks: hang (`catalog.json`), its DEFLATE-compressed `.z` sibling, and
-/// the MSF catalog (`catalog`) derived from the base media sections.
-fn emit<E: CatalogExt>(
-	hang: &mut moq_json::snapshot::Producer<Catalog<E>>,
-	hangz: &mut moq_json::snapshot::Producer<Catalog<E>>,
-	msf_track: &mut moq_net::track::Producer,
-	catalog: &Catalog<E>,
-) -> crate::Result<()> {
-	// One snapshot per group while deltas are disabled; the `.z` track carries the identical catalog.
-	hang.update(catalog)?;
-	hangz.update(catalog)?;
-
-	// The MSF catalog is derived from our own types, so a serialize failure means an extension broke
-	// the shape; report it like any other JSON failure rather than panicking.
-	let msf = to_msf(&catalog.media()).to_json().map_err(moq_json::Error::from)?;
-	let mut group = msf_track.append_group()?;
-	group.write_frame(moq_net::Timestamp::now(), msf)?;
-	group.finish()?;
-
-	Ok(())
 }
 
 /// Determine the SAP starting type for a given video codec.
@@ -689,8 +735,8 @@ mod test {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let mut catalog = Producer::new(&mut broadcast).unwrap();
 
-		let mut plain = Consumer::new(catalog.hang.consume());
-		let mut compressed = Consumer::compressed(catalog.hangz.consume());
+		let mut plain = Consumer::new(catalog.outputs.hang.consume());
+		let mut compressed = Consumer::compressed(catalog.outputs.hangz.consume());
 
 		{
 			let mut guard = catalog.lock();
@@ -735,7 +781,7 @@ mod test {
 	fn commit_publishes_once() {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let mut catalog = Producer::new(&mut broadcast).unwrap();
-		let track = catalog.hang.consume();
+		let track = catalog.outputs.hang.consume();
 
 		let mut guard = catalog.lock();
 		guard
@@ -793,7 +839,7 @@ mod test {
 	fn reservation_gates_until_all_renditions_resolve() {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let catalog = Producer::new(&mut broadcast).unwrap();
-		let mut consumer: Consumer = Consumer::new(catalog.hang.consume());
+		let mut consumer: Consumer = Consumer::new(catalog.outputs.hang.consume());
 		let waiter = kio::Waiter::noop();
 
 		let reserved = catalog.reserve();
@@ -828,7 +874,7 @@ mod test {
 	fn reservation_gate_opens_when_unresolved_reservation_is_dropped() {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let catalog = Producer::new(&mut broadcast).unwrap();
-		let mut consumer: Consumer = Consumer::new(catalog.hang.consume());
+		let mut consumer: Consumer = Consumer::new(catalog.outputs.hang.consume());
 		let waiter = kio::Waiter::noop();
 
 		let reserved = catalog.reserve();
@@ -856,7 +902,7 @@ mod test {
 	fn staged_change_waits_for_a_held_reservation() {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let catalog = Producer::new(&mut broadcast).unwrap();
-		let mut consumer: Consumer = Consumer::new(catalog.hang.consume());
+		let mut consumer: Consumer = Consumer::new(catalog.outputs.hang.consume());
 		let waiter = kio::Waiter::noop();
 
 		// A deferred importer grabs a reservation up front and holds it until it can resolve.
