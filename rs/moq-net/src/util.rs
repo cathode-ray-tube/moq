@@ -3,7 +3,7 @@
 //! Native transports (Quinn) are `Send`, so boxed futures and tasks carry the
 //! `Send` bound. Browser WebTransport is `!Send`, so on wasm we box without it.
 //! `MaybeSendBox` / `MaybeSendTask` resolve to the right form per target, and
-//! `.maybe_boxed()` / [`poll_task`] pick the matching constructor.
+//! `.maybe_boxed()` / `future_task` pick the matching constructor.
 
 use std::{collections::VecDeque, future::Future, pin::Pin, task::Poll};
 
@@ -35,17 +35,6 @@ pub(crate) trait MaybeBoxedExt<'a>: Future + Sized + 'a {
 }
 #[cfg(target_family = "wasm")]
 impl<'a, F: Future + 'a> MaybeBoxedExt<'a> for F {}
-
-/// Box a poll closure into a [`MaybeSendTask`], for pushing a hand-rolled
-/// machine into a [`kio::Tasks`] stored behind the type-erased alias.
-#[cfg(not(target_family = "wasm"))]
-pub(crate) fn poll_task(task: impl FnMut(&kio::Waiter) -> Poll<()> + Send + 'static) -> MaybeSendTask {
-	Box::new(task)
-}
-#[cfg(target_family = "wasm")]
-pub(crate) fn poll_task(task: impl FnMut(&kio::Waiter) -> Poll<()> + 'static) -> MaybeSendTask {
-	Box::new(task)
-}
 
 /// Adapt a boxed future into a [`kio::Tasks`] task.
 fn future_task(mut task: MaybeSendBox<'static, ()>) -> MaybeSendTask {
