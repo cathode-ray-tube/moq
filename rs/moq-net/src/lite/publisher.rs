@@ -78,10 +78,10 @@ struct Shared<S: crate::transport::poll::Session> {
 	// peer from a source whose chain excludes them, keeping the data plane on
 	// the same split-horizon rule as the announces we send them.
 	peer_setup: super::PeerSetup,
-	// The identity assigned to the peer by `Client::with_peer_origin`, standing
-	// in wherever the peer declines to declare one. The data-plane half (serving
-	// from a chain that excludes it) is applied by the client on the origin
-	// handle itself; here it only backs the announce filter.
+	// The identity assigned to the peer by the caller (`Client::with_peer_origin`, or
+	// the per-session default a server hands every request), standing in wherever the
+	// peer declines to declare one. Backs both the announce filter and the serving
+	// origin, so a peer that names itself nowhere on the wire is still split-horizoned.
 	peer_origin: Option<Origin>,
 	// The excluded origin handle, resolved once: the peer sends exactly one
 	// SETUP, so its declared id never changes for the session.
@@ -110,23 +110,25 @@ fn serving_max_age(version: Version, requested: Duration) -> Duration {
 
 impl<S: crate::transport::poll::Session> Shared<S> {
 	/// The origin to resolve a peer-requested broadcast from: excludes routes
-	/// through the peer when its SETUP declared an origin id, so a subscription
-	/// is never served data that flowed through the subscriber. The first call
-	/// waits for the peer's SETUP (sent at startup on every lite-05+ session,
-	/// well before it could learn of anything to subscribe to); the result is
-	/// cached, since the peer sends exactly one SETUP per session.
+	/// through the peer, so a subscription is never served data that flowed
+	/// through the subscriber. The identity is the one the peer declared in its
+	/// SETUP, or the one the caller assigned it when it declared none, the same
+	/// order the announce filter applies. The first call waits for the peer's
+	/// SETUP (sent at startup on every lite-05+ session, well before it could
+	/// learn of anything to subscribe to); the result is cached, since the peer
+	/// sends exactly one SETUP per session.
 	fn poll_serving_origin(&self, waiter: &kio::Waiter) -> Poll<origin::Consumer> {
 		if let Some(origin) = self.serving.get() {
 			return Poll::Ready(origin.clone());
 		}
-		// Pre-SETUP versions never declare an id; there is nothing to exclude.
-		let origin = if !self.version.has_setup_stream() {
-			self.origin.clone()
-		} else {
-			match ready!(self.peer_setup.poll_origin(waiter)) {
-				Some(peer) => self.origin.clone().excluding(peer),
-				None => self.origin.clone(),
-			}
+		// Pre-SETUP versions never declare an id, so only the assigned one applies.
+		let declared = match self.version.has_setup_stream() {
+			true => ready!(self.peer_setup.poll_origin(waiter)),
+			false => None,
+		};
+		let origin = match declared.or(self.peer_origin) {
+			Some(peer) => self.origin.clone().excluding(peer),
+			None => self.origin.clone(),
 		};
 		// A concurrent first resolution may have won the race; either value is
 		// identical, so keep whichever landed.
@@ -3588,6 +3590,65 @@ mod tests {
 
 	/// The tokio-backed test runtime, matching the fake transport.
 	type TestRuntime = crate::runtime::tokio_test::Tokio<SinkSession>;
+
+	/// A peer that declares no origin in its SETUP is split-horizoned by the identity
+	/// the caller assigned it, on the data plane and not just the announce filter.
+	/// Otherwise it can subscribe its way back to content that already flowed through
+	/// it, which is the loop the announce filter exists to prevent.
+	#[tokio::test(start_paused = true)]
+	async fn serving_origin_falls_back_to_the_assigned_identity() {
+		let assigned = crate::Origin::new(777).unwrap();
+		let upstream = crate::Origin::new(778).unwrap();
+		let origin = crate::origin::Info::new(crate::Origin::new(1).unwrap()).produce();
+
+		let mut echoed_hops = OriginList::new();
+		echoed_hops.push(assigned).unwrap();
+		let _echoed = origin
+			.create_broadcast(
+				"echoed",
+				crate::broadcast::Route::new()
+					.with_hops(echoed_hops)
+					.with_announce(true),
+			)
+			.unwrap();
+
+		let mut local_hops = OriginList::new();
+		local_hops.push(upstream).unwrap();
+		let _local = origin
+			.create_broadcast(
+				"local",
+				crate::broadcast::Route::new().with_hops(local_hops).with_announce(true),
+			)
+			.unwrap();
+
+		// Broadcast visibility is deferred until the executor ticks.
+		tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+		// A SETUP that declares no origin of its own, so only the assigned one applies.
+		let peer_setup = crate::lite::PeerSetup::default();
+		peer_setup.set(crate::lite::Setup::default());
+		let (_, goaway) = crate::goaway::Handle::new(true);
+
+		let publisher = Publisher::new(PublisherConfig {
+			runtime: TestRuntime::new(),
+			session: SinkSession::new(Default::default()),
+			origin: origin.consume(),
+			version: Version::Lite06Wip,
+			peer_setup,
+			goaway,
+			peer_origin: Some(assigned),
+		});
+
+		let serving = kio::wait(|waiter| publisher.shared.poll_serving_origin(waiter)).await;
+		assert!(
+			serving.get_broadcast("echoed").is_none(),
+			"served the peer its own route"
+		);
+		assert!(
+			serving.get_broadcast("local").is_some(),
+			"withheld an independent route"
+		);
+	}
 
 	/// Lite01/02 send the initial active set as ANNOUNCE_INIT. It must apply the
 	/// same per-peer route selection as the live loop: a broadcast whose only
