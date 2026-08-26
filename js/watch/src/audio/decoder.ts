@@ -9,7 +9,7 @@ import { subscribeMedia } from "../media";
 
 import type { Sync } from "../sync";
 import { type AudioBuffer, createAudioBuffer } from "./buffer";
-import { reanchorFloor } from "./latency";
+import { reanchorFloor, ringSamples } from "./latency";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
 import RenderWorklet from "./render-worklet.ts?worklet";
 import type { Source } from "./source";
@@ -20,6 +20,7 @@ import { Warmup } from "./warmup";
 // How long the latency target must hold steady before a floor increase re-anchors. Coalesces a
 // slider drag (many small steps) into a single re-anchor once the user settles on a value.
 const LATENCY_REANCHOR_DEBOUNCE_MS = 150;
+
 const LEGACY_WARMUP_CALLBACKS = 3;
 
 export type DecoderInput = {
@@ -177,7 +178,7 @@ export class Decoder {
 
 			// Initial target latency in samples.
 			const latency = this.sync.out.buffer.peek();
-			const latencySamples = Math.ceil(sampleRate * Time.Second.fromMilli(latency));
+			const latencySamples = ringSamples(sampleRate, latency);
 			const buffered = this.sync.out.buffered.peek();
 
 			// Let the factory pick the best transport (SharedArrayBuffer or postMessage).
@@ -225,8 +226,7 @@ export class Decoder {
 		if (!ring) return;
 
 		const latency = effect.get(this.sync.out.buffer);
-		const latencySamples = Math.ceil(ring.rate * Time.Second.fromMilli(latency));
-		ring.setLatency(latencySamples);
+		ring.setLatency(ringSamples(ring.rate, latency));
 	}
 
 	// Re-anchor when the latency floor *increases*. A larger floor needs a deeper cushion: video
