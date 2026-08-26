@@ -4,14 +4,14 @@
 //! half, which is the only part specific to the relay. Unset (the default) keeps
 //! QUIC on the shared runtime with everything else.
 
-use clap::Args;
 use serde::{Deserialize, Serialize};
 
 /// How the relay lays its QUIC work out over threads.
-#[derive(Args, Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(usage::Args, Clone, Debug, Deserialize, Serialize)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
-#[group(id = "runtime-config")]
+#[derive(Default)]
 pub struct RuntimeConfig {
 	/// Serve QUIC from this many single-threaded workers instead of the shared
 	/// runtime, each pinned to a core with its own socket on the listen address.
@@ -21,7 +21,7 @@ pub struct RuntimeConfig {
 	/// Linux-only, and mutually exclusive with `--listen-tls-generate`, since
 	/// each worker would otherwise generate and serve a certificate of its own.
 	/// Unset (the default) keeps QUIC on the shared runtime.
-	#[arg(long = "runtime-workers", env = "MOQ_RUNTIME_WORKERS")]
+	#[usage(long = "runtime-workers", env = "MOQ_RUNTIME_WORKERS")]
 	pub workers: Option<u16>,
 
 	/// Pin each worker to a CPU core, defaulting to on.
@@ -32,7 +32,17 @@ pub struct RuntimeConfig {
 	/// scheduler migrating a busy worker, which should matter on a multi-socket
 	/// or NUMA machine, and costs nothing elsewhere. Turn it off when sharing
 	/// the machine with something that manages CPU placement itself.
-	#[arg(long = "runtime-pin", env = "MOQ_RUNTIME_PIN")]
+	///
+	/// `Option` rather than a Usage `default`, which a config file could not
+	/// override: Usage reads a standing `false` as an empty boolean, so the
+	/// re-parse over the CLI args would refill it with the declared `true`.
+	#[usage(
+		long = "runtime-pin",
+		env = "MOQ_RUNTIME_PIN",
+		default_missing = "true",
+		num_args = 0..=1,
+		require_equals = true,
+	)]
 	pub pin: Option<bool>,
 }
 

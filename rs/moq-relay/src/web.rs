@@ -21,7 +21,6 @@ use axum_server::{
 	tls_rustls::{RustlsAcceptor, RustlsConfig},
 };
 use bytes::Bytes;
-use clap::Parser;
 use futures::{FutureExt, future::BoxFuture};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::server::TlsStream;
@@ -31,53 +30,79 @@ use tower_service::Service;
 use crate::{Auth, AuthParams, Cluster};
 
 /// Configuration for the HTTP/HTTPS web server.
-#[derive(Parser, Clone, Debug, serde::Deserialize, serde::Serialize, Default)]
+#[derive(usage::Args, Clone, Debug, serde::Deserialize, serde::Serialize, Default)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 #[serde(deny_unknown_fields, default)]
 #[non_exhaustive]
 pub struct WebConfig {
 	/// Plain HTTP listener settings.
-	#[command(flatten)]
+	#[usage(flatten)]
 	#[serde(default)]
 	pub http: HttpConfig,
 
 	/// HTTPS listener settings with TLS.
-	#[command(flatten)]
+	#[usage(flatten)]
 	#[serde(default)]
 	pub https: HttpsConfig,
 
 	/// If true (default), expose a WebTransport compatible WebSocket polyfill.
-	#[arg(long = "web-ws", env = "MOQ_WEB_WS", default_value = "true")]
-	#[serde(default = "default_true")]
-	pub ws: bool,
+	///
+	/// `Option` with the default resolved by [`Self::resolved_ws`] rather than a
+	/// Usage `default`, which a config file could not override: Usage reads a
+	/// standing `false` as an empty boolean, so the re-parse over the CLI args
+	/// would refill it with the declared `true`.
+	#[usage(
+		long = "web-ws",
+		env = "MOQ_WEB_WS",
+		default_missing = "true",
+		num_args = 0..=1,
+		require_equals = true,
+	)]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub ws: Option<bool>,
+}
+
+impl WebConfig {
+	/// Whether the WebSocket polyfill is served, resolving the default.
+	pub fn resolved_ws(&self) -> bool {
+		self.ws.unwrap_or(true)
+	}
 }
 
 /// Plain HTTP listener configuration.
-#[derive(clap::Args, Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(usage::Args, Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 #[serde(deny_unknown_fields, default)]
 #[non_exhaustive]
 pub struct HttpConfig {
 	/// Socket address to bind the HTTP listener to.
-	#[arg(long = "web-http-listen", id = "http-listen", env = "MOQ_WEB_HTTP_LISTEN")]
+	#[usage(long = "web-http-listen", name = "http-listen", env = "MOQ_WEB_HTTP_LISTEN")]
 	pub listen: Option<net::SocketAddr>,
 }
 
 /// HTTPS listener configuration with TLS certificates and keys.
 #[serde_with::serde_as]
-#[derive(clap::Args, Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(usage::Args, Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 #[serde(deny_unknown_fields, default)]
 #[non_exhaustive]
 pub struct HttpsConfig {
 	/// Socket address to bind the HTTPS listener to.
-	#[arg(long = "web-https-listen", id = "web-https-listen", env = "MOQ_WEB_HTTPS_LISTEN", requires_all = ["web-https-cert", "web-https-key"])]
+	#[usage(
+		long = "web-https-listen",
+		name = "web-https-listen",
+		env = "MOQ_WEB_HTTPS_LISTEN",
+		requires("--web-https-cert", "--web-https-key")
+	)]
 	pub listen: Option<net::SocketAddr>,
 
 	/// Load the given certificate chain files from disk.
 	///
 	/// In config files, accepts either a single string or a TOML array.
-	#[arg(
+	#[usage(
 		long = "web-https-cert",
-		id = "web-https-cert",
-		value_delimiter = ',',
+		name = "web-https-cert",
+		delimiter = ',',
 		env = "MOQ_WEB_HTTPS_CERT"
 	)]
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -88,10 +113,10 @@ pub struct HttpsConfig {
 	///
 	/// Each key is paired with the certificate chain at the same index.
 	/// In config files, accepts either a single string or a TOML array.
-	#[arg(
+	#[usage(
 		long = "web-https-key",
-		id = "web-https-key",
-		value_delimiter = ',',
+		name = "web-https-key",
+		delimiter = ',',
 		env = "MOQ_WEB_HTTPS_KEY"
 	)]
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -107,10 +132,10 @@ pub struct HttpsConfig {
 	/// JWT path.
 	///
 	/// In config files, accepts either a single string or a TOML array.
-	#[arg(
+	#[usage(
 		long = "web-https-root",
-		id = "web-https-root",
-		value_delimiter = ',',
+		name = "web-https-root",
+		delimiter = ',',
 		env = "MOQ_WEB_HTTPS_ROOT"
 	)]
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -229,7 +254,7 @@ impl Web {
 		// through to the landing page, and the client's WS fallback is silently
 		// dead.
 		#[cfg(feature = "websocket")]
-		let app = if self.config.ws {
+		let app = if self.config.resolved_ws() {
 			app.route("/", axum::routing::any(crate::websocket::serve_ws))
 				.route("/{*path}", axum::routing::any(crate::websocket::serve_ws))
 		} else {
@@ -258,8 +283,9 @@ impl Web {
 			let listener = moq_tokio::bind::tcp(listen).context("failed to bind HTTP listener")?;
 			// Same socket capture the HTTPS path gets from `MtlsAcceptor`: without it
 			// a `ws://` session reaches qmux with no descriptor and reports no RTT.
-			let server =
-				crate::listener::server(listener, self.health.clone())?.acceptor(SocketAcceptor { ws: config.ws });
+			let server = crate::listener::server(listener, self.health.clone())?.acceptor(SocketAcceptor {
+				ws: config.resolved_ws(),
+			});
 			Some(server.serve(app.clone()))
 		} else {
 			None
@@ -281,7 +307,7 @@ impl Web {
 			// a near-no-op, but keeping a single path simplifies reload + serve.
 			let acceptor = MtlsAcceptor {
 				inner: RustlsAcceptor::new(rustls_config),
-				ws: config.ws,
+				ws: config.resolved_ws(),
 			};
 			let listener = moq_tokio::bind::tcp(listen).context("failed to bind HTTPS listener")?;
 			let server = crate::listener::server(listener, self.health.clone())?.acceptor(acceptor);
@@ -819,10 +845,6 @@ impl IntoResponse for ServeGroupError {
 	fn into_response(self) -> Response {
 		(StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string()).into_response()
 	}
-}
-
-fn default_true() -> bool {
-	true
 }
 
 #[cfg(test)]

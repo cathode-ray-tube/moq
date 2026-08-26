@@ -60,7 +60,7 @@ async fn spawn_ws_relay(auth: moq_relay::Auth) -> (u16, tokio::task::JoinHandle<
 		.certificates();
 
 	let mut web_config = WebConfig::default();
-	web_config.ws = true;
+	web_config.ws = Some(true);
 	web_config.http.listen = Some(format!("127.0.0.1:{port}").parse().expect("parse listen"));
 	let web = Web::new(auth, cluster, certificates, web_config);
 
@@ -77,7 +77,7 @@ fn client() -> moq_tokio::Client {
 	let mut config = moq_tokio::connect::Config::default();
 	config.tls.insecure = Some(true);
 	config.once = Some(true);
-	config.websocket.delay = Some(Duration::ZERO);
+	config.websocket.delay = Duration::ZERO.into();
 	config.bind = Some("127.0.0.1:0".parse().expect("parse bind"));
 	config.init(Default::default()).expect("client init")
 }

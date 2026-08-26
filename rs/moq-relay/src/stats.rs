@@ -6,7 +6,6 @@
 
 use std::time::Duration;
 
-use clap::Args;
 use moq_net::PathOwned;
 use moq_net::origin;
 use serde::{Deserialize, Serialize};
@@ -20,38 +19,37 @@ use serde::{Deserialize, Serialize};
 /// (a JSON map of broadcast path to a cumulative counter snapshot per frame)
 /// plus compressed `.json.z` siblings; see `moq_stats` for the wire format and
 /// per-field semantics.
-#[derive(Args, Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(usage::Args, Clone, Debug, Deserialize, Serialize)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
-#[group(id = "stats-config")]
 pub struct StatsConfig {
 	/// Master switch for stats publishing. Defaults to false.
 	///
-	/// Typed as `Option<bool>` (not bare `bool`) so a TOML file setting
-	/// `stats.enabled = true` survives `Config::load`'s `update_from` CLI
-	/// re-parse. With a bare `bool`, an absent `--stats-enabled` CLI flag
-	/// writes the `Default::default()` value (`false`) over the TOML value.
-	/// See `tests::cli_does_not_clobber_toml_stats_enabled` and the
-	/// "Config flags + TOML merge" note in `rs/CLAUDE.md`.
-	#[arg(
+	/// `Option` rather than a materialized default: Usage reads a standing `false`
+	/// as an empty boolean, so `update_from` would refill it from the environment
+	/// (or a declared default) over whatever the TOML file said. An `Option` is
+	/// empty only when nothing set it. A bare `Vec<T>` has the same hazard, since
+	/// an empty list also reads as absent; see moq-dev/moq#3051.
+	#[usage(
 		long = "stats-enabled",
 		env = "MOQ_STATS_ENABLED",
-		default_missing_value = "true",
+		default_missing = "true",
 		num_args = 0..=1,
 		require_equals = true,
-		value_parser = clap::value_parser!(bool),
 	)]
+	#[serde(skip_serializing_if = "Option::is_none")]
 	pub enabled: Option<bool>,
 
 	/// Top-level path under which stats broadcasts are published. Defaults
 	/// to `.stats`. Future stats categories (e.g. host-level node stats)
 	/// will share the same prefix.
-	#[arg(long = "stats-prefix", env = "MOQ_STATS_PREFIX")]
-	pub prefix: Option<String>,
+	#[usage(long = "stats-prefix", env = "MOQ_STATS_PREFIX", default = ".stats")]
+	pub prefix: String,
 
 	/// Interval (in seconds) between snapshot publishes. Defaults to 1.
-	#[arg(long = "stats-interval", env = "MOQ_STATS_INTERVAL")]
-	pub interval: Option<u64>,
+	#[usage(long = "stats-interval", env = "MOQ_STATS_INTERVAL", default = "1")]
+	pub interval: u64,
 
 	/// Node identifier appended to the advertised stats path to disambiguate
 	/// broadcasts when multiple relays share a cluster origin. Without this,
@@ -61,7 +59,7 @@ pub struct StatsConfig {
 	/// May be multi-segment (e.g. `sjc/1`, `sjc/2`) when a region has multiple
 	/// hosts; the segments nest under a shared region key on the advertised
 	/// path. Single-relay deployments can leave this unset.
-	#[arg(long = "stats-node", env = "MOQ_STATS_NODE")]
+	#[usage(long = "stats-node", env = "MOQ_STATS_NODE")]
 	pub node: Option<String>,
 
 	/// Number of leading broadcast-path segments to bucket stats by, one
@@ -70,8 +68,20 @@ pub struct StatsConfig {
 	/// publish a per-first-segment broadcast (e.g. per tenant), so a consumer can
 	/// announce-scope to just that group rather than slurping every node's full
 	/// stats. See [`moq_stats::ProducerConfig::depth`].
-	#[arg(long = "stats-depth", env = "MOQ_STATS_DEPTH")]
-	pub depth: Option<usize>,
+	#[usage(long = "stats-depth", env = "MOQ_STATS_DEPTH", default = "0")]
+	pub depth: usize,
+}
+
+impl Default for StatsConfig {
+	fn default() -> Self {
+		Self {
+			enabled: None,
+			prefix: ".stats".into(),
+			interval: 1,
+			node: None,
+			depth: 0,
+		}
+	}
 }
 
 impl StatsConfig {
@@ -86,10 +96,10 @@ impl StatsConfig {
 		if !self.enabled.unwrap_or(false) {
 			return moq_stats::Producer::new(moq_stats::ProducerConfig::new());
 		}
-		let prefix = self.prefix.clone().unwrap_or_else(|| ".stats".to_string());
-		let interval = Duration::from_secs(self.interval.unwrap_or(1).max(1));
+		let prefix = self.prefix.clone();
+		let interval = Duration::from_secs(self.interval.max(1));
 		let node = self.node.clone().map(PathOwned::from);
-		let depth = self.depth.unwrap_or(0);
+		let depth = self.depth;
 		tracing::info!(prefix, interval_secs = interval.as_secs(), node = ?node, depth, "stats publishing enabled");
 		let config = moq_stats::ProducerConfig::new()
 			.with_origin(origin)

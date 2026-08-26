@@ -1,7 +1,5 @@
-use std::str::FromStr;
 use std::time::Duration;
 
-use clap::Parser;
 use serde::{Deserialize, Serialize};
 
 use crate::Range;
@@ -11,99 +9,131 @@ use crate::Range;
 ///
 /// Each `[min, max]` range is rolled once per connection, so a single config can
 /// describe a heterogeneous swarm (e.g. some connections at 24fps, others at 60).
-#[derive(Parser, Clone, Debug, Deserialize, Serialize, Default)]
+#[derive(usage::Cli, Clone, Debug, Deserialize, Serialize)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 #[serde(default, deny_unknown_fields)]
-#[command(version = env!("VERSION"))]
+#[usage(name = "moq-bench", version = env!("VERSION"))]
+#[usage(completion)]
 #[non_exhaustive]
 pub struct Config {
 	/// The broadcast namespace prefix. Each broadcast is published under
 	/// `<name>/<run>/<connection>/<index>` and subscribers discover peers under `<name>`.
-	#[arg(long, env = "MOQ_BENCH_NAME")]
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub name: Option<String>,
+	#[usage(long, env = "MOQ_BENCH_NAME", default = "bench")]
+	pub name: String,
 
 	/// Run a 1:N benchmark around one named broadcast. The first connection
 	/// publishes `<name>/<run>/<fanout>` and every remaining connection subscribes.
-	#[arg(long, env = "MOQ_BENCH_FANOUT")]
+	#[usage(long, env = "MOQ_BENCH_FANOUT")]
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub fanout: Option<String>,
 
 	/// Spread connection and subscription startup over this duration to avoid a thundering herd.
-	#[arg(long, value_parser = humantime::parse_duration, env = "MOQ_BENCH_STARTUP")]
-	#[serde(default, with = "humantime_serde::option", skip_serializing_if = "Option::is_none")]
-	pub startup: Option<Duration>,
+	#[usage(long, env = "MOQ_BENCH_STARTUP", default = "10s")]
+	pub startup: moq_tokio::Duration,
 
 	/// Stop the benchmark after this duration. Runs until interrupted if unset.
-	#[arg(long, value_parser = humantime::parse_duration, env = "MOQ_BENCH_DURATION")]
-	#[serde(default, with = "humantime_serde::option", skip_serializing_if = "Option::is_none")]
-	pub duration: Option<Duration>,
+	#[usage(long, env = "MOQ_BENCH_DURATION")]
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub duration: Option<moq_tokio::Duration>,
 
 	/// How often to log throughput stats.
-	#[arg(long, value_parser = humantime::parse_duration, env = "MOQ_BENCH_REPORT")]
-	#[serde(default, with = "humantime_serde::option", skip_serializing_if = "Option::is_none")]
-	pub report: Option<Duration>,
+	#[usage(long, env = "MOQ_BENCH_REPORT", default = "1s")]
+	pub report: moq_tokio::Duration,
 
 	/// Number of connections (A) to establish. Rolled once for the whole run.
-	#[arg(long, value_parser = Range::from_str, env = "MOQ_BENCH_CONNECTIONS")]
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub connections: Option<Range>,
+	#[usage(long, env = "MOQ_BENCH_CONNECTIONS", default = "1")]
+	pub connections: Range,
 
 	/// Broadcasts published per connection (B), each with a single track.
-	#[arg(long, value_parser = Range::from_str, env = "MOQ_BENCH_BROADCASTS")]
+	///
+	/// `Option` because `--fanout` refuses to run alongside an explicit shape, and
+	/// a materialized default cannot say whether one was given.
+	#[usage(long, env = "MOQ_BENCH_BROADCASTS")]
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub broadcasts: Option<Range>,
 
 	/// Other broadcasts each connection subscribes to (C), discovered via announcements.
-	#[arg(long, value_parser = Range::from_str, env = "MOQ_BENCH_SUBSCRIBE")]
+	///
+	/// `Option` for the same reason as [`Self::broadcasts`].
+	#[usage(long, env = "MOQ_BENCH_SUBSCRIBE")]
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub subscribe: Option<Range>,
 
 	/// Frames per second per track (D). Zero leaves the track idle.
-	#[arg(long, value_parser = Range::from_str, env = "MOQ_BENCH_FPS")]
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub fps: Option<Range>,
+	#[usage(long, env = "MOQ_BENCH_FPS", default = "30")]
+	pub fps: Range,
 
 	/// Bytes per frame (E).
-	#[arg(long, value_parser = Range::from_str, env = "MOQ_BENCH_FRAME_SIZE")]
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub frame_size: Option<Range>,
+	#[usage(long, env = "MOQ_BENCH_FRAME_SIZE", default = "1200")]
+	pub frame_size: Range,
 
 	/// Zeroed frames per group (F) following the JSON keyframe. May be zero.
-	#[arg(long, value_parser = Range::from_str, env = "MOQ_BENCH_GROUP_SIZE")]
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub group_size: Option<Range>,
+	#[usage(long, env = "MOQ_BENCH_GROUP_SIZE", default = "60")]
+	pub group_size: Range,
 
 	/// Write machine-readable stats to this file: one JSON line of cumulative
 	/// counters per report interval. Truncates on start.
-	#[arg(long, env = "MOQ_BENCH_OUTPUT")]
+	#[usage(long, env = "MOQ_BENCH_OUTPUT")]
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub output: Option<std::path::PathBuf>,
 
 	/// The MoQ client (QUIC/TLS) configuration.
-	#[command(flatten)]
+	#[usage(flatten)]
 	#[serde(default)]
 	pub client: moq_tokio::connect::Config,
 
 	/// QUIC transport tuning (`--quic-*`).
-	#[command(flatten)]
+	#[usage(flatten)]
 	#[serde(default)]
 	pub quic: moq_tokio::quic::Config,
 
 	/// Log configuration.
-	#[command(flatten)]
+	#[usage(flatten)]
 	#[serde(default)]
 	pub log: moq_tokio::Log,
 
 	/// Load configuration from this TOML file. CLI flags still take precedence.
-	#[arg(long)]
+	#[usage(long)]
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub file: Option<String>,
+}
+
+impl Default for Config {
+	fn default() -> Self {
+		Self {
+			name: "bench".into(),
+			fanout: None,
+			startup: Duration::from_secs(10).into(),
+			duration: None,
+			report: Duration::from_secs(1).into(),
+			connections: Range::new(1, 1),
+			broadcasts: None,
+			subscribe: None,
+			fps: Range::new(30, 30),
+			frame_size: Range::new(1200, 1200),
+			group_size: Range::new(60, 60),
+			output: None,
+			client: Default::default(),
+			quic: Default::default(),
+			log: Default::default(),
+			file: None,
+		}
+	}
 }
 
 impl Config {
 	/// Parse from CLI args, optionally merging a TOML file, then init the logger.
 	pub fn load() -> anyhow::Result<Self> {
-		let config = Self::parse_and_merge(std::env::args_os())?;
+		let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+		// `#[usage(completion)]` installs the `__complete_word__` interception in the
+		// generated `parse()`, which this loader does not use: without this the request
+		// would reach the ordinary grammar and be refused. Recognized before the parse,
+		// because a completion is not a command this binary runs.
+		if let Some(reply) = Self::completion_request(args.get(1..).unwrap_or_default()) {
+			print!("{reply}");
+			std::process::exit(0);
+		}
+		let config = Self::parse_and_merge(args)?;
 		config.log.init()?;
 		tracing::trace!(?config, "final config");
 		Ok(config)
@@ -121,22 +151,40 @@ impl Config {
 		Ok(())
 	}
 
-	/// Merge order mirrors moq-relay: CLI args (including `--file`) -> TOML file
-	/// (if set) -> CLI args re-applied so explicit flags override the TOML.
-	///
-	/// Every overridable field is `Option<T>`, so an absent CLI flag leaves the
-	/// TOML value untouched during the final `update_from` re-parse. See
-	/// `rs/CLAUDE.md` for why bare fields would silently clobber the TOML.
+	/// Merge defaults and environment, then TOML, then explicit CLI flags.
 	pub(crate) fn parse_and_merge<I, T>(args: I) -> anyhow::Result<Self>
 	where
 		I: IntoIterator<Item = T>,
 		T: Into<std::ffi::OsString> + Clone,
 	{
 		let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
-		let mut config = Config::parse_from(&args);
+		let argv = args
+			.iter()
+			.skip(1)
+			.map(std::ffi::OsString::as_os_str)
+			.collect::<Vec<_>>();
+		// Help and version are questions rather than failures. Answered and exited
+		// here, because wrapping them renders an empty `anyhow` error and exits
+		// non-zero having printed nothing. A real failure still comes back as an
+		// error, so a caller that parses synthetic args keeps its Result.
+		let mut config = match Config::parse_from(&argv) {
+			Ok(config) => config,
+			Err(err) => {
+				let answer = moq_tokio::cli::answer(Config::spec(), Config::command(), &argv, err);
+				if answer.is_question() {
+					answer.exit();
+				}
+				anyhow::bail!("{}", answer.message());
+			}
+		};
 		if let Some(file) = config.file.clone() {
-			config = toml::from_str(&std::fs::read_to_string(file)?)?;
-			config.update_from(&args);
+			let mut merged = toml::Value::try_from(&config)?;
+			let source = std::fs::read_to_string(file)?;
+			let mut file = toml::from_str::<toml::Value>(&source)?;
+			normalize_client_aliases(&mut file)?;
+			merge_toml(&mut merged, file);
+			config = merged.try_into()?;
+			config.update_from(&argv);
 		}
 		config.check_deprecated()?;
 		// `Stats::report` feeds this into `tokio::time::interval`, which panics on a
@@ -158,7 +206,7 @@ impl Config {
 	}
 
 	pub fn name(&self) -> &str {
-		self.name.as_deref().unwrap_or("bench")
+		&self.name
 	}
 
 	/// The named 1:N broadcast, when fan-out mode is enabled.
@@ -167,15 +215,15 @@ impl Config {
 	}
 
 	pub fn startup(&self) -> Duration {
-		self.startup.unwrap_or(Duration::from_secs(10))
+		self.startup.into_std()
 	}
 
 	pub fn report(&self) -> Duration {
-		self.report.unwrap_or(Duration::from_secs(1))
+		self.report.into_std()
 	}
 
 	pub fn connections(&self) -> Range {
-		self.connections.unwrap_or(Range::new(1, 1))
+		self.connections
 	}
 
 	pub fn broadcasts(&self) -> Range {
@@ -187,15 +235,15 @@ impl Config {
 	}
 
 	pub fn fps(&self) -> Range {
-		self.fps.unwrap_or(Range::new(30, 30))
+		self.fps
 	}
 
 	pub fn frame_size(&self) -> Range {
-		self.frame_size.unwrap_or(Range::new(1200, 1200))
+		self.frame_size
 	}
 
 	pub fn group_size(&self) -> Range {
-		self.group_size.unwrap_or(Range::new(60, 60))
+		self.group_size
 	}
 
 	/// Whether this configuration expects subscribers to receive media.
@@ -206,6 +254,50 @@ impl Config {
 	/// Whether any connection may publish a generated broadcast.
 	pub fn publishes(&self) -> bool {
 		self.broadcasts().min.max(self.broadcasts().max) > 0
+	}
+}
+
+fn normalize_client_aliases(value: &mut toml::Value) -> anyhow::Result<()> {
+	let Some(connect) = value
+		.as_table_mut()
+		.and_then(|root| root.get_mut("client"))
+		.and_then(toml::Value::as_table_mut)
+	else {
+		return Ok(());
+	};
+	rename_toml_key(connect, "connect", "url")?;
+	rename_toml_key(connect, "failover_delay", "race")?;
+	if let Some(tls) = connect.get_mut("tls").and_then(toml::Value::as_table_mut) {
+		rename_toml_key(tls, "disable_verify", "insecure")?;
+	}
+	Ok(())
+}
+
+fn rename_toml_key(table: &mut toml::Table, alias: &str, canonical: &str) -> anyhow::Result<()> {
+	let Some(value) = table.remove(alias) else {
+		return Ok(());
+	};
+	anyhow::ensure!(
+		!table.contains_key(canonical),
+		"TOML specifies both `{alias}` and `{canonical}`"
+	);
+	table.insert(canonical.into(), value);
+	Ok(())
+}
+
+fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {
+	match (base, overlay) {
+		(toml::Value::Table(base), toml::Value::Table(overlay)) => {
+			for (key, value) in overlay {
+				match base.get_mut(&key) {
+					Some(base) => merge_toml(base, value),
+					None => {
+						base.insert(key, value);
+					}
+				}
+			}
+		}
+		(base, overlay) => *base = overlay,
 	}
 }
 
@@ -222,6 +314,9 @@ fps = "24:60"
 [client]
 connect = "https://example.com"
 tls.insecure = true
+
+[client.websocket]
+enabled = false
 "#;
 		let dir = std::env::temp_dir().join("moq-bench-config-test");
 		std::fs::create_dir_all(&dir).unwrap();
@@ -239,6 +334,7 @@ tls.insecure = true
 		assert_eq!(config.fps(), Range::new(24, 60));
 		assert_eq!(config.client.url.as_ref().unwrap().as_str(), "https://example.com/");
 		assert_eq!(config.client.tls.insecure, Some(true));
+		assert_eq!(config.client.websocket.enabled, Some(false));
 
 		// CLI flag wins over the TOML value.
 		let args = vec![
@@ -247,17 +343,18 @@ tls.insecure = true
 			path.into(),
 			std::ffi::OsString::from("--connections"),
 			std::ffi::OsString::from("5:10"),
+			std::ffi::OsString::from("--connect-websocket-enabled=true"),
 		];
 		let config = Config::parse_and_merge(args).unwrap();
 		assert_eq!(config.connections(), Range::new(5, 10));
 		// Untouched TOML field is still intact.
 		assert_eq!(config.fps(), Range::new(24, 60));
+		assert_eq!(config.client.websocket.enabled, Some(true));
 	}
 
 	#[test]
 	fn output_survives_toml_merge() {
-		// The TOML->CLI merge re-applies clap defaults, which clobbers bare fields;
-		// `output` must stay Option so an absent flag leaves the TOML value alone.
+		// Optional fields participate in the same source order as concrete defaults.
 		let toml = r#"
 output = "stats.jsonl"
 
@@ -337,5 +434,31 @@ connect = "https://example.com"
 	fn fanout_requires_a_publisher_and_subscriber() {
 		let err = Config::parse_and_merge(["moq-bench", "--fanout", "chat", "--connections", "1"]).unwrap_err();
 		assert!(err.to_string().contains("at least 2 connections"));
+	}
+
+	/// Help and version are answered, not wrapped as failures.
+	///
+	/// Usage renders those variants as an empty string through `render_failure`,
+	/// because the generated `parse()` is expected to take them first. This loader
+	/// parses twice for the TOML merge and never reaches that code, so wrapping
+	/// them exited non-zero having printed nothing.
+	#[test]
+	fn help_and_version_are_questions() {
+		for flag in ["--help", "-h", "--version", "-V"] {
+			let argv = [std::ffi::OsStr::new(flag)];
+			let err = Config::parse_from(&argv).unwrap_err();
+			let answer = moq_tokio::cli::answer(Config::spec(), Config::command(), &argv, err);
+			assert!(answer.is_question(), "{flag} was treated as a failure");
+			assert!(!answer.message().trim().is_empty(), "{flag} rendered nothing");
+		}
+	}
+
+	/// The spec is named for the binary, not for the struct that declares it.
+	///
+	/// Usage takes the program name from the type unless told otherwise, so an
+	/// undeclared name renders every usage line and completion as `config`.
+	#[test]
+	fn the_spec_is_named_for_the_binary() {
+		assert_eq!(Config::spec().bin.unwrap_or(Config::spec().name), "moq-bench");
 	}
 }
