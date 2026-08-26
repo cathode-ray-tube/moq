@@ -37,7 +37,7 @@ pub struct Options {
 	pub channels: Option<u32>,
 	/// Bitrate in bits per second. `None` lets Opus pick. PCM requires `None`
 	/// because its bitrate is fixed by the sample rate and channel count.
-	pub bitrate: Option<u32>,
+	pub bitrate: Option<moq_net::bandwidth::Rate>,
 	/// Enable Opus in-band forward error correction.
 	pub fec: bool,
 	/// Enable Opus discontinuous transmission during silence.
@@ -45,6 +45,20 @@ pub struct Options {
 	/// Encoded frame duration. Opus accepts 2.5 / 5 / 10 / 20 / 40 / 60 ms.
 	/// PCM accepts any duration containing a whole number of samples.
 	pub frame_duration: Duration,
+	/// The connection's bandwidth, as an allocator over
+	/// [`Session::send_bandwidth`](moq_net::Session::send_bandwidth).
+	///
+	/// The audio track reserves its bitrate against it, so the video encoder sharing
+	/// the connection sizes itself against what's actually left rather than against
+	/// the whole uplink. Pass the same allocator to both.
+	///
+	/// Defaults to [`Allocator::unlimited`](moq_net::bandwidth::Allocator::unlimited),
+	/// which reserves nothing and leaves every sender at its configured rate.
+	///
+	/// Audio reserves but does not follow its share: Opus can retune live and PCM
+	/// can't at all, and at `hang`'s priorities audio outranks video, so it is only
+	/// ever squeezed on a link that can't carry audio alone.
+	pub bandwidth: moq_net::bandwidth::Allocator,
 }
 
 impl Default for Options {
@@ -58,6 +72,7 @@ impl Default for Options {
 			fec: false,
 			dtx: false,
 			frame_duration: Duration::from_millis(20),
+			bandwidth: moq_net::bandwidth::Allocator::unlimited(),
 		}
 	}
 }
@@ -145,10 +160,13 @@ impl<E: CatalogExt> Producer<E> {
 			// The catalog's info carries the microsecond timescale audio hang frames stamp, so
 			// Lite05 subscribers know what scale to expect and the model layer accepts
 			// Frame::timestamp on append, plus whatever retention the broadcast declared.
-			Some(name) => broadcast.create_track(name.clone(), catalog.track_info())?,
+			Some(name) => broadcast.create_track(name.clone(), catalog.track_info(hang::catalog::PRIORITY.audio))?,
 			// Mirrors the video side, which derives a unique name from the codec
 			// rather than making every caller invent one.
-			None => broadcast.unique_track(&format!(".{}", options.codec), catalog.track_info())?,
+			None => broadcast.unique_track(
+				&format!(".{}", options.codec),
+				catalog.track_info(hang::catalog::PRIORITY.audio),
+			)?,
 		};
 		let name = track.name().to_string();
 		let track = catalog.media_producer(track, moq_mux::container::legacy::Wire)?;
@@ -182,13 +200,13 @@ impl<E: CatalogExt> Producer<E> {
 		self.track.track()
 	}
 
-	/// Current encoder target bitrate in bits per second.
-	pub fn bitrate(&self) -> u64 {
+	/// Current encoder target bitrate.
+	pub fn bitrate(&self) -> moq_net::bandwidth::Rate {
 		self.encoder.bitrate()
 	}
 
-	/// Retune the live encoder to `bitrate` bits per second.
-	pub fn set_bitrate(&mut self, bitrate: u64) -> Result<(), Error> {
+	/// Retune the live encoder to `bitrate`.
+	pub fn set_bitrate(&mut self, bitrate: moq_net::bandwidth::Rate) -> Result<(), Error> {
 		self.encoder.set_bitrate(bitrate)
 	}
 
@@ -412,7 +430,7 @@ mod tests {
 			};
 			let options = Options {
 				track: Some("audio".to_string()),
-				bitrate: Some(128_000),
+				bitrate: Some(moq_net::bandwidth::Rate::from_bps(128_000)),
 				..Options::default()
 			};
 			let decoder_config = Encoder::new(&options.config(input.clone())).unwrap().catalog();

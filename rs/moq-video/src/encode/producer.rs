@@ -105,7 +105,7 @@ impl<E: CatalogExt> Producer<E> {
 				)));
 			}
 		};
-		let track = broadcast.unique_track(suffix, catalog.track_info())?;
+		let track = broadcast.unique_track(suffix, catalog.track_info(hang::catalog::PRIORITY.video))?;
 		Self::with_track(track, catalog, rendition)
 	}
 
@@ -215,45 +215,35 @@ impl<E: CatalogExt> Producer<E> {
 ///
 /// `#[non_exhaustive]`: construct via [`Options::default`] and set fields, so
 /// new knobs can be added without breaking callers.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 #[cfg(feature = "capture")]
 pub struct Options {
-	/// Target bitrate in bits per second; `None` derives from resolution.
+	/// Target bitrate; `None` derives one from the resolution.
 	///
 	/// This is a ceiling, not a fixed rate: with [`bandwidth`](Self::bandwidth)
 	/// set, the encoder backs off below it while the uplink is congested and
 	/// climbs back afterwards, but never exceeds it.
-	pub bitrate: Option<u64>,
+	pub bitrate: Option<moq_net::bandwidth::Rate>,
 	/// Output codec. Defaults to [`Codec::H264`].
 	pub codec: Codec,
 	/// Encoder implementation preference.
 	pub kind: encoder::Kind,
-	/// The connection's send-bandwidth estimate, from
+	/// The connection's bandwidth, as an allocator over
 	/// [`Session::send_bandwidth`](moq_net::Session::send_bandwidth) (or
 	/// `moq_tokio::Connection::send_bandwidth`, which survives reconnects).
 	///
-	/// Set it and the encoder tracks the estimate per the default
-	/// [`rate::Policy`](super::rate::Policy), so a closing uplink gets a softer
-	/// picture instead of a stalled one. Leave it `None` and the
-	/// encoder holds [`bitrate`](Self::bitrate) regardless of congestion, which
-	/// is what you want when the estimate isn't meaningful (a local file, a test
-	/// harness) or unavailable (a publisher that only accepts inbound sessions).
-	pub bandwidth: Option<moq_net::bandwidth::Consumer>,
-}
-
-// Hand-written: `bandwidth::Consumer` isn't `Debug`, but its presence is the
-// only part worth printing anyway.
-#[cfg(feature = "capture")]
-impl std::fmt::Debug for Options {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("Options")
-			.field("bitrate", &self.bitrate)
-			.field("codec", &self.codec)
-			.field("kind", &self.kind)
-			.field("bandwidth", &self.bandwidth.is_some())
-			.finish()
-	}
+	/// Set it and the encoder reserves this track's ceiling, then tracks its share of
+	/// the estimate per the default [`rate::Policy`](super::rate::Policy), so a closing
+	/// uplink gets a softer picture instead of a stalled one. Pass the same allocator
+	/// to every sender on the connection, including the audio side: that's what keeps
+	/// their bitrates summing to the uplink instead of each matching it.
+	///
+	/// Defaults to [`Allocator::unlimited`](moq_net::bandwidth::Allocator::unlimited),
+	/// which holds [`bitrate`](Self::bitrate) regardless of congestion. That's what you
+	/// want when the estimate isn't meaningful (a local file, a test harness) or
+	/// unavailable (a publisher that only accepts inbound sessions).
+	pub bandwidth: moq_net::bandwidth::Allocator,
 }
 
 /// Capture a webcam and publish it as an on-demand video track.
@@ -341,21 +331,23 @@ fn assert_publish_capture_send(
 	is_send(&publish_capture(broadcast, catalog, capture, encode, clock));
 }
 
-/// The live rate control state: the estimate source paired with the policy
-/// tracking it. `None` once there's nothing left to track, which is what stops
-/// the `select!` arm from spinning on a channel that is permanently ready.
+/// The live rate control state: the estimate source paired with the policy tracking
+/// it. `None` once it has *retired*, which is the only thing absence means now that
+/// every encoder has a share to read: an allocator with nothing to divide grants
+/// `None` rather than being absent. Retiring stops the `select!` arm from spinning on
+/// a channel that is permanently ready.
 #[cfg(feature = "capture")]
-type Rate = Option<(moq_net::bandwidth::Consumer, Control)>;
+type RateControl = Option<(moq_net::bandwidth::Consumer, Control)>;
 
 /// Wait for the next bandwidth estimate, or forever when rate control is off or
 /// finished. Cancel-safe: [`Consumer::changed`](moq_net::bandwidth::Consumer::changed)
 /// only reads shared state, so losing this race to a frame drops no estimate,
 /// it just re-reads the latest one next time round.
 #[cfg(feature = "capture")]
-async fn next_estimate(rate: &mut Rate) -> Option<Option<u64>> {
+async fn next_estimate(rate: &mut RateControl) -> Option<Option<moq_net::bandwidth::Rate>> {
 	match rate {
 		Some((bandwidth, _)) => bandwidth.changed().await.ok(),
-		// No estimate source: park this arm forever so `select!` ignores it.
+		// Retired: park this arm forever so `select!` ignores it.
 		None => std::future::pending().await,
 	}
 }
@@ -366,7 +358,11 @@ async fn next_estimate(rate: &mut Rate) -> Option<Option<u64>> {
 /// control retires; a `Some(None)` estimate means the value is merely
 /// unavailable right now, which the policy holds through.
 #[cfg(feature = "capture")]
-async fn apply_estimate(encoder: &mut Sink, rate: &mut Rate, estimate: Option<Option<u64>>) {
+async fn apply_estimate(
+	encoder: &mut Sink,
+	rate: &mut RateControl,
+	estimate: Option<Option<moq_net::bandwidth::Rate>>,
+) {
 	let Some((_, control)) = rate.as_mut() else { return };
 
 	let Some(estimate) = estimate else {
@@ -380,7 +376,7 @@ async fn apply_estimate(encoder: &mut Sink, rate: &mut Rate, estimate: Option<Op
 	};
 
 	match encoder.set_bitrate(bitrate).await {
-		Ok(()) => tracing::debug!(bitrate, estimate, "adjusted encoder bitrate"),
+		Ok(()) => tracing::debug!(bitrate = bitrate.as_bps(), "adjusted encoder bitrate"),
 		// The encoder can't retune, so keep encoding at the rate it opened with
 		// and stop asking. Dropping the source also stops the estimate arm, which
 		// would otherwise wake this loop for nothing on every change.
@@ -391,7 +387,7 @@ async fn apply_estimate(encoder: &mut Sink, rate: &mut Rate, estimate: Option<Op
 		// A transient failure: keep the policy running so the next change retries.
 		// The policy already moved its target, so a persistent failure just means
 		// the encoder trails it; that's better than giving up on the first blip.
-		Err(err) => tracing::warn!(error = %err, bitrate, "failed to adjust encoder bitrate"),
+		Err(err) => tracing::warn!(error = %err, bitrate = bitrate.as_bps(), "failed to adjust encoder bitrate"),
 	}
 }
 
@@ -424,6 +420,11 @@ async fn capture_loop<E: CatalogExt>(
 	encode: &Options,
 	clock: &moq_mux::Clock,
 ) -> Result<(), Error> {
+	// This track's claim on the connection. Taken on the first open, because the
+	// negotiated mode is what finally says how much this encoder can ever send, and
+	// held across reopens so the claim doesn't lapse while the camera is closed.
+	let mut reservation: Option<moq_net::bandwidth::Reservation> = None;
+
 	loop {
 		// Idle until a viewer subscribes; the track ending is a clean exit. The
 		// catalog rendition was published when the track was created, so a
@@ -453,14 +454,19 @@ async fn capture_loop<E: CatalogExt>(
 		let mut force_keyframe = true;
 		tracing::info!(encoder = encoder.name(), device = camera.device(), "capturing");
 
+		// A reopen can negotiate a different mode (a display resized while nothing was
+		// subscribed), and the claim follows it: the old ceiling would otherwise cap a
+		// larger mode below what it can send, or keep claiming room a smaller one no
+		// longer needs.
+		let ceiling = encoder_config.resolved_bitrate();
+		let reservation = reservation.get_or_insert_with(|| encode.bandwidth.reserve(demand, ceiling));
+		reservation.update(ceiling);
+
 		// Rate control is per encoder: this one opened at the configured bitrate,
 		// so the policy's ceiling is that rate and the target starts there. A
 		// reopened camera starts optimistic again rather than inheriting the
 		// backed-off rate from whatever the link was doing last time.
-		let mut rate = encode
-			.bandwidth
-			.clone()
-			.map(|bandwidth| (bandwidth, Control::new(Policy::new(encoder_config.resolved_bitrate()))));
+		let mut rate = Some((reservation.consumer(), Control::new(Policy::new(ceiling))));
 
 		loop {
 			// Race the next frame against the last viewer leaving so we release the
@@ -595,7 +601,7 @@ mod tests {
 		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 
 		let mut config = Config::new(1920, 1080, 30);
-		config.bitrate = Some(6_000_000);
+		config.bitrate = Some(moq_net::bandwidth::Rate::from_mbps(6));
 		// Software (openh264) so the test is deterministic and never touches a hardware backend.
 		config.kind = encoder::Kind::Software;
 		let _producer = Producer::new(broadcast, catalog, config.probe().await.unwrap()).unwrap();

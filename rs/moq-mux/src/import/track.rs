@@ -199,7 +199,7 @@ impl<E: CatalogExt> Track<E> {
 	) -> Result<Self> {
 		// Accept at the legacy microsecond timescale, matching the frame timestamps the container
 		// stamps. A codec-specific timescale (e.g. the opus sample rate) would be chosen here.
-		let track = request.accept(reserved.track_info());
+		let track = request.accept(reserved.track_info(hang::catalog::PRIORITY.audio));
 		let data = init.data.as_ref();
 		let kind = match init.format {
 			AudioFormat::Aac => {
@@ -236,7 +236,7 @@ impl<E: CatalogExt> Track<E> {
 	) -> Result<Self> {
 		use hang::catalog::VideoCodec;
 
-		let track = request.accept(reserved.track_info());
+		let track = request.accept(reserved.track_info(hang::catalog::PRIORITY.video));
 		let data = init.data.as_ref();
 		let kind = match init.format {
 			VideoFormat::Avc1 => {
@@ -561,7 +561,7 @@ impl<E: CatalogExt> TrackStream<E> {
 		reserved: crate::catalog::Reserved<E>,
 		init: VideoInit,
 	) -> Result<Self> {
-		let track = request.accept(reserved.track_info());
+		let track = request.accept(reserved.track_info(hang::catalog::PRIORITY.video));
 		let hint = video_hint(&init, None);
 		// Only the self-delimiting codecs can be recovered from a raw byte stream.
 		let kind = match init.format {
@@ -891,7 +891,9 @@ mod tests {
 	#[tokio::test(start_paused = true)]
 	async fn opus_import_delivers_frames() {
 		let (mut broadcast, catalog) = new_broadcast();
-		let track = broadcast.create_track("audio", hang::container::track_info()).unwrap();
+		let track = broadcast
+			.create_track("audio", hang::container::track_info(hang::catalog::PRIORITY.audio))
+			.unwrap();
 		let subscriber = track.subscribe(None);
 
 		let config = crate::codec::opus::Config::new(48_000, 2);
@@ -933,7 +935,9 @@ mod tests {
 		broadcast: &mut moq_net::broadcast::Producer,
 		catalog: &crate::catalog::Producer,
 	) -> (crate::codec::opus::Import, moq_net::track::Subscriber) {
-		let track = broadcast.create_track("audio", hang::container::track_info()).unwrap();
+		let track = broadcast
+			.create_track("audio", hang::container::track_info(hang::catalog::PRIORITY.audio))
+			.unwrap();
 		// Every group is written before anything reads, which the default
 		// REAL_TIME budget would collapse to the live edge.
 		let subscriber = track.subscribe(moq_net::track::Subscription::default().with_max_age(Duration::from_secs(30)));
@@ -1089,6 +1093,33 @@ mod tests {
 		assert_eq!(audio.codec.to_string(), "opus");
 		assert_eq!(audio.sample_rate, 48_000);
 		assert_eq!(audio.channel_count, 2);
+	}
+
+	/// Each constructor stamps its own kind's priority, so an audio track never goes
+	/// out at the video priority and queues behind a video backlog.
+	#[tokio::test(start_paused = true)]
+	async fn each_kind_ranks_as_itself() {
+		use hang::catalog::PRIORITY;
+
+		let (mut broadcast, catalog) = new_broadcast();
+		let consumer = broadcast.consume();
+
+		let request = broadcast.reserve_track("audio").unwrap();
+		let _audio = Track::audio(
+			request,
+			catalog.reserve(),
+			AudioInit::new(AudioFormat::Opus, opus_head()),
+		)
+		.unwrap();
+
+		let request = broadcast.reserve_track("video").unwrap();
+		let _video = Track::video(request, catalog.reserve(), VideoInit::new(VideoFormat::Vp8, Vec::new())).unwrap();
+
+		let audio = consumer.track("audio").unwrap().info().await.unwrap();
+		assert_eq!(audio.priority, PRIORITY.audio);
+
+		let video = consumer.track("video").unwrap().info().await.unwrap();
+		assert_eq!(video.priority, PRIORITY.video);
 	}
 
 	/// An audio format with no init bytes errors up front (audio can't resolve its config from frames),
