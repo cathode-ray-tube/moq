@@ -199,6 +199,9 @@ impl GroupState {
 		}
 		let local = index - self.offset;
 		if let Some(f) = self.frames.get(local) {
+			// A frame read is a cache access: stamp it so expiry and the eviction
+			// walk spare a group a consumer is actively draining.
+			self.charge.refresh();
 			let info = frame::Info {
 				size: f.payload.len() as u64,
 				timestamp: f.timestamp,
@@ -208,6 +211,7 @@ impl GroupState {
 		if local == self.frames.len()
 			&& let Some(p) = &self.partial
 		{
+			self.charge.refresh();
 			let info = frame::Info {
 				size: p.buf.capacity() as u64,
 				timestamp: p.timestamp,
@@ -607,8 +611,15 @@ impl Producer {
 
 	/// Wake consumers parked on the group channel (called after a partial write).
 	pub(crate) fn frame_notify(&self) {
-		// Taking the write lock and dropping it triggers kio's notify.
-		let _ = self.state.write();
+		// The chunk that was just written is a write access: restart the retention
+		// clock so a straggler group streaming a large frame isn't expired
+		// mid-write (its bytes were already charged when the frame was created).
+		// `record_write` takes `&mut`, which marks the guard modified: kio only
+		// notifies on a mutably-accessed guard's release, and that notify is what
+		// delivers the chunk to parked readers.
+		if let Ok(mut state) = self.state.write() {
+			state.charge.record_write();
+		}
 	}
 
 	/// Commit the in-flight frame as a completed frame (called by [`frame::Producer::finish`]).
@@ -726,13 +737,13 @@ impl Producer {
 		}
 	}
 
-	/// Record a cache access (a FETCH hit, or a fetched backfill's birth),
-	/// protecting the group from eviction and restarting its expiry clock. A no-op
-	/// once the group is closed.
+	/// Record a cache access (delivery to a subscriber, a FETCH hit, or a fetched
+	/// backfill's birth), protecting the group from eviction and restarting its
+	/// expiry clock. Stamps through a read guard, whose release never notifies, so
+	/// delivery can't wake every consumer parked on the group. Harmless on a
+	/// closed group: its charge is already cleared.
 	pub(crate) fn cache_refresh(&self) {
-		if let Ok(mut state) = self.state.write() {
-			state.charge.refresh();
-		}
+		self.state.read().charge.refresh();
 	}
 
 	/// Create a new consumer for the group.
@@ -745,6 +756,8 @@ impl Producer {
 				index: 0,
 				end: None,
 				prefetch: Prefetch::default(),
+				last_refresh: crate::model::clock::now(),
+				max_age: self.track.max_age,
 			}),
 			// Untagged: a tagged track attaches the egress meter via `with_meter`
 			// when it hands the consumer to a subscriber/fetch.
@@ -941,6 +954,15 @@ struct Plain {
 
 	// A batch of completed frames drained ahead under one lock (whole-frame reads only).
 	prefetch: Prefetch,
+
+	// When this consumer last stamped the group's access time. The prefetch bounds
+	// a batch by frame count, not elapsed time, so pops re-stamp on a time bound
+	// (see [`Self::refresh_if_stale`]) or a slow reader could go a full retention
+	// window without an access and be expired mid-read.
+	last_refresh: crate::runtime::Instant,
+
+	// The publisher's retention window, used to bound refreshes on the prefetch path.
+	max_age: std::time::Duration,
 }
 
 impl Clone for Plain {
@@ -952,6 +974,8 @@ impl Clone for Plain {
 			index: self.index,
 			end: self.end,
 			prefetch: Prefetch::default(),
+			last_refresh: self.last_refresh,
+			max_age: self.max_age,
 		}
 	}
 }
@@ -1151,6 +1175,14 @@ impl Consumer {
 		}
 	}
 
+	/// Record a cache access from the consumer side: a parked group re-offered to
+	/// its subscriber. Same stamp as [`Producer::cache_refresh`].
+	pub(crate) fn cache_refresh(&self) {
+		if let ConsumerKind::Plain(plain) = &self.inner {
+			plain.state.read().charge.refresh();
+		}
+	}
+
 	/// Park `waiter` until the group closes (finish, abort, or eviction). Spliced
 	/// subscribers register on parked groups so an eviction wakes them; a group
 	/// that already closed cleanly can never abort, so no waiter is needed.
@@ -1290,6 +1322,7 @@ impl Consumer {
 			if !plain.capped()
 				&& let Some(frame) = plain.prefetch.pop()
 			{
+				plain.refresh_if_stale();
 				plain.index += 1;
 				return Ok(Some(frame));
 			}
@@ -1363,6 +1396,18 @@ impl Plain {
 		self.state.read().content_range(start, end)
 	}
 
+	/// Re-stamp the group's access time from the lock-free prefetch path once half
+	/// the retention window has passed since this consumer last stamped it. The
+	/// batch bounds frames, not elapsed time, so without this a reader pacing
+	/// through a batch could be expired while demonstrably active. Half the window
+	/// keeps the stamp comfortably inside it while staying rare on the hot path.
+	fn refresh_if_stale(&mut self) {
+		if crate::model::clock::now().duration_since(self.last_refresh) * 2 < self.max_age {
+			return;
+		}
+		self.state.read().charge.refresh();
+		self.last_refresh = crate::model::clock::now();
+	}
 	// A helper to automatically apply Dropped if the state is closed without an error.
 	fn poll<F, R>(&self, waiter: &kio::Waiter, f: F) -> Poll<Result<R>>
 	where
@@ -1406,6 +1451,7 @@ impl Plain {
 		// Their bytes were already counted at the batch fill, so the frame::Consumer
 		// carries no meter.
 		if let Some(frame) = self.prefetch.pop() {
+			self.refresh_if_stale();
 			self.index += 1;
 			let tail = self.index.saturating_add(self.prefetch.buffered().0 as usize)..end;
 			let info = frame::Info {
@@ -1443,6 +1489,7 @@ impl Plain {
 
 		// Fast path: serve from the prefetched batch without locking or allocating a waker.
 		if let Some(frame) = self.prefetch.pop() {
+			self.refresh_if_stale();
 			self.index += 1;
 			return Poll::Ready(Ok(Some(frame)));
 		}
@@ -1465,6 +1512,9 @@ impl Plain {
 			let local = (index - state.offset).min(state.frames.len());
 			prefetch.fill(state.frames.range(local..).take(budget).cloned());
 			if prefetch.len > 0 {
+				// One stamp covers the whole batch: frames popped from the prefetch
+				// don't re-stamp until the next refill, which `CAP` bounds.
+				state.charge.refresh();
 				return Poll::Ready(Ok(()));
 			}
 			// Nothing completed at `index`: an in-flight tail waits, otherwise resolve
@@ -1477,6 +1527,10 @@ impl Plain {
 			Ok(Err(err)) => return Poll::Ready(Err(err)),
 			Err(state) => return Poll::Ready(Err(state.abort.clone().unwrap_or(Error::Dropped))),
 		}
+
+		// The refill stamped the group under its lock; restart the staleness clock
+		// so the pops that follow don't immediately re-stamp.
+		self.last_refresh = crate::model::clock::now();
 
 		// A fresh batch was just filled (empty only on a clean end). Count the whole
 		// batch once here, under no lock, so the drained pops that follow stay free.
@@ -1936,6 +1990,33 @@ mod test {
 		// Take one frame so the batch is filled but only partially drained.
 		let _ = consumer.read_frame().now_or_never().unwrap().unwrap().unwrap();
 		drop(consumer);
+	}
+
+	/// A parked chunk reader is woken by each chunk write. kio only notifies when
+	/// a write guard was mutably accessed, so `frame_notify` must mark the guard
+	/// modified; a guard dropped untouched wakes nobody and the reader would
+	/// stall until the frame completed.
+	#[tokio::test]
+	async fn chunk_write_wakes_parked_reader() {
+		let mut producer = Info { sequence: 0 }.produce();
+		let mut consumer = producer.consume();
+		let mut frame = producer
+			.create_frame(frame::Info {
+				size: 6,
+				timestamp: Timestamp::ZERO,
+			})
+			.unwrap();
+		let mut f = consumer.next_frame().await.unwrap().unwrap();
+		let handle = tokio::spawn(async move { f.read_chunk().await });
+		// Let the reader park on the empty partial before the chunk lands.
+		tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+		frame.write(Bytes::from_static(b"foo")).unwrap();
+		let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+			.await
+			.expect("parked chunk reader was never woken by the chunk write")
+			.unwrap()
+			.unwrap();
+		assert_eq!(chunk, Some(Bytes::from_static(b"foo")));
 	}
 
 	/// A frame whose timestamp is at a different scale is converted to the group's

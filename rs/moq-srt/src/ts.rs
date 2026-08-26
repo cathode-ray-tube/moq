@@ -23,7 +23,10 @@ use crate::Result;
 /// Either [`Self::finish`] or dropping the publisher ends the broadcast and
 /// unannounces the path, the former without the dropped-without-finish warning.
 pub struct Publisher {
-	importer: ts::Import,
+	// TS carries undecoded elementary streams (SCTE-35, teletext, DVB AC-3, ...)
+	// verbatim, so the importer uses the `mpegts` catalog extension rather than the
+	// media-only `()`, which would route those PIDs to `Stream::Ignored` and drop them.
+	importer: ts::Import<ts::Ext>,
 	// A clone of the importer's producer, so a deliberate end can finish() the
 	// broadcast (prompt unannounce) even though the importer owns it.
 	broadcast: moq_net::broadcast::Producer,
@@ -37,7 +40,9 @@ impl Publisher {
 	/// long relays keep a non-latest group fetchable, or `None` for hang's own default.
 	pub fn new(origin: &origin::Producer, path: &str, max_age: Option<Duration>) -> Result<Self> {
 		let mut broadcast = origin.create_broadcast(path, broadcast::Route::new().with_announce(true))?;
-		let config = moq_mux::catalog::Config::default().with_max_age(max_age);
+		let config = moq_mux::catalog::Config::default()
+			.with_catalog(moq_mux::catalog::hang::Catalog::<ts::Ext>::default())
+			.with_max_age(max_age);
 		let catalog = moq_mux::catalog::Producer::with_config(&mut broadcast, config)?;
 		let handle = broadcast.clone();
 		let importer = ts::Import::new(broadcast, catalog.reserve());
@@ -81,7 +86,7 @@ impl Publisher {
 /// SRT caller can play it. Pull frames with [`next`](Self::next); each carries
 /// the TS bytes plus the media timestamp used to pace delivery.
 pub struct Subscriber {
-	export: ts::Export,
+	export: ts::Export<ts::Ext>,
 }
 
 impl Subscriber {
@@ -107,7 +112,9 @@ impl Subscriber {
 		}
 
 		let source = moq_mux::Source::new(origin.consume(), path);
-		let export = ts::Export::new(source).await?.with_max_age(latency);
+		let export = ts::Export::with_ts(source, moq_mux::catalog::CatalogFormat::Hang)
+			.await?
+			.with_max_age(latency);
 		Ok(Some(Self { export }))
 	}
 
@@ -120,6 +127,10 @@ impl Subscriber {
 
 #[cfg(test)]
 mod tests {
+	use moq_mux::catalog::hang::Container;
+	use moq_mux::catalog::{CatalogFormat, Stream};
+	use tokio::time::timeout;
+
 	/// Build an origin producer, spawning its driver on the ambient runtime.
 	fn produce_origin() -> moq_net::origin::Producer {
 		let (producer, driver) = moq_net::origin::Producer::new(moq_net::Origin::random().into());
@@ -134,6 +145,11 @@ mod tests {
 	}
 
 	use super::*;
+
+	/// Real 5s H.264 + AAC capture with SCTE-35 time_signal cues on a
+	/// CUEI-registered section PID (0x21, stream_type 0x86), the same fixture
+	/// moq-mux's export tests replay.
+	const BBB5S: &[u8] = include_bytes!("../../moq-mux/src/container/ts/test_data/scte35/bbb5s.ts");
 
 	/// One payload-only TS packet carrying a complete PSI section (PUSI + pointer_field
 	/// 0), padded to 188 with stuffing.
@@ -193,5 +209,105 @@ mod tests {
 		let broadcast = origin.consume().announced_broadcast("live/cam0").await.unwrap();
 		let info = broadcast.track("0.avc3").unwrap().info().await.unwrap();
 		assert_eq!(info.max_age, Duration::from_secs(3));
+	}
+
+	/// SRT is a contribution protocol, so SCTE-35 cues survive ingest and egress.
+	#[tokio::test(start_paused = true)]
+	async fn publisher_preserves_scte35_cues() {
+		let origin = produce_origin();
+		let mut publisher = Publisher::new(&origin, "ingest", None).unwrap();
+
+		let broadcast = timeout(Duration::from_secs(5), origin.consume().announced_broadcast("ingest"))
+			.await
+			.expect("announce timed out")
+			.expect("the ingest broadcast is announced");
+
+		publisher.feed(bytes::Bytes::from_static(BBB5S)).unwrap();
+
+		let mut catalog = moq_mux::catalog::Consumer::<ts::Ext>::new(&broadcast, CatalogFormat::Hang)
+			.await
+			.unwrap();
+		let name = loop {
+			let snapshot = timeout(Duration::from_secs(5), catalog.next())
+				.await
+				.expect("no catalog snapshot carried the cue track")
+				.unwrap()
+				.expect("the catalog ended without the cue track");
+			if let Some((name, track)) = snapshot.mpegts.tracks.iter().find(|(_, track)| {
+				track
+					.verbatim
+					.as_ref()
+					.is_some_and(|verbatim| verbatim.stream_type == 0x86)
+			}) {
+				assert_eq!(track.pid, 0x21, "the cue PID is preserved");
+				assert_eq!(
+					track.verbatim.as_ref().unwrap().framing,
+					ts::Framing::Section,
+					"SCTE-35 is section-framed"
+				);
+				break name.clone();
+			}
+		};
+
+		let track = broadcast.track(name.as_str()).unwrap().subscribe(None).await.unwrap();
+		let mut reader = moq_mux::container::Consumer::new(track, Container::Legacy);
+		let cue = timeout(Duration::from_secs(5), reader.read())
+			.await
+			.expect("cue read timed out")
+			.unwrap()
+			.expect("a published cue section");
+		let expected_cue = cue.payload;
+		assert_eq!(expected_cue[0], 0xFC, "a verbatim splice_info_section (table_id 0xFC)");
+
+		let mut subscriber = Subscriber::new(&origin.consume(), "ingest", Duration::ZERO)
+			.await
+			.unwrap()
+			.expect("the ingest broadcast is available for SRT egress");
+		let mut output = Vec::new();
+		loop {
+			match timeout(Duration::from_secs(5), subscriber.next()).await {
+				Ok(Ok(Some(frame))) => output.extend_from_slice(&frame.payload),
+				Ok(Ok(None)) => break,
+				Ok(Err(err)) => panic!("SRT egress failed: {err}"),
+				Err(_) => break,
+			}
+		}
+		publisher.finish().unwrap();
+
+		let mut roundtrip = moq_net::broadcast::Info::new().produce();
+		let roundtrip_consumer = roundtrip.consume();
+		let roundtrip_catalog = moq_mux::catalog::Producer::with_catalog(
+			&mut roundtrip,
+			moq_mux::catalog::hang::Catalog::<ts::Ext>::default(),
+		)
+		.unwrap();
+		let mut roundtrip_import = ts::Import::new(roundtrip, roundtrip_catalog.reserve());
+		roundtrip_import.decode(&output).unwrap();
+		roundtrip_import.finish().unwrap();
+
+		let snapshot = roundtrip_catalog.snapshot();
+		let (name, _) = snapshot
+			.mpegts
+			.tracks
+			.iter()
+			.find(|(_, track)| {
+				track
+					.verbatim
+					.as_ref()
+					.is_some_and(|verbatim| verbatim.stream_type == 0x86)
+			})
+			.expect("SRT egress preserves the SCTE-35 track");
+		let track = roundtrip_consumer.track(name).unwrap().subscribe(None).await.unwrap();
+		let mut reader = moq_mux::container::Consumer::new(track, Container::Legacy);
+		let cue = timeout(Duration::from_secs(5), reader.read())
+			.await
+			.expect("round-trip cue read timed out")
+			.unwrap()
+			.expect("SRT egress preserves a cue section");
+		assert_eq!(cue.payload[0], 0xFC, "the round-trip cue is a splice_info_section");
+		assert_eq!(
+			cue.payload, expected_cue,
+			"SRT egress preserves the complete cue section"
+		);
 	}
 }

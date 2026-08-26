@@ -133,6 +133,11 @@ export class Encoder {
 		return this.in.capture.peek();
 	}
 
+	// The catalog fields known before encoding starts. Opus adds its decoder description from the
+	// first encoder output without feeding that catalog-only update back into the encoder.
+	#config = new Signal<Catalog.AudioConfig | undefined>(undefined);
+	#decoderDescription = new Signal<{ config: Catalog.AudioConfig; description: Catalog.Hex } | undefined>(undefined);
+
 	readonly #out: EncoderOutput = {
 		catalog: new Signal<Catalog.AudioConfig | undefined>(undefined),
 		root: new Signal<AudioNode | undefined>(undefined),
@@ -175,6 +180,7 @@ export class Encoder {
 
 		this.#signals.run(this.#runCapture.bind(this));
 		this.#signals.run(this.#runConfig.bind(this));
+		this.#signals.run(this.#runCatalog.bind(this));
 		this.#signals.run(this.#runRegister.bind(this));
 	}
 
@@ -277,7 +283,7 @@ export class Encoder {
 		};
 	}
 
-	// Derive the catalog from the captured format and the codec. Re-runs whenever either changes, so a
+	// Derive the encoder config from the captured format and the codec. Re-runs whenever either changes, so a
 	// codec update (bitrate, frame duration) reconfigures without waiting for a channel-count change.
 	//
 	// Gated on `enabled` the same way the video encoder is: a disabled rendition has to drop out of
@@ -286,12 +292,26 @@ export class Encoder {
 		const capture = effect.get(this.in.capture);
 		const captured = capture ? effect.get(capture.out.format) : undefined;
 		if (!effect.get(this.in.enabled) || !captured) {
-			effect.set(this.#out.catalog, undefined);
+			effect.set(this.#config, undefined);
 			return;
 		}
 
 		const codec = normalizeCodec(effect.get(this.codec));
-		effect.set(this.#out.catalog, this.#createConfig(captured, codec));
+		effect.set(this.#config, this.#createConfig(captured, codec));
+	}
+
+	// Publish the config immediately so a consumer can request the demand-gated track. Once encoding
+	// starts, republish Opus with the exact decoder description reported for that encoder config.
+	#runCatalog(effect: Effect): void {
+		const config = effect.get(this.#config);
+		if (!config) {
+			effect.set(this.#out.catalog, undefined);
+			return;
+		}
+
+		const decoder = effect.get(this.#decoderDescription);
+		const catalog = decoder?.config === config ? { ...config, description: decoder.description } : config;
+		effect.set(this.#out.catalog, catalog);
 	}
 
 	// Collect the encode-only Opus knobs that are set, reading the codec through the effect so the
@@ -317,7 +337,7 @@ export class Encoder {
 			await Util.Libav.polyfill();
 
 			effect.run((effect: Effect) => {
-				const config = effect.get(this.out.catalog);
+				const config = effect.get(this.#config);
 				if (!config) return;
 
 				const capture = effect.get(this.in.capture);
@@ -341,10 +361,12 @@ export class Encoder {
 				const framer = createFramer(config, config.sampleRate);
 
 				const encoder = new AudioEncoder({
-					output: (frame) => {
+					output: (frame, metadata) => {
 						if (frame.type !== "key") {
 							throw new Error("only key frames are supported");
 						}
+
+						this.#setDecoderDescription(config, metadata?.decoderConfig?.description);
 
 						this.#out.stats.update((stats) => ({
 							frames: stats.frames + 1,
@@ -409,6 +431,19 @@ export class Encoder {
 				});
 			});
 		});
+	}
+
+	#setDecoderDescription(config: Catalog.AudioConfig, source: AllowSharedBufferSource | undefined): void {
+		if (config.codec !== "opus" || !source) return;
+
+		const bytes = ArrayBuffer.isView(source)
+			? new Uint8Array(source.buffer, source.byteOffset, source.byteLength)
+			: new Uint8Array(source);
+		const description = Util.Hex.fromBytes(bytes);
+		const current = this.#decoderDescription.peek();
+		if (current?.config === config && current.description === description) return;
+
+		this.#decoderDescription.set({ config, description });
 	}
 
 	close() {

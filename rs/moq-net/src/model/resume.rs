@@ -1594,6 +1594,8 @@ impl Subscriber {
 				{
 					continue;
 				}
+				// A re-offer is a delivery: stamp it like a fresh hand-out.
+				group.cache_refresh();
 				// Folded into a group already handed out: try the next parked one.
 				if let Some(group) = self.hand_out(index, group) {
 					self.next_sequence = self.next_sequence.max(sequence.saturating_add(1));

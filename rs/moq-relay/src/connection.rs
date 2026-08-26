@@ -156,14 +156,14 @@ impl Connection {
 
 		// The credential (JWT `exp` or client cert `notAfter`) is only checked at
 		// connect time, so hold the session open no longer than the credential is
-		// valid. Without an expiry, wait for the session to close. Either way, a
+		// valid. Without any bound, wait for the session to close. Either way, a
 		// relay shutdown drains the session with a GOAWAY instead of cutting it off.
 		let mut shutdown = self.shutdown.clone();
 
 		tokio::select! {
 			err = session.closed() => Err(err.into()),
-			_ = token.expired() => {
-				tracing::info!("credential expired, closing session");
+			reason = self.auth.expired(&token) => {
+				tracing::info!(%reason, "credential no longer valid, closing session");
 				session.abort(moq_net::Error::Unauthorized);
 				Ok(())
 			}
