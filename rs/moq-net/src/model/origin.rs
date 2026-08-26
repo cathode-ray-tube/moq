@@ -212,33 +212,51 @@ where
 /// Maximum number of origins (hops) an [`OriginList`] can hold.
 ///
 /// Caps pathological or loop-induced announcements at a reasonable cluster
-/// diameter; appending past this limit returns [`TooManyOrigins`] rather than
+/// diameter; appending past this limit returns [`InvalidHop::TooMany`] rather than
 /// silently truncating.
 pub(crate) const MAX_HOPS: usize = 32;
 
-/// Bounded list of [`Origin`] entries, typically the hop chain of a broadcast.
+/// Bounded, loop-free list of [`Origin`] entries: the hop chain of a broadcast.
 ///
-/// Guarantees `len() <= MAX_HOPS`. Construct via [`OriginList::new`] +
-/// [`OriginList::push`], or fall back to the fallible [`TryFrom<Vec<Origin>>`].
+/// Guarantees `len() <= MAX_HOPS` and that no non-zero [`Origin`] appears twice. Both
+/// are wire rules, and both hold wherever a list exists rather than only where one was
+/// parsed, so a chain that a conforming receiver would reject cannot be built and sent.
+/// Construct via [`OriginList::new`] + [`OriginList::push`], or fall back to the
+/// fallible [`TryFrom<Vec<Origin>>`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OriginList(Vec<Origin>);
 
-/// Returned when an operation would grow an [`OriginList`] past its hop-count cap.
+/// Why an [`Origin`] cannot join an [`OriginList`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct TooManyOrigins;
+pub enum InvalidHop {
+	/// The list is already at its hop-count cap, which a real path never reaches and a
+	/// loop does.
+	TooMany,
 
-impl fmt::Display for TooManyOrigins {
+	/// The id is already in the list. A chain that revisits a hop looped, which every
+	/// receiver of it must reject, so it must not be built in the first place. The
+	/// reserved id 0 identifies nothing and may repeat.
+	Duplicate,
+}
+
+impl fmt::Display for InvalidHop {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "too many origins (max {MAX_HOPS})")
+		match self {
+			Self::TooMany => write!(f, "too many origins (max {MAX_HOPS})"),
+			Self::Duplicate => write!(f, "origin already in the hop chain"),
+		}
 	}
 }
 
-impl std::error::Error for TooManyOrigins {}
+impl std::error::Error for InvalidHop {}
 
-impl From<TooManyOrigins> for DecodeError {
-	fn from(_: TooManyOrigins) -> Self {
-		DecodeError::BoundsExceeded
+impl From<InvalidHop> for DecodeError {
+	fn from(err: InvalidHop) -> Self {
+		match err {
+			InvalidHop::TooMany => DecodeError::BoundsExceeded,
+			InvalidHop::Duplicate => DecodeError::InvalidValue,
+		}
 	}
 }
 
@@ -248,10 +266,17 @@ impl OriginList {
 		Self(Vec::new())
 	}
 
-	/// Append an [`Origin`]. Returns [`TooManyOrigins`] if the list is full.
-	pub fn push(&mut self, origin: Origin) -> Result<(), TooManyOrigins> {
+	/// Append an [`Origin`], rejecting anything a conforming receiver would.
+	///
+	/// Fails with [`InvalidHop::TooMany`] once the list is full, and with
+	/// [`InvalidHop::Duplicate`] for an id already in the chain, which is a loop. The
+	/// reserved id 0 identifies nothing, so it may repeat.
+	pub fn push(&mut self, origin: Origin) -> Result<(), InvalidHop> {
 		if self.0.len() >= MAX_HOPS {
-			return Err(TooManyOrigins);
+			return Err(InvalidHop::TooMany);
+		}
+		if origin != Origin::UNKNOWN && self.0.contains(&origin) {
+			return Err(InvalidHop::Duplicate);
 		}
 		self.0.push(origin);
 		Ok(())
@@ -259,14 +284,28 @@ impl OriginList {
 
 	/// Replace the first entry equal to `target` with `replacement`, returning
 	/// true if a match was found. The length is unchanged.
-	pub fn replace_first(&mut self, target: Origin, replacement: Origin) -> bool {
-		for entry in &mut self.0 {
-			if *entry == target {
-				*entry = replacement;
-				return true;
-			}
+	///
+	/// Fails with [`InvalidHop::Duplicate`] only when the rewrite would actually name
+	/// `replacement` twice, which is the loop [`Self::push`] refuses to build. A `target`
+	/// that is not present changes nothing and so cannot duplicate anything, and the slot
+	/// being overwritten is not a duplicate of itself.
+	pub fn replace_first(&mut self, target: Origin, replacement: Origin) -> Result<bool, InvalidHop> {
+		let Some(index) = self.0.iter().position(|entry| *entry == target) else {
+			return Ok(false);
+		};
+
+		if replacement != Origin::UNKNOWN
+			&& self
+				.0
+				.iter()
+				.enumerate()
+				.any(|(i, entry)| i != index && *entry == replacement)
+		{
+			return Err(InvalidHop::Duplicate);
 		}
-		false
+
+		self.0[index] = replacement;
+		Ok(true)
 	}
 
 	/// Returns true if any entry matches `origin`.
@@ -296,11 +335,17 @@ impl OriginList {
 }
 
 impl TryFrom<Vec<Origin>> for OriginList {
-	type Error = TooManyOrigins;
+	type Error = InvalidHop;
 
 	fn try_from(v: Vec<Origin>) -> Result<Self, Self::Error> {
 		if v.len() > MAX_HOPS {
-			return Err(TooManyOrigins);
+			return Err(InvalidHop::TooMany);
+		}
+		// MAX_HOPS is 32, so the quadratic scan is cheaper than allocating a set.
+		for (i, origin) in v.iter().enumerate() {
+			if *origin != Origin::UNKNOWN && v[i + 1..].contains(origin) {
+				return Err(InvalidHop::Duplicate);
+			}
 		}
 		Ok(Self(v))
 	}
@@ -339,11 +384,13 @@ where
 		if count > MAX_HOPS {
 			return Err(DecodeError::BoundsExceeded);
 		}
-		let mut list = Vec::with_capacity(count);
+		// Through `push`, so a chain that revisits a hop is rejected here rather than
+		// entering the model and being forwarded on to a receiver that must close on it.
+		let mut list = Self(Vec::with_capacity(count));
 		for _ in 0..count {
-			list.push(Origin::decode(r, version)?);
+			list.push(Origin::decode(r, version)?)?;
 		}
-		Ok(Self(list))
+		Ok(list)
 	}
 }
 
@@ -5173,7 +5220,26 @@ mod tests {
 			list.push(Origin::random()).unwrap();
 		}
 		assert_eq!(list.len(), MAX_HOPS);
-		assert_eq!(list.push(Origin::random()), Err(TooManyOrigins));
+		assert_eq!(list.push(Origin::random()), Err(InvalidHop::TooMany));
+	}
+
+	/// A chain that revisits a hop looped, and every receiver of one must close the
+	/// session over it. Refusing it here is what keeps that unbuildable rather than a
+	/// rule each place that constructs a chain has to remember.
+	#[test]
+	fn origin_list_push_rejects_a_repeat() {
+		let seven = Origin::new(7).unwrap();
+		let mut list = OriginList::new();
+		list.push(seven).unwrap();
+		list.push(Origin::new(9).unwrap()).unwrap();
+
+		assert_eq!(list.push(seven), Err(InvalidHop::Duplicate));
+		assert_eq!(list.len(), 2, "a refused push must not grow the chain");
+
+		// 0 identifies nothing, so two unknown hops are two hops, not a loop.
+		list.push(Origin::UNKNOWN).unwrap();
+		list.push(Origin::UNKNOWN).unwrap();
+		assert_eq!(list.len(), 4);
 	}
 
 	#[test]
@@ -5184,15 +5250,44 @@ mod tests {
 		}
 
 		// Rewrites only the first placeholder, keeping the length the same.
-		assert!(list.replace_first(Origin::UNKNOWN, Origin::new(7).unwrap()));
+		assert!(list.replace_first(Origin::UNKNOWN, Origin::new(7).unwrap()).unwrap());
 		assert_eq!(
 			list.as_slice(),
 			&[Origin::new(7).unwrap(), Origin::UNKNOWN, Origin::UNKNOWN]
 		);
 
 		// No match leaves the list untouched.
-		assert!(!list.replace_first(Origin::new(99).unwrap(), Origin::new(8).unwrap()));
+		assert!(
+			!list
+				.replace_first(Origin::new(99).unwrap(), Origin::new(8).unwrap())
+				.unwrap()
+		);
 		assert_eq!(list.len(), 3);
+
+		// Writing in an id the chain already carries would name it twice, which is the
+		// loop `push` refuses; the rewrite has to refuse it for the same reason.
+		assert_eq!(
+			list.replace_first(Origin::UNKNOWN, Origin::new(7).unwrap()),
+			Err(InvalidHop::Duplicate)
+		);
+
+		// A target that is not there changes nothing, so it cannot duplicate anything,
+		// however many times the replacement already appears.
+		assert_eq!(
+			list.replace_first(Origin::new(99).unwrap(), Origin::new(7).unwrap()),
+			Ok(false)
+		);
+
+		// Overwriting a slot with what it already holds is a no-op, not a duplicate: the
+		// entry being replaced is not a second occurrence of itself.
+		assert_eq!(
+			list.replace_first(Origin::new(7).unwrap(), Origin::new(7).unwrap()),
+			Ok(true)
+		);
+		assert_eq!(
+			list.as_slice(),
+			&[Origin::new(7).unwrap(), Origin::UNKNOWN, Origin::UNKNOWN]
+		);
 	}
 
 	#[test]
@@ -5201,7 +5296,15 @@ mod tests {
 		assert!(OriginList::try_from(under).is_ok());
 
 		let over: Vec<Origin> = (0..MAX_HOPS + 1).map(|_| Origin::random()).collect();
-		assert_eq!(OriginList::try_from(over), Err(TooManyOrigins));
+		assert_eq!(OriginList::try_from(over), Err(InvalidHop::TooMany));
+
+		// The other wire rule, on the path that skips `push` entirely.
+		let seven = Origin::new(7).unwrap();
+		assert_eq!(
+			OriginList::try_from(vec![seven, Origin::new(9).unwrap(), seven]),
+			Err(InvalidHop::Duplicate)
+		);
+		assert!(OriginList::try_from(vec![Origin::UNKNOWN, seven, Origin::UNKNOWN]).is_ok());
 	}
 
 	/// Exact lookups and eligible announcements land synchronously in

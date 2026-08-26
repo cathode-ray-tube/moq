@@ -1,3 +1,4 @@
+import { ProtocolViolation } from "../error.ts";
 import { MAX_HOPS, type Origin, OriginSchema, UNKNOWN_ORIGIN } from "../hop.ts";
 import * as Path from "../path.ts";
 import type { Reader, Writer } from "../stream.ts";
@@ -57,9 +58,25 @@ export type AnnounceBroadcast =
 	 * chain after a relay failover, or a route whose cost moved). The id stays live. */
 	| { status: "restart"; id: bigint; hops: Origin[]; cost?: Cost };
 
+// Both wire rules on a hop chain, applied to what we send and to what we receive: a
+// chain that revisits a hop looped, so neither forwarding it nor subscribing through it
+// is safe, and a receiver must end the session over one. `UNKNOWN_ORIGIN` identifies
+// nothing, so any number of hops may be unknown.
+//
+// `ProtocolViolation` so a receipt takes the session down rather than the one stream,
+// matching what `ietf/cluster.ts` throws for the identical rule.
 function checkHops(hops: Origin[]) {
 	if (hops.length > MAX_HOPS) {
-		throw new Error(`hop count ${hops.length} exceeds maximum ${MAX_HOPS}`);
+		throw new ProtocolViolation(`hop count ${hops.length} exceeds maximum ${MAX_HOPS}`);
+	}
+
+	// MAX_HOPS is 32, so the quadratic scan is cheaper than allocating a set.
+	for (let i = 0; i < hops.length; i++) {
+		const hop = hops[i];
+		if (hop === UNKNOWN_ORIGIN) continue;
+		if (hops.indexOf(hop, i + 1) !== -1) {
+			throw new ProtocolViolation(`hop ${hop} appears twice in the chain`);
+		}
 	}
 }
 
@@ -102,6 +119,7 @@ async function decodeHops(r: Reader, version: Version): Promise<Origin[]> {
 			for (let i = 0; i < count; i++) {
 				hops.push(OriginSchema.parse(await r.u62()));
 			}
+			checkHops(hops);
 			return hops;
 		}
 	}
