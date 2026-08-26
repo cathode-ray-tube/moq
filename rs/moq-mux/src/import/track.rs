@@ -23,9 +23,11 @@ fn video_hint(init: &VideoInit, default_codec: Option<hang::catalog::VideoCodec>
 	hint
 }
 
-/// The codec parser fills everything from the init bytes, so the label is all the caller adds.
-fn with_label(init: &AudioInit, mut config: hang::catalog::AudioConfig) -> hang::catalog::AudioConfig {
+/// The codec parser fills everything from the init bytes, so the label and container are all the
+/// caller adds.
+fn with_init(init: &AudioInit, mut config: hang::catalog::AudioConfig) -> hang::catalog::AudioConfig {
 	config.label = init.label.clone();
+	config.container = init.container.clone();
 	config
 }
 
@@ -201,20 +203,20 @@ impl<E: CatalogExt> Track<E> {
 		let data = init.data.as_ref();
 		let kind = match init.format {
 			AudioFormat::Aac => {
-				let config = with_label(&init, crate::codec::aac::config(data)?);
+				let config = with_init(&init, crate::codec::aac::config(data)?);
 				TrackKind::Aac(crate::codec::aac::Import::new(track, reserved, config)?)
 			}
 			AudioFormat::Opus => {
-				let config = with_label(&init, crate::codec::opus::config(data)?);
+				let config = with_init(&init, crate::codec::opus::config(data)?);
 				TrackKind::Opus(crate::codec::opus::Import::new(track, reserved, config)?)
 			}
 			AudioFormat::Flac => {
 				// `data` is a FLAC header: the `fLaC` marker plus the STREAMINFO block.
-				let config = with_label(&init, crate::codec::flac::config(data)?);
+				let config = with_init(&init, crate::codec::flac::config(data)?);
 				TrackKind::Flac(crate::codec::flac::Import::new(track, reserved, config)?)
 			}
 			AudioFormat::Mp3 => {
-				let config = with_label(&init, crate::codec::mp3::config(data)?);
+				let config = with_init(&init, crate::codec::mp3::config(data)?);
 				TrackKind::Mp3(crate::codec::mp3::Import::new(track, reserved, config)?)
 			}
 		};
@@ -835,6 +837,28 @@ mod tests {
 		assert_eq!(audio.channel_count, config.channel_count);
 		assert_eq!(audio.description.as_deref(), Some(init.as_ref()));
 		assert_eq!(audio.label.as_deref(), Some("English"));
+	}
+
+	/// The audio counterpart to [`VideoInit::hint`]'s container: the caller's selection has to reach
+	/// the published rendition, since the codec parser resolves everything else from the init bytes.
+	#[tokio::test(start_paused = true)]
+	async fn an_audio_init_publishes_its_container() {
+		let (mut broadcast, catalog) = new_broadcast();
+		let request = broadcast.reserve_track("audio").unwrap();
+
+		let _import = Track::audio(
+			request,
+			catalog.reserve(),
+			AudioInit {
+				container: hang::catalog::Container::Loc,
+				..AudioInit::new(AudioFormat::Opus, opus_head())
+			},
+		)
+		.unwrap();
+
+		let snapshot = catalog.snapshot();
+		let audio = snapshot.audio.renditions.get("audio").unwrap();
+		assert_eq!(audio.container, hang::catalog::Container::Loc);
 	}
 
 	#[tokio::test(start_paused = true)]

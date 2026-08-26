@@ -4303,16 +4303,6 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "kio"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7fa984c3b737520c30b414041ec63b013614abba31418585d83c5c792fb5bb7d"
-dependencies = [
- "loom",
- "smallvec",
-]
-
-[[package]]
-name = "kio"
 version = "0.5.6"
 dependencies = [
  "criterion",
@@ -4784,7 +4774,7 @@ dependencies = [
  "bytes",
  "getrandom 0.4.3",
  "hang",
- "kio 0.5.6",
+ "kio",
  "moq-audio",
  "moq-json",
  "moq-mux",
@@ -4838,7 +4828,7 @@ dependencies = [
  "bytes",
  "hang",
  "humantime",
- "kio 0.5.6",
+ "kio",
  "m3u8-rs",
  "moq-mux",
  "moq-net",
@@ -4860,7 +4850,7 @@ dependencies = [
  "bytes",
  "criterion",
  "json-patch",
- "kio 0.5.6",
+ "kio",
  "moq-flate",
  "moq-net",
  "serde",
@@ -4898,7 +4888,7 @@ dependencies = [
  "futures",
  "h264-parser",
  "hang",
- "kio 0.5.6",
+ "kio",
  "memchr",
  "moq-json",
  "moq-loc",
@@ -4933,7 +4923,7 @@ dependencies = [
  "criterion",
  "futures",
  "getrandom 0.4.3",
- "kio 0.5.6",
+ "kio",
  "loom",
  "moq-net",
  "num_enum",
@@ -5174,6 +5164,7 @@ dependencies = [
  "bytes",
  "clap",
  "hang",
+ "kio",
  "moq-mux",
  "moq-net",
  "moq-tokio",
@@ -5191,7 +5182,7 @@ dependencies = [
  "anyhow",
  "criterion",
  "io-uring",
- "kio 0.5.6",
+ "kio",
  "libc",
  "moq-net",
  "nix",
@@ -10516,7 +10507,7 @@ dependencies = [
  "bytes",
  "http",
  "iroh",
- "kio 0.5.5",
+ "kio",
  "n0-error",
  "n0-future",
  "tokio",
@@ -10535,7 +10526,7 @@ dependencies = [
  "bytes",
  "futures",
  "http",
- "kio 0.5.5",
+ "kio",
  "noq",
  "rustls",
  "rustls-native-certs",
@@ -10572,7 +10563,7 @@ dependencies = [
  "flume",
  "futures",
  "http",
- "kio 0.5.5",
+ "kio",
  "rustls-pki-types",
  "thiserror 2.0.20",
  "tokio",
@@ -10592,7 +10583,7 @@ dependencies = [
  "bytes",
  "futures",
  "http",
- "kio 0.5.5",
+ "kio",
  "quinn",
  "rustls",
  "rustls-native-certs",

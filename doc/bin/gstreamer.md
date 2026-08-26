@@ -30,6 +30,25 @@ Both elements support the following properties:
 For `http://` URLs, `moq-tokio` automatically fetches the server's certificate fingerprint from `/certificate.sha256` and verifies TLS against it. You don't need `tls-disable-verify` for local development.
 :::
 
+`moqsink` additionally supports these QUIC connection properties:
+
+| Property            | Type   | Description                                                     |
+| ------------------- | ------ | --------------------------------------------------------------- |
+| `quic-idle-timeout` | uint64 | Idle timeout in milliseconds (default 30000; 0 disables locally) |
+| `quic-keep-alive`   | uint64 | Keep-alive interval in milliseconds (default 5000; 0 disables)   |
+
+An idle timeout of `0` disables it locally.
+These values apply only to QUIC connections. WebSocket fallback uses its own heartbeat policy.
+The iroh backend applies the idle timeout but ignores keep-alive because it has no keep-alive setting.
+
+```bash
+gst-launch-1.0 -e \
+  videotestsrc is-live=true ! x264enc tune=zerolatency ! h264parse \
+    ! video/x-h264,stream-format=byte-stream,alignment=au ! mux.sink_0 \
+  moqsink name=mux url=http://localhost:4443 broadcast=test \
+    quic-idle-timeout=15000 quic-keep-alive=3000
+```
+
 `moqsink` additionally exposes these read-only properties for monitoring. Each emits a `notify`
 signal when it changes, so you can poll it via `g_object_get` or connect to `notify::<property>`:
 
@@ -277,6 +296,21 @@ gst-launch-1.0 -v -e \
     sink_0::track=camera sink_1::track=commentary
 ```
 
+Media tracks use the legacy Hang container by default. Set a pad's `container=loc` before its CAPS
+event to publish that track as Low Overhead Container and advertise LOC in the catalog:
+
+```bash
+gst-launch-1.0 -v -e \
+  videotestsrc is-live=true ! x264enc tune=zerolatency ! h264parse \
+    ! video/x-h264,stream-format=byte-stream,alignment=au ! mux.sink_0 \
+  moqsink name=mux url=http://localhost:4443 broadcast=bbb.hang sink_0::container=loc
+```
+
+Set the property on each media pad that should use LOC; other pads remain Legacy.
+
+Like `track`, `container` is writable in any state until the pad's CAPS event reserves the track.
+It is fixed for that producer and becomes writable again after returning to `READY`.
+
 `track` is writable in any state until the pad's CAPS event reserves the track, so a pad requested
 while the pipeline runs can still be named before its first buffer. From then on it reads back the
 reserved name, the generated one included, and further writes are ignored with a warning; stopping the
@@ -285,7 +319,8 @@ the generated name. A name another pad already holds invalidates only that pad, 
 broadcast keeps publishing.
 
 A pad negotiated as `application/octet-stream` publishes application data instead of media. The bytes
-go out exactly as they arrive: no codec, no container, no interpretation.
+go out exactly as they arrive: no codec, no media container, no interpretation. A data pad's
+`container` property has no effect.
 
 ```bash
 gst-launch-1.0 -v -e \

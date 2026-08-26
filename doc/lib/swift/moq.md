@@ -14,7 +14,7 @@ Full API reference: [Swift Package Index](https://swiftpackageindex.com/moq-dev/
 ## Install
 
 ```swift
-.package(url: "https://github.com/moq-dev/moq-swift", from: "0.4.4"),
+.package(url: "https://github.com/moq-dev/moq-swift", from: "0.4.5"),
 ```
 
 Add `Moq` to your target's dependencies:
@@ -317,6 +317,8 @@ for try await request in dynamic {
         let track = try broadcast.publishTrack(name: "status")
         try request.accept(broadcast: broadcast)
         try track.writeFrame(Data("ready".utf8), timestampUs: 0)
+        try track.finish()
+        try broadcast.finish()
     } else {
         try request.abort(errorCode: 404)
     }

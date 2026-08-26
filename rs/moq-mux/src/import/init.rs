@@ -17,6 +17,11 @@ pub struct AudioInit {
 	pub data: Bytes,
 	/// Human-readable rendition name for a track picker.
 	pub label: Option<String>,
+	/// The container wrapping each frame on the wire.
+	///
+	/// [`Legacy`](hang::catalog::Container::Legacy) unless selected. A video rendition carries the
+	/// same knob on its [`VideoInit::hint`].
+	pub container: hang::catalog::Container,
 }
 
 impl AudioInit {
@@ -26,6 +31,7 @@ impl AudioInit {
 			format,
 			data: data.into(),
 			label: None,
+			container: hang::catalog::Container::default(),
 		}
 	}
 }

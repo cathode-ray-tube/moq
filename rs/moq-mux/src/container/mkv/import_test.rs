@@ -234,6 +234,40 @@ fn test_vp9_only_catalog() {
 	assert!(matches!(v.container, Container::Legacy));
 }
 
+#[tokio::test(start_paused = true)]
+async fn public_container_preserves_loc_for_mkv() {
+	let payload = b"vp9-key";
+	let data = MkvBuilder::new()
+		.header("webm")
+		.segment_start()
+		.info(1_000_000)
+		.track_video(1, "V_VP9", 320, 240)
+		.cluster(0, || vec![simple_block(1, 0, true, payload)])
+		.segment_end()
+		.build();
+
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let reserved = catalog.reserve();
+	let mut import = super::Import::new(broadcast, reserved).with_container(hang::catalog::Container::Loc);
+	import.decode(&data).unwrap();
+	import.finish().unwrap();
+
+	let snapshot = catalog.snapshot();
+	let (name, config) = snapshot.video.renditions.iter().next().unwrap();
+	assert_eq!(config.container, Container::Loc);
+
+	let track = consumer.track(name).unwrap().subscribe(None).await.unwrap();
+	let mut media = crate::container::Consumer::new(track, crate::catalog::hang::Container::Loc);
+	let frame = tokio::time::timeout(std::time::Duration::from_secs(1), media.read())
+		.await
+		.unwrap()
+		.unwrap()
+		.unwrap();
+	assert_eq!(frame.payload.as_ref(), payload);
+}
+
 #[test]
 fn test_vp9_opus_catalog() {
 	let data = MkvBuilder::new()
@@ -376,9 +410,10 @@ fn test_block_timestamp_scaling() {
 
 /// A rendition must never be advertised when its media producer could not be built.
 ///
-/// `media_producer` is fallible (it mints the rendition's `<name>.timeline.z` track, which can
-/// collide), so publishing the catalog entry first would leave consumers a rendition that is
-/// announced but has no producer behind it and is therefore never served.
+/// `media_producer` is fallible (it enrolls the track in the broadcast timeline, minting the
+/// shared `timeline.z` track, which can collide), so publishing the catalog entry first would
+/// leave consumers a rendition that is announced but has no producer behind it and is therefore
+/// never served.
 #[test]
 fn rendition_is_not_published_when_the_media_producer_fails() {
 	let data = MkvBuilder::new()

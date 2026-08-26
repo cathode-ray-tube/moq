@@ -119,12 +119,18 @@ impl<E: CatalogExt> Import<E> {
 		config: hang::catalog::AudioConfig,
 	) -> crate::Result<Self> {
 		tracing::debug!(name = ?track.name(), ?config, "starting track");
-		let mut rendition = reserved.audio(track.name())?;
+		// The caller's config names the container; the writer is built from that same value so the
+		// wire cannot disagree with what the rendition advertises.
+		let wire = crate::catalog::hang::Container::try_from(&config.container)?;
+		let name = track.name().to_string();
+		// Build the writer before advertising the rendition: it is fallible (enrolling the track in
+		// the broadcast timeline can collide), and a rendition published for a track we then fail to
+		// produce would be advertised to consumers but never served.
+		let media = reserved.producer().media_producer(track, wire)?;
+		let mut rendition = reserved.audio(name)?;
 		rendition.set(config);
 		Ok(Self {
-			track: reserved
-				.producer()
-				.media_producer(track, crate::catalog::hang::Container::Legacy)?,
+			track: media,
 			rendition,
 		})
 	}

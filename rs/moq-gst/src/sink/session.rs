@@ -99,6 +99,26 @@ pub struct ResolvedSettings {
 	pub broadcast: String,
 	/// Disable TLS certificate verification (local/dev use).
 	pub tls_disable_verify: bool,
+	/// QUIC idle timeout override.
+	pub quic_idle_timeout: Option<std::time::Duration>,
+	/// QUIC keep-alive override, including zero to disable it.
+	pub quic_keep_alive: Option<std::time::Duration>,
+}
+
+/// Builds the connect configuration with the sink's TLS and backoff overrides.
+pub(super) fn connect_config(settings: &ResolvedSettings) -> moq_tokio::connect::Config {
+	let mut config = moq_tokio::connect::Config::default();
+	config.tls.insecure = Some(settings.tls_disable_verify);
+	config.backoff.timeout = Some(std::time::Duration::ZERO);
+	config
+}
+
+/// The QUIC transport overrides the sink exposes as properties.
+pub(super) fn quic_config(settings: &ResolvedSettings) -> moq_tokio::quic::Config {
+	let mut config = moq_tokio::quic::Config::default();
+	config.idle_timeout = settings.quic_idle_timeout;
+	config.keep_alive = settings.quic_keep_alive;
+	config
 }
 
 /// A running session: the connect/lifecycle task plus the state the property getters read. Dropping the
@@ -144,10 +164,9 @@ impl Session {
 		// retry), posting the bus error below. During an outage the pad threads keep writing (bounded
 		// by moq-net's per-group eviction) and the relay catches up from a group boundary on
 		// reconnect. A bounded policy is available via `ClientConfig::backoff`.
-		let mut config = moq_tokio::connect::Config::default();
-		config.tls.insecure = Some(settings.tls_disable_verify);
-		config.backoff.timeout = Some(std::time::Duration::ZERO);
-		let client = config.init(Default::default())?.with_publisher(origin.consume());
+		let client = connect_config(&settings)
+			.init(quic_config(&settings))?
+			.with_publisher(origin.consume());
 		let reconnect = client.connect(settings.url.clone());
 		// Persistent handles that survive reconnects; the getters read them without touching the loop.
 		let send_bandwidth = reconnect.send_bandwidth();
