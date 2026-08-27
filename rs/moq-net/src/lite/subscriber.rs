@@ -260,6 +260,10 @@ impl<S: crate::transport::poll::Session> Subscriber<S> {
 			return Err(Error::ProtocolViolation);
 		}
 
+		// The peer holds this path now. Everything below either accepts the announcement,
+		// replacing this, or declines it and leaves it exactly as reserved.
+		announced.reserve(path.clone());
+
 		if let Some(responder) = responder_origin {
 			// A chain already naming the sender came back through it: a reflection, and
 			// appending the sender again would name it twice. That is legal in a lite
@@ -267,7 +271,6 @@ impl<S: crate::transport::poll::Session> Subscriber<S> {
 			// must not enter the model at all. Zero names nobody, so it may repeat.
 			if responder != crate::Origin::UNKNOWN && hops.contains(&responder) {
 				tracing::debug!(broadcast = %self.log_path(&path), "dropping announce reflected by its sender");
-				announced.declined(path);
 				return Ok(false);
 			}
 			// If the chain is already full, drop the announce. This is the same decision
@@ -277,7 +280,6 @@ impl<S: crate::transport::poll::Session> Subscriber<S> {
 					broadcast = %self.log_path(&path),
 					"dropping announce; hop chain at MAX_HOPS (possible loop)",
 				);
-				announced.declined(path);
 				return Ok(false);
 			}
 		}
@@ -289,7 +291,6 @@ impl<S: crate::transport::poll::Session> Subscriber<S> {
 		// every other version.
 		if hops.contains(&self.self_origin) {
 			tracing::debug!(broadcast = %self.log_path(&path), "dropping reflected announce");
-			announced.declined(path);
 			return Ok(false);
 		}
 
@@ -330,7 +331,6 @@ impl<S: crate::transport::poll::Session> Subscriber<S> {
 		// Reflections are already filtered above.
 		let route = self.announced_route(hops, cost, link_cost);
 		let Ok(source) = self.origin.create_broadcast(&path, route) else {
-			announced.declined(path);
 			return Ok(false);
 		};
 
@@ -1895,6 +1895,61 @@ mod tests {
 		);
 	}
 
+	/// Every path out of `start_announce` that declines an announce records it first.
+	///
+	/// The decline paths are a list one edit can fall off the end of, and a miss is silent:
+	/// the path reads as free, a later announce takes it, and the declined one's
+	/// `ANNOUNCE_END` retires that route instead. This walks the one that is hardest to
+	/// reach, where rewriting a placeholder hop would name this session twice.
+	#[tokio::test]
+	async fn every_declined_announce_is_recorded() {
+		let assigned = crate::Origin::new(777).unwrap();
+		let origin = origin::Info::new(crate::Origin::new(1).unwrap()).produce();
+		let mut subscriber = Subscriber::new(SubscriberConfig {
+			session: SinkSession::new(Default::default()),
+			origin,
+			recv_bandwidth: None,
+			// Lite03 sends placeholders rather than real ids, so this is the version whose
+			// chain gets rewritten on the way in.
+			version: Version::Lite03,
+			peer_setup: Default::default(),
+			cost: None,
+			peer_origin: Some(assigned),
+			going_away: Default::default(),
+		});
+
+		let path = Path::new("room/host").to_owned();
+		let mut announced = Announced::default();
+
+		// A chain whose placeholder cannot be rewritten: this session's id is already in it,
+		// so writing it over the placeholder would name it twice.
+		let hops = crate::OriginList::try_from(vec![crate::Origin::UNKNOWN, assigned]).unwrap();
+		assert!(
+			!subscriber
+				.start_announce(
+					path.clone(),
+					hops,
+					crate::broadcast::Cost::default(),
+					0,
+					None,
+					&mut announced
+				)
+				.unwrap(),
+			"a chain that cannot take this session's id must be declined",
+		);
+
+		// Declined, but still the peer's advertisement at that path.
+		let mut fresh = crate::OriginList::new();
+		fresh.push(crate::Origin::new(7).unwrap()).unwrap();
+		assert!(
+			matches!(
+				subscriber.start_announce(path, fresh, crate::broadcast::Cost::default(), 0, None, &mut announced),
+				Err(Error::ProtocolViolation)
+			),
+			"a declined announce still holds its path, so a second start for it is a violation",
+		);
+	}
+
 	/// A dropped announce still holds its path until the peer retracts it.
 	#[tokio::test]
 	async fn a_dropped_announce_still_holds_its_path() {
@@ -2313,6 +2368,21 @@ impl Announced {
 		if let Some(Some(route)) = self.0.insert(path, None) {
 			route.finish();
 		}
+	}
+
+	/// Record an advertisement before deciding what to do with it.
+	///
+	/// The peer owns the path from the moment it announces, whatever the receiver makes
+	/// of it, so the record is taken up front and every way out of the decision leaves it
+	/// standing. Accepting replaces it via [`Self::attach`]. Doing it this way rather than
+	/// at each rejection is what stops the next early return from silently freeing a path
+	/// the peer still holds.
+	/// Only valid on a path the peer does not already hold, which the caller establishes
+	/// with [`Self::contains`]. Overwriting an attached route here would drop its source
+	/// without finishing it, which is [`Self::declined`]'s job.
+	fn reserve(&mut self, path: PathOwned) {
+		debug_assert!(!self.0.contains_key(&path), "reserved a path already advertised");
+		self.0.insert(path, None);
 	}
 
 	fn attached(&mut self, path: &PathOwned) -> Option<&mut AnnouncedRoute> {
