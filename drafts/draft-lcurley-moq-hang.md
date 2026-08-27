@@ -654,7 +654,6 @@ For the same reason a publisher SHOULD NOT combine tracks into a single object, 
 ~~~
 Track Object {
   Publisher Priority (8)
-  Publisher Ordered (8)
   Timescale (i)
 }
 ~~~
@@ -780,7 +779,7 @@ TODO Security
 
 A consumer parsing a recording ({{recording}}) is parsing data at rest that it did not necessarily write.
 It MUST bounds-check a segment object's group `Length` and each frame's `Message Length` against the bytes actually retrieved, rather than trusting either to describe the object, and it MUST treat a malformed object as a missing segment rather than letting it invalidate the recording.
-It MUST reject a track object with an invalid `Publisher Ordered` value or a zero `Timescale`.
+It MUST reject a track object with a zero `Timescale`.
 Varint fields are subject to the same limits as moq-lite {{moql}}.
 A recording inherits the confidentiality and integrity properties of the storage holding it; encryption at rest is transparent to the format and out of scope.
 

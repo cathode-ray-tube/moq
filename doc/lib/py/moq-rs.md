@@ -240,7 +240,7 @@ track = await broadcast_consumer.subscribe_track(
     subscription=moq.Subscription(priority=10),
 )
 info = track.info()
-track.update(moq.Subscription(priority=20, ordered=False))
+track.update(moq.Subscription(priority=20))
 async for group in track:
     async for frame in group:
         print(frame.timestamp_us, frame.payload)
@@ -248,8 +248,7 @@ async for group in track:
 
 `write_frame` on a track creates a one-frame group by default, using a microsecond raw-track timescale. Consumers receive a `Frame` from `read_frame()` or group iteration, carrying `payload` and `timestamp_us`. (Media tracks yield a `MediaFrame`, which adds the codec-derived `keyframe` flag.) Use `append_group()` for multi-frame groups (e.g., a video GOP).
 Use `create_group(sequence)` for sparse or replayed groups. `finish_at(final_sequence)` declares the exclusive end while still permitting lower groups to arrive, and `abort(error_code)` terminates a track or group with an application error.
-`TrackConsumer.info()` returns the publisher's track properties (timescale, cache, priority, ordering priority), and `update()` changes this subscriber's delivery preferences without resubscribing.
-`ordered` controls prioritization only. When true, groups are prioritized in sequence order. Groups may always arrive out-of-order (or not at all) over the network.
+`TrackConsumer.info()` returns the publisher's track properties (timescale, cache, priority), and `update()` changes this subscriber's delivery preferences without resubscribing.
 
 ### Fetching raw groups
 

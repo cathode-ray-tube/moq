@@ -556,7 +556,13 @@ mod tests {
 		// Advance past one full group (keyframe + 2 payload) into the next.
 		tokio::time::advance(Duration::from_millis(350)).await;
 
-		let mut sub = consumer.track(TRACK).unwrap().subscribe(replay()).await.unwrap();
+		let mut sub = consumer
+			.track(TRACK)
+			.unwrap()
+			.subscribe(replay())
+			.await
+			.unwrap()
+			.ordered();
 		let mut group = sub.next_group().await.unwrap().expect("a group");
 
 		let keyframe = group.read_frame().await.unwrap().expect("keyframe");
@@ -591,7 +597,13 @@ mod tests {
 		let task = tokio::spawn(produce(0, "bench/test".into(), rolled(10, 4, 0), track, stats.clone()));
 		tokio::time::advance(Duration::from_millis(250)).await;
 
-		let mut sub = consumer.track(TRACK).unwrap().subscribe(replay()).await.unwrap();
+		let mut sub = consumer
+			.track(TRACK)
+			.unwrap()
+			.subscribe(replay())
+			.await
+			.unwrap()
+			.ordered();
 		let mut group = sub.next_group().await.unwrap().expect("a group");
 
 		// Just the keyframe, then the group ends.
@@ -623,7 +635,7 @@ mod tests {
 		));
 		tokio::time::advance(Duration::from_millis(250)).await;
 
-		let mut sub = consumer.track(TRACK).unwrap().subscribe(None).await.unwrap();
+		let mut sub = consumer.track(TRACK).unwrap().subscribe(None).await.unwrap().ordered();
 		let mut group = sub.next_group().await.unwrap().expect("a group");
 		let keyframe = group.read_frame().await.unwrap().expect("keyframe").payload;
 
@@ -650,7 +662,7 @@ mod tests {
 		let task = tokio::spawn(produce(3, "bench/test".into(), rolled(10, 50, 0), track, stats.clone()));
 		tokio::time::advance(Duration::from_millis(250)).await;
 
-		let mut sub = consumer.track(TRACK).unwrap().subscribe(None).await.unwrap();
+		let mut sub = consumer.track(TRACK).unwrap().subscribe(None).await.unwrap().ordered();
 		let mut group = sub.next_group().await.unwrap().expect("a group");
 		let keyframe = group.read_frame().await.unwrap().expect("keyframe").payload;
 

@@ -403,12 +403,12 @@ export class Subscriber {
 
 		console.debug(`subscribe start: id=${requestId} broadcast=${broadcast} track=${request.name}`);
 
-		// IETF negotiates group order in SUBSCRIBE_OK; this implementation only
-		// supports descending (newest-first), so commit ordered: false. (There's no
-		// per-frame timescale, so the rest stay at their defaults.) This
-		// resolves the consumer's track.info() and gives us the write side that
-		// incoming object streams are routed into.
-		const producer = request.accept({ ordered: false });
+		// IETF negotiates group order in SUBSCRIBE_OK; this implementation only supports
+		// descending (newest-first), which is what moq-lite fixes group order to, so the
+		// mapping needs nothing here. (There's no per-frame timescale either, so every
+		// property stays at its default.) This resolves the consumer's track.info() and
+		// gives us the write side that incoming object streams are routed into.
+		const producer = request.accept({});
 
 		// Open the stream and wait for SUBSCRIBE_OK under a timeout. State
 		// flows back via `state` so the timeout path can clean up the stream

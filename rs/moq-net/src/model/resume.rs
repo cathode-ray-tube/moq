@@ -469,8 +469,6 @@ impl Consumer {
 			min_sequence: 0,
 			end_sequence: None,
 			drift_cap: kio::Producer::new(None),
-			stale_stats: Default::default(),
-			reading: None,
 		}
 	}
 
@@ -1234,11 +1232,6 @@ pub struct Subscriber {
 	end_sequence: Option<u64>,
 	/// Shared copy of [`Self::end_sequence`] for groups that outlive this cursor poll.
 	drift_cap: kio::Producer<Option<u64>>,
-	/// Logical subscriber meter for groups drained internally by [`Self::poll_read_frame`].
-	stale_stats: crate::stats::Meter,
-
-	/// The group currently being drained by [`Self::read_frame`].
-	reading: Option<group::Consumer>,
 }
 
 impl Subscriber {
@@ -1247,14 +1240,6 @@ impl Subscriber {
 	fn poll_sync(&mut self, waiter: &kio::Waiter) {
 		self.sync(waiter);
 		self.reap();
-	}
-
-	/// Attribute expiry for the group this frame helper drains internally.
-	pub(crate) fn set_stale_meter(&mut self, meter: crate::stats::Meter) {
-		if let Some(reading) = &mut self.reading {
-			reading.set_stale_meter(meter.clone());
-		}
-		self.stale_stats = meter;
 	}
 
 	/// Reap retired cursors, then bound the live stragglers: a pruned segment's
@@ -1695,37 +1680,10 @@ impl Subscriber {
 		}
 	}
 
-	/// Poll for a single full frame from the next group in sequence order,
-	/// skipping the rest of the group. Intended for single-frame groups.
-	pub fn poll_read_frame(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<frame::Frame>>> {
-		loop {
-			if let Some(group) = &mut self.reading {
-				match group.poll_read_frame(waiter) {
-					Poll::Ready(Ok(Some(frame))) => {
-						self.reading = None;
-						return Poll::Ready(Ok(Some(frame)));
-					}
-					// An empty or broken group is skipped like a gap.
-					Poll::Ready(_) => self.reading = None,
-					Poll::Pending => return Poll::Pending,
-				}
-				continue;
-			}
-
-			match ready!(self.poll_next_group(waiter))? {
-				Some(mut group) => {
-					group.set_stale_meter(self.stale_stats.clone());
-					self.reading = Some(group);
-				}
-				None => return Poll::Ready(Ok(None)),
-			}
-		}
-	}
-
-	/// Read a single full frame from the next group in sequence order.
+	/// Return the next group with a higher sequence than any previously returned.
 	#[cfg(test)]
-	pub async fn read_frame(&mut self) -> Result<Option<frame::Frame>> {
-		kio::wait(|waiter| self.poll_read_frame(waiter)).await
+	pub async fn next_group(&mut self) -> Result<Option<group::Consumer>> {
+		kio::wait(|waiter| self.poll_next_group(waiter)).await
 	}
 
 	/// Poll for the next datagram, from the newest segment only (datagrams are a
@@ -2260,7 +2218,7 @@ mod test {
 	}
 
 	#[tokio::test]
-	async fn read_frame_across_segments() {
+	async fn next_group_across_segments() {
 		let (mut track_a, consumer_a) = track_pair("a");
 		let (mut track_b, consumer_b) = track_pair("b");
 
@@ -2272,10 +2230,13 @@ mod test {
 		producer.switch(&consumer_b, Position::group(1)).unwrap();
 		write_group(&mut track_b, 1, "b1");
 
-		let frame = sub.read_frame().now_or_never().unwrap().unwrap().unwrap();
-		assert_eq!(&frame.payload[..], b"a0");
-		let frame = sub.read_frame().now_or_never().unwrap().unwrap().unwrap();
-		assert_eq!(&frame.payload[..], b"b1");
+		let mut read = |expected: &[u8]| {
+			let mut group = sub.next_group().now_or_never().unwrap().unwrap().unwrap();
+			let frame = group.read_frame().now_or_never().unwrap().unwrap().unwrap();
+			assert_eq!(&frame.payload[..], expected);
+		};
+		read(b"a0");
+		read(b"b1");
 	}
 
 	#[tokio::test]

@@ -411,7 +411,7 @@ class BroadcastConsumer:
     async def subscribe_track(self, name: str, subscription: Subscription | None = None) -> TrackConsumer:
         """Subscribe to a track and receive arbitrary byte payloads.
 
-        ``subscription`` tunes delivery priority, group ordering priority, and group range; omit for defaults.
+        ``subscription`` tunes delivery priority, group range, and staleness; omit for defaults.
         """
         return TrackConsumer(await self._inner.subscribe_track(name, subscription))
 
@@ -474,7 +474,7 @@ class BroadcastConsumer:
         ``catalog.video[name]``), whose ``container`` describes how to parse the
         bitstream, or a :class:`Container` directly. Pass a bare container for the
         dynamic flow, where you subscribe before the catalog exists.
-        ``subscription`` tunes delivery priority, group ordering priority, group
+        ``subscription`` tunes delivery priority, group
         range, and the max age; omit for defaults. Raise
         :attr:`Subscription.max_age_ms` to buffer instead of skipping a
         stalled group.

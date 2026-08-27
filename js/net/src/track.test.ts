@@ -33,7 +33,7 @@ test("used reflects subscriber demand and unused resolves when the last one leav
 	expect(producer.used.peek()).toBe(false);
 
 	const a = producer.subscribe();
-	const b = producer.subscribe();
+	const b = producer.subscribe().ordered();
 	expect(producer.used.peek()).toBe(true);
 
 	// Closing one of two keeps demand, so unused() stays pending.
@@ -61,7 +61,7 @@ test("a producer never self-closes on zero demand: a publisher keeps serving new
 
 	// A later subscriber still works and replays the cache.
 	producer.writeString("still here");
-	const b = producer.subscribe();
+	const b = producer.subscribe().ordered();
 	expect(await b.readString()).toBe("still here");
 	expect(producer.used.peek()).toBe(true);
 });
@@ -124,16 +124,19 @@ test("writeDatagram preserves an explicit sequence", async () => {
 	expect(producer.appendGroup().sequence).toBe(101);
 });
 
-test("recvDatagram advances the ordered group cursor", async () => {
+// Datagrams and groups are separate channels that share only a sequence namespace, so
+// consuming one must not move the other's cursor.
+test("recvDatagram leaves the ordered group cursor alone", async () => {
 	const producer = new TrackProducer("test");
-	const track = producer.subscribe();
+	const datagrams = producer.subscribe();
+	const track = producer.subscribe({ maxAge: 5000 }).ordered();
 
 	producer.writeDatagram({ sequence: 5, timestamp: Timestamp.fromMillis(5), payload: enc.encode("x") });
-	expect((await track.recvDatagram())?.sequence).toBe(5);
+	expect((await datagrams.recvDatagram())?.sequence).toBe(5);
 
-	// Ordered group reads treat lower sequences as late once a datagram used sequence 5.
 	producer.writeGroup(new GroupProducer(3));
 	producer.writeGroup(new GroupProducer(6));
+	expect((await track.nextGroup())?.sequence).toBe(3);
 	expect((await track.nextGroup())?.sequence).toBe(6);
 });
 
@@ -149,7 +152,6 @@ test("subscriber options and updates are forwarded to the producer's aggregate",
 	// The initial options are available before the request is accepted or put on the wire.
 	expect(producer.subscription.peek()).toEqual({
 		priority: 0,
-		ordered: false,
 		maxAge: 0,
 		startGroup: 0,
 		endGroup: undefined,
@@ -157,18 +159,17 @@ test("subscriber options and updates are forwarded to the producer's aggregate",
 
 	// The wire layer watches the producer's signal to emit SUBSCRIBE_UPDATE.
 	const next = producer.subscription.changed();
-	track.update({ priority: 7, ordered: true, maxAge: 250, startGroup: 2, endGroup: 9 });
-	expect(await next).toEqual({ priority: 7, ordered: true, maxAge: 250, startGroup: 2, endGroup: 9 });
+	track.update({ priority: 7, maxAge: 250, startGroup: 2, endGroup: 9 });
+	expect(await next).toEqual({ priority: 7, maxAge: 250, startGroup: 2, endGroup: 9 });
 });
 
 test("multiple subscriber options aggregate like Rust", async () => {
 	const producer = new TrackProducer("test");
-	const bounded = producer.subscribe({ priority: 2, ordered: true, maxAge: 100, startGroup: 10, endGroup: 20 });
-	const live = producer.subscribe({ priority: 7, ordered: false, maxAge: 250, startGroup: 5 });
+	const bounded = producer.subscribe({ priority: 2, maxAge: 100, startGroup: 10, endGroup: 20 });
+	const live = producer.subscribe({ priority: 7, maxAge: 250, startGroup: 5 });
 
 	expect(producer.subscription.peek()).toEqual({
 		priority: 7,
-		ordered: false,
 		maxAge: 250,
 		startGroup: 5,
 		endGroup: undefined,
@@ -178,7 +179,6 @@ test("multiple subscriber options aggregate like Rust", async () => {
 	live.close();
 	expect(await narrowed).toEqual({
 		priority: 2,
-		ordered: true,
 		maxAge: 100,
 		startGroup: 10,
 		endGroup: 20,
@@ -202,7 +202,7 @@ test("the producer aggregate is clamped without changing subscriber options", as
 
 test("nextGroup skips late arrivals", async () => {
 	const producer = new TrackProducer("test");
-	const track = producer.subscribe();
+	const track = producer.subscribe().ordered();
 
 	producer.writeGroup(new GroupProducer(5));
 
@@ -220,7 +220,7 @@ test("nextGroup skips late arrivals", async () => {
 
 test("nextGroup returns buffered groups in sequence", async () => {
 	const producer = new TrackProducer("test");
-	const track = producer.subscribe({ maxAge: 5000 });
+	const track = producer.subscribe({ maxAge: 5000 }).ordered();
 
 	producer.writeGroup(new GroupProducer(3));
 	producer.writeGroup(new GroupProducer(5));
@@ -229,19 +229,23 @@ test("nextGroup returns buffered groups in sequence", async () => {
 	expect((await track.nextGroup())?.sequence).toBe(5);
 });
 
-test("latency budget skips a buffered timeline in every group read", async () => {
+// The arrival cursor writes a backlog off; the ordered cursor does not. A group already
+// buffered costs nothing to deliver, and dropping it would put a hole in the sequence a
+// decoder is reading. The budget bounds how long a *blocking* group may stall instead.
+test("the latency budget skips a buffered timeline only on the arrival cursor", async () => {
 	const producer = new TrackProducer("test").accept({ maxAge: 5000 });
 	const arrival = producer.subscribe();
-	const ordered = producer.subscribe();
-	const frames = producer.subscribe();
+	const ordered = producer.subscribe().ordered();
 
 	for (const timestamp of [0, 1000, 2000]) {
 		producer.writeFrame({ payload: enc.encode(`${timestamp}`), timestamp: Timestamp.fromMillis(timestamp) });
 	}
 
 	expect((await arrival.recvGroup())?.sequence).toBe(2);
+
+	expect((await ordered.nextGroup())?.sequence).toBe(0);
+	expect((await ordered.nextGroup())?.sequence).toBe(1);
 	expect((await ordered.nextGroup())?.sequence).toBe(2);
-	expect((await frames.readFrameSequence())?.group).toBe(2);
 });
 
 test("zero latency takes the latest group when ages are equal", async () => {
@@ -657,7 +661,7 @@ test("endAt caps the live edge used by the latency budget", async () => {
 
 test("endAt does not cap frame-level reads", async () => {
 	const producer = new TrackProducer("test").accept({ maxAge: 5000 });
-	const track = producer.subscribe({ maxAge: 5000 });
+	const track = producer.subscribe({ maxAge: 5000 }).ordered();
 	track.endAt(0);
 
 	producer.writeFrame({ payload: enc.encode("zero"), timestamp: Timestamp.fromMillis(0) });
@@ -671,7 +675,7 @@ test("endAt does not cap frame-level reads", async () => {
 
 test("local cursor bounds can skip, pause, and release buffered groups", async () => {
 	const producer = new TrackProducer("test");
-	const track = producer.subscribe({ maxAge: 5000 });
+	const track = producer.subscribe({ maxAge: 5000 }).ordered();
 
 	for (let sequence = 0; sequence < 5; sequence++) producer.writeGroup(new GroupProducer(sequence));
 
@@ -842,25 +846,24 @@ test("closing the subscriber releases a recvGroup parked while the producer is l
 	expect(await pending).toBeUndefined();
 });
 
-test("recvGroup after nextGroup still returns late arrivals", async () => {
+test("the ordered and arrival cursors are independent", async () => {
 	const producer = new TrackProducer("test");
-	const track = producer.subscribe({ maxAge: 5000 });
+	const ordered = producer.subscribe({ maxAge: 5000 }).ordered();
+	const arrival = producer.subscribe({ maxAge: 5000 });
 
 	producer.writeGroup(new GroupProducer(5));
+	expect((await ordered.nextGroup())?.sequence).toBe(5);
 
-	// Ordered returns seq 5, advancing its cursor.
-	const ordered = await track.nextGroup();
-	expect(ordered?.sequence).toBe(5);
-
-	// recvGroup is independent of the ordered cursor: a late seq 3 still surfaces.
+	// A late seq 3 is skipped by the ordered cursor, which has already passed it, but the
+	// arrival cursor has both buffered and still delivers each exactly once.
 	producer.writeGroup(new GroupProducer(3));
-	const recv = await track.recvGroup();
-	expect(recv?.sequence).toBe(3);
+	expect((await arrival.recvGroup())?.sequence).toBe(3);
+	expect((await arrival.recvGroup())?.sequence).toBe(5);
 });
 
 test("nextGroup returns undefined when track closes", async () => {
 	const producer = new TrackProducer("test");
-	const track = producer.subscribe();
+	const track = producer.subscribe().ordered();
 	producer.close();
 	expect(await track.nextGroup()).toBeUndefined();
 });
@@ -870,7 +873,7 @@ test("nextGroup returns undefined when track closes", async () => {
 // the data (mirrors the Rust subscriber). Only a drained closed track reports finished.
 test("a closed track still delivers a group parked above the cap once the cap is raised", async () => {
 	const producer = new TrackProducer("test");
-	const track = producer.subscribe({ maxAge: 5000 });
+	const track = producer.subscribe({ maxAge: 5000 }).ordered();
 
 	for (let sequence = 0; sequence < 3; sequence++) {
 		const group = new GroupProducer(sequence);
@@ -928,7 +931,7 @@ test("final is 0 for an empty track and undefined after an abort", async () => {
 
 test("readFrame does not livelock when a sole group finishes before the next arrives", async () => {
 	const producer = new TrackProducer("test");
-	const track = producer.subscribe();
+	const track = producer.subscribe().ordered();
 
 	// A group is appended then finished empty while the track stays open. A finished group's
 	// readable() resolves immediately, so the reader must not busy-wait on it (which would starve the

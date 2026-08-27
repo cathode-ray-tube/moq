@@ -50,7 +50,7 @@ func (b *BroadcastConsumer) SubscribeCatalog() (*CatalogConsumer, error) {
 }
 
 // SubscribeTrack subscribes to a track, receiving arbitrary byte payloads.
-// subscription tunes delivery priority, group ordering priority, and group range; pass nil for defaults.
+// subscription tunes delivery priority, group range, and staleness; pass nil for defaults.
 func (b *BroadcastConsumer) SubscribeTrack(name string, subscription *Subscription) (*TrackConsumer, error) {
 	inner, err := b.inner.SubscribeTrack(name, subscription)
 	if err != nil {
@@ -81,7 +81,7 @@ func (b *BroadcastConsumer) FetchMediaGroup(name string, sequence uint64, contai
 }
 
 // SubscribeMedia subscribes to a media track, decoded with the given container.
-// subscription tunes delivery priority, group ordering priority, group range, and
+// subscription tunes delivery priority, group range, and
 // the max age; pass nil for defaults. Raise Subscription.MaxAgeMs to
 // buffer instead of skipping a stalled group.
 func (b *BroadcastConsumer) SubscribeMedia(name string, container Container, subscription *Subscription) (*MediaConsumer, error) {

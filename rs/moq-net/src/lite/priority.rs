@@ -21,45 +21,25 @@ use std::{
 /// belongs to, and its group sequence.
 ///
 /// Higher `track` always wins. `group` breaks ties only *within* one `subscribe`,
-/// in the direction that subscription asked for: a live subscription transmits the
-/// newest group first, an `Ordered` one the oldest.
+/// newest first, so a congested track sheds its backlog rather than its live edge.
 ///
-/// Scoping the tie-break to a subscription is what keeps `Ordered` from deciding
-/// between tracks. The draft gives that job to `Priority` alone, so a session
-/// carrying an ordered track and a live one at equal priority must interleave them
-/// by priority, not by direction. Comparing the two directions in one space cannot
-/// do that: whichever encoding puts the oldest group on top also puts it above
-/// every group of the other subscription.
+/// Scoping the tie-break to a subscription is what keeps group sequence from deciding
+/// between tracks. The draft gives that job to `Priority` alone, so a session carrying
+/// two tracks at equal priority interleaves them rather than draining one first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Priority {
 	track: u8,
 	subscribe: u64,
 	group: u64,
-	/// The owning subscription's `Ordered` preference, which decides which way
-	/// `group` is read. [`PriorityState::set_ordered`] moves a whole
-	/// subscription's groups at once so they agree on it.
-	ordered: bool,
 }
 
 impl Priority {
-	/// Rank for a live (unordered) subscription: the newest group transmits first.
+	/// Rank a group for transmission: the newest group of a track transmits first.
 	pub fn new(track: u8, subscribe: u64, group: u64) -> Self {
 		Self {
 			track,
 			subscribe,
 			group,
-			ordered: false,
-		}
-	}
-
-	/// Rank for an `Ordered` subscription: the oldest group transmits first, so
-	/// back-to-back groups leave the session in sequence order.
-	pub fn ordered(track: u8, subscribe: u64, group: u64) -> Self {
-		Self {
-			track,
-			subscribe,
-			group,
-			ordered: true,
 		}
 	}
 }
@@ -74,19 +54,9 @@ impl Ord for Priority {
 			// stable and independent of either one's direction. The older (lower id)
 			// subscription goes first.
 			.then(self.subscribe.cmp(&other.subscribe))
-			// Normally redundant, since one subscription's groups all carry its
-			// direction. It is here so the comparison below is reached only by two
-			// groups that agree on it, which makes this a total order for every
-			// value rather than only for well-formed ones: reversing the sense for
-			// one side alone is intransitive, and `sort` is documented to be free
-			// to panic on a comparator that does that. Nothing in the protocol
-			// stops a peer opening two SUBSCRIBEs with one id and disagreeing.
-			.then(self.ordered.cmp(&other.ordered))
-			// Both sides agree on the direction, so it can be read off either.
-			.then_with(|| match self.ordered {
-				true => self.group.cmp(&other.group),
-				false => other.group.cmp(&self.group),
-			})
+			// Newest group first, which is what makes a congested track shed its
+			// backlog rather than its live edge.
+			.then(other.group.cmp(&self.group))
 	}
 }
 
@@ -131,12 +101,6 @@ impl PriorityQueue {
 	// TODO Implement some sort of round robin between tracks with the same priority.
 	pub fn insert(&self, priority: Priority) -> PriorityHandle {
 		self.state.lock().unwrap().insert(priority, self.clone())
-	}
-
-	/// Apply a subscription's new `Ordered` preference to the groups it has already
-	/// queued, so a SUBSCRIBE_UPDATE reaches the backlog and not just what follows it.
-	pub fn set_ordered(&self, subscribe: u64, ordered: bool) {
-		self.state.lock().unwrap().set_ordered(subscribe, ordered);
 	}
 }
 
@@ -294,47 +258,10 @@ impl PriorityState {
 	}
 
 	/// Change one item's track priority, leaving the rest of its rank alone.
-	///
-	/// Deliberately narrower than "write back a whole [`Priority`]": a handle's copy
-	/// of the direction goes stale the moment [`Self::set_ordered`] runs, and pushing
-	/// that copy back would resurrect the old direction for a single group.
 	fn set_track(&mut self, id: usize, track: u8) {
 		let mut item = self.extract(id);
 		item.priority.track = track;
 		self.place(item);
-	}
-
-	/// Flip the group direction for every queued group of one subscription.
-	///
-	/// Done wholesale rather than per item because [`Priority`] is only a total order
-	/// while every group of a subscription agrees on its direction. Re-placing them
-	/// one at a time would leave the queue comparing an ordered rank against a live
-	/// one from the same subscription, which is intransitive and would corrupt the
-	/// sorted vec. The flip can also move entries across the vec/overflow boundary,
-	/// so both containers are rebuilt from one sorted snapshot.
-	fn set_ordered(&mut self, subscribe: u64, ordered: bool) {
-		let stale = |item: &PriorityItem| item.priority.subscribe == subscribe && item.priority.ordered != ordered;
-		if !self.vec.iter().any(stale) && !self.overflow.iter().any(|Reverse(item)| stale(item)) {
-			return;
-		}
-
-		let mut items = std::mem::take(&mut self.vec);
-		items.extend(self.overflow.drain().map(|Reverse(item)| item));
-		for item in &mut items {
-			if item.priority.subscribe == subscribe {
-				item.priority.ordered = ordered;
-			}
-		}
-		items.sort();
-
-		let overflow = items.split_off(items.len().min(MAX_VEC_SIZE));
-		self.vec = items;
-		self.update_indices_from(0);
-		for item in overflow {
-			let id = item.id;
-			self.overflow.push(Reverse(item));
-			Self::update_location(&mut self.indexes, id, Location::Overflow);
-		}
 	}
 
 	fn remove(&mut self, id: usize) {
@@ -355,9 +282,8 @@ impl PriorityState {
 
 pub struct PriorityHandle {
 	id: usize,
-	/// This item's track priority, the only part of its rank a handle owns. The
-	/// rest lives in the queue, which [`PriorityQueue::set_ordered`] can change
-	/// underneath us.
+	/// This item's track priority, the only part of its rank a handle owns; the
+	/// rest is fixed when the item is queued.
 	track: u8,
 	rx: kio::Consumer<u8>,
 	/// Last value observed via [`current`](Self::current)/[`next`](Self::next), so
@@ -434,11 +360,6 @@ mod tests {
 		Priority::new(track, 0, group)
 	}
 
-	/// The same, for a subscription that asked for `Ordered`.
-	fn older_first(track: u8, group: u64) -> Priority {
-		Priority::ordered(track, 0, group)
-	}
-
 	#[test]
 	fn test_single_item() {
 		let queue = PriorityQueue::default();
@@ -491,96 +412,12 @@ mod tests {
 		assert_eq!(group1.current(), 2);
 	}
 
+	/// `Ord` has to hold for every value: the queue sorts a shared vec, and a
+	/// comparator that says `a < b` and `b < a` is free to panic `sort`.
 	#[test]
-	fn test_ordered_prefers_older_groups() {
-		let queue = PriorityQueue::default();
-
-		// Same track priority, ordered subscription: sequence order wins.
-		let mut group1 = queue.insert(older_first(100, 1));
-		let mut group5 = queue.insert(older_first(100, 5));
-		let mut group10 = queue.insert(older_first(100, 10));
-
-		assert_eq!(group1.current(), 0);
-		assert_eq!(group5.current(), 1);
-		assert_eq!(group10.current(), 2);
-	}
-
-	/// `Ordered` chooses between a subscription's own groups, never between
-	/// subscriptions. One queue serves the whole session, so an ordered rank and a
-	/// live rank meet here constantly; if the direction were compared across them,
-	/// every ordered group would outrank every live one at the same priority and
-	/// starve a live track that shares the session.
-	#[test]
-	fn test_ordered_does_not_outrank_a_live_subscription() {
-		let queue = PriorityQueue::default();
-
-		// Same track priority: one live subscription, one that asked for Ordered.
-		let mut live_new = queue.insert(Priority::new(100, 0, 2));
-		let mut live_old = queue.insert(Priority::new(100, 0, 1));
-		let mut ordered_old = queue.insert(Priority::ordered(100, 1, 1));
-		let mut ordered_new = queue.insert(Priority::ordered(100, 1, 2));
-
-		// The subscriptions stay whole and in id order; neither one's direction
-		// promotes it past the other.
-		assert_eq!(live_new.current(), 0);
-		assert_eq!(live_old.current(), 1);
-		assert_eq!(ordered_old.current(), 2);
-		assert_eq!(ordered_new.current(), 3);
-	}
-
-	/// A subscription that flips to `Ordered` mid-stream means it about the groups
-	/// already queued for it, not just the ones that follow. Leaving the backlog on
-	/// the old direction would let every new group outrank exactly the groups the
-	/// subscriber just asked to receive first.
-	#[test]
-	fn test_set_ordered_reranks_the_backlog() {
-		let queue = PriorityQueue::default();
-
-		let mut group1 = queue.insert(live(100, 1));
-		let mut group2 = queue.insert(live(100, 2));
-		let mut group3 = queue.insert(live(100, 3));
-		assert_eq!((group3.current(), group2.current(), group1.current()), (0, 1, 2));
-
-		queue.set_ordered(0, true);
-		assert_eq!((group1.current(), group2.current(), group3.current()), (0, 1, 2));
-
-		// And back: the direction is not a one-way door.
-		queue.set_ordered(0, false);
-		assert_eq!((group3.current(), group2.current(), group1.current()), (0, 1, 2));
-	}
-
-	/// The flip can move an entry across the vec/overflow boundary, so both sides
-	/// are rebuilt: the oldest groups start out demoted past index 254 and have to
-	/// come back as the top of the queue.
-	#[test]
-	fn test_set_ordered_promotes_across_the_overflow_boundary() {
-		let queue = PriorityQueue::default();
-
-		let total = MAX_VEC_SIZE + 50;
-		let mut handles: Vec<_> = (0..total as u64).map(|group| queue.insert(live(100, group))).collect();
-
-		// Live ranks newest first, so the oldest groups sit in overflow.
-		assert_eq!(handles[total - 1].current(), 0);
-		assert_eq!(handles[0].current(), u8::MAX);
-
-		queue.set_ordered(0, true);
-
-		// Ordered inverts it: the oldest group leads and the newest is demoted.
-		assert_eq!(handles[0].current(), 0);
-		assert_eq!(handles[1].current(), 1);
-		assert_eq!(handles[total - 1].current(), u8::MAX);
-	}
-
-	/// `Ord` has to hold for every value, not just the ones a well-behaved peer
-	/// produces. Nothing stops a peer opening two SUBSCRIBEs with the same id and
-	/// opposite `Ordered`, which lands both directions under one subscribe id, and
-	/// a comparator that says `a < b` and `b < a` is free to panic `sort`.
-	#[test]
-	fn test_ord_is_total_across_mixed_directions() {
+	fn test_ord_is_total() {
 		let mixed = [
-			Priority::ordered(100, 7, 1),
 			Priority::new(100, 7, 1),
-			Priority::ordered(100, 7, 2),
 			Priority::new(100, 7, 2),
 			Priority::new(100, 8, 1),
 			Priority::new(200, 7, 1),
@@ -598,22 +435,6 @@ mod tests {
 				}
 			}
 		}
-	}
-
-	/// A flip must not disturb a subscription that did not ask for one.
-	#[test]
-	fn test_set_ordered_leaves_other_subscriptions_alone() {
-		let queue = PriorityQueue::default();
-
-		let mut other_new = queue.insert(Priority::new(100, 7, 2));
-		let mut other_old = queue.insert(Priority::new(100, 7, 1));
-		let mut mine = queue.insert(Priority::new(100, 9, 1));
-
-		queue.set_ordered(9, true);
-
-		assert_eq!(other_new.current(), 0, "an untouched subscription keeps newest-first");
-		assert_eq!(other_old.current(), 1);
-		assert_eq!(mine.current(), 2);
 	}
 
 	#[test]

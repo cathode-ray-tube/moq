@@ -460,7 +460,6 @@ export class Subscriber {
 			broadcast,
 			track: request.name,
 			priority: subscription.priority ?? 0,
-			ordered: subscription.ordered,
 			maxAge: subscription.maxAge,
 			startGroup: subscription.startGroup,
 			endGroup: subscription.endGroup,
@@ -611,7 +610,6 @@ export class Subscriber {
 			// matches what the upstream advertises (relays re-serve with the same bound).
 			maxAge: info.maxAge,
 			priority: info.priority,
-			ordered: info.ordered,
 		};
 	}
 
@@ -768,7 +766,6 @@ export class Subscriber {
 		const stopped: Promise<null> = Promise.race([track.closed, stream.reader.closed]).then(() => null);
 		let lastSent: track.Subscription = {
 			priority: msg.priority,
-			ordered: msg.ordered,
 			maxAge: msg.maxAge,
 			startGroup: msg.startGroup,
 			endGroup: msg.endGroup,
@@ -787,7 +784,6 @@ export class Subscriber {
 			// interpret SUBSCRIBE_UPDATE as a reset of ordered/maxAge/etc.
 			const update = new SubscribeUpdate({
 				priority: current.priority ?? 0,
-				ordered: current.ordered,
 				maxAge: current.maxAge,
 				startGroup: current.startGroup,
 				endGroup: current.endGroup,
@@ -801,7 +797,6 @@ export class Subscriber {
 	#sameSubscription(a: track.Subscription, b: track.Subscription): boolean {
 		return (
 			(a.priority ?? 0) === (b.priority ?? 0) &&
-			(a.ordered ?? false) === (b.ordered ?? false) &&
 			(a.maxAge ?? 0) === (b.maxAge ?? 0) &&
 			a.startGroup === b.startGroup &&
 			a.endGroup === b.endGroup

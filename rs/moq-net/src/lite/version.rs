@@ -138,6 +138,19 @@ impl Version {
 		}
 	}
 
+	/// Whether this version's SUBSCRIBE, SUBSCRIBE_UPDATE, SUBSCRIBE_OK, and TRACK_INFO
+	/// carry the retired `Ordered` byte.
+	///
+	/// The field is gone from the model: a publisher transmits newest-first within a
+	/// track, always. Deployed drafts still have the byte in their layout, so it is
+	/// written as 0 and ignored on read rather than shifting every field behind it.
+	pub fn has_group_order(self) -> bool {
+		match self {
+			Self::Lite01 | Self::Lite02 | Self::Lite03 | Self::Lite04 | Self::Lite05 => true,
+			Self::Lite06Wip => false,
+		}
+	}
+
 	/// Whether announcements carry the route cost: the marginal cost of pulling
 	/// the broadcast via this route, accumulated per link. Added in lite-06.
 	/// Older versions carry nothing, so a received route stays at zero and ranks

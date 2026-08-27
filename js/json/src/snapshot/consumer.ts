@@ -13,14 +13,14 @@ import type { Config } from "./encoder.ts";
  * directly.
  */
 export class Consumer<T> {
-	#track: Moq.Track.Subscriber;
+	#track: Moq.Track.Ordered;
 	#decoder: Decoder<T>;
 
 	#group?: Moq.Group.Consumer;
 	#framesRead = 0;
 
 	constructor(track: Moq.Track.Subscriber, config: Config<T> = {}) {
-		this.#track = track;
+		this.#track = track.ordered();
 		this.#decoder = new Decoder(config);
 	}
 

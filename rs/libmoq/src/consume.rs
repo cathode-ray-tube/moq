@@ -603,7 +603,7 @@ impl Consume {
 		// `subscribe` blocks on SUBSCRIBE_OK, so run it inside the task.
 		tokio::spawn(async move {
 			let res = async move {
-				let mut track = broadcast.track(&name)?.subscribe(subscription.clone()).await?;
+				let mut track = broadcast.track(&name)?.subscribe(subscription.clone()).await?.ordered();
 				Self::apply_raw_subscription(&mut track, subscription);
 				Self::run_raw(on_frame, track, channel.1, updates).await
 			}
@@ -620,10 +620,7 @@ impl Consume {
 		Ok(id)
 	}
 
-	fn apply_raw_subscription(
-		track: &mut moq_net::track::Subscriber,
-		subscription: Option<moq_net::track::Subscription>,
-	) {
+	fn apply_raw_subscription(track: &mut moq_net::track::Ordered, subscription: Option<moq_net::track::Subscription>) {
 		let subscription = subscription.unwrap_or_default();
 		if let Some(start) = subscription.start.map(|start| start.group).or_else(|| track.latest()) {
 			track.start_at(start);
@@ -639,7 +636,7 @@ impl Consume {
 
 	async fn run_raw(
 		callback: OnStatus,
-		mut track: moq_net::track::Subscriber,
+		mut track: moq_net::track::Ordered,
 		mut close: oneshot::Receiver<()>,
 		mut updates: mpsc::UnboundedReceiver<Option<moq_net::track::Subscription>>,
 	) -> Result<(), Error> {
@@ -708,7 +705,7 @@ impl Consume {
 	fn poll_raw_control(
 		close: &mut oneshot::Receiver<()>,
 		updates: &mut mpsc::UnboundedReceiver<Option<moq_net::track::Subscription>>,
-		track: &mut moq_net::track::Subscriber,
+		track: &mut moq_net::track::Ordered,
 		waiter: &moq_net::kio::Waiter,
 	) -> bool {
 		let mut cx = std::task::Context::from_waker(waiter.waker());

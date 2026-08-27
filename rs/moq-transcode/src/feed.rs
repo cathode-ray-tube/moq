@@ -176,7 +176,7 @@ async fn decode(inner: &Inner, sender: &broadcast::Sender<Item>) -> Result<(), E
 
 	// The feed serves whichever rungs are active, so there is no single
 	// downstream subscription to mirror; live-edge defaults fit every rung.
-	let mut subscriber = inner.source.subscribe(None).await?;
+	let mut subscriber = inner.source.subscribe(None).await?.ordered();
 
 	while let Some(mut group) = subscriber.next_group().await? {
 		// Sends only fail with zero receivers, which is fine: teardown aborts

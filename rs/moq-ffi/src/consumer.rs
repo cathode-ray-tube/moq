@@ -44,17 +44,12 @@ fn media_container(container: MoqContainer) -> Result<moq_mux::catalog::hang::Co
 /// Subscriber-side delivery preferences, mirroring [`moq_net::track::Subscription`].
 ///
 /// Construct with the fields you care about; the rest default to moq-net's defaults
-/// (priority 0, unordered, no staleness tolerance, full group range).
+/// (priority 0, no staleness tolerance, full group range).
 #[derive(Clone, uniffi::Record)]
 pub struct MoqSubscription {
 	/// Delivery priority; higher values preempt lower ones under bandwidth contention.
 	#[uniffi(default = 0)]
 	pub priority: u8,
-	/// Whether groups are prioritized in sequence order. Groups may always arrive
-	/// out-of-order (or not at all) over the network. Defaults to `false`; the
-	/// aggregate is ordered only when every subscriber asks for it.
-	#[uniffi(default = false)]
-	pub ordered: bool,
 	/// Maximum age of a non-latest group before it is skipped, in milliseconds.
 	/// `0` skips immediately; a larger value tolerates that much reordering.
 	///
@@ -88,7 +83,6 @@ impl From<MoqSubscription> for moq_net::track::Subscription {
 	fn from(s: MoqSubscription) -> Self {
 		moq_net::track::Subscription::default()
 			.with_priority(s.priority)
-			.with_ordered(s.ordered)
 			.with_max_age(std::time::Duration::from_millis(s.max_age_ms))
 			.with_start(s.group_start.map(moq_net::track::Position::group))
 			.with_end(s.group_end.and_then(moq_net::track::Position::after_group))
@@ -285,7 +279,7 @@ impl MoqBroadcastConsumer {
 	/// Subscribe to a track by name, the same pattern as moq-boy's command/status tracks.
 	///
 	/// Frames are returned as plain byte payloads with no codec or container parsing.
-	/// `subscription` tunes delivery priority, group ordering priority, and group range; omit for defaults.
+	/// `subscription` tunes delivery priority, group range, and staleness; omit for defaults.
 	pub async fn subscribe_track(
 		&self,
 		name: String,
@@ -337,7 +331,7 @@ impl MoqBroadcastConsumer {
 	/// Subscribe to a track by name, delivering frames in decode order.
 	///
 	/// `container` is the track container from the catalog.
-	/// `subscription` tunes delivery priority, group ordering priority, and group range; omit for defaults.
+	/// `subscription` tunes delivery priority, group range, and staleness; omit for defaults.
 	///
 	/// [`MoqSubscription::max_age_ms`] bounds the local jitter buffer as well as
 	/// the publisher's cache, so both ends skip a stalled group on the same budget.
@@ -369,25 +363,65 @@ fn map_fetch_error(err: moq_net::Error) -> MoqError {
 
 // ---- Track Consumer ----
 
+/// A track subscription reading one way or the other.
+///
+/// `moq_net` makes the choice a handle you consume the subscriber into, which a foreign
+/// binding can't express in its type system, so the handle commits on first use instead:
+/// whichever cursor a caller reaches for first is the one this track keeps.
+enum Cursor {
+	Arrival(moq_net::track::Subscriber),
+	Ordered(moq_net::track::Ordered),
+	/// Transient, while the subscriber is moved out to be converted.
+	Converting,
+}
+
 struct TrackInner {
-	track: moq_net::track::Subscriber,
+	track: Cursor,
 }
 
 impl TrackInner {
+	/// The arrival cursor, or [`MoqError::Unsupported`] once this track committed to
+	/// sequence order.
+	fn arrival(&mut self) -> Result<&mut moq_net::track::Subscriber, MoqError> {
+		match &mut self.track {
+			Cursor::Arrival(track) => Ok(track),
+			_ => Err(MoqError::Unsupported),
+		}
+	}
+
+	/// The sequence cursor, committing this track to it on first use.
+	fn ordered(&mut self) -> &mut moq_net::track::Ordered {
+		// Only move the subscriber out when there is one to convert: `ordered()` consumes
+		// it, and swapping unconditionally would drop an already-converted handle.
+		if matches!(self.track, Cursor::Arrival(_)) {
+			let Cursor::Arrival(track) = std::mem::replace(&mut self.track, Cursor::Converting) else {
+				unreachable!("just matched Arrival");
+			};
+			self.track = Cursor::Ordered(track.ordered());
+		}
+		match &mut self.track {
+			Cursor::Ordered(track) => track,
+			_ => unreachable!("converted above"),
+		}
+	}
+
 	async fn recv_group(&mut self) -> Result<Option<moq_net::group::Consumer>, MoqError> {
-		Ok(self.track.recv_group().await?)
+		Ok(self.arrival()?.recv_group().await?)
 	}
 
 	async fn next_group(&mut self) -> Result<Option<moq_net::group::Consumer>, MoqError> {
-		Ok(self.track.next_group().await?)
+		Ok(self.ordered().next_group().await?)
 	}
 
 	async fn read_frame(&mut self) -> Result<Option<MoqFrame>, MoqError> {
-		self.track.read_frame().await?.map(raw_frame).transpose()
+		let Some(mut group) = self.ordered().next_group().await? else {
+			return Ok(None);
+		};
+		group.read_frame().await?.map(raw_frame).transpose()
 	}
 
 	async fn recv_datagram(&mut self) -> Result<Option<MoqDatagram>, MoqError> {
-		let Some(datagram) = self.track.recv_datagram().await? else {
+		let Some(datagram) = self.arrival()?.recv_datagram().await? else {
 			return Ok(None);
 		};
 		let timestamp_us = datagram
@@ -415,7 +449,9 @@ impl MoqTrackConsumer {
 		let control = track.control();
 		let info = track.info().clone();
 		Self {
-			task: Task::new(TrackInner { track }),
+			task: Task::new(TrackInner {
+				track: Cursor::Arrival(track),
+			}),
 			control,
 			info,
 		}

@@ -18,7 +18,7 @@ async function drain(track: Track.Subscriber): Promise<Value[]> {
 
 // Inspect the published layout via the public API: the frame count of each group, in order.
 // The track must be finished first so group/frame reads terminate.
-async function structure(track: Track.Subscriber): Promise<number[]> {
+async function structure(track: Track.Ordered): Promise<number[]> {
 	const counts: number[] = [];
 	for (;;) {
 		const group = await track.nextGroup();
@@ -51,7 +51,7 @@ test("deltaRatio 0 disables deltas, like off", async () => {
 
 	// `0` is treated as off, not a degenerate "enabled" value that keeps the group open: each change
 	// is its own single-frame snapshot group.
-	expect(await structure(track.subscribe({ maxAge: REPLAY_LATENCY }))).toEqual([1, 1]);
+	expect(await structure(track.subscribe({ maxAge: REPLAY_LATENCY }).ordered())).toEqual([1, 1]);
 });
 
 test("live consumer sees each update", async () => {
@@ -72,7 +72,7 @@ test("unchanged value writes nothing", async () => {
 	producer.update({ a: 1 });
 	producer.finish();
 
-	expect(await structure(track.subscribe())).toEqual([1]);
+	expect(await structure(track.subscribe().ordered())).toEqual([1]);
 });
 
 test("deltas share one group", async () => {
@@ -84,7 +84,7 @@ test("deltas share one group", async () => {
 	producer.finish();
 
 	// All updates fit in a single group as snapshot + two deltas.
-	expect(await structure(track.subscribe())).toEqual([3]);
+	expect(await structure(track.subscribe().ordered())).toEqual([3]);
 });
 
 test("deltas reconstruct to the final value", async () => {
@@ -165,7 +165,7 @@ test("tight ratio rolls snapshots", async () => {
 	producer.update({ a: 4 }); // budget already exceeded, rolls group 1
 	producer.finish();
 
-	expect(await structure(track.subscribe({ maxAge: REPLAY_LATENCY }))).toEqual([3, 1]);
+	expect(await structure(track.subscribe({ maxAge: REPLAY_LATENCY }).ordered())).toEqual([3, 1]);
 });
 
 test("deltas stay within ratio times snapshot", async () => {
@@ -179,7 +179,7 @@ test("deltas stay within ratio times snapshot", async () => {
 	for (let n = 0; n <= 10; n++) producer.update({ n });
 	producer.finish();
 
-	expect(await structure(track.subscribe({ maxAge: REPLAY_LATENCY }))).toEqual([10, 1]);
+	expect(await structure(track.subscribe({ maxAge: REPLAY_LATENCY }).ordered())).toEqual([10, 1]);
 });
 
 test("array change is a wholesale delta", async () => {
@@ -190,7 +190,7 @@ test("array change is a wholesale delta", async () => {
 	producer.finish();
 
 	// The array is replaced wholesale in a delta, so it stays in the same group.
-	expect(await structure(track.subscribe())).toEqual([2]);
+	expect(await structure(track.subscribe().ordered())).toEqual([2]);
 });
 
 test("late joiner collapses a buffered backlog to the latest value", async () => {
@@ -216,5 +216,5 @@ test("frame cap rolls snapshot", async () => {
 	}
 	producer.finish();
 
-	expect(await structure(track.subscribe({ maxAge: REPLAY_LATENCY }))).toEqual([256, 1]);
+	expect(await structure(track.subscribe({ maxAge: REPLAY_LATENCY }).ordered())).toEqual([256, 1]);
 });

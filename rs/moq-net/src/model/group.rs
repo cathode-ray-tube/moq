@@ -712,11 +712,6 @@ impl Producer {
 		self.state.read().timestamp
 	}
 
-	/// Snapshot the content a subscriber would discard by skipping this group.
-	pub(crate) fn content(&self) -> stats::Content {
-		self.state.read().content()
-	}
-
 	/// The group's full cached footprint (payload plus fixed overhead), used by the
 	/// track to size this group as an eviction victim.
 	pub(crate) fn cache_size(&self) -> u64 {

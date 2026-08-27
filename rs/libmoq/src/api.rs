@@ -426,10 +426,6 @@ pub struct moq_track_info {
 	/// Priority, used to break ties between subscriptions of equal subscriber priority.
 	pub priority: u8,
 
-	/// Whether groups are prioritized in sequence order.
-	/// Groups may always arrive out-of-order (or not at all) over the network.
-	pub ordered: bool,
-
 	/// Maximum age of a non-latest group before the publisher evicts it, in milliseconds.
 	/// The publisher-side half of `moq_subscription.max_age_ms`.
 	pub max_age_ms: u64,
@@ -451,8 +447,7 @@ impl TryFrom<&moq_track_info> for moq_net::track::Info {
 		// timestamp_us units. An explicit timescale below overrides it.
 		let mut out = moq_net::track::Info::default()
 			.with_timescale(moq_net::Timescale::MICRO)
-			.with_priority(info.priority)
-			.with_ordered(info.ordered);
+			.with_priority(info.priority);
 		if info.max_age_present {
 			out = out.with_max_age(std::time::Duration::from_millis(info.max_age_ms));
 		}
@@ -473,10 +468,6 @@ pub struct moq_subscription {
 	/// Delivery priority. Higher values preempt lower ones under contention.
 	pub priority: u8,
 
-	/// Whether groups are prioritized in sequence order.
-	/// Groups may always arrive out-of-order (or not at all) over the network.
-	pub ordered: bool,
-
 	/// Maximum age of a non-latest group before it is skipped, in milliseconds.
 	/// Zero skips immediately. Enforced by the publisher's cache and by any local buffering.
 	pub max_age_ms: u64,
@@ -496,7 +487,6 @@ impl From<&moq_subscription> for moq_net::track::Subscription {
 	fn from(subscription: &moq_subscription) -> Self {
 		let mut out = moq_net::track::Subscription::default()
 			.with_priority(subscription.priority)
-			.with_ordered(subscription.ordered)
 			.with_max_age(std::time::Duration::from_millis(subscription.max_age_ms));
 		if subscription.group_start_present {
 			out = out.with_start(moq_net::track::Position::group(subscription.group_start));

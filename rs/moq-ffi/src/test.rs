@@ -284,7 +284,6 @@ async fn raw_track_datagram_roundtrip() {
 			"events".into(),
 			Some(MoqTrackInfo {
 				priority: 0,
-				ordered: true,
 				max_age_ms: None,
 				timescale: Some(1_000_000),
 			}),
@@ -315,7 +314,6 @@ async fn raw_track_info_reports_publisher_properties() {
 	let broadcast = MoqBroadcastProducer::new().unwrap();
 	let info = MoqTrackInfo {
 		priority: 7,
-		ordered: false,
 		max_age_ms: Some(2_500),
 		timescale: Some(90_000),
 	};
@@ -324,18 +322,8 @@ async fn raw_track_info_reports_publisher_properties() {
 
 	let got = consumer.info().unwrap();
 	assert_eq!(got.priority, 7);
-	assert!(!got.ordered);
 	assert_eq!(got.max_age_ms, Some(2_500));
 	assert_eq!(got.timescale, Some(90_000));
-}
-
-#[tokio::test]
-async fn raw_track_info_defaults_to_unordered() {
-	let broadcast = MoqBroadcastProducer::new().unwrap();
-	let track = broadcast.publish_track("status".into(), None).unwrap();
-	let consumer = track.consume(None).unwrap();
-
-	assert!(!consumer.info().unwrap().ordered);
 }
 
 #[tokio::test]
@@ -351,7 +339,6 @@ async fn raw_track_update_does_not_wait_for_pending_read() {
 
 	consumer.update(MoqSubscription {
 		priority: 10,
-		ordered: false,
 		max_age_ms: 25,
 		group_start: Some(0),
 		group_end: None,
@@ -1827,6 +1814,45 @@ async fn dynamic_broadcast_request() {
 
 	track.finish().unwrap();
 	served.finish().unwrap();
+}
+
+/// The sequence cursor commits on first use, so every later read has to reach the same
+/// converted handle. Repeating the conversion (or dropping it on the way through) leaves
+/// the track in its transient state and panics the next read.
+#[tokio::test]
+async fn raw_track_next_group_is_repeatable() {
+	let broadcast = MoqBroadcastProducer::new().unwrap();
+	let track = broadcast.publish_track("commands".into(), None).unwrap();
+	let consumer = broadcast
+		.consume()
+		.unwrap()
+		.subscribe_track("commands".into(), None)
+		.await
+		.unwrap();
+
+	for payload in [b"one".to_vec(), b"two".to_vec(), b"three".to_vec()] {
+		track
+			.write_frame(MoqFrame {
+				payload: payload.clone(),
+				timestamp_us: 0,
+			})
+			.unwrap();
+
+		let group = tokio::time::timeout(TIMEOUT, consumer.next_group())
+			.await
+			.expect("timed out waiting for a group")
+			.unwrap()
+			.expect("expected a group");
+		let frame = tokio::time::timeout(TIMEOUT, group.read_frame())
+			.await
+			.expect("timed out waiting for a frame")
+			.unwrap()
+			.expect("expected a frame");
+		assert_eq!(frame.payload, payload);
+	}
+
+	// The arrival cursor is gone once the track committed to sequence order.
+	assert!(matches!(consumer.recv_group().await, Err(MoqError::Unsupported)));
 }
 
 #[tokio::test]
