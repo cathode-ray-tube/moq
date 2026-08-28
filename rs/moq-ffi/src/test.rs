@@ -1855,6 +1855,67 @@ async fn raw_track_next_group_is_repeatable() {
 	assert!(matches!(consumer.recv_group().await, Err(MoqError::Unsupported)));
 }
 
+/// The first group read commits the cursor either way: mixing arrival and sequence
+/// reads on one track is refused rather than silently interleaving two cursors.
+/// Datagrams are a separate cursor, so they flow regardless of the commitment.
+#[tokio::test]
+async fn raw_track_group_order_commits_on_first_read() {
+	let broadcast = MoqBroadcastProducer::new().unwrap();
+	let track = broadcast.publish_track("commands".into(), None).unwrap();
+	let consumer = broadcast
+		.consume()
+		.unwrap()
+		.subscribe_track("commands".into(), None)
+		.await
+		.unwrap();
+
+	track
+		.write_frame(MoqFrame {
+			payload: b"one".to_vec(),
+			timestamp_us: 0,
+		})
+		.unwrap();
+
+	// An arrival read commits the track to arrival order.
+	let group = tokio::time::timeout(TIMEOUT, consumer.recv_group())
+		.await
+		.expect("timed out waiting for a group")
+		.unwrap()
+		.expect("expected a group");
+	assert_eq!(group.sequence(), 0);
+	assert!(matches!(consumer.next_group().await, Err(MoqError::Unsupported)));
+	assert!(matches!(consumer.read_frame().await, Err(MoqError::Unsupported)));
+
+	// The commitment refuses the other cursor without poisoning this one.
+	track
+		.write_frame(MoqFrame {
+			payload: b"two".to_vec(),
+			timestamp_us: 0,
+		})
+		.unwrap();
+	let group = tokio::time::timeout(TIMEOUT, consumer.recv_group())
+		.await
+		.expect("timed out waiting for a group")
+		.unwrap()
+		.expect("expected a group");
+	assert_eq!(group.sequence(), 1);
+
+	// Datagrams never commit and keep working after a commitment.
+	let sequence = track
+		.append_datagram(MoqFrame {
+			payload: b"beep".to_vec(),
+			timestamp_us: 0,
+		})
+		.unwrap();
+	let datagram = tokio::time::timeout(TIMEOUT, consumer.recv_datagram())
+		.await
+		.expect("timed out waiting for a datagram")
+		.unwrap()
+		.expect("expected a datagram");
+	assert_eq!(datagram.sequence, sequence);
+	assert_eq!(datagram.payload, b"beep".to_vec());
+}
+
 #[tokio::test]
 async fn dynamic_broadcast_request_can_reject() {
 	let origin = MoqOriginProducer::new(MoqOriginOptions::default());

@@ -176,9 +176,13 @@ async fn decode(inner: &Inner, sender: &broadcast::Sender<Item>) -> Result<(), E
 
 	// The feed serves whichever rungs are active, so there is no single
 	// downstream subscription to mirror; live-edge defaults fit every rung.
-	let mut subscriber = inner.source.subscribe(None).await?.ordered();
+	// Arrival order on purpose: its drift budget keeps dropping whatever falls
+	// behind the live edge, where a sequence cursor would burst the backlog
+	// through the codecs. Group order doesn't matter here, since every group
+	// decodes independently from its own keyframe.
+	let mut subscriber = inner.source.subscribe(None).await?;
 
-	while let Some(mut group) = subscriber.next_group().await? {
+	while let Some(mut group) = subscriber.recv_group().await? {
 		// Sends only fail with zero receivers, which is fine: teardown aborts
 		// this task at the next await anyway.
 		let _ = sender.send(Item::Group(group.sequence));

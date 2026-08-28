@@ -244,7 +244,7 @@ fn bench_track_recv(c: &mut Criterion) {
 			b.iter_batched(
 				|| {
 					let ctx = filled_track(n, &payload);
-					let subscriber = ctx.track.subscribe(replay());
+					let subscriber = ctx.track.subscribe(replay()).ordered();
 					(ctx, subscriber)
 				},
 				|(ctx, mut subscriber)| {

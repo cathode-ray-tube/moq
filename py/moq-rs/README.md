@@ -207,7 +207,6 @@ All consumers (`CatalogConsumer`, `MediaConsumer`, `TrackConsumer`, `AudioConsum
 - **`Dimensions`**. `.width: int`, `.height: int`.
 - **`Container`**. The catalog container enum, carried on each `Video`/`Audio` record.
 
-
 ### Logging and errors
 
 - **`log_level(level="info")`**. Initialize logging for the underlying Rust layer (`"error"`, `"warn"`, `"info"`, `"debug"`, `"trace"`). Call once per process.

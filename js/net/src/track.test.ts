@@ -924,6 +924,46 @@ test("the ordered and arrival cursors are independent", async () => {
 	expect((await arrival.recvGroup())?.sequence).toBe(5);
 });
 
+// Both cursors draw from one buffer, so interleaving them produces a stream in neither
+// order. The first group read commits the subscription; the other order is refused.
+test("the first group read commits the cursor and refuses the other order", async () => {
+	const producer = new TrackProducer("test");
+
+	// An arrival read commits to arrival order; ordered() is refused afterwards.
+	const arrival = producer.subscribe({ maxAge: 5000 });
+	producer.writeGroup(new GroupProducer(5));
+	expect((await arrival.recvGroup())?.sequence).toBe(5);
+	expect(() => arrival.ordered()).toThrow("arrival order");
+
+	// The commitment refuses the other cursor without poisoning this one: a late
+	// lower sequence still flows in arrival order.
+	producer.writeGroup(new GroupProducer(3));
+	expect((await arrival.recvGroup())?.sequence).toBe(3);
+
+	// The other direction: ordered() takes the subscription and arrival reads throw.
+	const inert = producer.subscribe({ maxAge: 5000 });
+	const ordered = inert.ordered();
+	expect(inert.recvGroup()).rejects.toThrow("sequence order");
+	expect(() => inert.ordered()).toThrow("sequence order");
+	expect((await ordered.nextGroup())?.sequence).toBe(3);
+	expect((await ordered.nextGroup())?.sequence).toBe(5);
+});
+
+// Datagrams are a separate cursor on either handle, so reading them must not commit
+// the subscription to a group order.
+test("recvDatagram does not commit the group cursor", async () => {
+	const producer = new TrackProducer("test");
+	const track = producer.subscribe({ maxAge: 5000 });
+
+	producer.writeDatagram({ sequence: 0, timestamp: Timestamp.fromMillis(0), payload: enc.encode("x") });
+	expect((await track.recvDatagram())?.sequence).toBe(0);
+
+	// Still uncommitted: the subscription can go sequence-ordered.
+	const ordered = track.ordered();
+	producer.writeGroup(new GroupProducer(1));
+	expect((await ordered.nextGroup())?.sequence).toBe(1);
+});
+
 test("nextGroup returns undefined when track closes", async () => {
 	const producer = new TrackProducer("test");
 	const track = producer.subscribe().ordered();

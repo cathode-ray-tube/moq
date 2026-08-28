@@ -250,23 +250,12 @@ impl GroupState {
 	}
 
 	/// Record where the group starts and currently ends in presentation time, plus
-	/// when it last produced. `timestamp` is the first frame only; the rest track
-	/// every frame, so a reader that has caught up can be measured where it sits.
+	/// when it last produced. `timestamp` keeps the first frame only; `latest` and
+	/// `activity` follow every frame.
 	fn stamp(&mut self, timestamp: Timestamp) {
 		self.timestamp.get_or_insert(timestamp);
 		self.latest = Some(timestamp);
 		self.activity = Some(crate::model::clock::now());
-	}
-
-	/// Where a cursor at `index` sits in presentation time: the next frame it would
-	/// read, or the newest frame in the group once it has taken them all.
-	///
-	/// `None` only while the group has presented nothing at all.
-	fn position(&self, index: usize) -> Option<Timestamp> {
-		self.frames
-			.get(index.saturating_sub(self.offset))
-			.map(|frame| frame.timestamp)
-			.or(self.latest)
 	}
 
 	/// Evict completed frames from the front until within the byte budget.
@@ -1224,12 +1213,8 @@ impl Consumer {
 		self.expired
 	}
 
-	/// Where this cursor sits, for a drift budget to measure it against the live edge.
-	///
-	/// A group is not late because it *started* long ago. What is late is the content
-	/// its reader has yet to take, so a reader that has drained a group sits at the
-	/// group's newest frame, not its first. Measuring from the first would make every
-	/// group one group-duration behind by construction.
+	/// When this cursor's group last produced, for a drift budget to age it against
+	/// the live edge instead of when the group first arrived.
 	pub(crate) fn position(&self) -> Position {
 		match &self.inner {
 			ConsumerKind::Plain(plain) => plain.position(),
@@ -1479,24 +1464,19 @@ impl Consumer {
 	}
 }
 
-/// Where a group cursor sits in presentation and wall-clock time.
+/// When a group cursor last saw producer activity.
 ///
-/// `None` fields mean the group has presented nothing (an empty or stalled group),
+/// `None` means the group has presented nothing (an empty or stalled group),
 /// where the track falls back to when the group arrived.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Position {
-	pub(crate) presentation: Option<Timestamp>,
 	pub(crate) activity: Option<crate::runtime::Instant>,
 }
 
 impl Plain {
 	fn position(&self) -> Position {
-		// The prefetch batch was drained under an earlier lock, so the cursor's real
-		// position is past it.
-		let index = self.index.saturating_add(self.prefetch.buffered().0 as usize);
 		let state = self.state.read();
 		Position {
-			presentation: state.position(index),
 			activity: state.activity,
 		}
 	}

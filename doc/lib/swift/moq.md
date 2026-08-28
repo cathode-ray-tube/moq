@@ -126,7 +126,6 @@ let info = try track.info()
 track.update(subscription: Subscription(priority: 20))
 ```
 
-
 A catalog rendition may name a *different* broadcast: `Video.broadcast` / `Audio.broadcast` is a path
 relative to the broadcast the catalog came from, so a transcode output at `live/hd` can describe a
 track that actually lives in `live/source`. `decodeAudio` and `decodeVideo` follow it for you.

@@ -695,9 +695,11 @@ export class Subscriber {
 	#nextSequence = 0;
 	#cursor = new Signal<{ start: number; end?: number }>({ start: 0 });
 	#enforceLatency = true;
-	// Set by {@link ordered}: both cursors draw from one buffer, so the handle that
-	// wins is the only one allowed to read from here on.
-	#committed = false;
+	// Which cursor owns this subscription. Both cursors draw from one buffer, so the
+	// first group read commits the track to arrival order and {@link ordered} commits
+	// it to sequence order; whichever wins is the only one allowed from here on.
+	// Datagrams are a separate cursor and never commit.
+	#mode?: "arrival" | "ordered";
 
 	#drift(): {
 		budget: number;
@@ -846,9 +848,9 @@ export class Subscriber {
 		};
 	}
 
-	// Refuse an arrival-order read once `ordered()` has taken the subscription.
+	// Refuse a read on this handle once `ordered()` has taken the subscription.
 	#live() {
-		if (this.#committed) throw new Error("track is read in sequence order; use the Ordered handle");
+		if (this.#mode === "ordered") throw new Error("track is read in sequence order; use the Ordered handle");
 	}
 
 	/**
@@ -930,9 +932,12 @@ export class Subscriber {
 	 * than this subscriber's `maxAge` is skipped. The default of zero takes the live edge.
 	 * The budget remains attached after return, so a pending frame read rejects if a stalled
 	 * group becomes stale while newer data advances.
+	 *
+	 * The first call commits this track to arrival order: {@link ordered} throws afterwards.
 	 */
 	async recvGroup(): Promise<GroupConsumer | undefined> {
 		this.#live();
+		this.#mode = "arrival";
 		for (;;) {
 			const recv = this.#tryRecvGroup();
 			switch (recv.kind) {
@@ -1177,14 +1182,16 @@ export class Subscriber {
 	 *
 	 * Both cursors draw from the same buffer, so a track is read one way or the other: this
 	 * hands the subscription to the returned {@link Ordered} and leaves this handle inert.
-	 * {@link recvGroup} and {@link recvDatagram} throw afterwards.
+	 * {@link recvGroup} and {@link recvDatagram} throw afterwards. Throws once a
+	 * {@link recvGroup} call has already committed the track to arrival order.
 	 *
 	 * Datagrams come along: they are a separate cursor either way, so the choice of group
-	 * order says nothing about them.
+	 * order says nothing about them, and reading them commits nothing.
 	 */
 	ordered(): Ordered {
-		if (this.#committed) throw new Error("track is already read in sequence order");
-		this.#committed = true;
+		if (this.#mode === "ordered") throw new Error("track is already read in sequence order");
+		if (this.#mode === "arrival") throw new Error("track is already read in arrival order");
+		this.#mode = "ordered";
 		return makeOrdered(this);
 	}
 

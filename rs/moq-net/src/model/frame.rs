@@ -603,10 +603,7 @@ impl Consumer {
 		let Some(expiry) = &self.expiry else {
 			return false;
 		};
-		// A half-read payload sits at its own frame's presentation time, not at the
-		// start of the group that carries it.
 		let at = group::Position {
-			presentation: Some(self.info.timestamp),
 			activity: self.state.read().activity,
 		};
 		if !expiry.policy.is_expired(waiter, at) {

@@ -1132,6 +1132,12 @@ struct SegmentSub {
 	/// the lowest is re-offered first; holding them here (rather than blocking on
 	/// the first) keeps in-range groups that arrive behind a capped one flowing.
 	parked: BTreeMap<u64, group::Consumer>,
+	/// The next group this segment's sequence cursor would deliver, held so the
+	/// spliced sequence path ([`Subscriber::poll_next_group`]) can pick the lowest
+	/// across segments without consuming more than one group per segment ahead.
+	/// The cursor behind it is monotonic, so a staged group past the subscriber's
+	/// cap also correctly stalls everything after it in this segment.
+	staged: Option<group::Consumer>,
 }
 
 impl SegmentSub {
@@ -1179,7 +1185,9 @@ impl SegmentSub {
 	/// replaced before producing, so it holds nothing. The straggler bound in
 	/// `reap` cuts what lingers too long, parked group and all.
 	fn retired(&self) -> bool {
-		self.pruned && (self.end.is_none() || (matches!(self.sub, SubState::Done(_)) && self.parked.is_empty()))
+		self.pruned
+			&& (self.end.is_none()
+				|| (matches!(self.sub, SubState::Done(_)) && self.parked.is_empty() && self.staged.is_none()))
 	}
 }
 
@@ -1268,6 +1276,7 @@ impl Subscriber {
 					seg.sub = SubState::Done(None);
 					seg.terminal = None;
 					seg.parked.clear();
+					seg.staged = None;
 					cut -= 1;
 				}
 			}
@@ -1391,6 +1400,7 @@ impl Subscriber {
 						terminal: None,
 						pruned: false,
 						parked: BTreeMap::new(),
+						staged: None,
 					});
 				}
 			}
@@ -1514,6 +1524,55 @@ impl Subscriber {
 					// cursor's demand is what keeps the upstream serving them. The
 					// reap in `poll_recv_group` bounds how many such stragglers may
 					// linger instead.
+					Poll::Pending => return Poll::Pending,
+				},
+				SubState::Done(_) => return Poll::Ready(None),
+			}
+		}
+	}
+
+	/// Drive one segment's sequence cursor: resolve a pending subscription, then poll
+	/// for the next in-sequence group. Out-of-bounds groups (a route racing its cap) are
+	/// skipped. Unlike [`Self::poll_segment`], groups are never discarded for age: the
+	/// spliced sequence path inherits the [`track::Ordered`] contract of bursting a
+	/// backlog instead of skipping it.
+	fn poll_segment_ordered(
+		seg: &mut SegmentSub,
+		prefs: &Subscription,
+		min_sequence: u64,
+		end_sequence: Option<u64>,
+		waiter: &kio::Waiter,
+	) -> Poll<Option<group::Consumer>> {
+		loop {
+			match &mut seg.sub {
+				SubState::Pending(_) => {
+					ready!(Self::poll_activate(seg, prefs, min_sequence, end_sequence, waiter));
+				}
+				SubState::Active(sub) => match sub.poll_next_group(waiter) {
+					Poll::Ready(Ok(Some(group))) => {
+						// The floor is enforced by the caller; enforce the segment
+						// boundary here since the inner cursor is deliberately uncapped.
+						if let Some(end) = seg.last_group()
+							&& group.sequence > end
+						{
+							continue;
+						}
+						return Poll::Ready(Some(group));
+					}
+					Poll::Ready(Ok(None)) => {
+						let count = match sub.poll_finished(waiter) {
+							Poll::Ready(count) => count.ok(),
+							Poll::Pending => None,
+						};
+						seg.complete(count);
+						return Poll::Ready(None);
+					}
+					// A dead segment stalls the logical track rather than erroring;
+					// the next switch resumes it.
+					Poll::Ready(Err(_)) => {
+						seg.complete(None);
+						return Poll::Ready(None);
+					}
 					Poll::Pending => return Poll::Pending,
 				},
 				SubState::Done(_) => return Poll::Ready(None),
@@ -1663,21 +1722,105 @@ impl Subscriber {
 	/// Poll for the next group with a higher sequence than any previously
 	/// returned, skipping late arrivals, across the segments.
 	///
-	/// Unlike [`track::Subscriber`], the arrival-order and sequence-order cursors
-	/// are shared: groups consumed here are also consumed for
-	/// [`Self::poll_recv_group`].
+	/// Mirrors [`track::Ordered`]: each segment is driven through its own sequence
+	/// cursor with no age-based pruning, so a backlog bursts in order instead of
+	/// being discarded, and [`Subscription::max_age`] only bounds how long a
+	/// handed-out group's reads may block. One group per segment is staged so the
+	/// lowest sequence across segments is delivered first; a segment's cursor is
+	/// monotonic, so a staged group past the [`Self::end_at`] cap stalls only that
+	/// segment until the cap rises.
 	pub fn poll_next_group(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<group::Consumer>>> {
-		loop {
-			// Snapshot the floor before receiving: `poll_recv_group` advances
-			// `next_sequence` for every group it returns, and a duplicate of the
-			// last returned sequence (a boundary splicing at the delivered edge)
-			// must compare against the floor as it was, or it slips through.
-			let floor = self.next_sequence;
-			match ready!(self.poll_recv_group(waiter))? {
-				Some(group) if group.sequence < floor => continue,
-				res => return Poll::Ready(Ok(res)),
+		self.poll_sync(waiter);
+
+		let end_sequence = self.end_sequence;
+		let beyond_cap = |sequence: u64| end_sequence.is_some_and(|end| sequence > end);
+		let floor = self.next_sequence.max(self.min_sequence);
+
+		// A staged group needs a waiter for the same reason a parked one does: an
+		// eviction aborts it without touching any cursor this subscriber polls.
+		let watch = |group: &group::Consumer| match group.poll_closed(waiter) {
+			Poll::Pending => true,
+			Poll::Ready(()) => !group.is_aborted(),
+		};
+
+		let mut all_done = true;
+		for index in 0..self.segments.len() {
+			// A raised `start_at` or an abort invalidates a staged group. The floor
+			// itself cannot overtake one: it only advances past delivered sequences,
+			// and delivery always takes the lowest staged.
+			if let Some(group) = &self.segments[index].staged
+				&& (group.sequence < floor || !watch(group))
+			{
+				self.segments[index].staged = None;
+			}
+
+			while self.segments[index].staged.is_none() {
+				let polled = Self::poll_segment_ordered(
+					&mut self.segments[index],
+					&self.last_prefs,
+					self.min_sequence,
+					end_sequence,
+					waiter,
+				);
+				match polled {
+					Poll::Ready(Some(group)) => {
+						let sequence = group.sequence;
+						// Fold a copy that continues a group already handed out
+						// before the floor is consulted: a boundary can land inside a
+						// group whose head this cursor has not surfaced yet, and such
+						// a copy must splice rather than pose as a fresh group.
+						let Some(group) = self.hand_out(index, group) else {
+							continue;
+						};
+						// A late arrival the sequence contract skips.
+						if sequence < floor {
+							continue;
+						}
+						if watch(&group) {
+							self.segments[index].staged = Some(group);
+						}
+					}
+					Poll::Ready(None) => break,
+					Poll::Pending => break,
+				}
+			}
+
+			let seg = &self.segments[index];
+			if seg.staged.is_some() || !matches!(seg.sub, SubState::Done(_)) {
+				all_done = false;
 			}
 		}
+
+		// Deliver the lowest staged group within the cap.
+		let candidate = self
+			.segments
+			.iter()
+			.enumerate()
+			.filter_map(|(index, seg)| seg.staged.as_ref().map(|group| (index, group.sequence)))
+			.filter(|(_, sequence)| !beyond_cap(*sequence))
+			.min_by_key(|(_, sequence)| *sequence);
+		if let Some((index, sequence)) = candidate {
+			let group = self.segments[index].staged.take().expect("staged just observed");
+			// Staging is not a delivery; this is.
+			group.cache_refresh();
+			self.next_sequence = self.next_sequence.max(sequence.saturating_add(1));
+			return Poll::Ready(Ok(Some(group)));
+		}
+
+		if let Some(err) = &self.abort {
+			return Poll::Ready(Err(err.clone()));
+		}
+		if all_done {
+			if self.finished {
+				return Poll::Ready(Ok(None));
+			}
+			// The producer is gone without finishing: no takeover can ever resume
+			// the drained segments, so report the drop like a plain track would.
+			if self.closed {
+				return Poll::Ready(Err(Error::Dropped));
+			}
+		}
+		Poll::Pending
 	}
 
 	/// Return the next group with a higher sequence than any previously returned.
@@ -2465,6 +2608,65 @@ mod test {
 		write_group(&mut track_b, 1, "b1");
 		write_group(&mut track_b, 2, "b2");
 		assert_eq!(next(&mut sub), 2);
+	}
+
+	/// The spliced sequence path inherits the [`track::Ordered`] contract: a backlog
+	/// the drift budget would discard on the arrival path is still delivered whole,
+	/// in order, exactly as a plain track's sequence cursor delivers it.
+	#[tokio::test]
+	async fn next_group_bursts_a_stale_backlog_like_a_plain_track() {
+		// Groups spaced 10s apart on the media timeline, so with the default (zero)
+		// max age budget every group behind the newest one's reach is stale.
+		let stamp = |sequence: u64| Duration::from_secs(10 * sequence);
+
+		// Plain baseline: the same content through `track::Ordered`.
+		let (mut plain, _plain_consumer) = track_pair("plain");
+		for sequence in 0..4 {
+			write_group_at(&mut plain, sequence, "data", stamp(sequence));
+		}
+		let mut plain_ordered = plain.subscribe(None).ordered();
+		let baseline: Vec<u64> = std::iter::from_fn(|| {
+			plain_ordered
+				.next_group()
+				.now_or_never()?
+				.expect("should not error")
+				.map(|group| group.sequence)
+		})
+		.collect();
+		assert_eq!(baseline, vec![0, 1, 2, 3], "a plain sequence cursor bursts the backlog");
+
+		// The arrival path on the same content discards the backlog instead.
+		let mut arrival = plain.subscribe(None);
+		assert_eq!(
+			arrival.recv_group().now_or_never().unwrap().unwrap().unwrap().sequence,
+			3,
+			"the arrival path skips straight to the live edge"
+		);
+
+		// Spliced: the same backlog split across a takeover boundary.
+		let (mut track_a, consumer_a) = track_pair("a");
+		let (mut track_b, consumer_b) = track_pair("b");
+		let mut producer = Producer::new();
+		producer.switch(&consumer_a, None).unwrap();
+		producer.switch(&consumer_b, Position::group(2)).unwrap();
+		let mut sub = producer.consume().subscribe(None);
+
+		write_group_at(&mut track_a, 0, "a0", stamp(0));
+		write_group_at(&mut track_a, 1, "a1", stamp(1));
+		write_group_at(&mut track_b, 2, "b2", stamp(2));
+		write_group_at(&mut track_b, 3, "b3", stamp(3));
+
+		let spliced: Vec<u64> = std::iter::from_fn(|| {
+			kio::wait(|waiter| sub.poll_next_group(waiter))
+				.now_or_never()?
+				.expect("should not error")
+				.map(|group| group.sequence)
+		})
+		.collect();
+		assert_eq!(
+			spliced, baseline,
+			"spliced and plain sequence cursors deliver the same backlog"
+		);
 	}
 
 	#[tokio::test]
