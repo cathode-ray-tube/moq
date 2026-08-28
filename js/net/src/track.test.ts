@@ -248,7 +248,7 @@ test("a long group is not stale while its tail reaches the edge", async () => {
 	expect((await sub.recvGroup())?.sequence).toBe(1);
 });
 
-test("a long group is stale once its tail falls behind", async () => {
+test("a long group is stale once its successor falls behind", async () => {
 	const producer = new TrackProducer("test").accept({ maxAge: 5000 });
 	const sub = producer.subscribe({ maxAge: 500 });
 
@@ -257,10 +257,14 @@ test("a long group is stale once its tail falls behind", async () => {
 		long.writeFrame({ payload: enc.encode(`${ms}`), timestamp: Timestamp.fromMillis(ms) });
 	}
 	long.close();
-	// The edge starts 2s past where group 0 ends, well beyond the budget.
+	// Group 0 reaches at most 3s (where group 1 starts), a second behind the 4s edge and
+	// so past the budget. A frame's duration is not on the wire, so group 0's own last
+	// timestamp proves nothing about where it ends; only group 1's start bounds it.
 	producer.writeFrame({ payload: enc.encode("edge"), timestamp: Timestamp.fromMillis(3000) });
+	producer.writeFrame({ payload: enc.encode("later"), timestamp: Timestamp.fromMillis(4000) });
 
 	expect((await sub.recvGroup())?.sequence).toBe(1);
+	expect((await sub.recvGroup())?.sequence).toBe(2);
 });
 
 // Datagrams are unordered by construction, so the sequence cursor carries them too: a
@@ -318,6 +322,8 @@ test("latency budget admits groups within its presentation-time window", async (
 		producer.writeFrame({ payload: enc.encode(`${timestamp}`), timestamp: Timestamp.fromMillis(timestamp) });
 	}
 
+	// Group 0 reaches 1s, only 1s behind the 2s edge, so a 1.5s budget still admits it.
+	expect((await track.recvGroup())?.sequence).toBe(0);
 	expect((await track.recvGroup())?.sequence).toBe(1);
 	expect((await track.recvGroup())?.sequence).toBe(2);
 });
@@ -459,6 +465,9 @@ test("committing track info wakes a group newly outside the retention window", a
 	const waiting = group.readFrame();
 
 	producer.writeFrame({ payload: enc.encode("edge"), timestamp: Timestamp.fromMillis(1_000) });
+	// A group beyond the edge, so group 0's reach (1s) is provably behind it: a group is
+	// bounded by where its successor begins, so the successor alone never convicts it.
+	producer.writeFrame({ payload: enc.encode("later"), timestamp: Timestamp.fromMillis(2_000) });
 	await settle();
 	producer.accept({ maxAge: 100 });
 
@@ -504,6 +513,9 @@ test("a guarded write keeps the position of the frame removed from the buffer", 
 	const guarded = hooks.guardGroup(group, operation, read.position);
 
 	producer.writeFrame({ payload: enc.encode("edge"), timestamp: Timestamp.fromMillis(1_000) });
+	// A group beyond the edge, so group 0's reach (1s) is provably behind it: a group is
+	// bounded by where its successor begins, so the successor alone never convicts it.
+	producer.writeFrame({ payload: enc.encode("later"), timestamp: Timestamp.fromMillis(2_000) });
 	await expect(guarded).rejects.toThrow("latency budget");
 	read.complete();
 	release();
@@ -531,6 +543,9 @@ test("clean source closure stays provisional while a frame write can expire", as
 
 	const edge = producer.appendGroup();
 	edge.writeFrame({ payload: enc.encode("edge"), timestamp: Timestamp.fromMillis(1_000) });
+	// See above: a group is bounded by where its successor begins, so convicting group 0
+	// needs a group beyond that successor.
+	producer.writeFrame({ payload: enc.encode("later"), timestamp: Timestamp.fromMillis(2_000) });
 	await expect(guarded).rejects.toThrow("latency budget");
 	expect(await closed).toBeInstanceOf(Error);
 

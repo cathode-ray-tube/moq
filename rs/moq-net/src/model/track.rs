@@ -455,6 +455,7 @@ impl TrackState {
 	fn live_edge(&self, cap: Option<u64>) -> Option<Edge> {
 		let mut wall: Option<WallEdge> = None;
 		let mut presentation: Option<PresentationEdge> = None;
+		let mut stamped: Vec<(u64, Timestamp)> = Vec::new();
 		for slot in self.lookup.values() {
 			if !slot.visible {
 				continue;
@@ -470,33 +471,62 @@ impl TrackState {
 					arrived: slot.arrived,
 				});
 			}
-			if let Some(timestamp) = group.timestamp()
-				&& presentation.is_none_or(|edge| group.sequence > edge.sequence)
-			{
-				presentation = Some(PresentationEdge {
-					sequence: group.sequence,
-					stamp: slot.stamp,
-					timestamp,
-				});
+			if let Some(timestamp) = group.timestamp() {
+				// The suffix table bounds a candidate's reach, so it wants where each group
+				// *begins*; the edge wants the newest content that exists, so it takes the
+				// newest group's latest frame.
+				stamped.push((group.sequence, timestamp));
+				if presentation.is_none_or(|edge| group.sequence > edge.sequence) {
+					presentation = Some(PresentationEdge {
+						sequence: group.sequence,
+						stamp: slot.stamp,
+						timestamp: group.latest().unwrap_or(timestamp),
+					});
+				}
 			}
 		}
-		wall.map(|wall| Edge { wall, presentation })
+
+		// Turn the stamped groups into a suffix minimum: entry `i` carries the earliest
+		// presentation time any group at or after that sequence begins at. One backwards
+		// pass, so the whole poll still costs a single scan.
+		stamped.sort_unstable_by_key(|(sequence, _)| *sequence);
+		let mut min: Option<Timestamp> = None;
+		for entry in stamped.iter_mut().rev() {
+			min = Some(min.map_or(entry.1, |seen: Timestamp| seen.min(entry.1)));
+			entry.1 = min.expect("just assigned");
+		}
+
+		wall.map(|wall| Edge {
+			wall,
+			presentation,
+			suffix: stamped.into(),
+		})
 	}
 
 	/// Whether the group at `sequence` has drifted further behind `edge` than `budget`
 	/// tolerates, so a subscriber should skip it rather than hand it over.
 	///
-	/// Presentation time distinguishes a backlog delivered as a burst from live content,
-	/// measured from where the group's *unread* content ends rather than where the group
-	/// began: a long group whose tail reaches the live edge still owes the reader
-	/// something. Wall-clock arrival time backstops it, including for an empty or stalled
-	/// group that has supplied no timestamp. Either age exceeding the budget makes the
-	/// group stale.
+	/// Presentation time measures a group by how far it could still *reach*, not by how far
+	/// behind it started. Being behind is survivable: priority transmits newer groups
+	/// first, so a backlog bursts at whatever rate is left over and closes the gap faster
+	/// than the live edge advances. What is not survivable is having nothing left worth
+	/// delivering, so a group is abandoned only once everything it could still present
+	/// falls outside the budget.
+	///
+	/// A group's reach is bounded by its nearest successor: it cannot present past where
+	/// the next group begins. Its own frames say nothing, since a frame's duration is not
+	/// on the wire and its last timestamp is where that frame *starts*. Wall-clock arrival
+	/// backstops the whole thing for an empty group that has supplied no timestamp at all.
+	///
+	/// The bound is exclusive, so the comparison is `>=` rather than `>`: the freshest frame
+	/// a group could still hold sits just *below* its reach, so an age equal to the budget
+	/// already puts every frame in it strictly past the budget. That also makes a zero
+	/// budget fall out for free instead of needing a special case.
 	///
 	/// The edge must sit strictly above the candidate. The live edge is never late
 	/// against itself, and backfill or the tail of a rewound timeline can carry a high
 	/// timestamp on a low sequence without being an edge at all.
-	fn is_stale(&self, sequence: u64, at: Option<group::Position>, edge: Option<Edge>, budget: Duration) -> bool {
+	fn is_stale(&self, sequence: u64, at: Option<group::Position>, edge: Option<&Edge>, budget: Duration) -> bool {
 		let Some(edge) = edge else {
 			return false;
 		};
@@ -504,13 +534,9 @@ impl TrackState {
 			return false;
 		};
 
-		// Where the candidate sits. One already handed out sits wherever its reader got
-		// to; one nobody has read sits at its newest frame, since that is the last of the
-		// content still owed. Either way the measure is what the reader has yet to take,
-		// not when the group opened: a long group whose tail reaches the live edge is not
-		// late just because its first frame is old.
+		// Where the candidate can still reach, which is a property of what follows it
+		// rather than of the reader or of the group's own frames.
 		let at = at.unwrap_or_default();
-		let presentation = at.presentation.or_else(|| slot.group.latest());
 		let arrived = at.activity.unwrap_or(slot.arrived);
 
 		// The anchors were resolved under an earlier lock, so confirm each still names
@@ -521,21 +547,21 @@ impl TrackState {
 				.lookup
 				.get(&edge.wall.sequence)
 				.is_some_and(|live| live.stamp == edge.wall.stamp && !live.group.is_aborted())
-			&& (budget.is_zero()
-				|| edge
-					.wall
-					.arrived
-					.checked_duration_since(arrived)
-					.is_some_and(|age| age > budget));
+			&& edge
+				.wall
+				.arrived
+				.checked_duration_since(arrived)
+				.is_some_and(|age| age >= budget);
 
-		let presentation_stale = edge.presentation.is_some_and(|edge| {
-			edge.sequence > sequence
+		let reach = edge.reach(sequence);
+		let presentation_stale = edge.presentation.is_some_and(|live_edge| {
+			live_edge.sequence > sequence
 				&& self
 					.lookup
-					.get(&edge.sequence)
-					.is_some_and(|live| live.stamp == edge.stamp && !live.group.is_aborted())
-				&& presentation.is_some_and(
-					|timestamp| matches!(edge.timestamp.checked_sub(timestamp), Ok(age) if Duration::from(age) > budget),
+					.get(&live_edge.sequence)
+					.is_some_and(|live| live.stamp == live_edge.stamp && !live.group.is_aborted())
+				&& reach.is_some_and(
+					|reach| matches!(live_edge.timestamp.checked_sub(reach), Ok(age) if Duration::from(age) >= budget),
 				)
 		});
 
@@ -2597,7 +2623,7 @@ enum SubscriberKind {
 /// One poll's view of how far this subscription may drift: the clamped budget and the
 /// live edge to measure a candidate group against. Resolved once, then applied to every
 /// group that poll considers.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Drift {
 	budget: Duration,
 	edge: Option<Edge>,
@@ -2637,7 +2663,7 @@ impl group::Expiry for GroupExpiry {
 			let budget = clamp_max_age(max_age, state.max_age_bound());
 			loop {
 				let edge = state.live_edge(cap);
-				expired = state.is_stale(self.sequence, Some(at), edge, budget);
+				expired = state.is_stale(self.sequence, Some(at), edge.as_ref(), budget);
 				if expired {
 					break;
 				}
@@ -2657,6 +2683,7 @@ impl group::Expiry for GroupExpiry {
 					}
 				}
 				let presentation_sequence = edge
+					.as_ref()
 					.and_then(|edge| edge.presentation)
 					.map_or(self.sequence, |edge| edge.sequence.max(self.sequence));
 				for slot in state.lookup.values() {
@@ -2688,10 +2715,33 @@ impl group::Expiry for GroupExpiry {
 
 /// The group a poll's drift is measured against, identified well enough to tell it apart
 /// from whatever may occupy its sequence by the time a candidate is judged.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Edge {
 	wall: WallEdge,
 	presentation: Option<PresentationEdge>,
+	/// Every servable stamped group by sequence, paired with the minimum first-timestamp
+	/// at or after it. A candidate's reach is bounded by its successors: it cannot present
+	/// past where the next group begins, so `reach()` reads that bound off in one lookup
+	/// rather than rescanning, keeping a backlog walk linear.
+	///
+	/// Sorted by sequence, so this is a suffix minimum. Once `lookup` becomes a `BTreeMap`
+	/// (it already is on main) this collapses to a `range(sequence + 1..)` walk and the
+	/// table goes away.
+	suffix: Arc<[(u64, Timestamp)]>,
+}
+
+impl Edge {
+	/// The furthest presentation time the group at `sequence` could still reach: where its
+	/// nearest successor begins, or `None` when nothing follows it yet.
+	///
+	/// An upper bound, deliberately. A frame's duration is not on the wire, so a group's
+	/// own last timestamp says where it *starts* presenting, not where it ends; only a
+	/// successor's start proves the predecessor cannot run past it. Overestimating keeps a
+	/// group longer, which is the safe direction: we abort only what is provably useless.
+	fn reach(&self, sequence: u64) -> Option<Timestamp> {
+		let index = self.suffix.partition_point(|(seq, _)| *seq <= sequence);
+		self.suffix.get(index).map(|(_, timestamp)| *timestamp)
+	}
 }
 
 /// The newest servable group, including an empty group with no media timestamp.
@@ -2711,6 +2761,10 @@ struct PresentationEdge {
 	/// The slot incarnation this timestamp was read from, so an eviction or a re-served
 	/// sequence between resolving the anchor and using it is detectable.
 	stamp: u32,
+	/// The newest frame this group has presented, not its first. The candidate side of the
+	/// comparison is an upper bound on what a group could still reach, so the edge side has
+	/// to be the newest content that actually exists, or the two meet and nothing is ever
+	/// convicted. Only ever grows as the group fills.
 	timestamp: Timestamp,
 }
 
@@ -2807,9 +2861,14 @@ impl PlainSubscriber {
 
 	/// Whether the drift budget says to skip `group`, against a [`Drift`] already resolved
 	/// for this poll.
-	fn poll_stale(&self, group: &group::Consumer, drift: Drift, waiter: &kio::Waiter) -> Poll<Result<bool>> {
+	fn poll_stale(&self, group: &group::Consumer, drift: &Drift, waiter: &kio::Waiter) -> Poll<Result<bool>> {
 		self.poll(waiter, move |state| {
-			Poll::Ready(Ok(state.is_stale(group.sequence, None, drift.edge, drift.budget)))
+			Poll::Ready(Ok(state.is_stale(
+				group.sequence,
+				None,
+				drift.edge.as_ref(),
+				drift.budget,
+			)))
 		})
 	}
 
@@ -2888,7 +2947,7 @@ impl PlainSubscriber {
 
 			// Drop a group the drift budget has given up on and keep scanning, so one
 			// poll walks a whole backlog off rather than handing it out group by group.
-			if ready!(self.poll_stale(&consumer, drift, waiter))? {
+			if ready!(self.poll_stale(&consumer, &drift, waiter))? {
 				self.stale.add(consumer.content());
 				continue;
 			}
@@ -3011,7 +3070,7 @@ impl Subscriber {
 			return Poll::Ready(Ok(false));
 		};
 		let drift = ready!(plain.poll_drift(waiter))?;
-		let stale = ready!(plain.poll_stale(group, drift, waiter))?;
+		let stale = ready!(plain.poll_stale(group, &drift, waiter))?;
 		if stale {
 			plain.note_stale(group);
 		}
@@ -4330,7 +4389,9 @@ mod test {
 		}
 
 		// Two seconds of tolerance keeps the groups presenting within 2s of the live
-		// edge (2s, 3s, 4s) and drops the two below it.
+		// edge (2s, 3s, 4s) and drops the two below it. Group 1 reaches exactly 2s behind
+		// the edge, and the reach bound is exclusive, so every frame it could hold is
+		// already past the budget.
 		let mut subscriber = producer.subscribe(Subscription::default().with_max_age(Duration::from_secs(2)));
 		assert_eq!(drain(&mut subscriber), vec![2, 3, 4]);
 	}
@@ -4346,7 +4407,7 @@ mod test {
 		}
 
 		let mut subscriber = producer.subscribe(Subscription::default().with_max_age(Duration::from_millis(1500)));
-		assert_eq!(drain(&mut subscriber), vec![2, 3]);
+		assert_eq!(drain(&mut subscriber), vec![1, 2, 3]);
 	}
 
 	#[tokio::test]
@@ -4387,6 +4448,10 @@ mod test {
 		assert!(matches!(result, Ok(None)), "the held group ends: {result:?}");
 	}
 
+	/// A first timestamp on a *newer* group can convict a held one, so the held reader has
+	/// to be woken by it. The conviction needs a group beyond the held one's successor:
+	/// a group is bounded by where its successor begins, so the successor itself never
+	/// proves it stale.
 	#[tokio::test]
 	async fn a_handed_out_group_wakes_when_a_newer_group_gets_its_first_timestamp() {
 		let mut producer = track_producer("test", None);
@@ -4395,15 +4460,20 @@ mod test {
 		old.write_frame(Timestamp::ZERO, bytes::Bytes::from_static(b"old"))
 			.unwrap();
 
+		// Group 1 bounds group 0's reach at 1s.
+		append_at(&mut producer, 1000);
+
 		let mut held = subscriber.recv_group().await.unwrap().expect("old group");
 		assert!(held.read_frame().await.unwrap().is_some());
+
 		let mut live = producer.append_group().unwrap();
 		let pending = tokio::spawn(async move { held.read_frame().await });
 		tokio::task::yield_now().await;
 		assert!(!pending.is_finished(), "the newer group has no timestamp yet");
 
+		// 2s edge against group 0's 1s reach: a full second past the budget.
 		live.write_frame(
-			Timestamp::from_millis(1000).unwrap(),
+			Timestamp::from_millis(2000).unwrap(),
 			bytes::Bytes::from_static(b"live"),
 		)
 		.unwrap();
@@ -4629,9 +4699,12 @@ mod test {
 		let mut producer = track_producer("test", Info::default().with_max_age(Duration::from_millis(500)));
 		append_at(&mut producer, 0);
 		append_at(&mut producer, 1000);
+		append_at(&mut producer, 2000);
 
+		// Group 0 reaches 1s, a full second behind the 2s edge, so the clamped 500ms
+		// budget drops it. An unclamped ten seconds would have kept it.
 		let mut subscriber = producer.subscribe(Subscription::default().with_max_age(Duration::from_secs(10)));
-		assert_eq!(drain(&mut subscriber), vec![1]);
+		assert_eq!(drain(&mut subscriber), vec![1, 2]);
 	}
 
 	#[test]
@@ -4682,8 +4755,12 @@ mod test {
 	}
 
 	/// The same group, once its tail has fallen behind, is stale like any other.
+	/// The same long group, once its *successor* has itself fallen behind. A frame's
+	/// duration is not on the wire, so group 0's own last timestamp proves nothing about
+	/// where it ends; only group 1's start bounds it. Group 0 is convicted once that bound
+	/// is further behind the edge than the budget allows.
 	#[test]
-	fn a_long_group_is_stale_once_its_tail_falls_behind() {
+	fn a_long_group_is_stale_once_its_successor_falls_behind() {
 		let mut producer = track_producer("test", None);
 
 		let mut long = producer.append_group().unwrap();
@@ -4692,11 +4769,13 @@ mod test {
 				.unwrap();
 		}
 		long.finish().unwrap();
-		// The edge starts 2s past where group 0 ends, well beyond the budget.
+		// Group 0 reaches at most 3s (where group 1 starts), a full second behind the 4s
+		// edge and so past the budget. Group 1 reaches the edge itself and is kept.
 		append_at(&mut producer, 3000);
+		append_at(&mut producer, 4000);
 
 		let mut sub = producer.subscribe(Subscription::default().with_max_age(Duration::from_millis(500)));
-		assert_eq!(drain(&mut sub), vec![1]);
+		assert_eq!(drain(&mut sub), vec![1, 2]);
 	}
 
 	/// Datagrams are unordered by construction, so the sequence cursor carries them too:
@@ -4822,7 +4901,7 @@ mod test {
 			edge: state.live_edge(None),
 		};
 		assert!(
-			state.is_stale(0, None, drift.edge, drift.budget),
+			state.is_stale(0, None, drift.edge.as_ref(), drift.budget),
 			"stale against a live edge"
 		);
 		drop(state);
@@ -4833,7 +4912,7 @@ mod test {
 
 		let state = producer.state.read();
 		assert!(
-			!state.is_stale(0, None, drift.edge, drift.budget),
+			!state.is_stale(0, None, drift.edge.as_ref(), drift.budget),
 			"a vanished edge is no reason to drop what is left"
 		);
 	}

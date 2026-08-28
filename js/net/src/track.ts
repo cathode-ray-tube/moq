@@ -703,18 +703,33 @@ export class Subscriber {
 		budget: number;
 		wall?: { sequence: number; time: number };
 		presentation?: { sequence: number; timestamp: Timestamp };
+		suffix: { sequence: number; reach: number }[];
 	} {
 		const { end } = this.#cursor.peek();
 		let wall: { sequence: number; time: number } | undefined;
 		let presentation: { sequence: number; timestamp: Timestamp } | undefined;
+		const suffix: { sequence: number; reach: number }[] = [];
 		for (const { group, time } of this.#state.timeline.values()) {
 			if (end !== undefined && group.sequence > end) continue;
 			if (group.closed.peek() instanceof Error) continue;
 			if (!wall || group.sequence > wall.sequence) wall = { sequence: group.sequence, time };
 			const timestamp = hooks.groupTimestamp(group);
-			if (timestamp !== undefined && (!presentation || group.sequence > presentation.sequence)) {
-				presentation = { sequence: group.sequence, timestamp };
+			if (timestamp !== undefined) {
+				// The table bounds a candidate's reach, so it wants where each group
+				// begins; the edge wants the newest content that exists, so it takes the
+				// newest group's latest frame.
+				suffix.push({ sequence: group.sequence, reach: timestamp.asMillis() });
+				if (!presentation || group.sequence > presentation.sequence) {
+					presentation = { sequence: group.sequence, timestamp: hooks.groupLatest(group) ?? timestamp };
+				}
 			}
+		}
+
+		// Turn it into a suffix minimum: each entry carries the earliest presentation time
+		// any group at or after that sequence begins at, so a backlog walk stays linear.
+		suffix.sort((a, b) => a.sequence - b.sequence);
+		for (let i = suffix.length - 2; i >= 0; i--) {
+			suffix[i].reach = Math.min(suffix[i].reach, suffix[i + 1].reach);
 		}
 
 		const requested = this.#state.update.peek()?.maxAge ?? 0;
@@ -727,20 +742,49 @@ export class Subscriber {
 				: Number.POSITIVE_INFINITY,
 			wall,
 			presentation,
+			suffix,
 		};
 	}
 
-	// `at` is where a handed-out group's reader stands. A group nobody has started
-	// reading sits at its own start, which is what selection measures; one already
-	// handed out sits wherever its reader got to, so a reader keeping pace is not
-	// convicted by how long ago its group opened. Measuring from the group's first
-	// frame instead makes a GOP one GOP-duration behind by construction.
+	// The furthest presentation time the group at `sequence` could still reach: where its
+	// nearest successor begins, or undefined when nothing follows it yet. An upper bound,
+	// deliberately: a frame's duration is not on the wire, so a group's own last timestamp
+	// says where it starts presenting, not where it ends. Only a successor's start proves
+	// the predecessor cannot run past it.
+	static #reach(suffix: { sequence: number; reach: number }[], sequence: number): number | undefined {
+		let lo = 0;
+		let hi = suffix.length;
+		while (lo < hi) {
+			const mid = (lo + hi) >> 1;
+			if (suffix[mid].sequence <= sequence) lo = mid + 1;
+			else hi = mid;
+		}
+		return suffix[lo]?.reach;
+	}
+
+	// Whether the drift budget says to give up on `group`.
+	//
+	// Presentation time measures a group by how far it could still reach, not by how far
+	// behind it started. Being behind is survivable: priority transmits newer groups first,
+	// so a backlog bursts at whatever rate is left over and closes the gap faster than the
+	// live edge advances. A group is abandoned only once everything it could still present
+	// falls outside the budget.
+	//
+	// A group's reach is bounded by its nearest successor: it cannot present past where the
+	// next group begins. Its own frames say nothing, since a frame's duration is not on the
+	// wire. The bound is exclusive, so the comparison is `>=`: the freshest frame a group
+	// could still hold sits just below its reach, so an age equal to the budget already puts
+	// every frame in it strictly past the budget. A zero budget falls out for free.
+	//
+	// `at.activity` is where a handed-out group's reader last made progress, backstopping
+	// an empty group that has supplied no timestamp at all.
 	#isStale(
 		group: GroupConsumer,
 		drift: {
 			budget: number;
 			wall?: { sequence: number; time: number };
 			presentation?: { sequence: number; timestamp: Timestamp };
+			suffix: { sequence: number; reach: number }[];
 		},
 		at?: GroupPosition,
 	): boolean {
@@ -749,19 +793,14 @@ export class Subscriber {
 
 		const time = at?.activity ?? candidate.time;
 		const wallStale =
-			drift.wall !== undefined &&
-			drift.wall.sequence > group.sequence &&
-			(drift.budget === 0 || drift.wall.time - time > drift.budget);
+			drift.wall !== undefined && drift.wall.sequence > group.sequence && drift.wall.time - time >= drift.budget;
 
-		// Where the group's unread content *ends*, not where the group began: a long group
-		// whose tail reaches the live edge still owes the reader every frame in it. One
-		// already handed out is measured at its reader's position instead.
-		const timestamp = at?.presentation ?? hooks.groupLatest(group);
+		const reach = Subscriber.#reach(drift.suffix, group.sequence);
 		const presentationStale =
 			drift.presentation !== undefined &&
 			drift.presentation.sequence > group.sequence &&
-			timestamp !== undefined &&
-			drift.presentation.timestamp.asMillis() - timestamp.asMillis() > drift.budget;
+			reach !== undefined &&
+			drift.presentation.timestamp.asMillis() - reach >= drift.budget;
 
 		return wallStale || presentationStale;
 	}

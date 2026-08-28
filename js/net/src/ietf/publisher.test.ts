@@ -177,6 +177,14 @@ test("a blocked group header is reset when the group expires", async () => {
 		edge.close();
 		track.writeGroup(edge);
 
+		// A group beyond the edge, so group 0's reach (10s, where group 1 begins) is
+		// provably past the budget. A group is bounded by where its successor starts, so
+		// the successor alone never convicts it: nothing yet proves group 0 ends sooner.
+		const later = new GroupProducer(2);
+		later.writeFrame({ payload: new TextEncoder().encode("later"), timestamp: Timestamp.fromMillis(20_000) });
+		later.close();
+		track.writeGroup(later);
+
 		const resetBeforeRelease = await Promise.race([
 			streamReset.then(() => true),
 			new Promise<false>((resolve) => setTimeout(() => resolve(false), 500)),
