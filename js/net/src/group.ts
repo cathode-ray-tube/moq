@@ -360,6 +360,7 @@ export class Consumer {
 	static {
 		makeConsumer = (state) => new Consumer(state);
 		hooks.groupTimestamp = (group) => group.#state.timestamp;
+		hooks.groupLatest = (group) => group.#state.latest;
 		hooks.expireGroup = (group, expiry) => {
 			group.#expiry = expiry;
 		};

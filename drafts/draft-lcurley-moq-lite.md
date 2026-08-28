@@ -509,8 +509,13 @@ It is RECOMMENDED that an application set conservative limits and only resort to
 A group is never expired until at least the next group (by sequence number) has been received or queued.
 Once a newer group exists, the group's age is measured two ways, and it is expired once **either** measure exceeds the relevant `Max Age`:
 
-- **Timestamp age**: the difference between this group's first frame timestamp and the first frame timestamp of the latest group that has at least one frame. This measure is consistent across relays and unaffected by buffering or jitter.
+- **Timestamp age**: the difference between this group's *newest* frame timestamp and the *first* frame timestamp of the latest group that has at least one frame. This measure is consistent across relays and unaffected by buffering or jitter.
 - **Wall-clock age**: the difference between when this group's first byte arrived (subscriber) or was queued (publisher) and the same instant for the latest group.
+
+Timestamp age is measured from where a group's content *ends* because that is what is still owed.
+A group covering two seconds is not two seconds late when it opened two seconds ago; its tail is level with the live edge and every frame in it is unread.
+Judging it by its first frame would expire exactly the group being filled.
+A receiver that has already begun reading a group MAY substitute its own read position, which is never behind the group's start and so can only keep the group longer.
 
 The two backstop each other: a publisher cannot keep stale groups alive with fresh-looking timestamps, and a burst of groups arriving together does not reset their age.
 A group that contains zero frames has no timestamp, so only the wall-clock age applies; this avoids stalling expiration on empty groups sent as keep-alives or gap markers.
@@ -1353,6 +1358,7 @@ The `Message Length` describes the payload size on the wire.
 - Exempted a ceiling-cost serving path from the actively-carrying cost discount: a relay whose serving path costs the saturation ceiling (primarily a session that received a GOAWAY) advertises the ceiling instead of 0, so the drain propagates downstream instead of being re-masked by each carrying hop. Keyed on the value, not the reason, which does not travel on the wire.
 - Added the Error Codes section, defining separate session and stream code spaces and listing the codes moq-lite uses, reused unchanged from moq-transport. Codes 64+ are the application's; 32-63 are reserved and MUST NOT be interpreted, pending a future revision. Previously the codes were unspecified, so an endpoint could neither send one a peer would understand nor safely interpret one it received. Note this renumbers every code an existing implementation sent, and that a stream reset of 0x0 is now INTERNAL_ERROR rather than a cancellation (CANCELLED is 0x1).
 - Renamed `Subscriber Max Latency` to `Subscriber Max Age` and `Publisher Max Latency` to `Publisher Max Age`.
+- Measure a group's timestamp age from its *newest* frame rather than its first, against the latest group's first frame. A group covering a long span is not late while its tail is level with the live edge, and judging it by its first frame expired exactly the group being filled. Single-frame groups, where the two coincide, are unaffected.
 - Removed `Subscriber Ordered` from SUBSCRIBE and SUBSCRIBE_UPDATE, and `Publisher Ordered` from TRACK_INFO and SUBSCRIBE_OK. Group order within a Track is now normatively newest-first, with no field to invert it: a subscriber that wants sequence order reads in sequence order, which costs the network nothing and does not let one subscriber's preference reach a Track a relay is fanning out to many. Note this removes a byte from the middle of each message, so a lite-06 peer cannot parse a lite-05 one's SUBSCRIBE (the earlier drafts keep the byte, and an implementation serving them SHOULD write 0 and ignore what it reads).
 
 ## moq-lite-05

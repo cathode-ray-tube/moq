@@ -486,9 +486,12 @@ impl TrackState {
 	/// Whether the group at `sequence` has drifted further behind `edge` than `budget`
 	/// tolerates, so a subscriber should skip it rather than hand it over.
 	///
-	/// Presentation time distinguishes a backlog delivered as a burst from live content.
-	/// Wall-clock arrival time backstops it, including for an empty or stalled group that
-	/// has no first-frame timestamp. Either age exceeding the budget makes the group stale.
+	/// Presentation time distinguishes a backlog delivered as a burst from live content,
+	/// measured from where the group's *unread* content ends rather than where the group
+	/// began: a long group whose tail reaches the live edge still owes the reader
+	/// something. Wall-clock arrival time backstops it, including for an empty or stalled
+	/// group that has supplied no timestamp. Either age exceeding the budget makes the
+	/// group stale.
 	///
 	/// The edge must sit strictly above the candidate. The live edge is never late
 	/// against itself, and backfill or the tail of a rewound timeline can carry a high
@@ -501,11 +504,13 @@ impl TrackState {
 			return false;
 		};
 
-		// Where the candidate sits. A group nobody has started reading sits at its own
-		// start; one already handed out sits wherever its reader got to, so a reader
-		// that has kept up is not convicted by how long ago its group opened.
+		// Where the candidate sits. One already handed out sits wherever its reader got
+		// to; one nobody has read sits at its newest frame, since that is the last of the
+		// content still owed. Either way the measure is what the reader has yet to take,
+		// not when the group opened: a long group whose tail reaches the live edge is not
+		// late just because its first frame is old.
 		let at = at.unwrap_or_default();
-		let presentation = at.presentation.or_else(|| slot.group.timestamp());
+		let presentation = at.presentation.or_else(|| slot.group.latest());
 		let arrived = at.activity.unwrap_or(slot.arrived);
 
 		// The anchors were resolved under an earlier lock, so confirm each still names
@@ -3123,8 +3128,8 @@ impl Subscriber {
 	/// The two advance independently, and interleaving them produces a group stream that
 	/// is neither, which is why the choice is a handle rather than a method.
 	///
-	/// Datagrams stay on [`Subscriber`]: they are unordered by construction, so there is
-	/// nothing for a sequence cursor to do with them.
+	/// Datagrams come along: they are a separate cursor either way, so the choice of group
+	/// order says nothing about them.
 	pub fn ordered(self) -> Ordered {
 		Ordered { inner: self }
 	}
@@ -3279,6 +3284,27 @@ impl Ordered {
 	/// Return the next group with a higher sequence number than any previously returned.
 	pub async fn next_group(&mut self) -> Result<Option<group::Consumer>> {
 		kio::wait(|waiter| self.poll_next_group(waiter)).await
+	}
+
+	/// Poll for the next datagram in arrival order, without blocking.
+	///
+	/// Datagrams are a separate best-effort channel from groups (see
+	/// [`Producer::append_datagram`]); they share only the sequence namespace, and neither
+	/// cursor moves the other. Unordered by construction, so this behaves identically on
+	/// either handle; it is here so a track carrying both channels needs one subscription
+	/// rather than two.
+	pub fn poll_recv_datagram(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<Datagram>>> {
+		self.inner.poll_recv_datagram(waiter)
+	}
+
+	/// Receive the next datagram in arrival order.
+	///
+	/// To read groups and datagrams concurrently from one handle, poll
+	/// [`Self::poll_next_group`] and [`Self::poll_recv_datagram`] together in a single
+	/// `poll` closure (sequential `&mut` borrows), rather than awaiting the two `recv`
+	/// futures at once.
+	pub async fn recv_datagram(&mut self) -> Result<Option<Datagram>> {
+		kio::wait(|waiter| self.poll_recv_datagram(waiter)).await
 	}
 
 	/// Start this cursor at the given sequence.
@@ -4634,6 +4660,79 @@ mod test {
 	/// that is already cached costs nothing to deliver, and dropping it would put a
 	/// hole in the sequence a decoder is reading. The budget bounds how long a
 	/// *blocking* group may stall, which is what group expiry enforces.
+	/// A group's age is where its content *ends*, not where it began. A long group whose
+	/// tail is level with the live edge still owes the reader every frame in it, so
+	/// judging it by its first timestamp would discard exactly the group being filled.
+	#[test]
+	fn a_long_group_is_not_stale_while_its_tail_reaches_the_edge() {
+		let mut producer = track_producer("test", None);
+
+		// Group 0 spans 0..2000ms; group 1 starts at 2000ms, where group 0 ends.
+		let mut long = producer.append_group().unwrap();
+		for ms in [0u64, 500, 1000, 1500, 2000] {
+			long.write_frame(Timestamp::from_millis(ms).unwrap(), bytes::Bytes::from_static(b"x"))
+				.unwrap();
+		}
+		long.finish().unwrap();
+		append_at(&mut producer, 2000);
+
+		// A budget far shorter than the group's own span still keeps it.
+		let mut sub = producer.subscribe(Subscription::default().with_max_age(Duration::from_millis(500)));
+		assert_eq!(drain(&mut sub), vec![0, 1]);
+	}
+
+	/// The same group, once its tail has fallen behind, is stale like any other.
+	#[test]
+	fn a_long_group_is_stale_once_its_tail_falls_behind() {
+		let mut producer = track_producer("test", None);
+
+		let mut long = producer.append_group().unwrap();
+		for ms in [0u64, 500, 1000] {
+			long.write_frame(Timestamp::from_millis(ms).unwrap(), bytes::Bytes::from_static(b"x"))
+				.unwrap();
+		}
+		long.finish().unwrap();
+		// The edge starts 2s past where group 0 ends, well beyond the budget.
+		append_at(&mut producer, 3000);
+
+		let mut sub = producer.subscribe(Subscription::default().with_max_age(Duration::from_millis(500)));
+		assert_eq!(drain(&mut sub), vec![1]);
+	}
+
+	/// Datagrams are unordered by construction, so the sequence cursor carries them too:
+	/// a track using both channels needs one subscription, not two.
+	#[tokio::test]
+	async fn ordered_carries_datagrams() {
+		let mut producer = track_producer("test", None);
+		let mut sub = producer.subscribe(None).ordered();
+
+		producer
+			.write_datagram(Datagram {
+				sequence: 5,
+				timestamp: Timestamp::from_millis(5).unwrap(),
+				payload: bytes::Bytes::from_static(b"x"),
+			})
+			.unwrap();
+		producer.create_group(group::Info { sequence: 3 }).unwrap();
+
+		let datagram = sub
+			.recv_datagram()
+			.now_or_never()
+			.expect("datagram would have blocked")
+			.expect("would have errored")
+			.expect("track was closed");
+		assert_eq!(datagram.sequence, 5);
+
+		// The datagram did not consume the group cursor.
+		let group = sub
+			.next_group()
+			.now_or_never()
+			.expect("group would have blocked")
+			.expect("would have errored")
+			.expect("track was closed");
+		assert_eq!(group.sequence, 3);
+	}
+
 	#[test]
 	fn next_group_bursts_a_stale_backlog() {
 		let mut producer = track_producer("test", None);

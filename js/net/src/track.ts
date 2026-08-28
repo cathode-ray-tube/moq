@@ -312,6 +312,7 @@ let ordered_: {
 	readString(subscriber: Subscriber): Promise<string | undefined>;
 	readJson(subscriber: Subscriber): Promise<unknown | undefined>;
 	readBool(subscriber: Subscriber): Promise<boolean | undefined>;
+	recvDatagram(subscriber: Subscriber): Promise<Datagram | undefined>;
 };
 
 // Constructs a Subscriber from within this module without exposing a public
@@ -752,7 +753,10 @@ export class Subscriber {
 			drift.wall.sequence > group.sequence &&
 			(drift.budget === 0 || drift.wall.time - time > drift.budget);
 
-		const timestamp = at?.presentation ?? hooks.groupTimestamp(group);
+		// Where the group's unread content *ends*, not where the group began: a long group
+		// whose tail reaches the live edge still owes the reader every frame in it. One
+		// already handed out is measured at its reader's position instead.
+		const timestamp = at?.presentation ?? hooks.groupLatest(group);
 		const presentationStale =
 			drift.presentation !== undefined &&
 			drift.presentation.sequence > group.sequence &&
@@ -799,6 +803,8 @@ export class Subscriber {
 			readString: (subscriber) => subscriber.#readString(),
 			readJson: (subscriber) => subscriber.#readJson(),
 			readBool: (subscriber) => subscriber.#readBool(),
+			// Unordered either way, so both handles reach the same cursor.
+			recvDatagram: (subscriber) => subscriber.#recvDatagram(),
 		};
 	}
 
@@ -955,6 +961,12 @@ export class Subscriber {
 	 */
 	async recvDatagram(): Promise<Datagram | undefined> {
 		this.#live();
+		return this.#recvDatagram();
+	}
+
+	// The datagram cursor, reachable from either handle: unordered by construction, so the
+	// choice of group order says nothing about it.
+	async #recvDatagram(): Promise<Datagram | undefined> {
 		for (;;) {
 			const datagrams = this.#state.datagrams.peek();
 
@@ -1129,8 +1141,8 @@ export class Subscriber {
 	 * hands the subscription to the returned {@link Ordered} and leaves this handle inert.
 	 * {@link recvGroup} and {@link recvDatagram} throw afterwards.
 	 *
-	 * Datagrams stay on this handle by construction: they are unordered, so a sequence
-	 * cursor has nothing to do with them.
+	 * Datagrams come along: they are a separate cursor either way, so the choice of group
+	 * order says nothing about them.
 	 */
 	ordered(): Ordered {
 		if (this.#committed) throw new Error("track is already read in sequence order");
@@ -1259,5 +1271,18 @@ export class Ordered {
 	/** Read the next frame and decode it as a one-byte boolean, throwing on a malformed frame. */
 	readBool(): Promise<boolean | undefined> {
 		return ordered_.readBool(this.#subscriber);
+	}
+
+	/**
+	 * Receive the next datagram in arrival order.
+	 *
+	 * Datagrams are a separate best-effort channel from groups (see
+	 * {@link Producer.appendDatagram}); they share only the sequence namespace, and
+	 * neither cursor moves the other. Unordered by construction, so this behaves
+	 * identically on either handle; it is here so a track carrying both channels needs
+	 * one subscription rather than two.
+	 */
+	recvDatagram(): Promise<Datagram | undefined> {
+		return ordered_.recvDatagram(this.#subscriber);
 	}
 }

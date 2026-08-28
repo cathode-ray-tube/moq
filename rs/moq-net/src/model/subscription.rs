@@ -39,9 +39,12 @@ pub struct Subscription {
 	/// # How age is measured
 	///
 	/// By both presentation time and wall-clock arrival, with either able to expire the
-	/// group. Presentation time compares a group's first timestamp against the newest
-	/// one above it, so a backlog delivered as a burst still reads as its true age.
-	/// Wall-clock backstops an empty or stalled group that has supplied no timestamp.
+	/// group. Presentation time compares where the group's unread content *ends* against
+	/// where the newest group above it begins, so a backlog delivered as a burst still
+	/// reads as its true age while a long group whose tail reaches the live edge does not.
+	/// A group already handed out is measured at its reader's position, so a reader that
+	/// keeps up is never convicted. Wall-clock backstops an empty or stalled group that
+	/// has supplied no timestamp.
 	///
 	/// Protocols whose wire can't carry a timestamp (pre-Lite05 moq-lite, moq-transport
 	/// without the Timestamp property) have their frames stamped on receipt, which makes

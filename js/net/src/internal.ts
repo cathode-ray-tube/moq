@@ -81,6 +81,7 @@ export const hooks: {
 	ignoreLatency: (subscriber: Subscriber) => void;
 	/** Return a group's first timestamp, retained even after its first frame is read. */
 	groupTimestamp: (group: GroupConsumer) => Timestamp | undefined;
+	groupLatest: (group: GroupConsumer) => Timestamp | undefined;
 	/** Keep applying a subscription's drift policy after it hands a group out. */
 	expireGroup: (
 		group: GroupConsumer,
@@ -106,6 +107,9 @@ export const hooks: {
 		throw new Error("track.ts not loaded");
 	},
 	groupTimestamp: () => {
+		throw new Error("group.ts not loaded");
+	},
+	groupLatest: () => {
 		throw new Error("group.ts not loaded");
 	},
 	expireGroup: () => {

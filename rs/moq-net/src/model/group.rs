@@ -712,6 +712,18 @@ impl Producer {
 		self.state.read().timestamp
 	}
 
+	/// Where the group ends in presentation time: its newest frame's timestamp, or
+	/// `None` while no frame has been opened.
+	///
+	/// This is what a drift budget measures an untouched group against. A group is not
+	/// late because it *started* long ago: a two-second group whose tail is level with
+	/// the live edge still has content nobody has read. Only once its newest frame has
+	/// fallen behind is there nothing left worth delivering. Grows as the group does, so
+	/// a group still receiving frames stays fresh and a stalled one ages in place.
+	pub(crate) fn latest(&self) -> Option<Timestamp> {
+		self.state.read().latest
+	}
+
 	/// The group's full cached footprint (payload plus fixed overhead), used by the
 	/// track to size this group as an eviction victim.
 	pub(crate) fn cache_size(&self) -> u64 {

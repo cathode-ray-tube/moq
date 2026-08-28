@@ -229,6 +229,54 @@ test("nextGroup returns buffered groups in sequence", async () => {
 	expect((await track.nextGroup())?.sequence).toBe(5);
 });
 
+// A group's age is where its content *ends*, not where it began. A long group whose tail
+// is level with the live edge still owes the reader every frame in it, so judging it by
+// its first timestamp would discard exactly the group being filled.
+test("a long group is not stale while its tail reaches the edge", async () => {
+	const producer = new TrackProducer("test").accept({ maxAge: 5000 });
+	const sub = producer.subscribe({ maxAge: 500 });
+
+	// Group 0 spans 0..2000ms; group 1 starts at 2000ms, where group 0 ends.
+	const long = producer.appendGroup();
+	for (const ms of [0, 500, 1000, 1500, 2000]) {
+		long.writeFrame({ payload: enc.encode(`${ms}`), timestamp: Timestamp.fromMillis(ms) });
+	}
+	long.close();
+	producer.writeFrame({ payload: enc.encode("edge"), timestamp: Timestamp.fromMillis(2000) });
+
+	expect((await sub.recvGroup())?.sequence).toBe(0);
+	expect((await sub.recvGroup())?.sequence).toBe(1);
+});
+
+test("a long group is stale once its tail falls behind", async () => {
+	const producer = new TrackProducer("test").accept({ maxAge: 5000 });
+	const sub = producer.subscribe({ maxAge: 500 });
+
+	const long = producer.appendGroup();
+	for (const ms of [0, 500, 1000]) {
+		long.writeFrame({ payload: enc.encode(`${ms}`), timestamp: Timestamp.fromMillis(ms) });
+	}
+	long.close();
+	// The edge starts 2s past where group 0 ends, well beyond the budget.
+	producer.writeFrame({ payload: enc.encode("edge"), timestamp: Timestamp.fromMillis(3000) });
+
+	expect((await sub.recvGroup())?.sequence).toBe(1);
+});
+
+// Datagrams are unordered by construction, so the sequence cursor carries them too: a
+// track using both channels needs one subscription, not two.
+test("the ordered handle carries datagrams", async () => {
+	const producer = new TrackProducer("test");
+	const track = producer.subscribe({ maxAge: 5000 }).ordered();
+
+	producer.writeDatagram({ sequence: 5, timestamp: Timestamp.fromMillis(5), payload: enc.encode("x") });
+	producer.writeGroup(new GroupProducer(3));
+
+	expect((await track.recvDatagram())?.sequence).toBe(5);
+	// The datagram did not consume the group cursor.
+	expect((await track.nextGroup())?.sequence).toBe(3);
+});
+
 // The arrival cursor writes a backlog off; the ordered cursor does not. A group already
 // buffered costs nothing to deliver, and dropping it would put a hole in the sequence a
 // decoder is reading. The budget bounds how long a *blocking* group may stall instead.
