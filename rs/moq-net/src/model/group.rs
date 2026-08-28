@@ -476,6 +476,9 @@ impl Producer {
 		if state.fin.is_some() {
 			return Err(Error::Closed);
 		}
+		if state.partial.is_some() {
+			return Err(Error::FrameOpen);
+		}
 		let next_index = state
 			.next_index
 			.checked_add(1)
@@ -501,6 +504,64 @@ impl Producer {
 		Ok(())
 	}
 
+	/// Write a whole batch of frames at once, draining `frames`.
+	///
+	/// One lock covers the batch, so an ingest with several frames in hand pays the
+	/// group mutex and the track's eviction settle once rather than per frame. Build
+	/// the batch with [`frame::Buffer::push`].
+	///
+	/// The batch is validated before anything is written, so a rejected frame leaves
+	/// both the group and the buffer exactly as they were, ready to retry or redirect.
+	/// Returns [`Error::FrameOpen`] if another handle is streaming a frame into this
+	/// group, since appending around it would reorder the group.
+	pub fn write_frames<const N: usize>(&mut self, frames: &mut frame::Buffer<N>) -> Result<()> {
+		for frame in frames.filled() {
+			frame
+				.timestamp
+				.convert(self.track.timescale)
+				.map_err(|_| Error::TimestampMismatch)?;
+			if frame.payload.len() as u64 > MAX_GROUP_CACHE {
+				return Err(Error::FrameTooLarge);
+			}
+		}
+
+		let count = frames.len();
+		let mut state = modify(&self.state)?;
+		if state.fin.is_some() {
+			return Err(Error::Closed);
+		}
+		if state.partial.is_some() {
+			return Err(Error::FrameOpen);
+		}
+		let next_index = state
+			.next_index
+			.checked_add(count)
+			.ok_or(Error::BoundsExceeded(crate::coding::BoundsExceeded))?;
+
+		let mut bytes = 0;
+		for mut frame in frames.drain() {
+			frame.timestamp = frame
+				.timestamp
+				.convert(self.track.timescale)
+				.expect("timestamp scale checked above");
+			let size = frame.payload.len() as u64;
+			bytes += size;
+			state.cache += size;
+			state.charge.add(size);
+			state.stamp(frame.timestamp);
+			state.frames.push_back(frame);
+		}
+		state.next_index = next_index;
+		state.committed = next_index;
+		state.evict();
+		drop(state);
+
+		self.cache.settle();
+		self.stats.frames(count as u64);
+		self.stats.bytes(bytes);
+		Ok(())
+	}
+
 	/// Create a frame with an upfront size and presentation timestamp, streamed in
 	/// chunks. Borrows the group exclusively until the returned [`frame::Producer`]
 	/// is finished or dropped, so only one frame is open at a time.
@@ -523,11 +584,13 @@ impl Producer {
 		if state.fin.is_some() {
 			return Err(Error::Closed);
 		}
+		if state.partial.is_some() {
+			return Err(Error::FrameOpen);
+		}
 		let next_index = state
 			.next_index
 			.checked_add(1)
 			.ok_or(Error::BoundsExceeded(crate::coding::BoundsExceeded))?;
-		debug_assert!(state.partial.is_none(), "a frame is already open");
 		state.cache += frame.size;
 		state.charge.add(frame.size);
 		state.partial = Some(Partial {
@@ -575,11 +638,13 @@ impl Producer {
 		if state.fin.is_some() {
 			return Err(Error::Closed);
 		}
+		if state.partial.is_some() {
+			return Err(Error::FrameOpen);
+		}
 		let next_index = state
 			.next_index
 			.checked_add(1)
 			.ok_or(Error::BoundsExceeded(crate::coding::BoundsExceeded))?;
-		debug_assert!(state.partial.is_none(), "a frame is already open");
 		state.cache += frame.size;
 		state.charge.add(frame.size);
 		state.partial = Some(Partial {
@@ -654,6 +719,9 @@ impl Producer {
 	/// [`abort`](Self::abort). The handle also keeps the cached frames readable.
 	pub fn finish(&mut self) -> Result<()> {
 		let mut state = modify(&self.state)?;
+		if state.partial.is_some() {
+			return Err(Error::FrameOpen);
+		}
 		state.fin = Some(state.next_index);
 		Ok(())
 	}
@@ -1182,12 +1250,17 @@ impl Consumer {
 		}
 	}
 
-	/// Record a cache access from the consumer side: a parked group re-offered to
-	/// its subscriber. Same stamp as [`Producer::cache_refresh`].
-	pub(crate) fn cache_refresh(&self) {
+	/// Mark the group as still being read, so a slow batch drain does not expire it.
+	pub fn keep_alive(&self) {
 		if let ConsumerKind::Plain(plain) = &self.inner {
 			plain.state.read().charge.refresh();
 		}
+	}
+
+	/// Record a cache access from the consumer side: a parked group re-offered to
+	/// its subscriber. Same stamp as [`Producer::cache_refresh`].
+	pub(crate) fn cache_refresh(&self) {
+		self.keep_alive();
 	}
 
 	/// Park `waiter` until the group closes (finish, abort, or eviction). Spliced
@@ -1335,6 +1408,49 @@ impl Consumer {
 			}
 		}
 		kio::wait(|waiter| self.poll_read_frame(waiter)).await
+	}
+
+	/// Fill `out` with every frame that is ready, up to its capacity, without blocking.
+	///
+	/// This is a short read: it returns as soon as anything is ready rather than
+	/// waiting for `out` to fill. A zero count means the group ended when the buffer
+	/// has non-zero capacity.
+	pub fn poll_read_frames<const N: usize>(
+		&mut self,
+		waiter: &kio::Waiter,
+		out: &mut frame::Buffer<N>,
+	) -> Poll<Result<usize>> {
+		out.clear();
+		if out.capacity() == 0 {
+			return Poll::Ready(Ok(0));
+		}
+
+		while !out.is_full() {
+			match self.poll_read_frame(waiter) {
+				Poll::Ready(Ok(Some(frame))) => out.push(frame).expect("buffer capacity checked"),
+				Poll::Ready(Ok(None)) => break,
+				Poll::Ready(Err(err)) => {
+					if out.is_empty() {
+						return Poll::Ready(Err(err));
+					}
+					break;
+				}
+				Poll::Pending if !out.is_empty() => break,
+				Poll::Pending => return Poll::Pending,
+			}
+		}
+
+		Poll::Ready(Ok(out.len()))
+	}
+
+	/// Fill `out` with every frame that is ready, blocking until a frame arrives or
+	/// the group ends. Returns the current batch, empty only at the end of the group.
+	pub async fn read_frames<'a, const N: usize>(
+		&mut self,
+		out: &'a mut frame::Buffer<N>,
+	) -> Result<&'a mut [frame::Frame]> {
+		kio::wait(|waiter| self.poll_read_frames(waiter, out)).await?;
+		Ok(out.filled_mut())
 	}
 
 	/// Poll for the final number of frames in the group.

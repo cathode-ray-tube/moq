@@ -21,13 +21,18 @@ the UDP sockets bound through it.
 - **Parking**: a futex word per worker. Remote wakes are an atomic store, plus
   one `futex(2)` wake only while the worker is actually parked (a `FUTEX_WAIT`
   SQE armed on the word).
-- **QUIC**: sans-IO quiche over that UDP path. A `quic::Endpoint` serves many
-  connections on one socket, demuxed by connection id (dials share the socket
-  with accepts, ids rotate as peers consume them, unknown versions get a
-  version negotiation packet). Each `quic::Connection` implements the
-  transport traits and the worker's `Handle` implements `moq_net::Runtime`,
-  so `connect_lite`/`accept_lite` run moq-lite sessions on the worker. Raw
-  QUIC only: the ALPN carries the application protocol, no HTTP/3 layer yet.
+- **QUIC**: a sans-IO QUIC stack over that UDP path. A `quic::Endpoint` serves
+  many connections on one socket, demuxed by connection id (dials share the
+  socket with accepts, ids rotate as peers consume them, unknown versions get a
+  version negotiation packet). Native peers speak raw QUIC: the ALPN carries
+  the application protocol.
+- **WebTransport**: browsers negotiate `h3` and `quic::web::Request` runs the
+  HTTP/3 CONNECT handshake (SETTINGS, subprotocol selection, capsule close)
+  over the same adapter via `web-transport-proto`. `quic::web::Session` is
+  the one transport type the runtime drives, raw or web (`Session::raw`), so
+  `connect_lite`/`accept_lite` run moq-lite sessions on the worker either
+  way, with stream and close codes mapped through the HTTP/3 error space in
+  web mode.
 - **Steering**: an endpoint whose socket sits in a `moq-sock` steered
   `SO_REUSEPORT` group sets `endpoint::Config::shard`, and every issued
   connection id leads with the group's steering byte, so the kernel keeps a
@@ -38,17 +43,47 @@ error rather than degrading (note that default container seccomp policies
 block io\_uring entirely). There is no fallback here: older kernels keep using
 the tokio stack.
 
+## Backends
+
+The sans-IO QUIC stack behind `quic` is a build-time choice, and exactly one of
+them is compiled:
+
+| Feature | Stack | TLS |
+|---|---|---|
+| `quiche` (default) | [quiche](https://github.com/cloudflare/quiche) | BoringSSL, which needs cmake and a C++ toolchain to build |
+| `quinn` | [quinn-proto](https://github.com/quinn-rs/quinn) | rustls, the stack the rest of this workspace already links |
+
+Nothing above the module changes: the same `quic::{Endpoint, Connection,
+SendStream, RecvStream}`, the same WebTransport layer, the same tests. A build
+asking for both (`--all-features`) gets `quinn`, and a build asking for
+neither leaves the `quic` module out entirely, keeping the worker, its timers,
+and `udp::Socket`.
+
+```bash
+cargo test -p moq-uring --no-default-features --features quinn
+```
+
+`moq-relay` picks with its own pair: `--features io-uring` takes quiche and
+`--features io-uring-quinn` takes quinn, since cargo features are additive and
+a backend selected on top of a default one would compile both.
+
 ## Validation
+
+Every test runs against whichever backend is compiled, so the suite is the
+parity check between the two.
 
 `tests/echo.rs` runs a raw [quiche](https://github.com/cloudflare/quiche) echo
 over the worker: handshake, half a megabyte each way, timers driven by
 quiche's own timeout. `tests/session.rs` runs full moq-lite sessions through
 `quic::Endpoint` (including two clients demuxed on one server socket), and
 `tests/endpoint.rs` covers the endpoint mechanics (dial+accept on one socket,
-version negotiation, the dial-only refusal), and `tests/workers.rs` runs a
-steered two-worker reuseport group serving one port across threads. All of
-them skip (loudly) below the kernel floor, which includes GitHub-hosted CI
-runners.
+version negotiation, the dial-only refusal), `tests/workers.rs` runs a
+steered two-worker reuseport group serving one port across threads, and
+`tests/web.rs` is WebTransport interop against `web-transport-quinn` (the
+stack browsers interop with): stream/datagram echo through the H3 framing,
+close codes through the capsule, and a full moq-lite session over
+WebTransport. All of them skip (loudly) below the kernel floor, which
+includes GitHub-hosted CI runners.
 
 ## Benchmarks
 

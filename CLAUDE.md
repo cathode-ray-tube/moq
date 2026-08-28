@@ -16,9 +16,17 @@ nix develop --command just fix          # Auto-fix lint/formatting, same scope
 nix develop --command just check-all    # Same as check, over every package
 nix develop --command just fix-all      # Same as fix, over every package
 nix develop --command just build        # Build all packages
+nix develop --command just bench        # Benchmark the current tree
+nix develop --command just bench BASE   # Compare BASE with the current tree
 ```
 
 Use the Nix dev shell for project commands so local runs match CI tooling. If Nix is unavailable, use `cargo` or `bun` directly.
+
+`just bench` runs every Criterion target plus fixed video and 1:N fanout
+workloads against a temporary local relay. Pass a commit or ref to benchmark that
+revision first and print base-to-current changes. Timing changes are informational;
+benchmark crashes, zero delivery, and invalid samples still fail the command. Relay
+CPU and RSS are included on Linux, where `moq-bench-host` can read `/proc`.
 
 `just check`, `just test`, and `just fix` all diff the branch against its base and touch only the crates that changed plus everything depending on them, which is what keeps them fast when several worktrees are building at once. They skip a language entirely when the diff doesn't touch it. Reach for `just check-all` / `just test all` / `just fix-all` when you want the unscoped suite. See [Workflow](#workflow) for how the base is resolved.
 
@@ -34,7 +42,7 @@ One tool stays unrequired: `swift` exists only on macOS, so swift.yml is its gat
 
 Two path-filtered workflows run recipes of their own alongside `check.yml`, each for something the Linux `just check` can't reach: swift.yml (`swift/scripts/check.sh`, on a Mac) and obs.yml (`just obs ci`, which links the OBS plugin against nixpkgs' libobs/Qt6 -- Linux is the only platform where that needs no obs-deps download).
 
-Three gates live outside the PR path, in `.github/workflows/nightly.yml`: `just rs audit` (cargo-deny) because an advisory lands without this repo changing, `just rs features` (the `--all-features` and `--no-default-features` compiles) because each is a full extra workspace compile that shares almost nothing with the default one, and `just obs ci` because obs.yml's path filter can't be complete (a build script can change what linking `libmoq.a` needs without touching a manifest). A break there lands on `main` rather than being caught in review, which is the accepted trade; anything that must block a merge belongs in `check`.
+Three workspace-wide gates live outside the PR path, in `.github/workflows/nightly.yml`: `just rs audit` (cargo-deny) because an advisory lands without this repo changing, `just rs features` (the `--all-features` and `--no-default-features` compiles) because each is a full extra workspace compile that shares almost nothing with the default one, and `just obs ci` because obs.yml's path filter can't be complete (a build script can change what linking `libmoq.a` needs without touching a manifest). The PR check makes one scoped exception: when `moq-tokio` is selected, it compiles that crate alone with no, default, and all features because workspace feature unification otherwise hides its zero-feature build. A break in any other feature permutation lands on `main` rather than being caught in review, which is the accepted trade; anything that must block a merge belongs in `check`.
 
 ## Architecture
 

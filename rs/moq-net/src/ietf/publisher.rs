@@ -8,7 +8,7 @@ use std::{
 use web_transport_trait::{MaybeSend, MaybeSync, poll::SendStream as _};
 
 use crate::{
-	AsPath, Error, Timescale,
+	AsPath, Error, Timescale, Timestamp,
 	coding::{Stream, Writer},
 	ietf::{self, Control, FetchHeader, FetchType, FilterType, GroupOrder, Location, RequestId},
 	track::Subscription,
@@ -1520,6 +1520,8 @@ enum GroupState<S: crate::transport::poll::Session> {
 		writer: Writer<S::SendStream, Version>,
 		frame: Option<frame::Consumer>,
 		chunk: Option<bytes::Bytes>,
+		batch: Box<frame::Buffer>,
+		batch_pos: usize,
 	},
 	/// Every frame is written and the FIN sent: wait for the acknowledgement so a
 	/// late cancel can still reset the stream.
@@ -1567,9 +1569,17 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 						writer,
 						frame: None,
 						chunk: None,
+						batch: Box::new(frame::Buffer::new()),
+						batch_pos: 0,
 					};
 				}
-				GroupState::Serve { writer, frame, chunk } => {
+				GroupState::Serve {
+					writer,
+					frame,
+					chunk,
+					batch,
+					batch_pos,
+				} => {
 					// The peer closing first cancels the group.
 					if writer.poll_closed(&mut cx).is_ready() {
 						self.state = GroupState::Done;
@@ -1617,7 +1627,34 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 									Poll::Ready(Err(err)) => break 'serve Err(err),
 									Poll::Pending => return Poll::Pending,
 								}
+							} else if *batch_pos < batch.len() {
+								let batched = &mut batch.filled_mut()[*batch_pos];
+								if let Err(err) = buffer_object_info(
+									writer,
+									batched.timestamp,
+									batched.payload.len() as u64,
+									self.timescale,
+									self.version,
+								) {
+									break 'serve Err(err);
+								}
+								let payload = std::mem::take(&mut batched.payload);
+								if !payload.is_empty() {
+									*chunk = Some(payload);
+								}
+								*batch_pos += 1;
+								self.group.keep_alive();
 							} else {
+								match self.group.poll_read_frames(waiter, batch) {
+									Poll::Ready(Ok(count)) if count > 0 => {
+										*batch_pos = 0;
+										continue;
+									}
+									Poll::Ready(Ok(_)) => break 'serve Ok(()),
+									Poll::Ready(Err(err)) => break 'serve Err(err),
+									Poll::Pending => {}
+								}
+
 								match self.group.poll_next_frame(waiter) {
 									Poll::Ready(Ok(Some(next))) => {
 										if let Err(err) = buffer_object(writer, &next, self.timescale, self.version) {
@@ -1675,17 +1712,27 @@ fn buffer_object<W: crate::transport::poll::SendStream>(
 	timescale: Timescale,
 	version: Version,
 ) -> Result<(), Error> {
+	buffer_object_info(writer, frame.timestamp, frame.size, timescale, version)
+}
+
+fn buffer_object_info<W: crate::transport::poll::SendStream>(
+	writer: &mut Writer<W, Version>,
+	timestamp: Timestamp,
+	size: u64,
+	timescale: Timescale,
+	version: Version,
+) -> Result<(), Error> {
 	// object id delta is always 0.
 	writer.buffer(&0u64)?;
 
 	// Per-object extension headers carry the frame's presentation timestamp.
 	let mut ext = bytes::BytesMut::new();
-	ietf::encode_object_time(&mut ext, frame.timestamp, timescale, version)?;
+	ietf::encode_object_time(&mut ext, timestamp, timescale, version)?;
 	writer.buffer(&(ext.len() as u64))?;
 	writer.buffer_raw(&ext);
 
-	writer.buffer(&frame.size)?;
-	if frame.size == 0 {
+	writer.buffer(&size)?;
+	if size == 0 {
 		// Have to write the object status too.
 		writer.buffer(&0u8)?;
 	}

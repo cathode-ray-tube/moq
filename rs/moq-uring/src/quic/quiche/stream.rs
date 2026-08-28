@@ -33,6 +33,51 @@ impl SendStream {
 			reset: false,
 		}
 	}
+
+	/// The QUIC stream id, which the WebTransport layer uses as the session id.
+	pub(crate) fn id(&self) -> u64 {
+		self.id
+	}
+
+	/// Whether the send side is already terminated, so [`Drop`] would do
+	/// nothing. The WebTransport wrapper asks before mapping a reset of its
+	/// own, since a finished stream must not be reset instead.
+	pub(crate) fn ended(&self) -> bool {
+		self.fin || self.reset
+	}
+
+	/// Queue as much of `buf` as quiche will take right now, without parking.
+	/// Best-effort, for the close path where nobody is left to poll.
+	pub(crate) fn try_write(&mut self, buf: &[u8]) -> usize {
+		if self.fin || self.reset {
+			return 0;
+		}
+		let n = self
+			.shared
+			.conn
+			.borrow_mut()
+			.stream_send(self.id, buf, false)
+			.unwrap_or(0);
+		if n > 0 {
+			self.shared.kick();
+		}
+		n
+	}
+
+	/// [`reset`](web_transport_trait::poll::SendStream::reset) with a
+	/// full-width code, for the WebTransport HTTP/3 error mapping.
+	pub(crate) fn reset_code(&mut self, code: u64) {
+		if self.reset {
+			return;
+		}
+		let _ = self
+			.shared
+			.conn
+			.borrow_mut()
+			.stream_shutdown(self.id, quiche::Shutdown::Write, code);
+		self.reset = true;
+		self.shared.kick();
+	}
 }
 
 impl web_transport_trait::poll::SendStream for SendStream {
@@ -41,7 +86,7 @@ impl web_transport_trait::poll::SendStream for SendStream {
 	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>> {
 		let waiter = self.park.hold(cx);
 		if self.fin || self.reset {
-			return Poll::Ready(Err(Error::Quic(quiche::Error::FinalSize)));
+			return Poll::Ready(Err(Error::Quic("stream already finished".to_string())));
 		}
 		if let Some(err) = self.shared.closed() {
 			return Poll::Ready(Err(err));
@@ -95,16 +140,7 @@ impl web_transport_trait::poll::SendStream for SendStream {
 	}
 
 	fn reset(&mut self, code: u32) {
-		if self.reset {
-			return;
-		}
-		let _ = self
-			.shared
-			.conn
-			.borrow_mut()
-			.stream_shutdown(self.id, quiche::Shutdown::Write, u64::from(code));
-		self.reset = true;
-		self.shared.kick();
+		self.reset_code(u64::from(code));
 	}
 
 	fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -143,7 +179,7 @@ impl web_transport_trait::poll::SendStream for SendStream {
 
 impl Drop for SendStream {
 	fn drop(&mut self) {
-		self.shared.forget(self.id);
+		self.shared.forget_send(self.id);
 		if !self.fin && !self.reset {
 			let _ = self
 				.shared
@@ -189,6 +225,28 @@ impl RecvStream {
 			stopped: false,
 			backlog: BytesMut::new(),
 		}
+	}
+
+	/// Whether the read side is already terminated, so [`Drop`] would do
+	/// nothing.
+	pub(crate) fn ended(&self) -> bool {
+		self.finished || self.stopped
+	}
+
+	/// [`stop`](web_transport_trait::poll::RecvStream::stop) with a
+	/// full-width code, for the WebTransport HTTP/3 error mapping.
+	pub(crate) fn stop_code(&mut self, code: u64) {
+		self.backlog.clear();
+		if self.stopped || self.finished {
+			return;
+		}
+		let _ = self
+			.shared
+			.conn
+			.borrow_mut()
+			.stream_shutdown(self.id, quiche::Shutdown::Read, code);
+		self.stopped = true;
+		self.shared.kick();
 	}
 
 	/// Move up to `dst.len()` read-ahead bytes out of the backlog.
@@ -254,17 +312,7 @@ impl web_transport_trait::poll::RecvStream for RecvStream {
 	fn stop(&mut self, code: u32) {
 		// Giving up on the read side abandons whatever was read ahead, even
 		// when the FIN is already in and only the backlog is left.
-		self.backlog.clear();
-		if self.stopped || self.finished {
-			return;
-		}
-		let _ = self
-			.shared
-			.conn
-			.borrow_mut()
-			.stream_shutdown(self.id, quiche::Shutdown::Read, u64::from(code));
-		self.stopped = true;
-		self.shared.kick();
+		self.stop_code(u64::from(code));
 	}
 
 	fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -326,6 +374,7 @@ impl web_transport_trait::poll::RecvStream for RecvStream {
 
 impl Drop for RecvStream {
 	fn drop(&mut self) {
+		self.shared.forget_recv(self.id);
 		if !self.finished && !self.stopped {
 			let _ = self
 				.shared

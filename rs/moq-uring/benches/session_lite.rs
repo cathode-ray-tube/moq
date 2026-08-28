@@ -9,11 +9,11 @@
 
 use criterion::{criterion_group, criterion_main};
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(feature = "quiche", feature = "quinn")))]
 #[path = "../tests/support/quiche.rs"]
 mod support;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(feature = "quiche", feature = "quinn")))]
 mod linux {
 	use std::net::UdpSocket;
 	use std::pin::Pin;
@@ -154,7 +154,7 @@ mod linux {
 
 			let certs = support::certs().expect("certificates");
 			let mut server_config =
-				quic::server::Config::new(quic::Identity::new(certs.cert.clone(), certs.key.clone()));
+				quic::server::Config::new(quic::Identity::open(&certs.cert, &certs.key).expect("identity"));
 			server_config.alpn = vec![ALPN.to_string()];
 
 			let server_sock = handle
@@ -175,7 +175,7 @@ mod linux {
 					.expect("quic accept");
 				let session = moq_net::Server::new()
 					.with_publisher(&pub_origin)
-					.accept_lite(server_handle.clone(), conn)
+					.accept_lite(server_handle.clone(), quic::web::Session::raw(conn))
 					.await
 					.expect("accept_lite");
 				session.closed().await;
@@ -189,7 +189,7 @@ mod linux {
 						.expect("quic connect");
 					let session = moq_net::Client::new()
 						.with_subscriber(sub_origin.clone())
-						.connect_lite(handle.clone(), conn)
+						.connect_lite(handle.clone(), quic::web::Session::raw(conn))
 						.await
 						.expect("connect_lite");
 					let bc = sub_origin
@@ -254,10 +254,10 @@ mod linux {
 	}
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(feature = "quiche", feature = "quinn")))]
 use linux::benchmark;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", any(feature = "quiche", feature = "quinn"))))]
 fn benchmark(_: &mut criterion::Criterion) {}
 
 criterion_group!(benches, benchmark);

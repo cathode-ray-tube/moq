@@ -87,7 +87,43 @@ workers = 8
 
 # Pin each worker to a CPU core. Default: true.
 pin = true
+
+# Drive the workers with io_uring instead of tokio. Each worker owns a ring
+# with batched UDP (multishot receive with UDP_GRO, UDP_SEGMENT send),
+# userspace timers, and a local task set; authentication and session
+# supervision stay on the shared runtime. Serves browsers (WebTransport) and
+# native peers (raw QUIC) alike, moq-lite sessions only: moq-transport
+# versions are not offered on this listener, and neither is the pre-lite-05
+# SETUP exchange a browser reaches by offering no subprotocol. Requires
+# `workers`, Linux 6.12+, a build with the `io-uring` cargo feature, and
+# exactly one listen.tls certificate, read once at startup (no hot reload
+# yet). Refuses to start anywhere it cannot deliver. Default: false.
+io_uring = false
 ```
+
+The `io-uring` feature is off by default because quiche links BoringSSL, which
+a default relay build does not need. Prebuilt binaries that ship it say so;
+building it yourself is `cargo build -p moq-relay --features io-uring`.
+
+The `[quic]` section applies to this listener too: `max_streams`,
+`idle_timeout`, `keep_alive`, `congestion_control` and `gso` are honored.
+`qlog` and `mtu_discovery` are not (the datagram path sends a fixed payload,
+so there is nothing to discover), and asking for either is a startup error
+rather than a setting that quietly does nothing.
+
+The same goes for the listener settings this mode cannot deliver: `lb_id`
+(QUIC-LB server ids, which cannot share the connection id with the shard
+prefix), an explicit `backend`, `tls.generate`, more than one certificate, and
+moq-lite 01/02, whose version is negotiated in the SETUP rather than by ALPN.
+Each is refused at startup. `listen.bind` must be named too, rather than
+defaulted: leaving it unset means stream-only when a tcp or unix listener is
+configured, and this mode will not guess.
+
+`tls.root` works here as it does on the tokio listener: a client that presents
+a certificate chaining to one of those roots is authenticated by it, with full
+access within its path's canonical root, and one that presents none falls back
+to the usual token flow. `/certificate.sha256` serves what the workers are
+presenting, so a client can still pin a self-signed relay through it.
 
 The shared runtime is still there for everything that is not QUIC, and it still
 sizes its thread pool to the machine. Set `TOKIO_WORKER_THREADS` in the

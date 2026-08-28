@@ -9,14 +9,25 @@ const CONTROL_SLOTS = 4;
 
 export interface SharedRingBufferInit {
 	channels: number;
-	capacity: number; // samples per channel
+	capacity: number; // samples per channel, always a power of two
 	rate: number;
 	samples: SharedArrayBuffer; // channels * capacity * Float32Array.BYTES_PER_ELEMENT bytes
 	control: SharedArrayBuffer; // CONTROL_SLOTS * Int32Array.BYTES_PER_ELEMENT bytes
-	// Buffered mode: anchor to the first sample and never skip ahead on read.
+	// Buffered mode: never skip ahead on read, so we play through everything buffered.
 	buffered: boolean;
 }
 
+/** Rounds up to a power of two, which is what makes `slot` wrap-invariant. */
+function ceilPow2(n: number): number {
+	return n <= 1 ? 1 : 1 << (32 - Math.clz32(n - 1));
+}
+
+/**
+ * Allocate the shared memory for a ring holding at least `capacity` samples per channel.
+ *
+ * The capacity is rounded up to a power of two so `slot` can mask instead of taking a
+ * remainder; read `init.capacity` back rather than assuming the requested value.
+ */
 export function allocSharedRingBuffer(
 	channels: number,
 	capacity: number,
@@ -24,8 +35,10 @@ export function allocSharedRingBuffer(
 	buffered = false,
 ): SharedRingBufferInit {
 	if (channels <= 0) throw new Error("invalid channels");
-	if (capacity <= 0) throw new Error("invalid capacity");
+	if (capacity <= 0 || capacity > 2 ** 30) throw new Error("invalid capacity");
 	if (rate <= 0) throw new Error("invalid sample rate");
+
+	capacity = ceilPow2(capacity);
 
 	const samples = new SharedArrayBuffer(channels * capacity * Float32Array.BYTES_PER_ELEMENT);
 	const control = new SharedArrayBuffer(CONTROL_SLOTS * Int32Array.BYTES_PER_ELEMENT);
@@ -42,9 +55,15 @@ function i32Max(a: number, b: number): number {
 	return ((a - b) | 0) > 0 ? a : b;
 }
 
-/** Maps an absolute sample index to a [0, capacity) array slot. */
+/**
+ * Maps a sample index to a [0, capacity) array slot.
+ *
+ * `capacity` is a power of two, so masking is exact for negative indexes and, unlike a
+ * remainder, survives the i32 wrap: consecutive indexes stay consecutive slots across
+ * 0x7fffffff -> 0x80000000, which is what keeps unread samples from aliasing there.
+ */
 function slot(idx: number, capacity: number): number {
-	return ((idx % capacity) + capacity) % capacity;
+	return idx & (capacity - 1);
 }
 
 /**
@@ -71,8 +90,22 @@ export class SharedRingBuffer {
 	#control: Int32Array;
 	#samples: Float32Array[];
 
-	// Whether READ/WRITE have been anchored to the first inserted sample (buffered mode).
+	// Whether READ/WRITE have been anchored to the first inserted sample.
 	#anchored = false;
+
+	// Absolute sample index of that first sample. READ/WRITE are stored relative to it, so
+	// `timestamp` adds it back to recover media time. Main-thread only: the worklet reads by
+	// difference and never needs an absolute position.
+	#anchor = 0;
+
+	// Unwrapped READ, in anchor-relative samples, plus the raw i32 it was last derived from.
+	// READ is Int32 and wraps every ~13.5h at 44.1kHz. That is harmless for the modular
+	// comparisons the ring runs on, but reading the negative half as a magnitude would report
+	// the playhead jumping back 2^32 samples, so accumulate deltas here instead. Main-thread
+	// only, and only accurate while `timestamp` is observed more often than READ can advance
+	// 2^31 samples, which the 50ms poll in `buffer.ts` satisfies by six orders of magnitude.
+	#position = 0;
+	#lastRead = 0;
 
 	constructor(init: SharedRingBufferInit) {
 		this.channels = init.channels;
@@ -101,13 +134,24 @@ export class SharedRingBuffer {
 		const originalLength = data[0].length;
 		let offset = 0;
 
-		// Buffered mode: anchor READ/WRITE to the first sample so playback starts at its
-		// timestamp, instead of skipping ahead or gap-filling silence from index 0.
-		if (this.buffered && !this.#anchored) {
-			Atomics.store(this.#control, READ, start | 0);
-			Atomics.store(this.#control, WRITE, start | 0);
+		// Anchor to the first sample so playback starts at its timestamp rather than gap-filling
+		// from index 0.
+		if (!this.#anchored) {
+			this.#anchor = start;
+			Atomics.store(this.#control, READ, 0);
+			Atomics.store(this.#control, WRITE, 0);
 			this.#anchored = true;
+			this.#position = 0;
+			this.#lastRead = 0;
 		}
+
+		// Positions are relative to the anchor. READ/WRITE are Int32, so an absolute sample index
+		// wraps once a stream has been broadcasting a while, and the wrapped value reads as far
+		// ahead of READ, so every insert would be discarded as too old and the ring would go
+		// silent for good. Relative positions start at 0 instead. They still wrap, after ~13.5h at
+		// 44.1kHz, but nothing here reads them as magnitudes: the comparisons are modular, `slot`
+		// masks a power-of-two capacity, and `timestamp` keeps its own unwrapped position.
+		start = (start - this.#anchor) | 0;
 
 		const end = (start + originalLength) | 0;
 
@@ -217,7 +261,7 @@ export class SharedRingBuffer {
 	 * track wrote beyond them would otherwise still play once the successor runs out.
 	 */
 	truncate(timestamp: Time.Micro): void {
-		const target = Math.round(Time.Second.fromMicro(timestamp) * this.rate) | 0;
+		const target = (Math.round(Time.Second.fromMicro(timestamp) * this.rate) - this.#anchor) | 0;
 		for (;;) {
 			const write = Atomics.load(this.#control, WRITE);
 			if (((write - target) | 0) <= 0) return; // nothing buffered past the new timeline
@@ -259,6 +303,7 @@ export class SharedRingBuffer {
 		const init = allocSharedRingBuffer(this.channels, newCapacity, this.rate, this.buffered);
 		const dst = new SharedRingBuffer(init);
 		dst.#anchored = this.#anchored;
+		dst.#anchor = this.#anchor;
 
 		const read = Atomics.load(this.#control, READ);
 		const write = Atomics.load(this.#control, WRITE);
@@ -283,13 +328,38 @@ export class SharedRingBuffer {
 		Atomics.store(dst.#control, LATENCY, latency);
 		Atomics.store(dst.#control, STALLED, stalled);
 
+		// Carry the unwrapped playhead over, rebased onto dst's READ. Fold the same `read`
+		// snapshot the copy used so both sides agree on one observation; `copyStart` is at or
+		// ahead of it whenever the copy dropped the oldest samples.
+		dst.#position = this.#foldRead(read) + ((copyStart - read) | 0);
+		dst.#lastRead = copyStart;
+
 		return dst;
 	}
 
-	/** Current playback timestamp derived from READ position. */
+	/**
+	 * Fold an observed READ into `#position`, so the returned offset keeps counting up across
+	 * the i32 wrap. Idempotent: folding the same value twice adds a zero delta.
+	 */
+	#foldRead(read: number): number {
+		this.#position += (read - this.#lastRead) | 0;
+		this.#lastRead = read;
+		return this.#position;
+	}
+
+	/** `#foldRead` against the current READ. */
+	#unwrapRead(): number {
+		return this.#foldRead(Atomics.load(this.#control, READ));
+	}
+
+	/**
+	 * Current playback timestamp derived from READ position.
+	 *
+	 * Main thread only, and stateful: it advances the unwrapped read position, so it has to be
+	 * polled rather than sampled once. See `#position`.
+	 */
 	get timestamp(): Time.Micro {
-		const read = Atomics.load(this.#control, READ);
-		return Time.Micro.fromSecond((read / this.rate) as Time.Second);
+		return Time.Micro.fromSecond(((this.#anchor + this.#unwrapRead()) / this.rate) as Time.Second);
 	}
 
 	/** Whether the buffer is stalled (waiting to fill). */

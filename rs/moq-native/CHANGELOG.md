@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 - Rename the crate to `moq-tokio`. This release intentionally produces a compile error with migration instructions.
+
+## [0.19.14](https://github.com/moq-dev/moq/compare/moq-native-v0.19.13...moq-native-v0.19.14) - 2026-08-26
+
+### Fixed
+
+- *(native)* apply TLS hostname to WebSocket fallback ([#3083](https://github.com/moq-dev/moq/pull/3083))
+- *(net)* assign anonymous server peers an origin ([#3042](https://github.com/moq-dev/moq/pull/3042))
+
 ## [0.19.13](https://github.com/moq-dev/moq/compare/moq-native-v0.19.12...moq-native-v0.19.13) - 2026-08-24
 
 ### Other

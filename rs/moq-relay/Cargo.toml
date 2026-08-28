@@ -39,47 +39,66 @@ websocket = ["moq-tokio/websocket", "dep:qmux", "axum/ws"]
 # Unix-domain-socket stream listener (`--server-unix-bind`), unix-only. In the
 # default set; drop via --no-default-features on platforms without Unix sockets.
 uds = ["moq-tokio/uds"]
+# Serve QUIC from io_uring workers (`--runtime-io-uring`), Linux-only, in one of
+# two flavors. Both are off by default: the relay is useful without io_uring,
+# and `io-uring` links a second TLS stack (quiche brings BoringSSL, which needs
+# cmake and a C++ toolchain a default relay build does not). `io-uring-quinn`
+# serves the same path from quinn-proto over the rustls this relay already
+# links, so it builds no second stack.
+#
+# Cargo features are additive, so asking for both compiles both and runs quinn,
+# which is what the nightly `--all-features` pass (`just rs features`) does.
+# `just rs uring` builds each on its own.
+io-uring = ["_uring", "moq-uring/quiche"]
+io-uring-quinn = ["_uring", "moq-uring/quinn"]
+# The listener both flavors share. Not one to enable on its own: moq-uring has
+# no `quic` module without a backend, so this alone does not build.
+_uring = ["dep:moq-sock", "dep:moq-uring"]
 
 [dependencies]
-anyhow = { version = "1", features = ["backtrace"] }
-axum = { version = "0.8", features = ["tokio"] }
-axum-server = { version = "0.8", features = ["tls-rustls"] }
-bytes = "1"
+anyhow = { workspace = true, features = ["backtrace"] }
+axum = { workspace = true }
+axum-server = { workspace = true }
+bytes = { workspace = true }
 bytesize = "2.4.2"
-futures = "0.3"
+futures = { workspace = true }
 http-body = "1"
 http-cache-reqwest = { version = "1.0.0-alpha.6", features = ["manager-moka", "reqwest-middleware", "url-standard"], default-features = false }
-jsonwebtoken = "11"
+jsonwebtoken = { workspace = true }
 moq-net = { workspace = true }
 moq-stats = { workspace = true }
 moq-token = { workspace = true, features = ["tokio"] }
 moq-tokio = { workspace = true, default-features = false, features = ["aws-lc-rs", "watch", "tcp"] }
 qmux = { workspace = true, features = ["ws"], optional = true }
-rand = "0.10"
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+rand = { workspace = true }
+reqwest = { workspace = true, features = ["rustls"] }
 reqwest-middleware = "0.5"
 rustls = { version = "0.23", features = ["aws-lc-rs"], default-features = false }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_with = { version = "3", features = ["json", "base64"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_with = { workspace = true, features = ["json", "base64"] }
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
-thiserror = "2"
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-tokio-rustls = { version = "0.26", default-features = false }
-toml = "1.1"
-tower-http = { version = "0.7", features = ["cors"] }
+tokio-rustls = { workspace = true }
+toml = { workspace = true }
+tower-http = { workspace = true }
 tower-service = "0.3"
-tracing = "0.1"
-url = { version = "2", features = ["serde"] }
+tracing = { workspace = true }
+url = { workspace = true, features = ["serde"] }
 usage = { workspace = true, features = ["completions"] }
 web-transport-trait = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+moq-sock = { workspace = true, optional = true }
+moq-uring = { workspace = true, optional = true }
+
 [target.'cfg(unix)'.dependencies]
-sd-notify = "0.5"
+sd-notify = { workspace = true }
 
 [dev-dependencies]
 rcgen = "0.14"
-tempfile = "3"
+tempfile = { workspace = true }
 wiremock = "0.6"
 
 # `raise(SIGINT)` at ourselves, so the shutdown test exercises the real signal
