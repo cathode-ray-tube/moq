@@ -37,6 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drop-in replacement for an existing header.
 - `moq_publish_media` rejects a label on a container format (fmp4, mkv, ts, flv) instead of
   silently dropping it.
+
+## [0.5.11](https://github.com/moq-dev/moq/compare/libmoq-v0.5.10...libmoq-v0.5.11) - 2026-08-26
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, moq-native, moq-video, hang, moq-json, moq-loc, moq-audio
+
 ## [0.5.10](https://github.com/moq-dev/moq/compare/libmoq-v0.5.9...libmoq-v0.5.10) - 2026-08-24
 
 ### Added

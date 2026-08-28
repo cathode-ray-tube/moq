@@ -1545,6 +1545,8 @@ enum FetchState {
 		prev_ts: u64,
 		frame: Option<frame::Consumer>,
 		chunk: Option<bytes::Bytes>,
+		batch: Box<frame::Buffer>,
+		batch_pos: usize,
 	},
 	/// FIN and wait for the acknowledgement.
 	Finish {
@@ -1664,6 +1666,8 @@ impl<S: crate::transport::poll::Session> FetchServe<S> {
 						prev_ts: 0,
 						frame: None,
 						chunk: None,
+						batch: Box::new(frame::Buffer::new()),
+						batch_pos: 0,
 					};
 				}
 				FetchState::Serve {
@@ -1672,6 +1676,8 @@ impl<S: crate::transport::poll::Session> FetchServe<S> {
 					prev_ts,
 					frame,
 					chunk,
+					batch,
+					batch_pos,
 				} => {
 					let stream = self.stream.as_mut().expect("stream present");
 					let mut cx = Context::from_waker(waiter.waker());
@@ -1687,11 +1693,40 @@ impl<S: crate::transport::poll::Session> FetchServe<S> {
 								Some(next) => *chunk = Some(next),
 								None => *frame = None,
 							}
+						} else if *batch_pos < batch.len() {
+							let batched = &mut batch.filled_mut()[*batch_pos];
+							buffer_frame_info(
+								&mut stream.writer,
+								batched.timestamp,
+								batched.payload.len() as u64,
+								*timescale,
+								prev_ts,
+							)?;
+							let payload = std::mem::take(&mut batched.payload);
+							if !payload.is_empty() {
+								*chunk = Some(payload);
+							}
+							*batch_pos += 1;
+							group.keep_alive();
 						} else {
+							match group.poll_read_frames(waiter, batch) {
+								Poll::Ready(Ok(count)) if count > 0 => {
+									*batch_pos = 0;
+									continue;
+								}
+								Poll::Ready(Ok(_)) => break,
+								Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+								Poll::Pending => {}
+							}
 							match ready!(group.poll_next_frame(waiter))? {
 								Some(next) => {
-									buffer_frame_timing(&mut stream.writer, &next, *timescale, prev_ts)?;
-									stream.writer.buffer(&next.size)?;
+									buffer_frame_info(
+										&mut stream.writer,
+										next.timestamp,
+										next.size,
+										*timescale,
+										prev_ts,
+									)?;
 									*frame = Some(next);
 								}
 								None => break,
@@ -2512,19 +2547,17 @@ mod announce_test {
 /// model layer (`group::Producer::create_frame`) already converted the timestamp
 /// into the track timescale, so its raw value goes straight onto the wire. Mirrors
 /// the decode in the subscriber's `run_group`.
-fn buffer_frame_timing<W: crate::transport::poll::SendStream>(
+fn buffer_frame_info<W: crate::transport::poll::SendStream>(
 	writer: &mut Writer<W, Version>,
-	frame: &frame::Consumer,
+	timestamp: crate::Timestamp,
+	size: u64,
 	timescale: Option<crate::Timescale>,
 	prev_ts: &mut u64,
 ) -> Result<(), Error> {
-	if timescale.is_none() {
-		return Ok(());
+	if timescale.is_some() {
+		buffer_zigzag_delta(writer, timestamp.value(), prev_ts)?;
 	}
-
-	let ts = frame.timestamp.value();
-	buffer_zigzag_delta(writer, ts, prev_ts)?;
-
+	writer.buffer(&size)?;
 	Ok(())
 }
 
@@ -2992,6 +3025,9 @@ struct GroupServe<S: crate::transport::poll::Session> {
 	state: GroupState<S>,
 }
 
+// A state machine's enum is its storage: one transient instance per stream, so the
+// big variant is the working state, not padding held in bulk.
+#[allow(clippy::large_enum_variant)]
 enum GroupState<S: crate::transport::poll::Session> {
 	/// Waiting for stream credit on this machine's own session handle.
 	Open,
@@ -3001,6 +3037,8 @@ enum GroupState<S: crate::transport::poll::Session> {
 		writer: Writer<S::SendStream, Version>,
 		frame: Option<frame::Consumer>,
 		chunk: Option<bytes::Bytes>,
+		batch: Box<frame::Buffer>,
+		batch_pos: usize,
 	},
 	/// Every frame is written and the FIN sent: wait for the acknowledgement so a
 	/// late cancel can still reset the stream.
@@ -3066,9 +3104,17 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 						writer,
 						frame: None,
 						chunk: None,
+						batch: Box::new(frame::Buffer::new()),
+						batch_pos: 0,
 					};
 				}
-				GroupState::Serve { writer, frame, chunk } => {
+				GroupState::Serve {
+					writer,
+					frame,
+					chunk,
+					batch,
+					batch_pos,
+				} => {
 					let mut cx = Context::from_waker(waiter.waker());
 
 					// Queue and SUBSCRIBE_UPDATE priority changes apply on every pass,
@@ -3137,12 +3183,44 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 									Poll::Ready(Err(err)) => break 'serve Err(err),
 									Poll::Pending => return Poll::Pending,
 								}
+							} else if *batch_pos < batch.len() {
+								let batched = &mut batch.filled_mut()[*batch_pos];
+								let buffered = buffer_frame_info(
+									writer,
+									batched.timestamp,
+									batched.payload.len() as u64,
+									self.ctx.timescale,
+									&mut self.prev_ts,
+								);
+								if let Err(err) = buffered {
+									break 'serve Err(err);
+								}
+								let payload = std::mem::take(&mut batched.payload);
+								if !payload.is_empty() {
+									*chunk = Some(payload);
+								}
+								*batch_pos += 1;
+								self.group.keep_alive();
 							} else {
+								match self.group.poll_read_frames(waiter, batch) {
+									Poll::Ready(Ok(count)) if count > 0 => {
+										*batch_pos = 0;
+										continue;
+									}
+									Poll::Ready(Ok(_)) => break 'serve Ok(()),
+									Poll::Ready(Err(err)) => break 'serve Err(err),
+									Poll::Pending => {}
+								}
+
 								match self.group.poll_next_frame(waiter) {
 									Poll::Ready(Ok(Some(next))) => {
-										let buffered =
-											buffer_frame_timing(writer, &next, self.ctx.timescale, &mut self.prev_ts)
-												.and_then(|()| writer.buffer(&next.size));
+										let buffered = buffer_frame_info(
+											writer,
+											next.timestamp,
+											next.size,
+											self.ctx.timescale,
+											&mut self.prev_ts,
+										);
 										if let Err(err) = buffered {
 											break 'serve Err(err);
 										}

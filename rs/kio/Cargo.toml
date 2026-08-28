@@ -35,5 +35,9 @@ harness = false
 name = "waiter"
 harness = false
 
+[[bench]]
+name = "channel"
+harness = false
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

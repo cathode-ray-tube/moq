@@ -41,6 +41,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An audio format rejects an `import::Init` video hint instead of dropping it.
 - `catalog::VideoHint::label` is no longer public. `import::Init::label` is the single source of a
   rendition label, matching the hang draft, which classifies it as a common rendition field.
+
+## [0.9.10](https://github.com/moq-dev/moq/compare/moq-mux-v0.9.9...moq-mux-v0.9.10) - 2026-08-26
+
+### Added
+
+- *(moq-gst)* select media container for sink pads ([#2997](https://github.com/moq-dev/moq/pull/2997))
+
+### Fixed
+
+- *(net)* restore dynamic routing APIs ([#3038](https://github.com/moq-dev/moq/pull/3038))
+- *(net)* deprecate unsupported dynamic routing ([#3029](https://github.com/moq-dev/moq/pull/3029))
+
 ## [0.9.9](https://github.com/moq-dev/moq/compare/moq-mux-v0.9.8...moq-mux-v0.9.9) - 2026-08-24
 
 ### Fixed

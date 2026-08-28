@@ -36,6 +36,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `publish_media` and `publish_media_stream` reject a `MoqInit` label or video hint on a container
   format, and an audio format rejects a video hint, instead of silently dropping either.
+
+## [0.3.14](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.13...moq-ffi-v0.3.14) - 2026-08-26
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, moq-native, moq-video, hang, moq-json, moq-audio
+
 ## [0.3.13](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.12...moq-ffi-v0.3.13) - 2026-08-24
 
 ### Added

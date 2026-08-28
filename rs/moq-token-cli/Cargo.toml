@@ -22,9 +22,9 @@ name = "moq-token"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1"
+anyhow = { workspace = true }
 moq-token = { workspace = true }
 usage = { workspace = true, features = ["completions"] }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
