@@ -1,12 +1,13 @@
 //! The connection: shared state, the driver task, and the session handle.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
+use rustc_hash::FxHashMap;
 
 use super::{Error, SEGMENT};
 use crate::{Handle, udp};
@@ -64,18 +65,24 @@ pub(crate) struct State {
 	open_waiters: kio::WaiterList,
 
 	/// Per-stream read/write parking, keyed by stream id.
-	readable: HashMap<u64, kio::WaiterList>,
-	writable: HashMap<u64, kio::WaiterList>,
+	///
+	/// FxHash rather than SipHash on all four of these: they sit on the
+	/// driver's per-event path. A peer does shape which of its ids stay parked
+	/// here, but only by opening them in order, so clustering enough of them
+	/// into one bucket costs millions of stream opens for a cluster the
+	/// stream limit caps anyway.
+	readable: FxHashMap<u64, kio::WaiterList>,
+	writable: FxHashMap<u64, kio::WaiterList>,
 	/// Send streams waiting for their end (FIN acknowledged, a STOP, or a
 	/// reset); the driver probes these after connection events since quiche has
 	/// no event for stream collection.
-	finishing: HashMap<u64, kio::WaiterList>,
+	finishing: FxHashMap<u64, kio::WaiterList>,
 	/// How each send stream ended, for the ones the driver saw collected while
 	/// the connection was still up: `None` for a FIN the peer acknowledged,
 	/// `Some(code)` for a `STOP_SENDING` the probe consumed on our behalf.
 	/// That is what makes a later close mean "already delivered" rather than
 	/// "we never found out". Cleared when the stream drops.
-	pub(crate) collected: HashMap<u64, Option<u64>>,
+	pub(crate) collected: FxHashMap<u64, Option<u64>>,
 
 	/// Received datagrams, oldest first; over [`DGRAM_QUEUE`] the oldest drop.
 	datagrams: VecDeque<Bytes>,
@@ -112,16 +119,30 @@ impl State {
 			next_open_bi,
 			next_open_uni,
 			open_waiters: kio::WaiterList::new(),
-			readable: HashMap::new(),
-			writable: HashMap::new(),
-			finishing: HashMap::new(),
-			collected: HashMap::new(),
+			readable: FxHashMap::default(),
+			writable: FxHashMap::default(),
+			finishing: FxHashMap::default(),
+			collected: FxHashMap::default(),
 			datagrams: VecDeque::new(),
 			datagram_recv_waiters: kio::WaiterList::new(),
 			datagram_send_waiters: kio::WaiterList::new(),
 			closed: None,
 			closed_waiters: kio::WaiterList::new(),
 		}
+	}
+
+	/// Drop send stream `id`'s bookkeeping, parking included.
+	fn forget_send(&mut self, id: u64) {
+		self.collected.remove(&id);
+		self.finishing.remove(&id);
+		self.writable.remove(&id);
+	}
+
+	/// The same for the read half. Only its own table: the two halves of a
+	/// bidirectional stream are separate handles, and the other one may still
+	/// be parked.
+	fn forget_recv(&mut self, id: u64) {
+		self.readable.remove(&id);
 	}
 
 	/// Terminate with `err` (the first one wins) and wake absolutely everyone,
@@ -203,11 +224,19 @@ impl Inner {
 		self.state.borrow().collected.get(&id).copied()
 	}
 
-	/// Forget stream `id`'s bookkeeping; called when a handle drops.
-	pub(crate) fn forget(&self, id: u64) {
-		let mut state = self.state.borrow_mut();
-		state.collected.remove(&id);
-		state.finishing.remove(&id);
+	/// Forget send stream `id`'s bookkeeping; called when its handle drops.
+	///
+	/// The parking table goes with it. A stream shut down on the way out is
+	/// never reported writable again, so nothing else would ever remove the
+	/// entry, and a peer withholding flow control credit could have streams
+	/// opened and cancelled against it without bound.
+	pub(crate) fn forget_send(&self, id: u64) {
+		self.state.borrow_mut().forget_send(id);
+	}
+
+	/// The same for the read half, which parks on its own table.
+	pub(crate) fn forget_recv(&self, id: u64) {
+		self.state.borrow_mut().forget_recv(id);
 	}
 
 	/// Wake anyone parked on stream `id` being readable.
@@ -251,9 +280,13 @@ pub struct Connection {
 }
 
 impl Connection {
-	/// The shared connection state, for the WebTransport layer on top.
-	pub(crate) fn shared(&self) -> &Shared {
-		&self.shared
+	/// Close the connection with a full-width application code.
+	///
+	/// The [`web_transport_trait::poll::Session::close`] surface narrows codes
+	/// to `u32`; the WebTransport layer maps its codes into HTTP/3's error
+	/// space, which needs the whole varint range.
+	pub(crate) fn close_code(&self, code: u64, reason: &str) {
+		self.shared.close_code(code, reason);
 	}
 
 	/// The peer's certificate chain in DER, leaf first, or `None` if it
@@ -945,5 +978,30 @@ mod tests {
 				drop(client);
 			})
 			.expect("worker");
+	}
+
+	/// A dropped handle takes its parking with it.
+	///
+	/// Nothing else can: a stream shut down on the way out is never reported
+	/// writable or readable again, so an entry left behind sits there for the
+	/// life of the connection, one per cancelled stream.
+	#[test]
+	fn forgetting_a_handle_clears_its_parking() {
+		let mut state = State::new(false);
+		let id = 0;
+		state.writable.entry(id).or_default();
+		state.readable.entry(id).or_default();
+		state.finishing.entry(id).or_default();
+		state.collected.insert(id, None);
+
+		state.forget_send(id);
+		assert!(state.writable.is_empty(), "the write half's parking");
+		assert!(state.finishing.is_empty(), "the finish watch");
+		assert!(state.collected.is_empty(), "the end bookkeeping");
+		// The read half is a separate handle, which may still be parked.
+		assert!(!state.readable.is_empty(), "the read half's parking survives");
+
+		state.forget_recv(id);
+		assert!(state.readable.is_empty(), "the read half's parking");
 	}
 }
