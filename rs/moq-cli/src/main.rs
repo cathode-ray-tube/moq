@@ -268,7 +268,7 @@ impl Directions {
 /// publish is never announced back to us.
 ///
 /// Returns an allocator over the uplink's bandwidth estimate, for the sources that
-/// can encode to fit it. Only an outbound client has one: a `--server-bind`
+/// can encode to fit it. Only an outbound client has one: a `--listen`
 /// publisher's sessions are inbound and never surfaced here, so it gets an
 /// [`unlimited`](moq_net::bandwidth::Allocator::unlimited) allocator and those
 /// sources encode at their configured rate.
@@ -732,5 +732,40 @@ mod tests {
 		assert!(err.to_string().contains("failed to bind listeners"), "{err:#}");
 		assert!(!ready.get(), "readiness must be withheld after a bind failure");
 		assert!(tasks.is_empty(), "nothing should be spawned after a bind failure");
+	}
+
+	/// A raw TCP bind is a complete server side even when no QUIC bind is set.
+	#[tokio::test]
+	async fn tcp_only_moq_side_starts_a_server() {
+		let invocation = Invocation::try_parse_from(["moq", "--listen-tcp-bind", "127.0.0.1:0", "import", "ts"])
+			.expect("parse TCP-only invocation");
+		let origin = invocation.moq.origin().expect("create origin");
+		let net = Net {
+			quic: invocation.moq.quic.clone(),
+			#[cfg(feature = "iroh")]
+			iroh: None,
+		};
+		let mut tasks = JoinSet::new();
+
+		spawn_server(
+			&mut tasks,
+			&invocation.moq,
+			&origin,
+			&net,
+			Directions {
+				publish: true,
+				consume: false,
+			},
+		)
+		.await
+		.expect("start TCP-only server");
+
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(50), tasks.join_next())
+				.await
+				.is_err(),
+			"the server task should still be accepting connections"
+		);
+		tasks.abort_all();
 	}
 }
