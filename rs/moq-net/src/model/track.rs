@@ -486,15 +486,8 @@ impl TrackState {
 			}
 		}
 
-		// Turn the stamped groups into a suffix minimum: entry `i` carries the earliest
-		// presentation time any group at or after that sequence begins at. One backwards
-		// pass, so the whole poll still costs a single scan.
+		// Sequence order, so a candidate's immediate successor is one lookup away.
 		stamped.sort_unstable_by_key(|(sequence, _)| *sequence);
-		let mut min: Option<Timestamp> = None;
-		for entry in stamped.iter_mut().rev() {
-			min = Some(min.map_or(entry.1, |seen: Timestamp| seen.min(entry.1)));
-			entry.1 = min.expect("just assigned");
-		}
 
 		wall.map(|wall| Edge {
 			wall,
@@ -2719,20 +2712,24 @@ impl group::Expiry for GroupExpiry {
 struct Edge {
 	wall: WallEdge,
 	presentation: Option<PresentationEdge>,
-	/// Every servable stamped group by sequence, paired with the minimum first-timestamp
-	/// at or after it. A candidate's reach is bounded by its successors: it cannot present
-	/// past where the next group begins, so `reach()` reads that bound off in one lookup
-	/// rather than rescanning, keeping a backlog walk linear.
+	/// Every servable stamped group, sorted by sequence, paired with its own first frame
+	/// timestamp. A candidate's reach is where its immediate successor begins, so `reach()`
+	/// finds that one entry rather than rescanning, keeping a backlog walk linear.
 	///
-	/// Sorted by sequence, so this is a suffix minimum. Once `lookup` becomes a `BTreeMap`
-	/// (it already is on main) this collapses to a `range(sequence + 1..)` walk and the
-	/// table goes away.
+	/// Deliberately *not* a minimum over later groups. Timestamps need not rise with
+	/// sequence (a rewind reorders them), and a distant group starting earlier proves
+	/// nothing about where the candidate's own successor begins. Taking the minimum would
+	/// shrink the bound, which is the unsafe direction: it discards content that might
+	/// still be inside the budget. Only the immediate successor bounds a group.
+	///
+	/// Once `lookup` becomes a `BTreeMap` (it already is on main) this collapses to a
+	/// `range(sequence + 1..).next()` and the table goes away.
 	suffix: Arc<[(u64, Timestamp)]>,
 }
 
 impl Edge {
 	/// The furthest presentation time the group at `sequence` could still reach: where its
-	/// nearest successor begins, or `None` when nothing follows it yet.
+	/// immediate successor begins, or `None` when nothing follows it yet.
 	///
 	/// An upper bound, deliberately. A frame's duration is not on the wire, so a group's
 	/// own last timestamp says where it *starts* presenting, not where it ends; only a
@@ -4776,6 +4773,31 @@ mod test {
 
 		let mut sub = producer.subscribe(Subscription::default().with_max_age(Duration::from_millis(500)));
 		assert_eq!(drain(&mut sub), vec![1, 2]);
+	}
+
+	/// Reach is the *immediate* successor's start, never a minimum across later groups.
+	/// Timestamps need not rise with sequence: a rewind can put a much earlier timestamp on
+	/// a much later group, and that group proves nothing about where the candidate's own
+	/// successor begins. Taking the minimum would shrink the bound and discard content that
+	/// is still well inside the budget.
+	#[test]
+	fn reach_follows_the_immediate_successor_not_a_later_rewind() {
+		let mut producer = track_producer("test", None);
+
+		// Group 0 is bounded by group 1 at 10s. Groups 2 and 3 rewind to 1s and 2s.
+		append_at(&mut producer, 0);
+		append_at(&mut producer, 10_000);
+		append_at(&mut producer, 1_000);
+		append_at(&mut producer, 2_000);
+
+		// Group 0 reaches 10s, so nothing here proves it is past a 500ms budget: it could
+		// hold frames through nearly 10s. A minimum over later groups would put its reach
+		// at 1s and drop it.
+		let mut sub = producer.subscribe(Subscription::default().with_max_age(Duration::from_millis(500)));
+		assert!(
+			drain(&mut sub).contains(&0),
+			"group 0 is bounded by its successor at 10s, not by a later rewind"
+		);
 	}
 
 	/// Datagrams are unordered by construction, so the sequence cursor carries them too:

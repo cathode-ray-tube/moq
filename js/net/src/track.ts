@@ -725,12 +725,11 @@ export class Subscriber {
 			}
 		}
 
-		// Turn it into a suffix minimum: each entry carries the earliest presentation time
-		// any group at or after that sequence begins at, so a backlog walk stays linear.
+		// Sequence order, so a candidate's immediate successor is one lookup away.
+		// Deliberately not a minimum over later groups: timestamps need not rise with
+		// sequence, and taking the minimum would shrink the bound, which is the unsafe
+		// direction. Only the immediate successor bounds a group.
 		suffix.sort((a, b) => a.sequence - b.sequence);
-		for (let i = suffix.length - 2; i >= 0; i--) {
-			suffix[i].reach = Math.min(suffix[i].reach, suffix[i + 1].reach);
-		}
 
 		const requested = this.#state.update.peek()?.maxAge ?? 0;
 		const retained = this.#state.info.peek()?.maxAge;
@@ -747,7 +746,7 @@ export class Subscriber {
 	}
 
 	// The furthest presentation time the group at `sequence` could still reach: where its
-	// nearest successor begins, or undefined when nothing follows it yet. An upper bound,
+	// immediate successor begins, or undefined when nothing follows it yet. An upper bound,
 	// deliberately: a frame's duration is not on the wire, so a group's own last timestamp
 	// says where it starts presenting, not where it ends. Only a successor's start proves
 	// the predecessor cannot run past it.
