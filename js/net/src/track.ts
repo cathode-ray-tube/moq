@@ -700,6 +700,9 @@ export class Subscriber {
 	// it to sequence order; whichever wins is the only one allowed from here on.
 	// Datagrams are a separate cursor and never commit.
 	#mode?: "arrival" | "ordered";
+	// The group the frame-level helpers are currently draining, acquired through the
+	// sequence cursor so frame reads and {@link Ordered.nextGroup} share one floor.
+	#frameGroup?: GroupConsumer;
 
 	#drift(): {
 		budget: number;
@@ -914,6 +917,8 @@ export class Subscriber {
 			for (const group of groups) group.close(abort);
 			groups.length = 0;
 		});
+		this.#frameGroup?.close(abort);
+		this.#frameGroup = undefined;
 		this.#state.timeline.clear();
 	}
 
@@ -1056,7 +1061,7 @@ export class Subscriber {
 	}
 
 	/**
-	 * Reads the next frame across all groups, discarding older groups.
+	 * Reads the next frame across groups, in sequence order.
 	 * Treat the returned frame bytes as read-only; they are shared with other consumers.
 	 */
 	async #readFrame(): Promise<Frame | undefined> {
@@ -1067,90 +1072,47 @@ export class Subscriber {
 	/**
 	 * Reads the next frame along with its group and frame sequence numbers.
 	 * Treat the returned frame bytes as read-only; they are shared with other consumers.
-	 * Groups outside the subscription's `maxAge` budget are discarded before reading.
+	 *
+	 * Groups are acquired through the same sequence cursor as {@link Ordered.nextGroup},
+	 * so frames never run backwards: a late lower-sequence group is skipped, and a
+	 * buffered backlog is drained in full rather than discarded for age. A group the
+	 * `maxAge` budget abandons mid-stall ends cleanly and the cursor resyncs from the
+	 * next group; an eviction gap inside a group still surfaces as {@link Lagged}.
 	 */
 	async #readFrameSequence(): Promise<({ group: number; frame: number } & Frame) | undefined> {
 		for (;;) {
-			const groups = this.#state.groups.peek();
-			const { start } = this.#cursor.peek();
-			while (groups.length > 0 && groups[0].sequence < start) groups.shift()?.close();
-			const drift = this.#drift();
-			for (let i = 0; i < groups.length; ) {
-				const group = groups[i];
-				if (!this.#isStale(group, drift)) {
-					i++;
-					continue;
-				}
-				groups.splice(i, 1);
+			if (!this.#frameGroup) {
+				this.#frameGroup = await this.#nextGroup();
+				if (!this.#frameGroup) return undefined;
+			}
+			const group = this.#frameGroup;
+
+			let next: ({ sequence: number } & Frame) | undefined;
+			try {
+				next = await group.readFrameSequence();
+			} catch (err) {
+				// The group failed underneath us: resync from the next one, surfacing
+				// only what the caller can act on (a gap, or the track's own abort).
+				this.#frameGroup = undefined;
 				group.close();
-			}
-
-			let readable = groups.length;
-
-			// Drain older groups first, dropping each once empty.
-			while (readable > 1) {
-				if (groups[0].skipped) {
-					// The reader fell behind this group's eviction window. Drop it and
-					// signal the gap; the next read resyncs from the following group.
-					groups.shift()?.close();
-					throw new Lagged();
-				}
-				const next = groups[0].tryReadFrameSequence();
-				if (next) {
-					return {
-						group: groups[0].sequence,
-						frame: next.sequence,
-						payload: next.payload,
-						timestamp: next.timestamp,
-					};
-				}
-				groups.shift()?.close();
-				readable--;
-			}
-
-			if (readable === 0) {
+				if (err instanceof Lagged) throw err;
 				const closed = this.#state.closed.peek();
 				if (closed instanceof Error) throw closed;
-				if (closed !== undefined && groups.length === 0) return undefined;
-				if (closed !== undefined) {
-					await Signal.race(this.#cursor);
-					continue;
-				}
-				await Signal.race(this.#state.groups, this.#cursor, this.#state.closed);
 				continue;
 			}
 
-			const group = groups[0];
-			if (group.skipped) {
-				// Fell behind this group's eviction window. Drop it and signal the gap;
-				// the next read resyncs from the following group.
-				groups.shift()?.close();
-				throw new Lagged();
-			}
-			const next = group.tryReadFrameSequence();
-			if (next)
+			if (next) {
 				return {
 					group: group.sequence,
 					frame: next.sequence,
 					payload: next.payload,
 					timestamp: next.timestamp,
 				};
-
-			const closed = this.#state.closed.peek();
-			if (closed instanceof Error) throw closed;
-			if (closed !== undefined) return undefined;
-
-			// A finished (drained + closed) group has nothing left: drop it and loop, rather than
-			// busy-waiting on its already-resolved readable() (which would livelock and starve the
-			// macrotask that delivers the next group).
-			if (group.done) {
-				groups.shift()?.close();
-				continue;
 			}
 
-			// Lone open group with nothing buffered yet: wait for a frame on it, a new group, or
-			// the track closing.
-			await Promise.race([Signal.race(this.#state.groups, this.#cursor, this.#state.closed), group.readable()]);
+			// The group is exhausted (or the budget abandoned its stall); move on.
+			this.#frameGroup = undefined;
+			group.close();
 		}
 	}
 

@@ -1135,9 +1135,11 @@ struct SegmentSub {
 	/// The next group this segment's sequence cursor would deliver, held so the
 	/// spliced sequence path ([`Subscriber::poll_next_group`]) can pick the lowest
 	/// across segments without consuming more than one group per segment ahead.
-	/// The cursor behind it is monotonic, so a staged group past the subscriber's
-	/// cap also correctly stalls everything after it in this segment.
 	staged: Option<group::Consumer>,
+	/// The outer cap last applied to the inner sequence cursor, so the ordered path
+	/// only rewrites it on change. `None` until first applied; the arrival path
+	/// leaves the inner uncapped instead (see [`Subscriber::poll_activate`]).
+	inner_cap: Option<Option<u64>>,
 }
 
 impl SegmentSub {
@@ -1401,6 +1403,7 @@ impl Subscriber {
 						pruned: false,
 						parked: BTreeMap::new(),
 						staged: None,
+						inner_cap: None,
 					});
 				}
 			}
@@ -1548,33 +1551,46 @@ impl Subscriber {
 				SubState::Pending(_) => {
 					ready!(Self::poll_activate(seg, prefs, min_sequence, end_sequence, waiter));
 				}
-				SubState::Active(sub) => match sub.poll_next_group(waiter) {
-					Poll::Ready(Ok(Some(group))) => {
-						// The floor is enforced by the caller; enforce the segment
-						// boundary here since the inner cursor is deliberately uncapped.
-						if let Some(end) = seg.last_group()
-							&& group.sequence > end
-						{
-							continue;
+				SubState::Active(sub) => {
+					// The inner cursor must not advance past the outer cap: a beyond-cap
+					// group it returned would sit staged while a late in-range arrival
+					// slipped underneath it, and the monotonic cursor would then skip
+					// that arrival for good. The arrival path instead leaves the inner
+					// uncapped, since an inner cap would hide the segment's completion
+					// from it; the sequence path never needs completion before the cap
+					// lifts, because an uncompleted segment just reads as Pending.
+					if seg.inner_cap != Some(end_sequence) {
+						sub.end_at(end_sequence);
+						seg.inner_cap = Some(end_sequence);
+					}
+					match sub.poll_next_group(waiter) {
+						Poll::Ready(Ok(Some(group))) => {
+							// The floor is enforced by the caller; enforce the segment
+							// boundary here since the boundary is not on the inner cursor.
+							if let Some(end) = seg.last_group()
+								&& group.sequence > end
+							{
+								continue;
+							}
+							return Poll::Ready(Some(group));
 						}
-						return Poll::Ready(Some(group));
+						Poll::Ready(Ok(None)) => {
+							let count = match sub.poll_finished(waiter) {
+								Poll::Ready(count) => count.ok(),
+								Poll::Pending => None,
+							};
+							seg.complete(count);
+							return Poll::Ready(None);
+						}
+						// A dead segment stalls the logical track rather than erroring;
+						// the next switch resumes it.
+						Poll::Ready(Err(_)) => {
+							seg.complete(None);
+							return Poll::Ready(None);
+						}
+						Poll::Pending => return Poll::Pending,
 					}
-					Poll::Ready(Ok(None)) => {
-						let count = match sub.poll_finished(waiter) {
-							Poll::Ready(count) => count.ok(),
-							Poll::Pending => None,
-						};
-						seg.complete(count);
-						return Poll::Ready(None);
-					}
-					// A dead segment stalls the logical track rather than erroring;
-					// the next switch resumes it.
-					Poll::Ready(Err(_)) => {
-						seg.complete(None);
-						return Poll::Ready(None);
-					}
-					Poll::Pending => return Poll::Pending,
-				},
+				}
 				SubState::Done(_) => return Poll::Ready(None),
 			}
 		}
@@ -2607,6 +2623,49 @@ mod test {
 		producer.switch(&consumer_b, Position::group(1)).unwrap();
 		write_group(&mut track_b, 1, "b1");
 		write_group(&mut track_b, 2, "b2");
+		assert_eq!(next(&mut sub), 2);
+	}
+
+	/// A beyond-cap group arriving (and being polled) before an in-range one must not
+	/// advance the sequence cursor past the late arrival: the inner cursor is capped,
+	/// so the reordered burst is delivered in order once the cap admits each group.
+	#[tokio::test]
+	async fn next_group_cap_holds_a_reordered_group_without_losing_late_arrivals() {
+		let (mut track_a, consumer_a) = track_pair("a");
+		let mut producer = Producer::new();
+		producer.switch(&consumer_a, None).unwrap();
+		let mut sub = producer.consume().subscribe(replay());
+
+		let next = |sub: &mut Subscriber| {
+			kio::wait(|waiter| sub.poll_next_group(waiter))
+				.now_or_never()
+				.expect("should not block")
+				.expect("should not error")
+				.expect("should not be finished")
+				.sequence
+		};
+		let next_pending = |sub: &mut Subscriber| {
+			assert!(
+				kio::wait(|waiter| sub.poll_next_group(waiter)).now_or_never().is_none(),
+				"should have blocked"
+			);
+		};
+
+		sub.end_at(1);
+
+		// The beyond-cap group arrives first and is polled: it must hold, not advance
+		// the cursor past the in-range groups still on their way.
+		write_group(&mut track_a, 2, "a2");
+		next_pending(&mut sub);
+
+		write_group(&mut track_a, 0, "a0");
+		write_group(&mut track_a, 1, "a1");
+		assert_eq!(next(&mut sub), 0);
+		assert_eq!(next(&mut sub), 1);
+		next_pending(&mut sub);
+
+		// Raising the cap admits the held group.
+		sub.end_at(2);
 		assert_eq!(next(&mut sub), 2);
 	}
 

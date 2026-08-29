@@ -38,8 +38,10 @@ test("deltas off: a snapshot group per change", async () => {
 	producer.update({ a: 2 });
 	producer.finish();
 
-	// Two changes => two single-frame snapshot groups, reconstructed in order.
-	expect(await drain(track.subscribe({ maxAge: REPLAY_LATENCY }))).toEqual([{ a: 1 }, { a: 2 }]);
+	// Two changes => two single-frame snapshot groups. A consumer joining after the fact
+	// collapses the backlog to the newest value: older groups only hold superseded state
+	// (mirrors the Rust consumer). The layout itself is asserted via structure() below.
+	expect(await drain(track.subscribe({ maxAge: REPLAY_LATENCY }))).toEqual([{ a: 2 }]);
 });
 
 test("deltaRatio 0 disables deltas, like off", async () => {

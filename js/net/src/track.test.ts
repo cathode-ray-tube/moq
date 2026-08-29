@@ -300,6 +300,46 @@ test("the latency budget skips a buffered timeline only on the arrival cursor", 
 	expect((await ordered.nextGroup())?.sequence).toBe(2);
 });
 
+// The ordered frame helpers share the burst contract: a buffered backlog is drained
+// in full rather than discarded for age.
+test("ordered frame reads drain a stale backlog", async () => {
+	const producer = new TrackProducer("test").accept({ maxAge: 5000 });
+	const ordered = producer.subscribe().ordered();
+
+	for (const timestamp of [0, 1000, 2000]) {
+		producer.writeFrame({ payload: enc.encode(`${timestamp}`), timestamp: Timestamp.fromMillis(timestamp) });
+	}
+
+	expect(await ordered.readString()).toBe("0");
+	expect(await ordered.readString()).toBe("1000");
+	expect(await ordered.readString()).toBe("2000");
+});
+
+// The frame helpers ride the same sequence cursor as nextGroup: a lower group arriving
+// after a higher one was read is skipped, never fed to the caller backwards.
+test("ordered frame reads skip a late lower-sequence group", async () => {
+	const producer = new TrackProducer("test");
+	const track = producer.subscribe({ maxAge: 5000 }).ordered();
+
+	const five = new GroupProducer(5);
+	five.writeString("five");
+	five.close();
+	producer.writeGroup(five);
+	expect(await track.readString()).toBe("five");
+
+	const three = new GroupProducer(3);
+	three.writeString("three");
+	three.close();
+	producer.writeGroup(three);
+
+	const six = new GroupProducer(6);
+	six.writeString("six");
+	six.close();
+	producer.writeGroup(six);
+
+	expect(await track.readString()).toBe("six");
+});
+
 test("zero latency takes the latest group when ages are equal", async () => {
 	const clock = mockMonotonicTime(10_000);
 	try {
@@ -722,7 +762,9 @@ test("endAt caps the live edge used by the latency budget", async () => {
 	expect((await track.recvGroup())?.sequence).toBe(2);
 });
 
-test("endAt does not cap frame-level reads", async () => {
+// The frame helpers ride the group cursor, so its bounds apply to them too: a group
+// above the cap parks (surviving a clean close) until the cap admits it.
+test("endAt caps frame-level reads like the group cursor", async () => {
 	const producer = new TrackProducer("test").accept({ maxAge: 5000 });
 	const track = producer.subscribe({ maxAge: 5000 }).ordered();
 	track.endAt(0);
@@ -732,7 +774,15 @@ test("endAt does not cap frame-level reads", async () => {
 	producer.close();
 
 	expect((await track.readFrameSequence())?.group).toBe(0);
-	expect((await track.readFrameSequence())?.group).toBe(1);
+
+	// Group 1 parks above the cap; a clean close must not resolve it as finished.
+	const parked = track.readFrameSequence();
+	const timeout = new Promise((resolve) => setTimeout(() => resolve("pending"), 10));
+	expect(await Promise.race([parked, timeout])).toBe("pending");
+
+	// Raising the cap releases the parked group, frames intact.
+	track.endAt(1);
+	expect((await parked)?.group).toBe(1);
 	expect(await track.readFrameSequence()).toBeUndefined();
 });
 
