@@ -1132,14 +1132,6 @@ struct SegmentSub {
 	/// the lowest is re-offered first; holding them here (rather than blocking on
 	/// the first) keeps in-range groups that arrive behind a capped one flowing.
 	parked: BTreeMap<u64, group::Consumer>,
-	/// The next group this segment's sequence cursor would deliver, held so the
-	/// spliced sequence path ([`Subscriber::poll_next_group`]) can pick the lowest
-	/// across segments without consuming more than one group per segment ahead.
-	staged: Option<group::Consumer>,
-	/// The outer cap last applied to the inner sequence cursor, so the ordered path
-	/// only rewrites it on change. `None` until first applied; the arrival path
-	/// leaves the inner uncapped instead (see [`Subscriber::poll_activate`]).
-	inner_cap: Option<Option<u64>>,
 }
 
 impl SegmentSub {
@@ -1187,9 +1179,7 @@ impl SegmentSub {
 	/// replaced before producing, so it holds nothing. The straggler bound in
 	/// `reap` cuts what lingers too long, parked group and all.
 	fn retired(&self) -> bool {
-		self.pruned
-			&& (self.end.is_none()
-				|| (matches!(self.sub, SubState::Done(_)) && self.parked.is_empty() && self.staged.is_none()))
+		self.pruned && (self.end.is_none() || (matches!(self.sub, SubState::Done(_)) && self.parked.is_empty()))
 	}
 }
 
@@ -1278,7 +1268,6 @@ impl Subscriber {
 					seg.sub = SubState::Done(None);
 					seg.terminal = None;
 					seg.parked.clear();
-					seg.staged = None;
 					cut -= 1;
 				}
 			}
@@ -1402,8 +1391,6 @@ impl Subscriber {
 						terminal: None,
 						pruned: false,
 						parked: BTreeMap::new(),
-						staged: None,
-						inner_cap: None,
 					});
 				}
 			}
@@ -1536,65 +1523,113 @@ impl Subscriber {
 		}
 	}
 
-	/// Drive one segment's sequence cursor: resolve a pending subscription, then poll
-	/// for the next in-sequence group. Out-of-bounds groups (a route racing its cap) are
-	/// skipped. Unlike [`Self::poll_segment`], groups are never discarded for age: the
-	/// spliced sequence path inherits the [`track::Ordered`] contract of bursting a
-	/// backlog instead of skipping it.
-	fn poll_segment_ordered(
-		seg: &mut SegmentSub,
-		prefs: &Subscription,
-		min_sequence: u64,
-		end_sequence: Option<u64>,
+	/// Seek this subscriber's lowest servable group at or above `floor` (bounded by
+	/// `end`, inclusive), without advancing any cursor. The shared engine behind
+	/// [`Self::poll_next_group`] and [`Self::poll_seek_group`].
+	///
+	/// Unlike [`Self::poll_segment`], nothing is discarded for age: the spliced
+	/// sequence path inherits the [`track::Ordered`] contract of bursting a backlog
+	/// instead of skipping it. Nothing is consumed either: each segment is *seeked*
+	/// rather than read, so a candidate a poll does not deliver stays where it was,
+	/// and a cap lowered between polls never strands a group behind a segment cursor
+	/// that had already stepped past it.
+	fn poll_seek(
+		&mut self,
+		floor: u64,
+		end: Option<u64>,
 		waiter: &kio::Waiter,
-	) -> Poll<Option<group::Consumer>> {
-		loop {
-			match &mut seg.sub {
-				SubState::Pending(_) => {
-					ready!(Self::poll_activate(seg, prefs, min_sequence, end_sequence, waiter));
+	) -> Poll<Result<Option<group::Consumer>>> {
+		self.poll_sync(waiter);
+
+		let mut floor = floor;
+		'retry: loop {
+			let mut all_done = true;
+			let mut best: Option<(usize, group::Consumer)> = None;
+
+			for index in 0..self.segments.len() {
+				if matches!(self.segments[index].sub, SubState::Pending(_))
+					&& Self::poll_activate(
+						&mut self.segments[index],
+						&self.last_prefs,
+						self.min_sequence,
+						end,
+						waiter,
+					)
+					.is_pending()
+				{
+					all_done = false;
+					continue;
 				}
-				SubState::Active(sub) => {
-					// The inner cursor must not advance past the outer cap: a beyond-cap
-					// group it returned would sit staged while a late in-range arrival
-					// slipped underneath it, and the monotonic cursor would then skip
-					// that arrival for good. The arrival path instead leaves the inner
-					// uncapped, since an inner cap would hide the segment's completion
-					// from it; the sequence path never needs completion before the cap
-					// lifts, because an uncompleted segment just reads as Pending.
-					if seg.inner_cap != Some(end_sequence) {
-						sub.end_at(end_sequence);
-						seg.inner_cap = Some(end_sequence);
-					}
-					match sub.poll_next_group(waiter) {
+
+				let seg = &mut self.segments[index];
+				// A boundary behind the floor can never serve this cursor again;
+				// release its inner subscription rather than holding demand open.
+				if seg.last_group().is_some_and(|last| last < floor)
+					&& let SubState::Active(sub) = &mut seg.sub
+				{
+					let count = match sub.poll_finished(waiter) {
+						Poll::Ready(count) => count.ok(),
+						Poll::Pending => None,
+					};
+					seg.complete(count);
+				}
+
+				let cap = min_some(end, seg.last_group());
+				match &mut seg.sub {
+					SubState::Active(sub) => match sub.poll_seek_group(floor, cap, waiter) {
 						Poll::Ready(Ok(Some(group))) => {
-							// The floor is enforced by the caller; enforce the segment
-							// boundary here since the boundary is not on the inner cursor.
-							if let Some(end) = seg.last_group()
-								&& group.sequence > end
-							{
-								continue;
+							all_done = false;
+							// Strict, so the earlier segment wins a boundary tie: it
+							// holds the head copy, the one `hand_out` can surface.
+							if best.as_ref().is_none_or(|(_, best)| group.sequence < best.sequence) {
+								best = Some((index, group));
 							}
-							return Poll::Ready(Some(group));
 						}
+						// The track ran out at or below the floor: the segment drained.
 						Poll::Ready(Ok(None)) => {
 							let count = match sub.poll_finished(waiter) {
 								Poll::Ready(count) => count.ok(),
 								Poll::Pending => None,
 							};
 							seg.complete(count);
-							return Poll::Ready(None);
 						}
 						// A dead segment stalls the logical track rather than erroring;
 						// the next switch resumes it.
-						Poll::Ready(Err(_)) => {
-							seg.complete(None);
-							return Poll::Ready(None);
-						}
-						Poll::Pending => return Poll::Pending,
+						Poll::Ready(Err(_)) => seg.complete(None),
+						Poll::Pending => all_done = false,
+					},
+					SubState::Pending(_) => all_done = false,
+					SubState::Done(_) => {}
+				}
+			}
+
+			if let Some((index, group)) = best {
+				let sequence = group.sequence;
+				// A copy continuing a group already handed out splices into it rather
+				// than surfacing again; step past it and look for the next sequence.
+				match self.hand_out(index, group) {
+					Some(group) => return Poll::Ready(Ok(Some(group))),
+					None => {
+						floor = sequence.saturating_add(1);
+						continue 'retry;
 					}
 				}
-				SubState::Done(_) => return Poll::Ready(None),
 			}
+
+			if let Some(err) = &self.abort {
+				return Poll::Ready(Err(err.clone()));
+			}
+			if all_done {
+				if self.finished {
+					return Poll::Ready(Ok(None));
+				}
+				// The producer is gone without finishing: no takeover can ever resume
+				// the drained segments, so report the drop like a plain track would.
+				if self.closed {
+					return Poll::Ready(Err(Error::Dropped));
+				}
+			}
+			return Poll::Pending;
 		}
 	}
 
@@ -1740,105 +1775,30 @@ impl Subscriber {
 	/// Poll for the next group with a higher sequence than any previously
 	/// returned, skipping late arrivals, across the segments.
 	///
-	/// Mirrors [`track::Ordered`]: each segment is driven through its own sequence
-	/// cursor with no age-based pruning, so a backlog bursts in order instead of
-	/// being discarded, and [`Subscription::max_age`] only bounds how long a
-	/// handed-out group's reads may block. One group per segment is staged so the
-	/// lowest sequence across segments is delivered first; a segment's cursor is
-	/// monotonic, so a staged group past the [`Self::end_at`] cap stalls only that
-	/// segment until the cap rises.
+	/// Mirrors [`track::Ordered`]: segments are seeked rather than read, no group is
+	/// discarded for age, and [`Subscription::max_age`] only bounds how long a
+	/// handed-out group's reads may block. See [`Self::poll_seek`].
 	pub fn poll_next_group(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<group::Consumer>>> {
-		self.poll_sync(waiter);
-
-		let end_sequence = self.end_sequence;
-		let beyond_cap = |sequence: u64| end_sequence.is_some_and(|end| sequence > end);
 		let floor = self.next_sequence.max(self.min_sequence);
-
-		// A staged group needs a waiter for the same reason a parked one does: an
-		// eviction aborts it without touching any cursor this subscriber polls.
-		let watch = |group: &group::Consumer| match group.poll_closed(waiter) {
-			Poll::Pending => true,
-			Poll::Ready(()) => !group.is_aborted(),
+		let Some(group) = ready!(self.poll_seek(floor, self.end_sequence, waiter))? else {
+			return Poll::Ready(Ok(None));
 		};
+		self.next_sequence = self.next_sequence.max(group.sequence.saturating_add(1));
+		Poll::Ready(Ok(Some(group)))
+	}
 
-		let mut all_done = true;
-		for index in 0..self.segments.len() {
-			// A raised `start_at` or an abort invalidates a staged group. The floor
-			// itself cannot overtake one: it only advances past delivered sequences,
-			// and delivery always takes the lowest staged.
-			if let Some(group) = &self.segments[index].staged
-				&& (group.sequence < floor || !watch(group))
-			{
-				self.segments[index].staged = None;
-			}
-
-			while self.segments[index].staged.is_none() {
-				let polled = Self::poll_segment_ordered(
-					&mut self.segments[index],
-					&self.last_prefs,
-					self.min_sequence,
-					end_sequence,
-					waiter,
-				);
-				match polled {
-					Poll::Ready(Some(group)) => {
-						let sequence = group.sequence;
-						// Fold a copy that continues a group already handed out
-						// before the floor is consulted: a boundary can land inside a
-						// group whose head this cursor has not surfaced yet, and such
-						// a copy must splice rather than pose as a fresh group.
-						let Some(group) = self.hand_out(index, group) else {
-							continue;
-						};
-						// A late arrival the sequence contract skips.
-						if sequence < floor {
-							continue;
-						}
-						if watch(&group) {
-							self.segments[index].staged = Some(group);
-						}
-					}
-					Poll::Ready(None) => break,
-					Poll::Pending => break,
-				}
-			}
-
-			let seg = &self.segments[index];
-			if seg.staged.is_some() || !matches!(seg.sub, SubState::Done(_)) {
-				all_done = false;
-			}
-		}
-
-		// Deliver the lowest staged group within the cap.
-		let candidate = self
-			.segments
-			.iter()
-			.enumerate()
-			.filter_map(|(index, seg)| seg.staged.as_ref().map(|group| (index, group.sequence)))
-			.filter(|(_, sequence)| !beyond_cap(*sequence))
-			.min_by_key(|(_, sequence)| *sequence);
-		if let Some((index, sequence)) = candidate {
-			let group = self.segments[index].staged.take().expect("staged just observed");
-			// Staging is not a delivery; this is.
-			group.cache_refresh();
-			self.next_sequence = self.next_sequence.max(sequence.saturating_add(1));
-			return Poll::Ready(Ok(Some(group)));
-		}
-
-		if let Some(err) = &self.abort {
-			return Poll::Ready(Err(err.clone()));
-		}
-		if all_done {
-			if self.finished {
-				return Poll::Ready(Ok(None));
-			}
-			// The producer is gone without finishing: no takeover can ever resume
-			// the drained segments, so report the drop like a plain track would.
-			if self.closed {
-				return Poll::Ready(Err(Error::Dropped));
-			}
-		}
-		Poll::Pending
+	/// Seek the lowest servable group at or above `floor` (bounded by `end`) without
+	/// advancing this subscriber's own cursor: the nested-splice counterpart of
+	/// [`track::Subscriber::poll_seek_group`].
+	pub(crate) fn poll_seek_group(
+		&mut self,
+		floor: u64,
+		end: Option<u64>,
+		waiter: &kio::Waiter,
+	) -> Poll<Result<Option<group::Consumer>>> {
+		let floor = floor.max(self.min_sequence);
+		let end = min_some(end, self.end_sequence);
+		self.poll_seek(floor, end, waiter)
 	}
 
 	/// Return the next group with a higher sequence than any previously returned.
@@ -2680,6 +2640,51 @@ mod test {
 
 		// Raising the cap admits the held group.
 		sub.end_at(2);
+		assert_eq!(next(&mut sub), 2);
+	}
+
+	/// Lowering the cap after the cursor already considered (but did not deliver) a
+	/// higher group must not strand a late in-range arrival: seeking consumes
+	/// nothing, so no segment cursor ever steps past an undelivered sequence.
+	#[tokio::test]
+	async fn next_group_cap_lowering_after_a_lookahead_keeps_late_arrivals() {
+		let (mut track_a, consumer_a) = track_pair("a");
+		let (mut track_b, consumer_b) = track_pair("b");
+		let mut producer = Producer::new();
+		producer.switch(&consumer_a, None).unwrap();
+		producer.switch(&consumer_b, Position::group(1)).unwrap();
+		let mut sub = producer.consume().subscribe(replay());
+
+		let next = |sub: &mut Subscriber| {
+			kio::wait(|waiter| sub.poll_next_group(waiter))
+				.now_or_never()
+				.expect("should not block")
+				.expect("should not error")
+				.expect("should not be finished")
+				.sequence
+		};
+		let next_pending = |sub: &mut Subscriber| {
+			assert!(
+				kio::wait(|waiter| sub.poll_next_group(waiter)).now_or_never().is_none(),
+				"should have blocked"
+			);
+		};
+
+		// The new segment's group 2 arrives early, and the old segment delivers 0.
+		write_group(&mut track_b, 2, "b2");
+		write_group(&mut track_a, 0, "a0");
+		assert_eq!(next(&mut sub), 0);
+
+		// Cap below the group the cursor could already see. It must hold, not have
+		// committed the segment past the still-missing group 1.
+		sub.end_at(1);
+		next_pending(&mut sub);
+
+		write_group(&mut track_b, 1, "b1");
+		assert_eq!(next(&mut sub), 1);
+		next_pending(&mut sub);
+
+		sub.end_at(None);
 		assert_eq!(next(&mut sub), 2);
 	}
 

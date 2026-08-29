@@ -1054,6 +1054,12 @@ export class Subscriber {
 			if (group && (cursor.end === undefined || group.sequence <= cursor.end)) {
 				groups.shift();
 				this.#nextSequence = group.sequence + 1;
+				// One cursor: the frame helpers must not keep draining a group this
+				// read just moved past, or interleaved reads would run backwards.
+				if (this.#frameGroup && this.#frameGroup.sequence < group.sequence) {
+					this.#frameGroup.close();
+					this.#frameGroup = undefined;
+				}
 				return this.#guard(group);
 			}
 

@@ -2944,6 +2944,25 @@ impl PlainSubscriber {
 		self.next_sequence = group.sequence.saturating_add(1);
 		Poll::Ready(Ok(Some(self.with_expiry(group))))
 	}
+
+	/// Seek the lowest cached group in `floor..=end` without advancing any cursor.
+	///
+	/// Repeated polls return the same group until the caller's own floor passes it,
+	/// which is the point: the spliced sequence path picks the lowest candidate across
+	/// segments and must not commit a segment past a group it has not delivered.
+	fn poll_seek_group(
+		&mut self,
+		floor: u64,
+		end: Option<u64>,
+		waiter: &kio::Waiter,
+	) -> Poll<Result<Option<group::Consumer>>> {
+		let floor = floor.max(self.min_sequence);
+		let end = super::subscription::min_some(end, self.end_sequence);
+		let Some(group) = ready!(self.poll(waiter, |state| state.poll_next_in_range(floor, end))?) else {
+			return Poll::Ready(Ok(None));
+		};
+		Poll::Ready(Ok(Some(self.with_expiry(group))))
+	}
 }
 
 /// A cloneable handle to a subscriber's delivery preferences.
@@ -3140,12 +3159,30 @@ impl Subscriber {
 	}
 
 	/// The sequence cursor behind [`Ordered`], which owns the only public door to it.
-	/// Crate-visible so a [`super::resume::Subscriber`] segment can drive it too.
-	pub(crate) fn poll_next_group(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<group::Consumer>>> {
+	fn poll_next_group(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<group::Consumer>>> {
 		let meter = self.stats.meter();
 		let res = match &mut self.inner {
 			SubscriberKind::Plain(plain) => plain.poll_next_group(waiter),
 			SubscriberKind::Spliced(spliced) => spliced.poll_next_group(waiter),
+		};
+		self.count_stale(&meter);
+		res.map(|res| res.map(|group| group.map(|group| group.with_meter(meter))))
+	}
+
+	/// Seek the lowest cached group in `floor..=end` without advancing any cursor.
+	/// Crate-visible for [`super::resume::Subscriber`], whose sequence path picks the
+	/// lowest candidate across its segments and advances only its own floor; see
+	/// [`PlainSubscriber::poll_seek_group`].
+	pub(crate) fn poll_seek_group(
+		&mut self,
+		floor: u64,
+		end: Option<u64>,
+		waiter: &kio::Waiter,
+	) -> Poll<Result<Option<group::Consumer>>> {
+		let meter = self.stats.meter();
+		let res = match &mut self.inner {
+			SubscriberKind::Plain(plain) => plain.poll_seek_group(floor, end, waiter),
+			SubscriberKind::Spliced(spliced) => spliced.poll_seek_group(floor, end, waiter),
 		};
 		self.count_stale(&meter);
 		res.map(|res| res.map(|group| group.map(|group| group.with_meter(meter))))

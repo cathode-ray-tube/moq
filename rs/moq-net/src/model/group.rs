@@ -1446,7 +1446,6 @@ impl Consumer {
 }
 
 impl Plain {
-
 	/// Whether this cursor still has unread content or may receive another frame.
 	fn expiry_pending(&self) -> bool {
 		if self.capped() {
