@@ -1533,10 +1533,16 @@ impl Subscriber {
 	/// rather than read, so a candidate a poll does not deliver stays where it was,
 	/// and a cap lowered between polls never strands a group behind a segment cursor
 	/// that had already stepped past it.
+	///
+	/// `deliver` marks the caller as the one handing the group out, which stamps the
+	/// winner's cache entry. A nested seek passes `false`: its candidate may lose at
+	/// the level above, and a loser re-seeked every poll must not be shielded from
+	/// eviction.
 	fn poll_seek(
 		&mut self,
 		floor: u64,
 		end: Option<u64>,
+		deliver: bool,
 		waiter: &kio::Waiter,
 	) -> Poll<Result<Option<group::Consumer>>> {
 		self.poll_sync(waiter);
@@ -1562,16 +1568,12 @@ impl Subscriber {
 				}
 
 				let seg = &mut self.segments[index];
-				// A boundary behind the floor can never serve this cursor again;
-				// release its inner subscription rather than holding demand open.
-				if seg.last_group().is_some_and(|last| last < floor)
-					&& let SubState::Active(sub) = &mut seg.sub
-				{
-					let count = match sub.poll_finished(waiter) {
-						Poll::Ready(count) => count.ok(),
-						Poll::Pending => None,
-					};
-					seg.complete(count);
+				// A boundary behind the floor has nothing to serve this poll. A pure
+				// skip, deliberately: the floor can come back down (a lowered
+				// `start_at` with nothing delivered yet), so the segment must not be
+				// completed or otherwise committed past its cache.
+				if seg.last_group().is_some_and(|last| last < floor) {
+					continue;
 				}
 
 				let cap = min_some(end, seg.last_group());
@@ -1605,6 +1607,10 @@ impl Subscriber {
 
 			if let Some((index, group)) = best {
 				let sequence = group.sequence;
+				// Delivery is a cache access; a candidate merely considered is not.
+				if deliver {
+					group.cache_refresh();
+				}
 				// A copy continuing a group already handed out splices into it rather
 				// than surfacing again; step past it and look for the next sequence.
 				match self.hand_out(index, group) {
@@ -1780,7 +1786,7 @@ impl Subscriber {
 	/// handed-out group's reads may block. See [`Self::poll_seek`].
 	pub fn poll_next_group(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<group::Consumer>>> {
 		let floor = self.next_sequence.max(self.min_sequence);
-		let Some(group) = ready!(self.poll_seek(floor, self.end_sequence, waiter))? else {
+		let Some(group) = ready!(self.poll_seek(floor, self.end_sequence, true, waiter))? else {
 			return Poll::Ready(Ok(None));
 		};
 		self.next_sequence = self.next_sequence.max(group.sequence.saturating_add(1));
@@ -1798,7 +1804,7 @@ impl Subscriber {
 	) -> Poll<Result<Option<group::Consumer>>> {
 		let floor = floor.max(self.min_sequence);
 		let end = min_some(end, self.end_sequence);
-		self.poll_seek(floor, end, waiter)
+		self.poll_seek(floor, end, false, waiter)
 	}
 
 	/// Return the next group with a higher sequence than any previously returned.

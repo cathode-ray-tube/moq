@@ -127,6 +127,27 @@ test("deltaRatio 0 disables deltas, like off", async () => {
 	expect(await structure(track.subscribe({ maxAge: REPLAY_LATENCY }).ordered())).toEqual([1, 1]);
 });
 
+// A consumer holding a group must jump when a newer snapshot group rolls: the
+// buffered deltas in the held group only reconstruct superseded state, and every
+// group restarts from a full snapshot (mirrors the Rust consumer, which drains to
+// the newest group on every poll).
+test("a held group is abandoned when a newer snapshot group rolls", async () => {
+	const track = new Track.Producer("test");
+	// A tiny ratio forces the update after any delta to roll a fresh snapshot group.
+	const producer = new Producer<Value>({ track, deltaRatio: 0.001 });
+	const consumer = new Consumer<Value>(track.subscribe({ maxAge: REPLAY_LATENCY }));
+
+	producer.update({ a: 1 });
+	expect(await consumer.next()).toEqual({ a: 1 });
+
+	// A delta lands in the held group, then the ratio rolls a new snapshot group.
+	producer.update({ a: 2 });
+	producer.update({ a: 3 });
+	producer.finish();
+
+	expect(await consumer.next()).toEqual({ a: 3 });
+});
+
 test("live consumer sees each update", async () => {
 	const track = new Track.Producer("test");
 	const producer = new Producer<Value>({ track });

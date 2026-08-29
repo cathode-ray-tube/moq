@@ -300,6 +300,23 @@ test("the latency budget skips a buffered timeline only on the arrival cursor", 
 	expect((await ordered.nextGroup())?.sequence).toBe(2);
 });
 
+// An unstamped immediate successor leaves a group's reach unbounded: a later stamped
+// group proves nothing about where the successor will begin, and shrinking the bound
+// is the unsafe direction.
+test("an unstamped immediate successor leaves reach unbounded", async () => {
+	const producer = new TrackProducer("test").accept({ maxAge: 5000 });
+	const track = producer.subscribe();
+
+	producer.writeFrame({ payload: enc.encode("0"), timestamp: Timestamp.fromMillis(0) });
+	producer.appendGroup(); // seq 1 stalls before its first frame
+	producer.writeFrame({ payload: enc.encode("2"), timestamp: Timestamp.fromMillis(10_000) });
+
+	// Group 1's reach is group 2's start, a full edge behind: stale at zero budget.
+	// Group 0's reach is unknown until group 1 presents its first frame, so it is kept.
+	expect((await track.recvGroup())?.sequence).toBe(0);
+	expect((await track.recvGroup())?.sequence).toBe(2);
+});
+
 // The ordered frame helpers share the burst contract: a buffered backlog is drained
 // in full rather than discarded for age.
 test("ordered frame reads drain a stale backlog", async () => {

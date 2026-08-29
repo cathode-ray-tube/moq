@@ -500,7 +500,7 @@ A subscriber MUST support gaps and out-of-order delivery regardless.
 
 ## Expiration
 Expiration governs when an older group is dropped.
-The publisher SHOULD reset Group Streams for non-latest groups whose age relative to the latest group exceeds `Subscriber Max Age` (see [SUBSCRIBE](#subscribe)); the subscriber MAY also locally drop such groups.
+The publisher SHOULD reset Group Streams for non-latest groups whose age relative to the latest group reaches `Subscriber Max Age` (see [SUBSCRIBE](#subscribe), and the age definition below); the subscriber MAY also locally drop such groups.
 Expiration only removes the group from live delivery; the publisher MAY still retain it for FETCH or new subscriptions until its age exceeds `Publisher Max Age` (see [TRACK_INFO](#track-info)).
 
 It is not crucial to aggressively expire groups thanks to [prioritization](#prioritization), but a lower priority group still consumes RAM, bandwidth, and potentially flow control.
@@ -978,7 +978,7 @@ See the [Expiration](#expiration) section for more information.
 The minimum group sequence to deliver: an absolute floor, defaulting to 0 (no floor).
 
 A floor is not a request; `Subscriber Max Age` is the only thing that asks for data.
-The publisher SHOULD start at the oldest group at or above the floor whose age (relative to the latest group, measured from its first frame) is within `Subscriber Max Age`, and MUST NOT deliver an older one.
+The publisher SHOULD start at the oldest group at or above the floor that [Expiration](#expiration) has not expired, and MUST NOT deliver an older one.
 A `Subscriber Max Age` of 0 therefore starts at the latest group, since every older group is already stale.
 A subscriber that buffers is then handed the head of what it can still play instead of only the live edge, and is never sent history it would discard on arrival: the same bound decides what to start at and what to expire, so the two cannot disagree.
 A floor above the latest group simply waits there: that is a resumed subscription naming where it left off.

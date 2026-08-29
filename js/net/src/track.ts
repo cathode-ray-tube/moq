@@ -722,31 +722,20 @@ export class Subscriber {
 	#drift(): {
 		budget: number;
 		presentation?: { sequence: number; timestamp: Timestamp };
-		suffix: { sequence: number; reach: number }[];
+		end?: number;
 	} {
 		const { end } = this.#cursor.peek();
 		let presentation: { sequence: number; timestamp: Timestamp } | undefined;
-		const suffix: { sequence: number; reach: number }[] = [];
 		for (const { group } of this.#state.timeline.values()) {
 			if (end !== undefined && group.sequence > end) continue;
 			if (group.closed.peek() instanceof Error) continue;
+			// The edge wants the newest content that exists, so it takes the newest
+			// stamped group's latest frame.
 			const timestamp = hooks.groupTimestamp(group);
-			if (timestamp !== undefined) {
-				// The table bounds a candidate's reach, so it wants where each group
-				// begins; the edge wants the newest content that exists, so it takes the
-				// newest group's latest frame.
-				suffix.push({ sequence: group.sequence, reach: timestamp.asMillis() });
-				if (!presentation || group.sequence > presentation.sequence) {
-					presentation = { sequence: group.sequence, timestamp: hooks.groupLatest(group) ?? timestamp };
-				}
+			if (timestamp !== undefined && (!presentation || group.sequence > presentation.sequence)) {
+				presentation = { sequence: group.sequence, timestamp: hooks.groupLatest(group) ?? timestamp };
 			}
 		}
-
-		// Sequence order, so a candidate's immediate successor is one lookup away.
-		// Deliberately not a minimum over later groups: timestamps need not rise with
-		// sequence, and taking the minimum would shrink the bound, which is the unsafe
-		// direction. Only the immediate successor bounds a group.
-		suffix.sort((a, b) => a.sequence - b.sequence);
 
 		const requested = this.#state.update.peek()?.maxAge ?? 0;
 		const retained = this.#state.info.peek()?.maxAge;
@@ -757,24 +746,28 @@ export class Subscriber {
 					: Math.min(requested, retained)
 				: Number.POSITIVE_INFINITY,
 			presentation,
-			suffix,
+			end,
 		};
 	}
 
 	// The furthest presentation time the group at `sequence` could still reach: where its
-	// immediate successor begins, or undefined when nothing follows it yet. An upper bound,
-	// deliberately: a frame's duration is not on the wire, so a group's own last timestamp
-	// says where it starts presenting, not where it ends. Only a successor's start proves
-	// the predecessor cannot run past it.
-	static #reach(suffix: { sequence: number; reach: number }[], sequence: number): number | undefined {
-		let lo = 0;
-		let hi = suffix.length;
-		while (lo < hi) {
-			const mid = (lo + hi) >> 1;
-			if (suffix[mid].sequence <= sequence) lo = mid + 1;
-			else hi = mid;
+	// immediate servable successor begins, or undefined when nothing proves where it
+	// stops. An upper bound, deliberately: a frame's duration is not on the wire, so a
+	// group's own last timestamp says where it starts presenting, not where it ends.
+	// Only the *immediate* successor counts: timestamps need not rise with sequence (a
+	// rewind reorders them), so a later stamped group proves nothing about where an
+	// unstamped successor will begin, and shrinking the bound is the unsafe direction.
+	// An unstamped successor leaves the reach unbounded until it presents a frame.
+	#reach(sequence: number, end?: number): number | undefined {
+		let successor: GroupConsumer | undefined;
+		for (const { group } of this.#state.timeline.values()) {
+			if (group.sequence <= sequence) continue;
+			if (end !== undefined && group.sequence > end) continue;
+			if (group.closed.peek() instanceof Error) continue;
+			if (!successor || group.sequence < successor.sequence) successor = group;
 		}
-		return suffix[lo]?.reach;
+		if (!successor) return undefined;
+		return hooks.groupTimestamp(successor)?.asMillis();
 	}
 
 	// Whether the drift budget says to give up on `group`.
@@ -798,13 +791,13 @@ export class Subscriber {
 		drift: {
 			budget: number;
 			presentation?: { sequence: number; timestamp: Timestamp };
-			suffix: { sequence: number; reach: number }[];
+			end?: number;
 		},
 	): boolean {
 		const candidate = this.#state.timeline.get(group.sequence);
 		if (candidate?.group !== group) return false;
 
-		const reach = Subscriber.#reach(drift.suffix, group.sequence);
+		const reach = this.#reach(group.sequence, drift.end);
 		return (
 			drift.presentation !== undefined &&
 			drift.presentation.sequence > group.sequence &&
@@ -1267,7 +1260,12 @@ export class Ordered {
 	}
 
 	/**
-	 * Read the next frame across groups, discarding older groups.
+	 * Read the next frame across groups, in sequence order.
+	 *
+	 * Rides the same cursor as {@link nextGroup} and shares this handle's contract: a
+	 * buffered backlog is drained in full, however old it is, never discarded for age.
+	 * A consumer that wants only the freshest content should jump via {@link latest}
+	 * and {@link startAt} rather than expect frame reads to skip ahead.
 	 * Treat the returned frame bytes as read-only; they are shared with other consumers.
 	 */
 	readFrame(): Promise<Frame | undefined> {

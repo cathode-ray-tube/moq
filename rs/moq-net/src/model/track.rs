@@ -373,8 +373,9 @@ impl TrackState {
 			.find(|group| !group.is_aborted());
 
 		if let Some(group) = best {
-			// Delivery is a cache access, same as the arrival-order path.
-			group.cache_refresh();
+			// Deliberately no cache refresh here: this is a pure seek, and the spliced
+			// merge consults candidates it may not deliver. The deliverer stamps the
+			// winner; a loser re-seeked every poll must not be shielded from eviction.
 			return Poll::Ready(Ok(Some(group.consume())));
 		}
 
@@ -441,7 +442,6 @@ impl TrackState {
 	/// as though it were a live replacement.
 	fn live_edge(&self, cap: Option<u64>) -> Option<Edge> {
 		let mut presentation: Option<PresentationEdge> = None;
-		let mut stamped: Vec<(u64, Timestamp)> = Vec::new();
 		for slot in self.lookup.values() {
 			if !slot.visible {
 				continue;
@@ -450,28 +450,40 @@ impl TrackState {
 			if cap.is_some_and(|cap| group.sequence > cap) || group.is_aborted() {
 				continue;
 			}
-			if let Some(timestamp) = group.timestamp() {
-				// The suffix table bounds a candidate's reach, so it wants where each group
-				// *begins*; the edge wants the newest content that exists, so it takes the
-				// newest group's latest frame.
-				stamped.push((group.sequence, timestamp));
-				if presentation.is_none_or(|edge| group.sequence > edge.sequence) {
-					presentation = Some(PresentationEdge {
-						sequence: group.sequence,
-						stamp: slot.stamp,
-						timestamp: group.latest().unwrap_or(timestamp),
-					});
-				}
+			// The edge wants the newest content that exists, so it takes the newest
+			// stamped group's latest frame.
+			if let Some(timestamp) = group.timestamp()
+				&& presentation.is_none_or(|edge| group.sequence > edge.sequence)
+			{
+				presentation = Some(PresentationEdge {
+					sequence: group.sequence,
+					stamp: slot.stamp,
+					timestamp: group.latest().unwrap_or(timestamp),
+				});
 			}
 		}
 
-		// Sequence order, so a candidate's immediate successor is one lookup away.
-		stamped.sort_unstable_by_key(|(sequence, _)| *sequence);
+		presentation.map(|presentation| Edge { presentation, cap })
+	}
 
-		presentation.map(|presentation| Edge {
-			presentation,
-			suffix: stamped.into(),
-		})
+	/// The furthest presentation time the group at `sequence` could still reach: where
+	/// its immediate successor begins, or `None` when nothing proves where it stops.
+	///
+	/// An upper bound, deliberately. A frame's duration is not on the wire, so a group's
+	/// own last timestamp says where it *starts* presenting, not where it ends; only its
+	/// successor's start proves it cannot run past it. And only the *immediate* servable
+	/// successor counts: timestamps need not rise with sequence (a rewind reorders them),
+	/// so a later stamped group proves nothing about where an unstamped successor will
+	/// begin, and shrinking the bound is the unsafe direction. An unstamped successor
+	/// therefore leaves the reach unbounded until it presents its first frame.
+	fn reach(&self, sequence: u64, cap: Option<u64>) -> Option<Timestamp> {
+		let successor = self
+			.lookup
+			.range(sequence.saturating_add(1)..)
+			.map(|(_, slot)| slot)
+			.take_while(|slot| cap.is_none_or(|cap| slot.group.sequence <= cap))
+			.find(|slot| slot.visible && !slot.group.is_aborted())?;
+		successor.group.timestamp()
 	}
 
 	/// Whether the group at `sequence` has drifted further behind `edge` than `budget`
@@ -484,12 +496,11 @@ impl TrackState {
 	/// delivering, so a group is abandoned only once everything it could still present
 	/// falls outside the budget.
 	///
-	/// A group's reach is bounded by its nearest successor: it cannot present past where
-	/// the next group begins. Its own frames say nothing, since a frame's duration is not
-	/// on the wire and its last timestamp is where that frame *starts*. The candidate
-	/// itself needs no timestamp: an empty group is bounded by its stamped successor the
-	/// same way. Only timestamps drive expiry; wall-clock reclamation of idle content is
-	/// the cache's own policy, not the budget's.
+	/// A group's reach is bounded by its immediate successor (see [`Self::reach`]): it
+	/// cannot present past where the next group begins. The candidate itself needs no
+	/// timestamp: an empty group is bounded by its stamped successor the same way. Only
+	/// timestamps drive expiry; wall-clock reclamation of idle content is the cache's
+	/// own policy, not the budget's.
 	///
 	/// The bound is exclusive, so the comparison is `>=` rather than `>`: the freshest frame
 	/// a group could still hold sits just *below* its reach, so an age equal to the budget
@@ -511,7 +522,7 @@ impl TrackState {
 		// the same servable incarnation before it convicts a candidate. Failing safe
 		// (delivering) is right, since the next poll resolves fresh anchors.
 		let live_edge = &edge.presentation;
-		let reach = edge.reach(sequence);
+		let reach = self.reach(sequence, edge.cap);
 		live_edge.sequence > sequence
 			&& self
 				.lookup
@@ -2651,10 +2662,11 @@ impl group::Expiry for GroupExpiry {
 					break;
 				}
 
-				// A first timestamp can change the presentation-time verdict without
-				// mutating the track. Register on the candidate and every unstamped
-				// group that could supersede the current presentation edge. If one
-				// raced this scan, resolve the edge again before returning Pending.
+				// A first timestamp can change the verdict without mutating the track:
+				// on a group past the edge (a new edge), or on the candidate's
+				// unstamped immediate successor (a reach where there was none).
+				// Register on the candidate and every unstamped servable group above
+				// it. If one raced this scan, resolve the edge again before Pending.
 				let mut timestamp_raced = false;
 				if let Some(slot) = state.lookup.get(&self.sequence) {
 					let group = &slot.group;
@@ -2665,15 +2677,13 @@ impl group::Expiry for GroupExpiry {
 						timestamp_raced = true;
 					}
 				}
-				let presentation_sequence = edge
-					.as_ref()
-					.map_or(self.sequence, |edge| edge.presentation.sequence.max(self.sequence));
 				for slot in state.lookup.values() {
 					let group = &slot.group;
 					if slot.visible
-						&& group.sequence > presentation_sequence
+						&& group.sequence > self.sequence
 						&& cap.is_none_or(|cap| group.sequence <= cap)
 						&& !group.is_aborted()
+						&& group.timestamp().is_none()
 						&& group.poll_timestamp(waiter).is_ready()
 						&& group.timestamp().is_some()
 					{
@@ -2700,33 +2710,9 @@ impl group::Expiry for GroupExpiry {
 #[derive(Clone)]
 struct Edge {
 	presentation: PresentationEdge,
-	/// Every servable stamped group, sorted by sequence, paired with its own first frame
-	/// timestamp. A candidate's reach is where its immediate successor begins, so `reach()`
-	/// finds that one entry rather than rescanning, keeping a backlog walk linear.
-	///
-	/// Deliberately *not* a minimum over later groups. Timestamps need not rise with
-	/// sequence (a rewind reorders them), and a distant group starting earlier proves
-	/// nothing about where the candidate's own successor begins. Taking the minimum would
-	/// shrink the bound, which is the unsafe direction: it discards content that might
-	/// still be inside the budget. Only the immediate successor bounds a group.
-	///
-	/// Once `lookup` becomes a `BTreeMap` (it already is on main) this collapses to a
-	/// `range(sequence + 1..).next()` and the table goes away.
-	suffix: Arc<[(u64, Timestamp)]>,
-}
-
-impl Edge {
-	/// The furthest presentation time the group at `sequence` could still reach: where its
-	/// immediate successor begins, or `None` when nothing follows it yet.
-	///
-	/// An upper bound, deliberately. A frame's duration is not on the wire, so a group's
-	/// own last timestamp says where it *starts* presenting, not where it ends; only a
-	/// successor's start proves the predecessor cannot run past it. Overestimating keeps a
-	/// group longer, which is the safe direction: we abort only what is provably useless.
-	fn reach(&self, sequence: u64) -> Option<Timestamp> {
-		let index = self.suffix.partition_point(|(seq, _)| *seq <= sequence);
-		self.suffix.get(index).map(|(_, timestamp)| *timestamp)
-	}
+	/// The cap the edge was resolved under, so per-candidate reach lookups measure
+	/// against the same servable window.
+	cap: Option<u64>,
 }
 
 /// The newest servable group that has presented at least one frame.
@@ -2942,6 +2928,8 @@ impl PlainSubscriber {
 			return Poll::Ready(Ok(None));
 		};
 		self.next_sequence = group.sequence.saturating_add(1);
+		// Delivery is a cache access, same as the arrival-order path.
+		group.cache_refresh();
 		Poll::Ready(Ok(Some(self.with_expiry(group))))
 	}
 
@@ -4892,6 +4880,24 @@ mod test {
 
 		let mut sub = producer.subscribe(Subscription::default().with_max_age(Duration::from_millis(500)));
 		assert_eq!(drain(&mut sub), vec![1, 2]);
+	}
+
+	/// An unstamped immediate successor leaves a group's reach unbounded: a later
+	/// stamped group proves nothing about where the successor will begin, and
+	/// shrinking the bound is the unsafe direction.
+	#[tokio::test]
+	async fn an_unstamped_immediate_successor_leaves_reach_unbounded() {
+		let mut producer = track_producer("test", None);
+		let mut subscriber = producer.subscribe(None);
+
+		append_at(&mut producer, 0); // seq 0
+		producer.append_group().unwrap(); // seq 1 stalls before its first frame
+		append_at(&mut producer, 10_000); // seq 2
+
+		// Group 1's reach is group 2's start, a full edge behind: stale at zero budget.
+		// Group 0's reach is unknown until group 1 presents its first frame, so it is
+		// kept rather than convicted on a bound that could shrink the wrong way.
+		assert_eq!(drain(&mut subscriber), vec![0, 2]);
 	}
 
 	/// Reach is the *immediate* successor's start, never a minimum across later groups.
