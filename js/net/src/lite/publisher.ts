@@ -25,7 +25,7 @@ import {
 	SubscribeUpdate,
 } from "./subscribe.ts";
 import { TrackInfo as TrackInfoMessage, type Track as TrackMessage } from "./track.ts";
-import { hasAnnounceId, hasAnnounceOk, hasDatagrams, hasProbeRtt, Version } from "./version.ts";
+import { hasAnnounceId, hasAnnounceOk, hasDatagrams, hasProbeRtt, resolvesStart, Version } from "./version.ts";
 
 const PROBE_INTERVAL = 100; // ms
 const PROBE_MAX_AGE = 10_000; // ms
@@ -270,8 +270,31 @@ function waitForSubscription(controls: SubscriptionControls, subscriber: track.S
  * and leave enforcement to the receiver, as the IETF path does for the same reason.
  */
 function servingMaxAge(version: Version, requested: number | undefined): number {
-	const carriesMaxAge = version !== Version.DRAFT_01 && version !== Version.DRAFT_02;
-	return carriesMaxAge ? (requested ?? 0) : Number.MAX_SAFE_INTEGER;
+	return carriesMaxAge(version) ? (requested ?? 0) : Number.MAX_SAFE_INTEGER;
+}
+
+/** Whether this version's SUBSCRIBE carries Subscriber Max Age at all. */
+function carriesMaxAge(version: Version): boolean {
+	return version !== Version.DRAFT_01 && version !== Version.DRAFT_02;
+}
+
+/**
+ * Position a subscription's read cursor for the wire serving it.
+ *
+ * On lite-06 there is nothing to do: the cursor is floored at the group the subscription
+ * named (or 0), and its Max Age decides what above the floor is worth delivering.
+ *
+ * Pre-06 wires are the exception: their drafts define an absent `Group Start` as the
+ * latest group, so say so explicitly rather than letting the budget reach back. Lite-03/04/05
+ * carry a Max Age, but there it is a staleness tolerance only; lite-01/02 additionally get
+ * an unbounded budget so nothing is dropped under them (see {@link servingMaxAge}), which
+ * must not read as a request to replay the whole cache on join.
+ */
+function positionCursor(track: track.Subscriber, version: Version, startGroup: number | undefined) {
+	if (resolvesStart(version) || startGroup !== undefined) return;
+
+	const latest = track.latest();
+	if (latest !== undefined) track.startAt(latest);
 }
 
 /**
@@ -470,8 +493,7 @@ export class Publisher {
 			startGroup: msg.startGroup,
 			endGroup: msg.endGroup,
 		});
-		const startGroup = msg.startGroup ?? track.latest();
-		if (startGroup !== undefined) track.startAt(startGroup);
+		positionCursor(track, this.version, msg.startGroup);
 		track.endAt(msg.endGroup);
 
 		// The best-effort datagram loop, started once serving begins. It parks when the

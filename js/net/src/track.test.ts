@@ -368,6 +368,70 @@ test("latency budget admits groups within its presentation-time window", async (
 	expect((await track.recvGroup())?.sequence).toBe(2);
 });
 
+test("a late lower group within the budget is delivered", async () => {
+	const producer = new TrackProducer("test").accept({ maxAge: 30_000 });
+	for (const [sequence, timestamp] of [
+		[5, 0],
+		[6, 1000],
+		[7, 2000],
+	]) {
+		const group = new GroupProducer(sequence);
+		producer.writeGroup(group);
+		group.writeFrame({ payload: enc.encode(`${timestamp}`), timestamp: Timestamp.fromMillis(timestamp) });
+		group.close();
+	}
+
+	const track = producer.subscribe({ maxAge: 5000 });
+	expect((await track.recvGroup())?.sequence).toBe(5);
+	expect((await track.recvGroup())?.sequence).toBe(6);
+	expect((await track.recvGroup())?.sequence).toBe(7);
+
+	// Arriving below everything already delivered is not what makes content stale: the
+	// budget is the only gate, and this straggler's timestamp is within it. A consumer
+	// that needs sequence order reorders (or drops) it itself.
+	const late = new GroupProducer(4);
+	producer.writeGroup(late);
+	late.writeFrame({ payload: enc.encode("late"), timestamp: Timestamp.fromMillis(500) });
+	late.close();
+
+	expect((await track.recvGroup())?.sequence).toBe(4);
+	producer.close();
+	expect(await track.recvGroup()).toBeUndefined();
+});
+
+test("a named start is a floor, not a request", async () => {
+	const producer = new TrackProducer("test").accept({ maxAge: 30_000 });
+	for (const timestamp of [0, 1000, 2000, 3000, 4000]) {
+		producer.writeFrame({ payload: enc.encode(`${timestamp}`), timestamp: Timestamp.fromMillis(timestamp) });
+	}
+
+	// The budget is the only thing that asks for data; a named start only bounds how far
+	// back it may reach.
+	const floored = producer.subscribe({ startGroup: 3, maxAge: 60_000 });
+	expect((await floored.recvGroup())?.sequence).toBe(3);
+	expect((await floored.recvGroup())?.sequence).toBe(4);
+
+	// Naming group 1 at real time still delivers the live edge alone: the zero budget
+	// calls everything older stale.
+	const named = producer.subscribe({ startGroup: 1 });
+	expect((await named.recvGroup())?.sequence).toBe(4);
+});
+
+test("the budget is clamped to the publisher's window", async () => {
+	const producer = new TrackProducer("test").accept({ maxAge: 1500 });
+	const track = producer.subscribe({ maxAge: 60_000 });
+
+	// Spaced so group 0's reach (2s) sits 2s behind the edge (4s): outside the
+	// publisher's 1.5s window, inside the subscriber's requested minute.
+	for (const timestamp of [0, 2000, 4000]) {
+		producer.writeFrame({ payload: enc.encode(`${timestamp}`), timestamp: Timestamp.fromMillis(timestamp) });
+	}
+
+	// Asking to tolerate a minute cannot reach back further than the publisher keeps a group
+	// live, the same clamp delivery applies.
+	expect((await track.recvGroup())?.sequence).toBe(1);
+});
+
 test("wall-clock age expires a group stalled before its first frame", async () => {
 	const clock = mockMonotonicTime(10_000);
 	try {

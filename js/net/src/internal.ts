@@ -77,8 +77,12 @@ export const hooks: {
 	tryRecvGroup: (subscriber: Subscriber) => Recv;
 	/** Wake once a subscriber's group cursor may read differently; assigned by `track.ts`. */
 	groupChanged: (subscriber: Subscriber, fn: () => void) => Dispose;
-	/** Disable subscription drift filtering for a one-shot FETCH scan. */
-	ignoreLatency: (subscriber: Subscriber) => void;
+	/**
+	 * Exempt a subscriber from live-delivery policy for a one-shot FETCH scan: it names one
+	 * old group explicitly, so it is neither late against the live edge nor bound by the start
+	 * a live subscription resolves to.
+	 */
+	exemptFetch: (subscriber: Subscriber) => void;
 	/** Return a group's first timestamp, retained even after its first frame is read. */
 	groupTimestamp: (group: GroupConsumer) => Timestamp | undefined;
 	groupLatest: (group: GroupConsumer) => Timestamp | undefined;
@@ -103,7 +107,7 @@ export const hooks: {
 	groupChanged: () => {
 		throw new Error("track.ts not loaded");
 	},
-	ignoreLatency: () => {
+	exemptFetch: () => {
 		throw new Error("track.ts not loaded");
 	},
 	groupTimestamp: () => {
