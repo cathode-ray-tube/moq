@@ -4303,6 +4303,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kio"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36d64d03bab237df643a5013adcf07764e4bd3265117e4c4f69e856d37928e69"
+dependencies = [
+ "loom",
+ "smallvec",
+]
+
+[[package]]
 name = "kqueue"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4763,7 +4773,7 @@ dependencies = [
  "bytes",
  "getrandom 0.4.3",
  "hang",
- "kio",
+ "kio 0.5.6",
  "moq-audio",
  "moq-json",
  "moq-mux",
@@ -4817,7 +4827,7 @@ dependencies = [
  "bytes",
  "hang",
  "humantime",
- "kio",
+ "kio 0.5.6",
  "m3u8-rs",
  "moq-mux",
  "moq-net",
@@ -4839,7 +4849,7 @@ dependencies = [
  "bytes",
  "criterion",
  "json-patch",
- "kio",
+ "kio 0.5.6",
  "moq-flate",
  "moq-net",
  "serde",
@@ -4877,7 +4887,7 @@ dependencies = [
  "futures",
  "h264-parser",
  "hang",
- "kio",
+ "kio 0.5.6",
  "memchr",
  "moq-json",
  "moq-loc",
@@ -4913,7 +4923,7 @@ dependencies = [
  "criterion",
  "futures",
  "getrandom 0.4.3",
- "kio",
+ "kio 0.5.6",
  "loom",
  "moq-net",
  "num_enum",
@@ -5165,7 +5175,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "hang",
- "kio",
+ "kio 0.5.6",
  "moq-mux",
  "moq-net",
  "moq-tokio",
@@ -5187,7 +5197,7 @@ dependencies = [
  "criterion",
  "http",
  "io-uring",
- "kio",
+ "kio 0.5.6",
  "libc",
  "moq-net",
  "moq-sock",
@@ -10590,7 +10600,7 @@ dependencies = [
  "bytes",
  "http",
  "iroh",
- "kio",
+ "kio 0.5.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "n0-error",
  "n0-future",
  "tokio",
@@ -10609,7 +10619,7 @@ dependencies = [
  "bytes",
  "futures",
  "http",
- "kio",
+ "kio 0.5.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "noq",
  "rustls",
  "rustls-native-certs",
@@ -10646,7 +10656,7 @@ dependencies = [
  "flume",
  "futures",
  "http",
- "kio",
+ "kio 0.5.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustls-pki-types",
  "thiserror 2.0.20",
  "tokio",
@@ -10666,7 +10676,7 @@ dependencies = [
  "bytes",
  "futures",
  "http",
- "kio",
+ "kio 0.5.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "quinn",
  "rustls",
  "rustls-native-certs",
