@@ -24,6 +24,32 @@ let
     filter = filterCargoSources;
   };
 
+  # The root manifest's `[patch.crates-io]` points `kio` at the workspace copy,
+  # because the published kio and this one share version 0.5.6 with diverged
+  # contents. That patch applies to THIRD-PARTY crates too: the vendored
+  # web-transport-quinn and web-transport-iroh resolve `kio` to rs/kio rather
+  # than to the registry.
+  #
+  # crane's dependency-only build replaces every workspace member with a stub, so
+  # those vendored crates end up compiling against an empty kio and fail on the
+  # `Park`/`Waiter`/`wait` they expect. Cargo is unaffected -- it never stubs
+  # anything -- which is why `cargo build` succeeds while `nix build` does not.
+  #
+  # Restore the real kio in the dummy tree. It is a leaf crate with no build
+  # script, so the dependency cache still keys on every other member's stub and
+  # only rebuilds when kio itself changes.
+  kioSource = final.lib.cleanSourceWith {
+    src = ../rs/kio;
+    name = "kio-source";
+    filter = filterCargoSources;
+  };
+  restoreRealKio = ''
+    rm -rf "$out/rs/kio/src"
+    cp -R ${kioSource}/src "$out/rs/kio/src"
+  '';
+  # Every package below vendors the same workspace, so they all need it.
+  withRealKio = args: args // { extraDummyScript = restoreRealKio; };
+
   moqRelayArgs = crateInfo ../rs/moq-relay/Cargo.toml // {
     src = cleanCargoSource;
     cargoExtraArgs = "-p moq-relay --features jemalloc";
@@ -69,7 +95,7 @@ let
     # The crate is `moq-token-cli`, but its `[[bin]]` ships as `moq-token`.
     meta.mainProgram = "moq-token";
   };
-  moqTokenPackage = craneLib.buildPackage moqTokenCliArgs;
+  moqTokenPackage = craneLib.buildPackage (withRealKio moqTokenCliArgs);
 
   moqBenchArgs = crateInfo ../rs/moq-bench/Cargo.toml // {
     src = cleanCargoSource;
@@ -267,37 +293,39 @@ let
   # Release artifacts still build via crane `buildPackage` below.
 in
 {
-  moq-relay = craneLib.buildPackage moqRelayArgs;
+  moq-relay = craneLib.buildPackage (withRealKio moqRelayArgs);
 
-  moq-cli = craneLib.buildPackage moqCliArgs;
+  moq-cli = craneLib.buildPackage (withRealKio moqCliArgs);
 
-  moq-bench = craneLib.buildPackage moqBenchArgs;
+  moq-bench = craneLib.buildPackage (withRealKio moqBenchArgs);
 
   moq-token = moqTokenPackage;
   moq-token-cli = moqTokenPackage;
 
   moq-boy = craneLib.buildPackage (
-    crateInfo ../rs/moq-boy/Cargo.toml
-    // {
-      src = cleanCargoSource;
-      cargoExtraArgs = "-p moq-boy --features jemalloc";
-      nativeBuildInputs = with final; [
-        pkg-config
-        clang
-      ];
-      buildInputs = with final; [ ffmpeg ];
-      LIBCLANG_PATH = "${final.libclang.lib}/lib";
-      # Enable frame pointers for profiling support (negligible overhead on x86_64).
-      RUSTFLAGS = "-C force-frame-pointers=yes";
-      # jemalloc's configure uses -O0 test builds, which conflict with
-      # Nix's _FORTIFY_SOURCE hardening (requires -O).
-      hardeningDisable = [ "fortify" ];
-    }
+    withRealKio (
+      crateInfo ../rs/moq-boy/Cargo.toml
+      // {
+        src = cleanCargoSource;
+        cargoExtraArgs = "-p moq-boy --features jemalloc";
+        nativeBuildInputs = with final; [
+          pkg-config
+          clang
+        ];
+        buildInputs = with final; [ ffmpeg ];
+        LIBCLANG_PATH = "${final.libclang.lib}/lib";
+        # Enable frame pointers for profiling support (negligible overhead on x86_64).
+        RUSTFLAGS = "-C force-frame-pointers=yes";
+        # jemalloc's configure uses -O0 test builds, which conflict with
+        # Nix's _FORTIFY_SOURCE hardening (requires -O).
+        hardeningDisable = [ "fortify" ];
+      }
+    )
   );
 
-  libmoq = craneLib.buildPackage libmoqArgs;
+  libmoq = craneLib.buildPackage (withRealKio libmoqArgs);
 
-  moq-gst-plugin = craneLib.buildPackage moqGstPluginArgs;
+  moq-gst-plugin = craneLib.buildPackage (withRealKio moqGstPluginArgs);
 
   # User-facing flake output. Bundles the plugin with wrapped gstreamer
   # tools so a single `nix shell .#moq-gst` gives you gst-inspect-1.0 /
