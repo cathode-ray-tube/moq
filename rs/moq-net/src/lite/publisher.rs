@@ -108,6 +108,27 @@ fn serving_max_age(version: Version, requested: Duration) -> Duration {
 	}
 }
 
+/// Position a subscription's read cursor for the wire serving it.
+///
+/// On lite-06 there is nothing to do: `Consumer::subscribe` resolves the cursor from the
+/// subscription itself, at the oldest group its own Max Age still considers fresh, floored
+/// at the group it named.
+///
+/// Pre-06 wires are the exception: their drafts define an absent `Group Start` as the
+/// latest group, so say so explicitly rather than letting the budget reach back. Lite03-05
+/// carry a Max Age, but there it is a staleness tolerance only; Lite01/02 additionally get
+/// an unbounded budget so nothing is dropped under them (see [`serving_max_age`]), which
+/// must not read as a request to replay the whole cache on join.
+fn position_cursor(track: &mut track::Subscriber, version: Version, start_group: Option<u64>) {
+	if version.resolves_start() || start_group.is_some() {
+		return;
+	}
+
+	if let Some(latest) = track.latest() {
+		track.start_at(latest);
+	}
+}
+
 impl<S: crate::transport::poll::Session> Shared<S> {
 	/// The origin to resolve a peer-requested broadcast from: excludes routes
 	/// through the peer, so a subscription is never served data that flowed
@@ -1759,6 +1780,62 @@ mod test {
 		track::Producer::new(Arc::new(broadcast::Info::default()), name, None)
 	}
 
+	/// A pre-06 wire is served from the live edge when it names no start: those drafts
+	/// define an absent `Group Start` as the latest group, and Lite01/02 additionally get
+	/// an unbounded budget (so nothing is dropped under them) that must not read as a
+	/// request to replay the whole cache.
+	#[test]
+	fn a_pre06_wire_is_pinned_to_the_live_edge() {
+		use futures::FutureExt;
+
+		let mut producer = track_producer("test");
+		for second in 0..3 {
+			let mut group = producer.append_group().unwrap();
+			group
+				.write_frame(Timestamp::from_millis(second * 1000).unwrap(), b"x".to_vec())
+				.unwrap();
+			group.finish().unwrap();
+		}
+
+		// What run_subscribe hands the model for a peer that sent no budget at all.
+		let served = |version| {
+			producer.subscribe(
+				track::Subscription::default().with_max_age(serving_max_age(version, std::time::Duration::ZERO)),
+			)
+		};
+		let drain = |subscriber: &mut track::Subscriber| {
+			let mut sequences = Vec::new();
+			while let Some(Ok(Some(group))) = subscriber.recv_group().now_or_never() {
+				sequences.push(group.sequence);
+			}
+			sequences
+		};
+
+		let mut unpinned = served(Version::Lite01);
+		assert_eq!(
+			drain(&mut unpinned),
+			vec![0, 1, 2],
+			"the unbounded budget alone resolves to the whole cache"
+		);
+
+		let mut legacy = served(Version::Lite01);
+		position_cursor(&mut legacy, Version::Lite01, None);
+		assert_eq!(drain(&mut legacy), vec![2]);
+
+		// Lite03-05 declare a budget, but their drafts define it as a staleness tolerance
+		// and an absent start as the latest group, so they are pinned all the same.
+		let mut tolerant =
+			producer.subscribe(track::Subscription::default().with_max_age(std::time::Duration::from_secs(5)));
+		position_cursor(&mut tolerant, Version::Lite05, None);
+		assert_eq!(drain(&mut tolerant), vec![2]);
+
+		// On lite-06 the declared budget is what resolves the start, so it stands.
+		let mut declared =
+			producer.subscribe(track::Subscription::default().with_max_age(std::time::Duration::from_secs(5)));
+		position_cursor(&mut declared, Version::Lite06Wip, None);
+		assert_eq!(drain(&mut declared), vec![0, 1, 2]);
+	}
+
 	/// The run_track contract behind SUBSCRIBE_OK's implicit drop: once the first
 	/// served group resolves the start, the cursor floor rises to it, so a lower
 	/// group arriving late (unordered delivery) is never served after the range
@@ -2863,10 +2940,7 @@ impl<S: crate::transport::poll::Session> TrackRun<S> {
 		bounds: Bounds,
 		track_priority_tx: kio::Producer<u8>,
 	) -> Self {
-		// Start the consumer at the specified sequence, otherwise start at the latest group.
-		if let Some(start_group) = bounds.start_group.or_else(|| track.latest()) {
-			track.start_at(start_group);
-		}
+		position_cursor(&mut track, ctx.version, bounds.start_group);
 
 		// Apply the initial cap from the original Subscribe. Subsequent updates
 		// flow through the SUBSCRIBE_UPDATE arm below.

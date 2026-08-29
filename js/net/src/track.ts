@@ -90,7 +90,14 @@ export interface Subscription {
 	ordered?: boolean;
 	/** Maximum age (milliseconds) of a non-latest group before it is skipped. Defaults to `0`. */
 	maxAge?: number;
-	/** First group the publisher should deliver, or omit to start at the latest group. */
+	/**
+	 * The lowest group the publisher may deliver (a floor), or omit for none.
+	 *
+	 * A floor, not a request: only {@link maxAge} asks for data, and the floor bounds how
+	 * far back it may reach. Omitting it and a floor of 0 mean the same thing, and a floor
+	 * above the live edge simply waits there (a resumed subscription naming where it left
+	 * off).
+	 */
 	startGroup?: number;
 	/** Last group the publisher should deliver (inclusive), or omit for no end. */
 	endGroup?: number;
@@ -123,11 +130,12 @@ function combineSubscriptions(states: Iterable<TrackState>): Subscription | unde
 		combined.ordered = (combined.ordered ?? false) && (subscription.ordered ?? false);
 		combined.maxAge = Math.max(combined.maxAge ?? 0, subscription.maxAge ?? 0);
 
-		if (subscription.startGroup !== undefined) {
-			combined.startGroup =
-				combined.startGroup === undefined
-					? subscription.startGroup
-					: Math.min(combined.startGroup, subscription.startGroup);
+		// A floor only restricts, so a subscriber without one clears the aggregate:
+		// its budget may reach below any floor the others set.
+		if (combined.startGroup === undefined || subscription.startGroup === undefined) {
+			combined.startGroup = undefined;
+		} else {
+			combined.startGroup = Math.min(combined.startGroup, subscription.startGroup);
 		}
 
 		if (combined.endGroup === undefined || subscription.endGroup === undefined) {
@@ -224,7 +232,14 @@ export class Consumer {
 		this.#broadcast = broadcast;
 	}
 
-	/** Open a live subscription to the track. */
+	/**
+	 * Open a live subscription to the track.
+	 *
+	 * The cursor starts at the group the subscription named (its floor), or 0.
+	 * {@link Subscription.maxAge} is what asks for data: delivery skips everything above
+	 * the floor that the budget convicts, so the default budget of zero delivers only the
+	 * latest group and a larger one reaches back over what it can still use.
+	 */
 	subscribe(options?: Subscription): Subscriber {
 		return this.#broadcast.subscribe(this.name, options);
 	}
@@ -394,7 +409,14 @@ export class Producer {
 		return this;
 	}
 
-	/** An independent {@link Subscriber} receiving a full copy of this track's groups. */
+	/**
+	 * An independent {@link Subscriber} reading this track's groups.
+	 *
+	 * Its cursor starts at the group the subscription named (its floor), or 0.
+	 * {@link Subscription.maxAge} is what asks for data: delivery skips everything above
+	 * the floor that the budget convicts, so the default budget of zero delivers only the
+	 * latest group and a larger one reaches back over what it can still use.
+	 */
 	subscribe(options: Subscription = {}): Subscriber {
 		const sink = new TrackState(options);
 		this.#addSink(sink);
@@ -775,13 +797,17 @@ export class Subscriber {
 	private constructor(name: string, state: TrackState) {
 		this.name = name;
 		this.#state = state;
+		// The cursor's floor is the group the subscription named, or 0. A floor is the
+		// only thing a start contributes; {@link Subscription.maxAge} is what asks for
+		// data, and delivery skips everything above the floor that the budget convicts.
+		this.#cursor.set({ start: state.update.peek()?.startGroup ?? 0 });
 	}
 
 	static {
 		makeSubscriber = (name, state) => new Subscriber(name, state);
 		hooks.tryRecvGroup = (subscriber) => subscriber.#tryRecvGroup();
 		hooks.groupChanged = (subscriber, fn) => subscriber.#groupChanged(fn);
-		hooks.ignoreLatency = (subscriber) => {
+		hooks.exemptFetch = (subscriber) => {
 			subscriber.#enforceLatency = false;
 		};
 	}
