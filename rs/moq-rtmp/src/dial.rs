@@ -580,10 +580,16 @@ mod tests {
 			.expect("catalog track")
 			.subscribe(None)
 			.await
-			.expect("subscribe catalog");
-		let frame = tokio::time::timeout(Duration::from_secs(5), catalog_track.read_frame())
+			.expect("subscribe catalog")
+			.ordered();
+		let mut group = tokio::time::timeout(Duration::from_secs(5), catalog_track.next_group())
 			.await
 			.expect("catalog read timed out")
+			.expect("catalog read")
+			.expect("a catalog group");
+		let frame = group
+			.read_frame()
+			.await
 			.expect("catalog read")
 			.expect("a catalog frame");
 		assert!(!frame.payload.is_empty(), "pulled broadcast should carry a catalog");

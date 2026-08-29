@@ -13,14 +13,14 @@ import type { Config } from "./encoder.ts";
  * directly.
  */
 export class Consumer<T> {
-	#track: Moq.Track.Subscriber;
+	#track: Moq.Track.Ordered;
 	#decoder: Decoder<T>;
 
 	#group?: Moq.Group.Consumer;
 	#framesRead = 0;
 
 	constructor(track: Moq.Track.Subscriber, config: Config<T> = {}) {
-		this.#track = track;
+		this.#track = track.ordered();
 		this.#decoder = new Decoder(config);
 	}
 
@@ -36,6 +36,11 @@ export class Consumer<T> {
 	async next(): Promise<T | undefined> {
 		for (;;) {
 			if (!this.#group) {
+				// Collapse the retained backlog: every group restarts from a full snapshot, so
+				// older groups only hold superseded state. Jump the cursor to the newest
+				// buffered group instead of replaying each one (mirrors the Rust consumer).
+				const latest = this.#track.latest();
+				if (latest !== undefined) this.#track.startAt(latest);
 				// Advance to the next group with a higher sequence number (skipping late arrivals).
 				this.#group = await this.#track.nextGroup();
 				if (!this.#group) return undefined;

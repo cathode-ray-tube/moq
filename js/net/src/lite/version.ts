@@ -168,6 +168,26 @@ export function hasFrameBounds(version: Version): boolean {
 	}
 }
 
+/** Whether SUBSCRIBE, SUBSCRIBE_UPDATE, SUBSCRIBE_OK, and TRACK_INFO carry the retired
+ * `Ordered` byte.
+ *
+ * The field is gone from the model: a publisher transmits newest-first within a track,
+ * always. Deployed drafts still have the byte in their layout, so it is written as 0 and
+ * ignored on read rather than shifting every field behind it. */
+export function hasGroupOrder(version: Version): boolean {
+	// Explicitly list older versions so future versions keep the lite-06+ behavior.
+	switch (version) {
+		case Version.DRAFT_01:
+		case Version.DRAFT_02:
+		case Version.DRAFT_03:
+		case Version.DRAFT_04:
+		case Version.DRAFT_05:
+			return true;
+		default:
+			return false;
+	}
+}
+
 /**
  * Whether SUBSCRIBE's `Group Start` is an absolute floor the publisher resolves a start
  * from: the raw minimum group sequence (default 0), with `Subscriber Max Age` as the only

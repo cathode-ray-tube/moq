@@ -306,8 +306,9 @@ export class Broadcast {
 			});
 			fetchNext = () => consumer.next();
 		} else {
+			const ordered = track.ordered();
 			fetchNext = async () => {
-				const update = await Msf.fetch(track);
+				const update = await Msf.fetch(ordered);
 				return update ? toHang(update) : undefined;
 			};
 		}

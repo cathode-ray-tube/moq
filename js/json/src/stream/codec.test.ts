@@ -103,7 +103,7 @@ test("a record JSON cannot represent is rejected", () => {
 // into it and wait there even though nothing was ever appended.
 test("a rejected record does not open a group", async () => {
 	const track = new Track.Producer("test");
-	const subscriber = track.subscribe();
+	const subscriber = track.subscribe().ordered();
 	const producer = new Producer<unknown>(track);
 
 	expect(() => producer.append(undefined)).toThrow("not representable as JSON");

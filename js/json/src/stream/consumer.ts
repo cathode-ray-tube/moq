@@ -10,13 +10,13 @@ import { type ConsumerConfig, Decoder } from "./decoder.ts";
  * {@link Decoder} directly.
  */
 export class Consumer<T> {
-	#track: Moq.Track.Subscriber;
+	#track: Moq.Track.Ordered;
 	#decoder: Decoder<T>;
 
 	#group?: Moq.Group.Consumer;
 
 	constructor(track: Moq.Track.Subscriber, config: ConsumerConfig = {}) {
-		this.#track = track;
+		this.#track = track.ordered();
 		this.#decoder = new Decoder(config);
 	}
 

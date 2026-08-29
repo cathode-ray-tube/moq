@@ -469,8 +469,6 @@ impl Consumer {
 			min_sequence: 0,
 			end_sequence: None,
 			drift_cap: kio::Producer::new(None),
-			stale_stats: Default::default(),
-			reading: None,
 		}
 	}
 
@@ -1234,11 +1232,6 @@ pub struct Subscriber {
 	end_sequence: Option<u64>,
 	/// Shared copy of [`Self::end_sequence`] for groups that outlive this cursor poll.
 	drift_cap: kio::Producer<Option<u64>>,
-	/// Logical subscriber meter for groups drained internally by [`Self::poll_read_frame`].
-	stale_stats: crate::stats::Meter,
-
-	/// The group currently being drained by [`Self::read_frame`].
-	reading: Option<group::Consumer>,
 }
 
 impl Subscriber {
@@ -1247,14 +1240,6 @@ impl Subscriber {
 	fn poll_sync(&mut self, waiter: &kio::Waiter) {
 		self.sync(waiter);
 		self.reap();
-	}
-
-	/// Attribute expiry for the group this frame helper drains internally.
-	pub(crate) fn set_stale_meter(&mut self, meter: crate::stats::Meter) {
-		if let Some(reading) = &mut self.reading {
-			reading.set_stale_meter(meter.clone());
-		}
-		self.stale_stats = meter;
 	}
 
 	/// Reap retired cursors, then bound the live stragglers: a pruned segment's
@@ -1538,6 +1523,116 @@ impl Subscriber {
 		}
 	}
 
+	/// Seek this subscriber's lowest servable group at or above `floor` (bounded by
+	/// `end`, inclusive), without advancing any cursor. The shared engine behind
+	/// [`Self::poll_next_group`] and [`Self::poll_seek_group`].
+	///
+	/// Unlike [`Self::poll_segment`], nothing is discarded for age: the spliced
+	/// sequence path inherits the [`track::Ordered`] contract of bursting a backlog
+	/// instead of skipping it. Nothing is consumed either: each segment is *seeked*
+	/// rather than read, so a candidate a poll does not deliver stays where it was,
+	/// and a cap lowered between polls never strands a group behind a segment cursor
+	/// that had already stepped past it.
+	fn poll_seek(
+		&mut self,
+		floor: u64,
+		end: Option<u64>,
+		waiter: &kio::Waiter,
+	) -> Poll<Result<Option<group::Consumer>>> {
+		self.poll_sync(waiter);
+
+		let mut floor = floor;
+		'retry: loop {
+			let mut all_done = true;
+			let mut best: Option<(usize, group::Consumer)> = None;
+
+			for index in 0..self.segments.len() {
+				if matches!(self.segments[index].sub, SubState::Pending(_))
+					&& Self::poll_activate(
+						&mut self.segments[index],
+						&self.last_prefs,
+						self.min_sequence,
+						end,
+						waiter,
+					)
+					.is_pending()
+				{
+					all_done = false;
+					continue;
+				}
+
+				let seg = &mut self.segments[index];
+				// A boundary behind the floor can never serve this cursor again;
+				// release its inner subscription rather than holding demand open.
+				if seg.last_group().is_some_and(|last| last < floor)
+					&& let SubState::Active(sub) = &mut seg.sub
+				{
+					let count = match sub.poll_finished(waiter) {
+						Poll::Ready(count) => count.ok(),
+						Poll::Pending => None,
+					};
+					seg.complete(count);
+				}
+
+				let cap = min_some(end, seg.last_group());
+				match &mut seg.sub {
+					SubState::Active(sub) => match sub.poll_seek_group(floor, cap, waiter) {
+						Poll::Ready(Ok(Some(group))) => {
+							all_done = false;
+							// Strict, so the earlier segment wins a boundary tie: it
+							// holds the head copy, the one `hand_out` can surface.
+							if best.as_ref().is_none_or(|(_, best)| group.sequence < best.sequence) {
+								best = Some((index, group));
+							}
+						}
+						// The track ran out at or below the floor: the segment drained.
+						Poll::Ready(Ok(None)) => {
+							let count = match sub.poll_finished(waiter) {
+								Poll::Ready(count) => count.ok(),
+								Poll::Pending => None,
+							};
+							seg.complete(count);
+						}
+						// A dead segment stalls the logical track rather than erroring;
+						// the next switch resumes it.
+						Poll::Ready(Err(_)) => seg.complete(None),
+						Poll::Pending => all_done = false,
+					},
+					SubState::Pending(_) => all_done = false,
+					SubState::Done(_) => {}
+				}
+			}
+
+			if let Some((index, group)) = best {
+				let sequence = group.sequence;
+				// A copy continuing a group already handed out splices into it rather
+				// than surfacing again; step past it and look for the next sequence.
+				match self.hand_out(index, group) {
+					Some(group) => return Poll::Ready(Ok(Some(group))),
+					None => {
+						floor = sequence.saturating_add(1);
+						continue 'retry;
+					}
+				}
+			}
+
+			if let Some(err) = &self.abort {
+				return Poll::Ready(Err(err.clone()));
+			}
+			if all_done {
+				if self.finished {
+					return Poll::Ready(Ok(None));
+				}
+				// The producer is gone without finishing: no takeover can ever resume
+				// the drained segments, so report the drop like a plain track would.
+				if self.closed {
+					return Poll::Ready(Err(Error::Dropped));
+				}
+			}
+			return Poll::Pending;
+		}
+	}
+
 	/// Poll for the next group in arrival order across the segments.
 	///
 	/// A group that continues one already returned (a boundary landed inside it) is
@@ -1680,54 +1775,36 @@ impl Subscriber {
 	/// Poll for the next group with a higher sequence than any previously
 	/// returned, skipping late arrivals, across the segments.
 	///
-	/// Unlike [`track::Subscriber`], the arrival-order and sequence-order cursors
-	/// are shared: groups consumed here are also consumed for
-	/// [`Self::poll_recv_group`].
+	/// Mirrors [`track::Ordered`]: segments are seeked rather than read, no group is
+	/// discarded for age, and [`Subscription::max_age`] only bounds how long a
+	/// handed-out group's reads may block. See [`Self::poll_seek`].
 	pub fn poll_next_group(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<group::Consumer>>> {
-		loop {
-			// Snapshot the floor before receiving: `poll_recv_group` advances
-			// `next_sequence` for every group it returns, and a duplicate of the
-			// last returned sequence (a boundary splicing at the delivered edge)
-			// must compare against the floor as it was, or it slips through.
-			let floor = self.next_sequence;
-			match ready!(self.poll_recv_group(waiter))? {
-				Some(group) if group.sequence < floor => continue,
-				res => return Poll::Ready(Ok(res)),
-			}
-		}
+		let floor = self.next_sequence.max(self.min_sequence);
+		let Some(group) = ready!(self.poll_seek(floor, self.end_sequence, waiter))? else {
+			return Poll::Ready(Ok(None));
+		};
+		self.next_sequence = self.next_sequence.max(group.sequence.saturating_add(1));
+		Poll::Ready(Ok(Some(group)))
 	}
 
-	/// Poll for a single full frame from the next group in sequence order,
-	/// skipping the rest of the group. Intended for single-frame groups.
-	pub fn poll_read_frame(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<frame::Frame>>> {
-		loop {
-			if let Some(group) = &mut self.reading {
-				match group.poll_read_frame(waiter) {
-					Poll::Ready(Ok(Some(frame))) => {
-						self.reading = None;
-						return Poll::Ready(Ok(Some(frame)));
-					}
-					// An empty or broken group is skipped like a gap.
-					Poll::Ready(_) => self.reading = None,
-					Poll::Pending => return Poll::Pending,
-				}
-				continue;
-			}
-
-			match ready!(self.poll_next_group(waiter))? {
-				Some(mut group) => {
-					group.set_stale_meter(self.stale_stats.clone());
-					self.reading = Some(group);
-				}
-				None => return Poll::Ready(Ok(None)),
-			}
-		}
+	/// Seek the lowest servable group at or above `floor` (bounded by `end`) without
+	/// advancing this subscriber's own cursor: the nested-splice counterpart of
+	/// [`track::Subscriber::poll_seek_group`].
+	pub(crate) fn poll_seek_group(
+		&mut self,
+		floor: u64,
+		end: Option<u64>,
+		waiter: &kio::Waiter,
+	) -> Poll<Result<Option<group::Consumer>>> {
+		let floor = floor.max(self.min_sequence);
+		let end = min_some(end, self.end_sequence);
+		self.poll_seek(floor, end, waiter)
 	}
 
-	/// Read a single full frame from the next group in sequence order.
+	/// Return the next group with a higher sequence than any previously returned.
 	#[cfg(test)]
-	pub async fn read_frame(&mut self) -> Result<Option<frame::Frame>> {
-		kio::wait(|waiter| self.poll_read_frame(waiter)).await
+	pub async fn next_group(&mut self) -> Result<Option<group::Consumer>> {
+		kio::wait(|waiter| self.poll_next_group(waiter)).await
 	}
 
 	/// Poll for the next datagram, from the newest segment only (datagrams are a
@@ -2274,7 +2351,7 @@ mod test {
 	}
 
 	#[tokio::test]
-	async fn read_frame_across_segments() {
+	async fn next_group_across_segments() {
 		let (mut track_a, consumer_a) = track_pair("a");
 		let (mut track_b, consumer_b) = track_pair("b");
 
@@ -2286,10 +2363,13 @@ mod test {
 		producer.switch(&consumer_b, Position::group(1)).unwrap();
 		write_group(&mut track_b, 1, "b1");
 
-		let frame = sub.read_frame().now_or_never().unwrap().unwrap().unwrap();
-		assert_eq!(&frame.payload[..], b"a0");
-		let frame = sub.read_frame().now_or_never().unwrap().unwrap().unwrap();
-		assert_eq!(&frame.payload[..], b"b1");
+		let mut read = |expected: &[u8]| {
+			let mut group = sub.next_group().now_or_never().unwrap().unwrap().unwrap();
+			let frame = group.read_frame().now_or_never().unwrap().unwrap().unwrap();
+			assert_eq!(&frame.payload[..], expected);
+		};
+		read(b"a0");
+		read(b"b1");
 	}
 
 	#[tokio::test]
@@ -2518,6 +2598,153 @@ mod test {
 		write_group(&mut track_b, 1, "b1");
 		write_group(&mut track_b, 2, "b2");
 		assert_eq!(next(&mut sub), 2);
+	}
+
+	/// A beyond-cap group arriving (and being polled) before an in-range one must not
+	/// advance the sequence cursor past the late arrival: the inner cursor is capped,
+	/// so the reordered burst is delivered in order once the cap admits each group.
+	#[tokio::test]
+	async fn next_group_cap_holds_a_reordered_group_without_losing_late_arrivals() {
+		let (mut track_a, consumer_a) = track_pair("a");
+		let mut producer = Producer::new();
+		producer.switch(&consumer_a, None).unwrap();
+		let mut sub = producer.consume().subscribe(replay());
+
+		let next = |sub: &mut Subscriber| {
+			kio::wait(|waiter| sub.poll_next_group(waiter))
+				.now_or_never()
+				.expect("should not block")
+				.expect("should not error")
+				.expect("should not be finished")
+				.sequence
+		};
+		let next_pending = |sub: &mut Subscriber| {
+			assert!(
+				kio::wait(|waiter| sub.poll_next_group(waiter)).now_or_never().is_none(),
+				"should have blocked"
+			);
+		};
+
+		sub.end_at(1);
+
+		// The beyond-cap group arrives first and is polled: it must hold, not advance
+		// the cursor past the in-range groups still on their way.
+		write_group(&mut track_a, 2, "a2");
+		next_pending(&mut sub);
+
+		write_group(&mut track_a, 0, "a0");
+		write_group(&mut track_a, 1, "a1");
+		assert_eq!(next(&mut sub), 0);
+		assert_eq!(next(&mut sub), 1);
+		next_pending(&mut sub);
+
+		// Raising the cap admits the held group.
+		sub.end_at(2);
+		assert_eq!(next(&mut sub), 2);
+	}
+
+	/// Lowering the cap after the cursor already considered (but did not deliver) a
+	/// higher group must not strand a late in-range arrival: seeking consumes
+	/// nothing, so no segment cursor ever steps past an undelivered sequence.
+	#[tokio::test]
+	async fn next_group_cap_lowering_after_a_lookahead_keeps_late_arrivals() {
+		let (mut track_a, consumer_a) = track_pair("a");
+		let (mut track_b, consumer_b) = track_pair("b");
+		let mut producer = Producer::new();
+		producer.switch(&consumer_a, None).unwrap();
+		producer.switch(&consumer_b, Position::group(1)).unwrap();
+		let mut sub = producer.consume().subscribe(replay());
+
+		let next = |sub: &mut Subscriber| {
+			kio::wait(|waiter| sub.poll_next_group(waiter))
+				.now_or_never()
+				.expect("should not block")
+				.expect("should not error")
+				.expect("should not be finished")
+				.sequence
+		};
+		let next_pending = |sub: &mut Subscriber| {
+			assert!(
+				kio::wait(|waiter| sub.poll_next_group(waiter)).now_or_never().is_none(),
+				"should have blocked"
+			);
+		};
+
+		// The new segment's group 2 arrives early, and the old segment delivers 0.
+		write_group(&mut track_b, 2, "b2");
+		write_group(&mut track_a, 0, "a0");
+		assert_eq!(next(&mut sub), 0);
+
+		// Cap below the group the cursor could already see. It must hold, not have
+		// committed the segment past the still-missing group 1.
+		sub.end_at(1);
+		next_pending(&mut sub);
+
+		write_group(&mut track_b, 1, "b1");
+		assert_eq!(next(&mut sub), 1);
+		next_pending(&mut sub);
+
+		sub.end_at(None);
+		assert_eq!(next(&mut sub), 2);
+	}
+
+	/// The spliced sequence path inherits the [`track::Ordered`] contract: a backlog
+	/// the drift budget would discard on the arrival path is still delivered whole,
+	/// in order, exactly as a plain track's sequence cursor delivers it.
+	#[tokio::test]
+	async fn next_group_bursts_a_stale_backlog_like_a_plain_track() {
+		// Groups spaced 10s apart on the media timeline, so with the default (zero)
+		// max age budget every group behind the newest one's reach is stale.
+		let stamp = |sequence: u64| Duration::from_secs(10 * sequence);
+
+		// Plain baseline: the same content through `track::Ordered`.
+		let (mut plain, _plain_consumer) = track_pair("plain");
+		for sequence in 0..4 {
+			write_group_at(&mut plain, sequence, "data", stamp(sequence));
+		}
+		let mut plain_ordered = plain.subscribe(None).ordered();
+		let baseline: Vec<u64> = std::iter::from_fn(|| {
+			plain_ordered
+				.next_group()
+				.now_or_never()?
+				.expect("should not error")
+				.map(|group| group.sequence)
+		})
+		.collect();
+		assert_eq!(baseline, vec![0, 1, 2, 3], "a plain sequence cursor bursts the backlog");
+
+		// The arrival path on the same content discards the backlog instead.
+		let mut arrival = plain.subscribe(None);
+		assert_eq!(
+			arrival.recv_group().now_or_never().unwrap().unwrap().unwrap().sequence,
+			3,
+			"the arrival path skips straight to the live edge"
+		);
+
+		// Spliced: the same backlog split across a takeover boundary.
+		let (mut track_a, consumer_a) = track_pair("a");
+		let (mut track_b, consumer_b) = track_pair("b");
+		let mut producer = Producer::new();
+		producer.switch(&consumer_a, None).unwrap();
+		producer.switch(&consumer_b, Position::group(2)).unwrap();
+		let mut sub = producer.consume().subscribe(None);
+
+		write_group_at(&mut track_a, 0, "a0", stamp(0));
+		write_group_at(&mut track_a, 1, "a1", stamp(1));
+		write_group_at(&mut track_b, 2, "b2", stamp(2));
+		write_group_at(&mut track_b, 3, "b3", stamp(3));
+
+		let spliced: Vec<u64> = std::iter::from_fn(|| {
+			kio::wait(|waiter| sub.poll_next_group(waiter))
+				.now_or_never()?
+				.expect("should not error")
+				.map(|group| group.sequence)
+		})
+		.collect();
+		assert_eq!(
+			spliced, baseline,
+			"spliced and plain sequence cursors deliver the same backlog"
+		);
 	}
 
 	#[tokio::test]

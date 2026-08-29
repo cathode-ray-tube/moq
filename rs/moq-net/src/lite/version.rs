@@ -138,6 +138,19 @@ impl Version {
 		}
 	}
 
+	/// Whether this version's SUBSCRIBE, SUBSCRIBE_UPDATE, SUBSCRIBE_OK, and TRACK_INFO
+	/// carry the retired `Ordered` byte.
+	///
+	/// The field is gone from the model: a publisher transmits newest-first within a
+	/// track, always. Deployed drafts still have the byte in their layout, so it is
+	/// written as 0 and ignored on read rather than shifting every field behind it.
+	pub(crate) fn has_group_order(self) -> bool {
+		match self {
+			Self::Lite01 | Self::Lite02 | Self::Lite03 | Self::Lite04 | Self::Lite05 => true,
+			Self::Lite06Wip => false,
+		}
+	}
+
 	/// Whether SUBSCRIBE's `Group Start` is an absolute floor the publisher resolves a
 	/// start from: the raw minimum group sequence (default 0), with `Subscriber Max Age`
 	/// as the only gate on how far back delivery begins. Changed in lite-06.

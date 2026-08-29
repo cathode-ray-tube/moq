@@ -64,14 +64,13 @@ async function encodeMessage(
 	return concat(written);
 }
 
-test("SubscribeOk round-trips priority/ordered/groups on draft-04", async () => {
+test("SubscribeOk round-trips priority/groups on draft-04", async () => {
 	const got = await responseRoundtrip(Version.DRAFT_04, {
-		ok: new SubscribeOk({ priority: 7, ordered: true, maxAge: 250, startGroup: 3 }),
+		ok: new SubscribeOk({ priority: 7, maxAge: 250, startGroup: 3 }),
 	});
 	expect("ok" in got).toBe(true);
 	if (!("ok" in got)) throw new Error("expected ok");
 	expect(got.ok.priority).toBe(7);
-	expect(got.ok.ordered).toBe(true);
 	expect(got.ok.startGroup).toBe(3);
 });
 
@@ -81,7 +80,6 @@ test("Subscribe round-trips every option including startGroup 0", async () => {
 		broadcast: Path.from("test"),
 		track: "video",
 		priority: 7,
-		ordered: true,
 		maxAge: 250,
 		startGroup: 0,
 		endGroup: 9,
@@ -93,7 +91,6 @@ test("Subscribe round-trips every option including startGroup 0", async () => {
 		Version.DRAFT_06,
 	);
 	expect(got.priority).toBe(7);
-	expect(got.ordered).toBe(true);
 	expect(got.maxAge).toBe(250);
 	expect(got.startGroup).toBeUndefined();
 	expect(got.endGroup).toBe(9);
@@ -122,7 +119,6 @@ test("Subscribe round-trips every option including startGroup 0", async () => {
 test("SubscribeUpdate round-trips every option including startGroup 0", async () => {
 	const message = new SubscribeUpdate({
 		priority: 8,
-		ordered: true,
 		maxAge: 500,
 		startGroup: 0,
 		endGroup: 12,
@@ -132,7 +128,6 @@ test("SubscribeUpdate round-trips every option including startGroup 0", async ()
 		Version.DRAFT_06,
 	);
 	expect(got.priority).toBe(8);
-	expect(got.ordered).toBe(true);
 	expect(got.maxAge).toBe(500);
 	expect(got.startGroup).toBeUndefined();
 	expect(got.endGroup).toBe(12);

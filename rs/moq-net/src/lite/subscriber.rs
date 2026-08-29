@@ -2331,7 +2331,6 @@ struct SubStream<S: crate::transport::poll::Session> {
 	id: u64,
 	/// Original SUBSCRIBE params, echoed in every SUBSCRIBE_UPDATE; refreshed as the
 	/// downstream aggregate changes.
-	ordered: bool,
 	max_age: Duration,
 	start: Option<Position>,
 	priority: u8,
@@ -2515,7 +2514,6 @@ impl<S: crate::transport::poll::Session> TrackServe<S> {
 						// SUBSCRIBE_UPDATE (Lite03+ only; older peers can't carry one).
 						let start_moved = active.start != subscription.start;
 						active.priority = subscription.priority;
-						active.ordered = subscription.ordered;
 						active.max_age = subscription.max_age;
 						active.start = subscription.start;
 						if supports_update {
@@ -2680,7 +2678,6 @@ fn buffer_update<S: crate::transport::poll::Session>(
 	let bounds = WireBounds::new(active.start, end);
 	active.stream.writer.buffer(&lite::SubscribeUpdate {
 		priority: active.priority,
-		ordered: active.ordered,
 		max_age: active.max_age,
 		start_group: bounds.start_group,
 		end_group: bounds.end_group,
@@ -2735,7 +2732,6 @@ impl<S: crate::transport::poll::Session> Establish<S> {
 						broadcast: self.serve.path.as_path(),
 						track: self.serve.name.as_str().into(),
 						priority: self.subscription.priority,
-						ordered: self.subscription.ordered,
 						max_age: self.subscription.max_age,
 						start_group: bounds.start_group,
 						end_group: bounds.end_group,
@@ -2780,7 +2776,6 @@ impl<S: crate::transport::poll::Session> Establish<S> {
 		SubStream {
 			stream,
 			id: self.id,
-			ordered: self.subscription.ordered,
 			max_age: self.subscription.max_age,
 			start: self.subscription.start,
 			priority: self.subscription.priority,
@@ -2955,8 +2950,7 @@ impl<S: crate::transport::poll::Session> TrackInfoFetch<S> {
 					let model = track::Info::default()
 						.with_timescale(info.timescale)
 						.with_max_age(info.max_age)
-						.with_priority(info.priority)
-						.with_ordered(info.ordered);
+						.with_priority(info.priority);
 					return Poll::Ready(Ok(model));
 				}
 			}

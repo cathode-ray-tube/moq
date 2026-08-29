@@ -6,6 +6,7 @@
 //! hands the live subscription over at a group boundary. A downstream consumer
 //! of the cluster origin observes contiguous groups and no unannounce.
 
+use std::collections::BTreeSet;
 use std::net::TcpListener;
 use std::time::Duration;
 
@@ -449,22 +450,20 @@ async fn cluster_diamond_goaway_seamless_failover_inner() {
 	)
 	.await
 	.expect("broadcast announced");
-	// Ordered, because the verification below asserts strict sequence order.
-	// A live (unordered) subscription transmits the newest group first, so a
-	// back-to-back burst legally arrives inverted; `ordered` is the protocol's
-	// way to ask every hop for sequence-order transmission instead.
+	// The age budget is what makes the completeness check below meaningful: this test
+	// asserts every group arrives exactly once, which is more than the default budget
+	// promises. A subscriber that wants completeness across a failover has to say how
+	// far behind the live edge it is willing to sit (clamped to what the publisher
+	// retains).
 	//
-	// The latency budget is the other half of that ask: this test asserts every group
-	// arrives exactly once, which is more than the default REAL_TIME budget promises.
-	// A subscriber that wants completeness across a failover has to say how far behind
-	// the live edge it is willing to sit (clamped to what the publisher retains).
+	// Arrival order, not sequence order: a publisher transmits the newest group of a
+	// track first, so a back-to-back burst legally arrives inverted. What the failover
+	// must preserve is that every group arrives, exactly once, with its frames intact.
 	let mut sub = within(
 		"subscribe to the video track",
-		bc.track("video").expect("track handle").subscribe(
-			moq_net::track::Subscription::default()
-				.with_ordered(true)
-				.with_max_age(Duration::from_secs(60)),
-		),
+		bc.track("video")
+			.expect("track handle")
+			.subscribe(moq_net::track::Subscription::default().with_max_age(Duration::from_secs(60))),
 	)
 	.await
 	.expect("subscribe");
@@ -479,7 +478,9 @@ async fn cluster_diamond_goaway_seamless_failover_inner() {
 	}
 	g.finish().expect("finish");
 
-	verify_group(&mut sub, 0, FRAMES_PER_GROUP, "pre-failover (via MID-A)").await;
+	let mut seen = BTreeSet::new();
+	collect_group(&mut sub, &mut seen, FRAMES_PER_GROUP, "pre-failover (via MID-A)").await;
+	assert_eq!(seen, BTreeSet::from([0]), "group 0 must arrive before the failover");
 
 	// ── continuous publishing THROUGH the failover window ────────────────
 	// Groups 1..=LAST_GROUP stream at a steady cadence, with multiple frames
@@ -516,9 +517,14 @@ async fn cluster_diamond_goaway_seamless_failover_inner() {
 
 	// ── completeness across the swap: every group exactly once, in order,
 	// every frame intact, exact frame count (no loss, no duplicates) ──────
-	for seq in 1..=LAST_GROUP {
-		verify_group(&mut sub, seq, FRAMES_PER_GROUP, "across the failover window").await;
+	for _ in 1..=LAST_GROUP {
+		collect_group(&mut sub, &mut seen, FRAMES_PER_GROUP, "across the failover window").await;
 	}
+	assert_eq!(
+		seen,
+		(0..=LAST_GROUP).collect::<BTreeSet<_>>(),
+		"every group must cross the failover exactly once"
+	);
 
 	let mut track = within("publisher task finishes", publisher)
 		.await
@@ -541,9 +547,14 @@ async fn cluster_diamond_goaway_seamless_failover_inner() {
 		}
 		g.finish().expect("finish");
 	}
-	for seq in (LAST_GROUP + 1)..=POST_DRAIN_LAST {
-		verify_group(&mut sub, seq, FRAMES_PER_GROUP, "post-drain (MID-B leg only)").await;
+	for _ in (LAST_GROUP + 1)..=POST_DRAIN_LAST {
+		collect_group(&mut sub, &mut seen, FRAMES_PER_GROUP, "post-drain (MID-B leg only)").await;
 	}
+	assert_eq!(
+		seen,
+		(0..=POST_DRAIN_LAST).collect::<BTreeSet<_>>(),
+		"the new leg alone must carry the rest, exactly once each"
+	);
 
 	// ── no GOAWAY cascade to the downstream subscriber ───────────────────
 	assert!(
@@ -567,16 +578,22 @@ async fn cluster_diamond_goaway_seamless_failover_inner() {
 	assert!(churn.is_err(), "failover must not churn announces under the subscriber");
 }
 
-/// Receive the next group and assert its sequence, every frame's payload, and
-/// the exact frame count. `stage` names the failover phase for diagnostics.
-async fn verify_group(sub: &mut moq_net::track::Subscriber, expected_seq: u64, frames: u64, stage: &str) {
-	let mut group = within(&format!("recv group {expected_seq} {stage}"), sub.recv_group())
+/// Receive the next group, assert every frame's payload and the exact frame count
+/// against the sequence it carries, and record that sequence in `seen`.
+///
+/// Sequence order is deliberately not asserted: a publisher transmits the newest group
+/// of a track first, so a back-to-back burst legally arrives inverted. Completeness is
+/// what the failover owes, and `seen` is what the caller checks it against.
+/// `stage` names the failover phase for diagnostics.
+async fn collect_group(sub: &mut moq_net::track::Subscriber, seen: &mut BTreeSet<u64>, frames: u64, stage: &str) {
+	let mut group = within(&format!("recv a group {stage}"), sub.recv_group())
 		.await
-		.unwrap_or_else(|err| panic!("subscription errored at group {expected_seq} {stage}: {err}"))
-		.unwrap_or_else(|| panic!("track ended early at group {expected_seq} {stage}"));
-	assert_eq!(
-		group.sequence, expected_seq,
-		"groups must arrive exactly once, in order ({stage})"
+		.unwrap_or_else(|err| panic!("subscription errored {stage}: {err}"))
+		.unwrap_or_else(|| panic!("track ended early {stage}"));
+	let expected_seq = group.sequence;
+	assert!(
+		seen.insert(expected_seq),
+		"group {expected_seq} arrived twice ({stage})"
 	);
 	for f in 0..frames {
 		let frame = within(&format!("read frame {f} of group {expected_seq}"), group.read_frame())

@@ -489,7 +489,6 @@ export class Publisher {
 
 		const track = broadcast.subscribe(msg.track, {
 			priority: msg.priority,
-			ordered: msg.ordered,
 			maxAge: servingMaxAge(this.version, msg.maxAge),
 			startGroup: msg.startGroup,
 			endGroup: msg.endGroup,
@@ -522,7 +521,6 @@ export class Publisher {
 				// Older drafts acknowledge with SUBSCRIBE_OK and stream frames verbatim.
 				const ok = new SubscribeOk({
 					priority: msg.priority,
-					ordered: msg.ordered,
 					maxAge: msg.maxAge,
 					startGroup: msg.startGroup,
 					endGroup: msg.endGroup,
@@ -545,7 +543,6 @@ export class Publisher {
 				apply: (update) => {
 					track.update({
 						priority: update.priority,
-						ordered: update.ordered,
 						maxAge: servingMaxAge(this.version, update.maxAge),
 						startGroup: update.startGroup,
 						endGroup: update.endGroup,
@@ -804,7 +801,6 @@ export class Publisher {
 			const info = await published.track(track).info();
 			return new TrackInfoMessage({
 				priority: info.priority,
-				ordered: info.ordered,
 				// Publisher Max Age: the publisher's retention bound, advertised so
 				// relays re-serve with the same window.
 				maxAge: info.maxAge,
@@ -959,12 +955,12 @@ export class Publisher {
 						if (timestamps) {
 							// Convert each frame to the track's advertised timescale.
 							const ts = BigInt(Math.round(read.frame.timestamp.as(timescale)));
-							await hooks.guardGroup(group, stream.u62(zigzag(ts - prevTs)), read.position);
+							await hooks.guardGroup(group, stream.u62(zigzag(ts - prevTs)));
 							prevTs = ts;
 						}
 
-						await hooks.guardGroup(group, stream.u53(read.frame.payload.byteLength), read.position);
-						await hooks.guardGroup(group, stream.write(read.frame.payload), read.position);
+						await hooks.guardGroup(group, stream.u53(read.frame.payload.byteLength));
+						await hooks.guardGroup(group, stream.write(read.frame.payload));
 					} finally {
 						read.complete();
 					}

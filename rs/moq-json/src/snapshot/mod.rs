@@ -431,7 +431,7 @@ mod test {
 	#[test]
 	fn a_rejected_snapshot_does_not_strand_an_empty_group() {
 		let track = rejecting_track();
-		let mut subscriber = track.subscribe(None);
+		let mut subscriber = track.subscribe(None).ordered();
 		let mut producer = Producer::<Value>::new(track, cfg(0));
 
 		assert!(matches!(producer.update(&json!({ "a": 1 })), Err(crate::Error::Net(_))));
@@ -645,7 +645,7 @@ mod test {
 	fn compressed_deltas_reuse_window() {
 		// The shared per-group window is the whole point: a delta that restates content already in
 		// the snapshot compresses to far fewer bytes than the raw patch.
-		let (mut producer, mut track) = producer(cfg_deflate(100));
+		let (mut producer, track) = producer(cfg_deflate(100));
 		let phrase = "Media over QUIC delivers real-time latency at massive scale";
 		producer.update(&json!({ "note": phrase })).unwrap();
 		producer.update(&json!({ "note": phrase, "echo": phrase })).unwrap();
@@ -653,6 +653,7 @@ mod test {
 
 		// Both frames land in group 0; read the delta (frame 1) verbatim.
 		let waiter = kio::Waiter::noop();
+		let mut track = track.ordered();
 		let Poll::Ready(Ok(Some(mut group))) = track.poll_next_group(&waiter) else {
 			panic!("expected a group");
 		};
@@ -715,11 +716,12 @@ mod test {
 
 	/// Publish a single value and return the byte length of the resulting (frame 0) wire frame.
 	fn wire_frame_len(config: ProducerConfig, value: &Value) -> usize {
-		let (mut producer, mut track) = producer(config);
+		let (mut producer, track) = producer(config);
 		producer.update(value).unwrap();
 		producer.finish().unwrap();
 
 		let waiter = kio::Waiter::noop();
+		let mut track = track.ordered();
 		let Poll::Ready(Ok(Some(mut group))) = track.poll_next_group(&waiter) else {
 			panic!("expected a group");
 		};

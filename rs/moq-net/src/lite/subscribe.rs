@@ -16,7 +16,6 @@ pub struct Subscribe<'a> {
 	pub broadcast: Path<'a>,
 	pub track: Cow<'a, str>,
 	pub priority: u8,
-	pub ordered: bool,
 	pub max_age: std::time::Duration,
 	/// The minimum group to deliver (a floor). On lite-06 the wire carries the raw
 	/// sequence and `None` is interchangeable with `Some(0)`: a floor of 0 constrains
@@ -51,14 +50,14 @@ impl Message for Subscribe<'_> {
 		let track = Cow::<str>::decode(r, version)?;
 		let priority = u8::decode(r, version)?;
 
-		let (ordered, max_age, start_group, end_group) = match version {
-			Version::Lite01 | Version::Lite02 => (false, std::time::Duration::ZERO, None, None),
+		let (max_age, start_group, end_group) = match version {
+			Version::Lite01 | Version::Lite02 => (std::time::Duration::ZERO, None, None),
 			_ => {
-				let ordered = u8::decode(r, version)? != 0;
+				skip_group_order(r, version)?;
 				let max_age = std::time::Duration::decode(r, version)?;
 				let start_group = decode_start_group(r, version)?;
 				let end_group = Option::<u64>::decode(r, version)?;
-				(ordered, max_age, start_group, end_group)
+				(max_age, start_group, end_group)
 			}
 		};
 
@@ -70,7 +69,6 @@ impl Message for Subscribe<'_> {
 			broadcast,
 			track,
 			priority,
-			ordered,
 			max_age,
 			start_group,
 			end_group,
@@ -88,7 +86,7 @@ impl Message for Subscribe<'_> {
 		match version {
 			Version::Lite01 | Version::Lite02 => {}
 			_ => {
-				(self.ordered as u8).encode(w, version)?;
+				pad_group_order(w, version)?;
 				self.max_age.encode(w, version)?;
 				encode_start_group(w, version, self.start_group)?;
 				self.end_group.encode(w, version)?;
@@ -106,6 +104,25 @@ impl Message for Subscribe<'_> {
 
 		Ok(())
 	}
+}
+
+/// Step over the retired `Ordered` byte on a version whose layout still has it.
+///
+/// The value is ignored: group order is fixed, so a peer that still sets it gets the
+/// same newest-first delivery as one that doesn't.
+pub(super) fn skip_group_order<R: bytes::Buf>(r: &mut R, version: Version) -> Result<(), DecodeError> {
+	if version.has_group_order() {
+		u8::decode(r, version)?;
+	}
+	Ok(())
+}
+
+/// Write the retired `Ordered` byte as 0, keeping a deployed version's field offsets.
+pub(super) fn pad_group_order<W: bytes::BufMut>(w: &mut W, version: Version) -> Result<(), EncodeError> {
+	if version.has_group_order() {
+		0u8.encode(w, version)?;
+	}
+	Ok(())
 }
 
 /// Decode the `Group Start` field shared by SUBSCRIBE and SUBSCRIBE_UPDATE.
@@ -209,7 +226,6 @@ fn encode_frame_bounds<W: bytes::BufMut>(
 #[derive(Clone, Debug)]
 pub struct SubscribeOk {
 	pub priority: u8,
-	pub ordered: bool,
 	pub max_age: std::time::Duration,
 	pub start_group: Option<u64>,
 	pub end_group: Option<u64>,
@@ -226,7 +242,7 @@ impl Message for SubscribeOk {
 			// Lite03/04 so a stray future use stays well-formed.
 			_ => {
 				self.priority.encode(w, version)?;
-				(self.ordered as u8).encode(w, version)?;
+				pad_group_order(w, version)?;
 				self.max_age.encode(w, version)?;
 				self.start_group.encode(w, version)?;
 				self.end_group.encode(w, version)?;
@@ -240,28 +256,25 @@ impl Message for SubscribeOk {
 		match version {
 			Version::Lite01 => Ok(Self {
 				priority: u8::decode(r, version)?,
-				ordered: false,
 				max_age: std::time::Duration::ZERO,
 				start_group: None,
 				end_group: None,
 			}),
 			Version::Lite02 => Ok(Self {
 				priority: 0,
-				ordered: false,
 				max_age: std::time::Duration::ZERO,
 				start_group: None,
 				end_group: None,
 			}),
 			_ => {
 				let priority = u8::decode(r, version)?;
-				let ordered = u8::decode(r, version)? != 0;
+				skip_group_order(r, version)?;
 				let max_age = std::time::Duration::decode(r, version)?;
 				let start_group = Option::<u64>::decode(r, version)?;
 				let end_group = Option::<u64>::decode(r, version)?;
 
 				Ok(Self {
 					priority,
-					ordered,
 					max_age,
 					start_group,
 					end_group,
@@ -336,7 +349,6 @@ impl Message for SubscribeEnd {
 #[derive(Clone, Debug)]
 pub struct SubscribeUpdate {
 	pub priority: u8,
-	pub ordered: bool,
 	pub max_age: std::time::Duration,
 	pub start_group: Option<u64>,
 	pub end_group: Option<u64>,
@@ -356,7 +368,7 @@ impl Message for SubscribeUpdate {
 		}
 
 		let priority = u8::decode(r, version)?;
-		let ordered = u8::decode(r, version)? != 0;
+		skip_group_order(r, version)?;
 		let max_age = std::time::Duration::decode(r, version)?;
 		let start_group = decode_start_group(r, version)?;
 		let end_group = match u64::decode(r, version)? {
@@ -369,7 +381,6 @@ impl Message for SubscribeUpdate {
 
 		Ok(Self {
 			priority,
-			ordered,
 			max_age,
 			start_group,
 			end_group,
@@ -387,7 +398,7 @@ impl Message for SubscribeUpdate {
 		}
 
 		self.priority.encode(w, version)?;
-		(self.ordered as u8).encode(w, version)?;
+		pad_group_order(w, version)?;
 		self.max_age.encode(w, version)?;
 
 		encode_start_group(w, version, self.start_group)?;
@@ -613,7 +624,6 @@ mod test {
 			broadcast: Path::new("room").to_owned(),
 			track: Cow::Borrowed("video"),
 			priority: 3,
-			ordered: true,
 			max_age: std::time::Duration::from_millis(250),
 			start_group: Some(7),
 			end_group: Some(9),
@@ -636,7 +646,7 @@ mod test {
 	/// lite-05 stays byte-identical. Compared without a floor, since `Group Start` itself
 	/// encodes differently across the two (see `group_start_is_absolute_on_lite06`).
 	#[test]
-	fn subscribe_without_frame_bounds_is_unchanged_on_lite05() {
+	fn subscribe_drops_the_retired_ordered_byte_on_lite06() {
 		let mut msg = subscribe_sample();
 		msg.start_group = None;
 		msg.start_frame = 0;
@@ -647,9 +657,20 @@ mod test {
 		let mut lite06 = Vec::new();
 		msg.encode_msg(&mut lite06, Version::Lite06Wip).unwrap();
 
-		// Lite06 appends the two defaulted varints and nothing else.
-		assert_eq!(&lite06[..lite05.len()], &lite05[..]);
-		assert_eq!(&lite06[lite05.len()..], &[0, 0]);
+		// The two layouts diverge in exactly one place: the retired byte lite-05 still
+		// reserves. A deployed peer's field offsets depend on it being there and zero.
+		let ordered_at = lite05
+			.iter()
+			.zip(&lite06)
+			.position(|(a, b)| a != b)
+			.expect("the layouts must diverge at the retired byte");
+		assert_eq!(lite05[ordered_at], 0, "the retired byte is written as zero");
+
+		// Remove it and lite-06 is the same message plus the two defaulted frame varints.
+		let mut spliced = lite05.clone();
+		spliced.remove(ordered_at);
+		assert_eq!(&lite06[..spliced.len()], &spliced[..]);
+		assert_eq!(&lite06[spliced.len()..], &[0, 0]);
 
 		let got = Subscribe::decode_msg(&mut lite05.as_slice(), Version::Lite05).unwrap();
 		assert_eq!((got.start_frame, got.end_frame), (0, None));
@@ -744,7 +765,6 @@ mod test {
 	fn subscribe_ok_rejected_on_lite05() {
 		let resp = SubscribeResponse::Ok(SubscribeOk {
 			priority: 1,
-			ordered: true,
 			max_age: std::time::Duration::ZERO,
 			start_group: None,
 			end_group: None,

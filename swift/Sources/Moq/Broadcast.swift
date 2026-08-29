@@ -27,8 +27,8 @@ public final class BroadcastConsumer: Sendable {
     }
 
     /// Subscribe to a track by name, delivering raw frame payloads with no codec
-    /// or container parsing. `subscription` tunes delivery priority, group ordering priority,
-    /// and group range; omit for defaults.
+    /// or container parsing. `subscription` tunes delivery priority, group range, and
+    /// staleness; omit for defaults.
     public func subscribeTrack(name: String, subscription: Subscription? = nil) async throws -> TrackConsumer {
         TrackConsumer(try await ffi.subscribeTrack(name: name, subscription: subscription))
     }

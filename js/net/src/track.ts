@@ -6,14 +6,7 @@
 import { type Dispose, type GetPromise, type Getter, Once, Signal } from "@moq/signals";
 import type { Datagram } from "./datagram.ts";
 import { type Frame, type Consumer as GroupConsumer, Producer as GroupProducer, Lagged } from "./group.ts";
-import {
-	type GroupPosition,
-	hooks,
-	type Recv,
-	type TrackRequestOptions,
-	type TrackSequence,
-	type TrackSequences,
-} from "./internal.ts";
+import { hooks, type Recv, type TrackRequestOptions, type TrackSequence, type TrackSequences } from "./internal.ts";
 import { Timescale, type Timestamp } from "./time.ts";
 
 export type { Datagram } from "./datagram.ts";
@@ -62,11 +55,6 @@ export interface Info {
 	maxAge: number;
 	/** Tie-break priority between subscriptions of equal subscriber priority. */
 	priority: number;
-	/**
-	 * Whether groups are prioritized in sequence order. Groups may always arrive
-	 * out-of-order (or not at all) over the network. Defaults to `false` (newest-first).
-	 */
-	ordered: boolean;
 }
 
 /** Fill in any unset {@link Info} fields with their defaults. */
@@ -75,7 +63,6 @@ export function infoDefaults(info: Partial<Info> = {}): Info {
 		timescale: info.timescale ?? Timescale.MILLI,
 		maxAge: info.maxAge ?? DEFAULT_MAX_AGE_MS,
 		priority: info.priority ?? 0,
-		ordered: info.ordered ?? false,
 	};
 }
 
@@ -86,8 +73,6 @@ export function infoDefaults(info: Partial<Info> = {}): Info {
 export interface Subscription {
 	/** Delivery priority relative to this session's other subscriptions. Defaults to `0`. */
 	priority?: number;
-	/** Whether groups are prioritized in sequence order. Defaults to `false` (newest-first). */
-	ordered?: boolean;
 	/** Maximum age (milliseconds) of a non-latest group before it is skipped. Defaults to `0`. */
 	maxAge?: number;
 	/**
@@ -108,7 +93,6 @@ export interface Subscription {
 function subscriptionDefaults(subscription: Subscription = {}): Subscription {
 	return {
 		priority: subscription.priority ?? 0,
-		ordered: subscription.ordered ?? false,
 		maxAge: subscription.maxAge ?? 0,
 		startGroup: subscription.startGroup,
 		endGroup: subscription.endGroup,
@@ -127,7 +111,6 @@ function combineSubscriptions(states: Iterable<TrackState>): Subscription | unde
 		}
 
 		combined.priority = Math.max(combined.priority ?? 0, subscription.priority ?? 0);
-		combined.ordered = (combined.ordered ?? false) && (subscription.ordered ?? false);
 		combined.maxAge = Math.max(combined.maxAge ?? 0, subscription.maxAge ?? 0);
 
 		// A floor only restricts, so a subscriber without one clears the aggregate:
@@ -325,6 +308,20 @@ function bindProducer(name: string, producer: Producer, sequences: TrackSequence
 }
 
 let bindProducerSequence: (producer: Producer, sequence: TrackSequence) => void;
+
+// The sequence-order cursor lives inside `Subscriber` (it shares the group buffer and the
+// drift anchor with the arrival cursor), so `Ordered` reaches it through this bridge,
+// assigned in the class's static block.
+let makeOrdered: (subscriber: Subscriber) => Ordered;
+let ordered_: {
+	nextGroup(subscriber: Subscriber): Promise<GroupConsumer | undefined>;
+	readFrame(subscriber: Subscriber): Promise<Frame | undefined>;
+	readFrameSequence(subscriber: Subscriber): Promise<({ group: number; frame: number } & Frame) | undefined>;
+	readString(subscriber: Subscriber): Promise<string | undefined>;
+	readJson(subscriber: Subscriber): Promise<unknown | undefined>;
+	readBool(subscriber: Subscriber): Promise<boolean | undefined>;
+	recvDatagram(subscriber: Subscriber): Promise<Datagram | undefined>;
+};
 
 // Constructs a Subscriber from within this module without exposing a public
 // constructor that would leak the unexported TrackState. Assigned in the class's
@@ -713,24 +710,43 @@ export class Subscriber {
 	#nextSequence = 0;
 	#cursor = new Signal<{ start: number; end?: number }>({ start: 0 });
 	#enforceLatency = true;
+	// Which cursor owns this subscription. Both cursors draw from one buffer, so the
+	// first group read commits the track to arrival order and {@link ordered} commits
+	// it to sequence order; whichever wins is the only one allowed from here on.
+	// Datagrams are a separate cursor and never commit.
+	#mode?: "arrival" | "ordered";
+	// The group the frame-level helpers are currently draining, acquired through the
+	// sequence cursor so frame reads and {@link Ordered.nextGroup} share one floor.
+	#frameGroup?: GroupConsumer;
 
 	#drift(): {
 		budget: number;
-		wall?: { sequence: number; time: number };
 		presentation?: { sequence: number; timestamp: Timestamp };
+		suffix: { sequence: number; reach: number }[];
 	} {
 		const { end } = this.#cursor.peek();
-		let wall: { sequence: number; time: number } | undefined;
 		let presentation: { sequence: number; timestamp: Timestamp } | undefined;
-		for (const { group, time } of this.#state.timeline.values()) {
+		const suffix: { sequence: number; reach: number }[] = [];
+		for (const { group } of this.#state.timeline.values()) {
 			if (end !== undefined && group.sequence > end) continue;
 			if (group.closed.peek() instanceof Error) continue;
-			if (!wall || group.sequence > wall.sequence) wall = { sequence: group.sequence, time };
 			const timestamp = hooks.groupTimestamp(group);
-			if (timestamp !== undefined && (!presentation || group.sequence > presentation.sequence)) {
-				presentation = { sequence: group.sequence, timestamp };
+			if (timestamp !== undefined) {
+				// The table bounds a candidate's reach, so it wants where each group
+				// begins; the edge wants the newest content that exists, so it takes the
+				// newest group's latest frame.
+				suffix.push({ sequence: group.sequence, reach: timestamp.asMillis() });
+				if (!presentation || group.sequence > presentation.sequence) {
+					presentation = { sequence: group.sequence, timestamp: hooks.groupLatest(group) ?? timestamp };
+				}
 			}
 		}
+
+		// Sequence order, so a candidate's immediate successor is one lookup away.
+		// Deliberately not a minimum over later groups: timestamps need not rise with
+		// sequence, and taking the minimum would shrink the bound, which is the unsafe
+		// direction. Only the immediate successor bounds a group.
+		suffix.sort((a, b) => a.sequence - b.sequence);
 
 		const requested = this.#state.update.peek()?.maxAge ?? 0;
 		const retained = this.#state.info.peek()?.maxAge;
@@ -740,48 +756,67 @@ export class Subscriber {
 					? requested
 					: Math.min(requested, retained)
 				: Number.POSITIVE_INFINITY,
-			wall,
 			presentation,
+			suffix,
 		};
 	}
 
-	// `at` is where a handed-out group's reader stands. A group nobody has started
-	// reading sits at its own start, which is what selection measures; one already
-	// handed out sits wherever its reader got to, so a reader keeping pace is not
-	// convicted by how long ago its group opened. Measuring from the group's first
-	// frame instead makes a GOP one GOP-duration behind by construction.
+	// The furthest presentation time the group at `sequence` could still reach: where its
+	// immediate successor begins, or undefined when nothing follows it yet. An upper bound,
+	// deliberately: a frame's duration is not on the wire, so a group's own last timestamp
+	// says where it starts presenting, not where it ends. Only a successor's start proves
+	// the predecessor cannot run past it.
+	static #reach(suffix: { sequence: number; reach: number }[], sequence: number): number | undefined {
+		let lo = 0;
+		let hi = suffix.length;
+		while (lo < hi) {
+			const mid = (lo + hi) >> 1;
+			if (suffix[mid].sequence <= sequence) lo = mid + 1;
+			else hi = mid;
+		}
+		return suffix[lo]?.reach;
+	}
+
+	// Whether the drift budget says to give up on `group`.
+	//
+	// Presentation time measures a group by how far it could still reach, not by how far
+	// behind it started. Being behind is survivable: priority transmits newer groups first,
+	// so a backlog bursts at whatever rate is left over and closes the gap faster than the
+	// live edge advances. A group is abandoned only once everything it could still present
+	// falls outside the budget.
+	//
+	// A group's reach is bounded by its nearest successor: it cannot present past where the
+	// next group begins. Its own frames say nothing, since a frame's duration is not on the
+	// wire, and the candidate needs no timestamp of its own: an empty group is bounded by
+	// its stamped successor the same way. The bound is exclusive, so the comparison is `>=`:
+	// the freshest frame a group could still hold sits just below its reach, so an age equal
+	// to the budget already puts every frame in it strictly past the budget. A zero budget
+	// falls out for free. Only timestamps drive expiry; wall-clock reclamation of idle
+	// content is the cache's own policy, not the budget's.
 	#isStale(
 		group: GroupConsumer,
 		drift: {
 			budget: number;
-			wall?: { sequence: number; time: number };
 			presentation?: { sequence: number; timestamp: Timestamp };
+			suffix: { sequence: number; reach: number }[];
 		},
-		at?: GroupPosition,
 	): boolean {
 		const candidate = this.#state.timeline.get(group.sequence);
 		if (candidate?.group !== group) return false;
 
-		const time = at?.activity ?? candidate.time;
-		const wallStale =
-			drift.wall !== undefined &&
-			drift.wall.sequence > group.sequence &&
-			(drift.budget === 0 || drift.wall.time - time > drift.budget);
-
-		const timestamp = at?.presentation ?? hooks.groupTimestamp(group);
-		const presentationStale =
+		const reach = Subscriber.#reach(drift.suffix, group.sequence);
+		return (
 			drift.presentation !== undefined &&
 			drift.presentation.sequence > group.sequence &&
-			timestamp !== undefined &&
-			drift.presentation.timestamp.asMillis() - timestamp.asMillis() > drift.budget;
-
-		return wallStale || presentationStale;
+			reach !== undefined &&
+			drift.presentation.timestamp.asMillis() - reach >= drift.budget
+		);
 	}
 
 	#guard(group: GroupConsumer): GroupConsumer {
 		if (!this.#enforceLatency) return group;
 		hooks.expireGroup(group, {
-			expired: (at) => this.#isStale(group, this.#drift(), at),
+			expired: () => this.#isStale(group, this.#drift()),
 			changed: [
 				this.#state.groups,
 				this.#state.timelineChanged,
@@ -810,6 +845,23 @@ export class Subscriber {
 		hooks.exemptFetch = (subscriber) => {
 			subscriber.#enforceLatency = false;
 		};
+		// The sequence cursor lives here (it shares the buffer and the drift anchor with
+		// the arrival cursor); `Ordered` is the handle that reaches it.
+		ordered_ = {
+			nextGroup: (subscriber) => subscriber.#nextGroup(),
+			readFrame: (subscriber) => subscriber.#readFrame(),
+			readFrameSequence: (subscriber) => subscriber.#readFrameSequence(),
+			readString: (subscriber) => subscriber.#readString(),
+			readJson: (subscriber) => subscriber.#readJson(),
+			readBool: (subscriber) => subscriber.#readBool(),
+			// Unordered either way, so both handles reach the same cursor.
+			recvDatagram: (subscriber) => subscriber.#recvDatagram(),
+		};
+	}
+
+	// Refuse a read on this handle once `ordered()` has taken the subscription.
+	#live() {
+		if (this.#mode === "ordered") throw new Error("track is read in sequence order; use the Ordered handle");
 	}
 
 	/**
@@ -854,9 +906,9 @@ export class Subscriber {
 	}
 
 	/**
-	 * Cap {@link nextGroup} and {@link recvGroup} at `sequence` inclusively, or omit it to
-	 * remove the cap. Groups above the cap remain buffered and become readable if the cap
-	 * is raised. This local cursor does not change the subscription's wire request.
+	 * Cap {@link recvGroup} at `sequence` inclusively, or omit it to remove the cap. Groups
+	 * above the cap remain buffered and become readable if the cap is raised. This local
+	 * cursor does not change the subscription's wire request.
 	 */
 	endAt(sequence?: number): void {
 		this.#cursor.update((cursor) => ({ ...cursor, end: sequence }));
@@ -873,6 +925,8 @@ export class Subscriber {
 			for (const group of groups) group.close(abort);
 			groups.length = 0;
 		});
+		this.#frameGroup?.close(abort);
+		this.#frameGroup = undefined;
 		this.#state.timeline.clear();
 	}
 
@@ -880,19 +934,23 @@ export class Subscriber {
 	 * Receive every group on this track exactly once, as it becomes available.
 	 *
 	 * Groups may arrive out of order or with gaps due to network conditions; unlike
-	 * {@link nextGroup}, one that arrives after a newer group was already returned is
-	 * still delivered. When several groups are buffered, the lowest sequence is
+	 * {@link Ordered.nextGroup}, one that arrives after a newer group was already returned
+	 * is still delivered. When several groups are buffered, the lowest sequence is
 	 * returned first.
 	 *
 	 * Honors the floor set by {@link startAt} and the cap set by {@link endAt}: a group
 	 * beyond the cap stays buffered (not dropped) and is offered once the cap rises, even
 	 * after a clean close, without blocking in-range groups that arrive behind it.
-	 * A group whose presentation time or wall-clock arrival is further behind the live edge
-	 * than this subscriber's `maxAge` is skipped. The default of zero takes the live edge.
+	 * A group whose presentation time is further behind the live edge than this
+	 * subscriber's `maxAge` is skipped. The default of zero takes the live edge.
 	 * The budget remains attached after return, so a pending frame read rejects if a stalled
 	 * group becomes stale while newer data advances.
+	 *
+	 * The first call commits this track to arrival order: {@link ordered} throws afterwards.
 	 */
 	async recvGroup(): Promise<GroupConsumer | undefined> {
+		this.#live();
+		this.#mode = "arrival";
 		for (;;) {
 			const recv = this.#tryRecvGroup();
 			switch (recv.kind) {
@@ -954,10 +1012,17 @@ export class Subscriber {
 	 * Datagrams are a separate best-effort channel from groups (see
 	 * {@link Producer.appendDatagram}); they share only the sequence namespace. A consumer
 	 * that falls too far behind silently loses the oldest datagrams. Read this alongside
-	 * {@link recvGroup} (e.g. in a separate loop) to receive both channels concurrently. Returning
-	 * a datagram advances {@link nextGroup} past that sequence.
+	 * {@link recvGroup} (e.g. in a separate loop) to receive both channels concurrently.
+	 * The two cursors are independent: a datagram never moves the group cursor.
 	 */
 	async recvDatagram(): Promise<Datagram | undefined> {
+		this.#live();
+		return this.#recvDatagram();
+	}
+
+	// The datagram cursor, reachable from either handle: unordered by construction, so the
+	// choice of group order says nothing about it.
+	async #recvDatagram(): Promise<Datagram | undefined> {
 		for (;;) {
 			const datagrams = this.#state.datagrams.peek();
 
@@ -967,11 +1032,7 @@ export class Subscriber {
 			while (datagrams.length > 0 && datagrams[0].time < cutoff) datagrams.shift();
 
 			if (datagrams.length > 0) {
-				const datagram = datagrams.shift()?.datagram;
-				if (datagram) {
-					this.#nextSequence = Math.max(this.#nextSequence, datagram.sequence + 1);
-				}
-				return datagram;
+				return datagrams.shift()?.datagram;
 			}
 
 			const closed = this.#state.closed.peek();
@@ -982,29 +1043,22 @@ export class Subscriber {
 		}
 	}
 
-	/**
-	 * Return the next group with a strictly-greater sequence number than the last returned.
-	 *
-	 * Late arrivals (sequence at or below the last returned) are silently skipped.
-	 * Use {@link recvGroup} to see every group in arrival order instead.
-	 * The subscription's `maxAge` also skips groups that drift behind the live edge.
-	 */
-	async nextGroup(): Promise<GroupConsumer | undefined> {
+	// The sequence cursor behind {@link Ordered}, which owns the only public door to it.
+	async #nextGroup(): Promise<GroupConsumer | undefined> {
 		for (;;) {
 			const groups = this.#state.groups.peek();
 			const cursor = this.#cursor.peek();
 			const start = Math.max(cursor.start, this.#nextSequence);
 			while (groups.length > 0 && groups[0].sequence < start) groups.shift()?.close();
-			const drift = this.#drift();
-
-			let group = groups[0];
-			while (group && (cursor.end === undefined || group.sequence <= cursor.end)) {
+			const group = groups[0];
+			if (group && (cursor.end === undefined || group.sequence <= cursor.end)) {
 				groups.shift();
 				this.#nextSequence = group.sequence + 1;
-				if (this.#isStale(group, drift)) {
-					group.close();
-					group = groups[0];
-					continue;
+				// One cursor: the frame helpers must not keep draining a group this
+				// read just moved past, or interleaved reads would run backwards.
+				if (this.#frameGroup && this.#frameGroup.sequence < group.sequence) {
+					this.#frameGroup.close();
+					this.#frameGroup = undefined;
 				}
 				return this.#guard(group);
 			}
@@ -1021,125 +1075,100 @@ export class Subscriber {
 	}
 
 	/**
-	 * Reads the next frame across all groups, discarding older groups.
+	 * Reads the next frame across groups, in sequence order.
 	 * Treat the returned frame bytes as read-only; they are shared with other consumers.
 	 */
-	async readFrame(): Promise<Frame | undefined> {
-		const next = await this.readFrameSequence();
+	async #readFrame(): Promise<Frame | undefined> {
+		const next = await this.#readFrameSequence();
 		return next ? { payload: next.payload, timestamp: next.timestamp } : undefined;
 	}
 
 	/**
 	 * Reads the next frame along with its group and frame sequence numbers.
 	 * Treat the returned frame bytes as read-only; they are shared with other consumers.
-	 * Groups outside the subscription's `maxAge` budget are discarded before reading.
+	 *
+	 * Groups are acquired through the same sequence cursor as {@link Ordered.nextGroup},
+	 * so frames never run backwards: a late lower-sequence group is skipped, and a
+	 * buffered backlog is drained in full rather than discarded for age. A group the
+	 * `maxAge` budget abandons mid-stall ends cleanly and the cursor resyncs from the
+	 * next group; an eviction gap inside a group still surfaces as {@link Lagged}.
 	 */
-	async readFrameSequence(): Promise<({ group: number; frame: number } & Frame) | undefined> {
+	async #readFrameSequence(): Promise<({ group: number; frame: number } & Frame) | undefined> {
 		for (;;) {
-			const groups = this.#state.groups.peek();
-			const { start } = this.#cursor.peek();
-			while (groups.length > 0 && groups[0].sequence < start) groups.shift()?.close();
-			const drift = this.#drift();
-			for (let i = 0; i < groups.length; ) {
-				const group = groups[i];
-				if (!this.#isStale(group, drift)) {
-					i++;
-					continue;
-				}
-				groups.splice(i, 1);
+			if (!this.#frameGroup) {
+				this.#frameGroup = await this.#nextGroup();
+				if (!this.#frameGroup) return undefined;
+			}
+			const group = this.#frameGroup;
+
+			let next: ({ sequence: number } & Frame) | undefined;
+			try {
+				next = await group.readFrameSequence();
+			} catch (err) {
+				// The group failed underneath us: resync from the next one, surfacing
+				// only what the caller can act on (a gap, or the track's own abort).
+				this.#frameGroup = undefined;
 				group.close();
-			}
-
-			let readable = groups.length;
-
-			// Drain older groups first, dropping each once empty.
-			while (readable > 1) {
-				if (groups[0].skipped) {
-					// The reader fell behind this group's eviction window. Drop it and
-					// signal the gap; the next read resyncs from the following group.
-					groups.shift()?.close();
-					throw new Lagged();
-				}
-				const next = groups[0].tryReadFrameSequence();
-				if (next) {
-					return {
-						group: groups[0].sequence,
-						frame: next.sequence,
-						payload: next.payload,
-						timestamp: next.timestamp,
-					};
-				}
-				groups.shift()?.close();
-				readable--;
-			}
-
-			if (readable === 0) {
+				if (err instanceof Lagged) throw err;
 				const closed = this.#state.closed.peek();
 				if (closed instanceof Error) throw closed;
-				if (closed !== undefined && groups.length === 0) return undefined;
-				if (closed !== undefined) {
-					await Signal.race(this.#cursor);
-					continue;
-				}
-				await Signal.race(this.#state.groups, this.#cursor, this.#state.closed);
 				continue;
 			}
 
-			const group = groups[0];
-			if (group.skipped) {
-				// Fell behind this group's eviction window. Drop it and signal the gap;
-				// the next read resyncs from the following group.
-				groups.shift()?.close();
-				throw new Lagged();
-			}
-			const next = group.tryReadFrameSequence();
-			if (next)
+			if (next) {
 				return {
 					group: group.sequence,
 					frame: next.sequence,
 					payload: next.payload,
 					timestamp: next.timestamp,
 				};
-
-			const closed = this.#state.closed.peek();
-			if (closed instanceof Error) throw closed;
-			if (closed !== undefined) return undefined;
-
-			// A finished (drained + closed) group has nothing left: drop it and loop, rather than
-			// busy-waiting on its already-resolved readable() (which would livelock and starve the
-			// macrotask that delivers the next group).
-			if (group.done) {
-				groups.shift()?.close();
-				continue;
 			}
 
-			// Lone open group with nothing buffered yet: wait for a frame on it, a new group, or
-			// the track closing.
-			await Promise.race([Signal.race(this.#state.groups, this.#cursor, this.#state.closed), group.readable()]);
+			// The group is exhausted (or the budget abandoned its stall); move on.
+			this.#frameGroup = undefined;
+			group.close();
 		}
 	}
 
 	/** Reads the next frame and decodes it as a UTF-8 string. */
-	async readString(): Promise<string | undefined> {
-		const next = await this.readFrame();
+	async #readString(): Promise<string | undefined> {
+		const next = await this.#readFrame();
 		if (!next) return undefined;
 		return new TextDecoder().decode(next.payload);
 	}
 
 	/** Reads the next frame and parses it as JSON. */
-	async readJson(): Promise<unknown | undefined> {
-		const next = await this.readString();
+	async #readJson(): Promise<unknown | undefined> {
+		const next = await this.#readString();
 		if (!next) return undefined;
 		return JSON.parse(next);
 	}
 
 	/** Reads the next frame and decodes it as a one-byte boolean, throwing on a malformed frame. */
-	async readBool(): Promise<boolean | undefined> {
-		const next = await this.readFrame();
+	async #readBool(): Promise<boolean | undefined> {
+		const next = await this.#readFrame();
 		if (!next) return undefined;
 		const payload = next.payload;
 		if (payload.byteLength !== 1 || !(payload[0] === 0 || payload[0] === 1)) throw new Error("invalid bool frame");
 		return payload[0] === 1;
+	}
+
+	/**
+	 * Read this track's groups in sequence order instead of arrival order.
+	 *
+	 * Both cursors draw from the same buffer, so a track is read one way or the other: this
+	 * hands the subscription to the returned {@link Ordered} and leaves this handle inert.
+	 * {@link recvGroup} and {@link recvDatagram} throw afterwards. Throws once a
+	 * {@link recvGroup} call has already committed the track to arrival order.
+	 *
+	 * Datagrams come along: they are a separate cursor either way, so the choice of group
+	 * order says nothing about them, and reading them commits nothing.
+	 */
+	ordered(): Ordered {
+		if (this.#mode === "ordered") throw new Error("track is already read in sequence order");
+		if (this.#mode === "arrival") throw new Error("track is already read in arrival order");
+		this.#mode = "ordered";
+		return makeOrdered(this);
 	}
 
 	/**
@@ -1148,5 +1177,133 @@ export class Subscriber {
 	 */
 	update(options: Subscription) {
 		this.#state.update.set(subscriptionDefaults(options));
+	}
+}
+
+/**
+ * A {@link Subscriber} that reads groups in sequence order.
+ *
+ * Created by {@link Subscriber.ordered}, which takes the subscription over: the two
+ * cursors draw from one buffer, so a track is read one way or the other and never both.
+ * Every group this returns has a higher sequence than the last, so a late arrival is
+ * skipped rather than delivered out of turn.
+ *
+ * This cursor never drops a group it can already serve: a backlog is delivered as a
+ * burst, in order, however old it is. `maxAge` instead bounds how long a group already
+ * handed out may block, so a stalled group's pending frame read rejects once newer
+ * content has pulled that far ahead.
+ */
+export class Ordered {
+	/** The track name. */
+	readonly name: string;
+
+	#subscriber: Subscriber;
+
+	private constructor(subscriber: Subscriber) {
+		this.name = subscriber.name;
+		this.#subscriber = subscriber;
+	}
+
+	static {
+		makeOrdered = (subscriber) => new Ordered(subscriber);
+	}
+
+	/** Resolve this track's immutable publisher properties; see {@link Subscriber.info}. */
+	info(): Promise<Info> {
+		return this.#subscriber.info();
+	}
+
+	/** Settles once the track closes; see {@link Producer.closed}. */
+	get closed(): GetPromise<Error | null> {
+		return this.#subscriber.closed;
+	}
+
+	/** This subscriber's current options, including defaults and the last {@link update}. */
+	get subscription(): Getter<Subscription | undefined> {
+		return this.#subscriber.subscription;
+	}
+
+	/** The latest group sequence observed on this track, if any. */
+	latest(): number | undefined {
+		return this.#subscriber.latest();
+	}
+
+	/** The track's exclusive final boundary; see {@link Subscriber.final}. */
+	final(): number | undefined {
+		return this.#subscriber.final();
+	}
+
+	/** Start this cursor at `sequence`, without changing the subscription's wire request. */
+	startAt(sequence: number): void {
+		this.#subscriber.startAt(sequence);
+	}
+
+	/**
+	 * Cap this cursor at `sequence` inclusively, or omit it to remove the cap. Groups above
+	 * the cap remain buffered and become readable if the cap is raised.
+	 */
+	endAt(sequence?: number): void {
+		this.#subscriber.endAt(sequence);
+	}
+
+	/** Update this subscription's options; see {@link Subscriber.update}. */
+	update(options: Subscription) {
+		this.#subscriber.update(options);
+	}
+
+	/** Close the track (optionally with an error), closing any pending groups. Idempotent. */
+	close(abort?: Error) {
+		this.#subscriber.close(abort);
+	}
+
+	/**
+	 * Return the next group with a strictly-greater sequence number than the last returned.
+	 *
+	 * Late arrivals (sequence at or below the last returned) are silently skipped. Honors
+	 * the bounds set by {@link startAt} and {@link endAt}.
+	 */
+	nextGroup(): Promise<GroupConsumer | undefined> {
+		return ordered_.nextGroup(this.#subscriber);
+	}
+
+	/**
+	 * Read the next frame across groups, discarding older groups.
+	 * Treat the returned frame bytes as read-only; they are shared with other consumers.
+	 */
+	readFrame(): Promise<Frame | undefined> {
+		return ordered_.readFrame(this.#subscriber);
+	}
+
+	/** The same, plus the group and frame sequence numbers the frame came from. */
+	readFrameSequence(): Promise<({ group: number; frame: number } & Frame) | undefined> {
+		return ordered_.readFrameSequence(this.#subscriber);
+	}
+
+	/** Read the next frame and decode it as a UTF-8 string. */
+	readString(): Promise<string | undefined> {
+		return ordered_.readString(this.#subscriber);
+	}
+
+	/** Read the next frame and parse it as JSON. */
+	readJson(): Promise<unknown | undefined> {
+		return ordered_.readJson(this.#subscriber);
+	}
+
+	/** Read the next frame and decode it as a one-byte boolean, throwing on a malformed frame. */
+	readBool(): Promise<boolean | undefined> {
+		return ordered_.readBool(this.#subscriber);
+	}
+
+	/**
+	 * Receive the next datagram in arrival order.
+	 *
+	 * Datagrams are a separate best-effort channel from groups (see
+	 * {@link Producer.appendDatagram}); they share only the sequence namespace, and
+	 * neither cursor moves the other. Unordered by construction, so this behaves
+	 * identically on either handle; it is here so a track carrying both channels needs
+	 * one subscription rather than two.
+	 */
+	recvDatagram(): Promise<Datagram | undefined> {
+		return ordered_.recvDatagram(this.#subscriber);
 	}
 }

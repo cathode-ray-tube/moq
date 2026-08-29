@@ -131,7 +131,6 @@ Both bounds may be refined to a Frame within their Group, so a subscription can 
 
 The subscriber and publisher both indicate their delivery preference:
 - `Priority` indicates if Track A should be transmitted instead of Track B.
-- `Ordered` indicates if the Groups within a Track should be transmitted in order.
 - `Subscriber Max Age` indicates the maximum age before a non-latest Group is dropped from live delivery; `Publisher Max Age` indicates the maximum age before a non-latest Group is dropped from the publisher's cache.
 
 The combination of these preferences enables the most important content to arrive during network degradation while still respecting encoding dependencies.
@@ -450,11 +449,10 @@ moq-lite consists of multiple groups being transmitted in parallel across separa
 How these streams get transmitted over the network is very important, and yet has been distilled down into a few simple properties:
 
 ## Prioritization
-The Publisher and Subscriber both exchange `Priority` and `Ordered` values:
-- `Priority` determines which Track should be transmitted next.
-- `Ordered` determines which Group within the Track should be transmitted next.
+The Publisher and Subscriber both exchange a `Priority` value, which determines which Track should be transmitted next.
+Group order within a Track is fixed: newest first.
 
-A publisher SHOULD attempt to transmit streams based on these fields.
+A publisher SHOULD attempt to transmit streams based on these rules.
 This depends on the QUIC implementation and it may not be possible to get fine-grained control.
 
 ### Priority
@@ -489,16 +487,15 @@ ali/video: subscriber_priority=1 publisher_priority=1
 
 The subscriber priority takes precedence, so the subscriber can likewise full-screen Ali's window by raising the subscriber priority of Ali's tracks above Bob's.
 
-### Ordered
-The `Subscriber Ordered` field signals if older (0x1) or newer (0x0) groups should be transmitted first within a Track.
-The `Publisher Ordered` field MAY likewise be used to resolve conflicts.
+### Group Order
+Within a Track, a publisher SHOULD transmit the newest Group first.
+Under congestion this sheds the backlog rather than the live edge, which is what a Group boundary exists to make possible.
 
-An application SHOULD use `ordered` when it wants to provide a VOD-like experience, preferring to buffer old groups rather than skip them.
-An application SHOULD NOT use `ordered` when it wants to provide a live experience, preferring to skip old groups rather than buffer them.
+There is no field to invert it.
+A subscriber that wants Groups in sequence order gets them by reading in sequence order: reordering is a local decision, it costs the network nothing, and encoding it on the wire only lets one subscriber's preference reach a Track that a relay is fanning out to many.
+Such a subscriber SHOULD raise its `Subscriber Max Age` so the Groups it intends to read in order are still being delivered when it reaches them.
 
-Note that [expiration](#expiration) is not affected by `ordered`.
-An old group may still be cancelled/skipped if it exceeds the `Subscriber Max Age`.
-An application MUST support gaps and out-of-order delivery even when `ordered` is true.
+A subscriber MUST support gaps and out-of-order delivery regardless.
 
 
 ## Expiration
@@ -509,14 +506,26 @@ Expiration only removes the group from live delivery; the publisher MAY still re
 It is not crucial to aggressively expire groups thanks to [prioritization](#prioritization), but a lower priority group still consumes RAM, bandwidth, and potentially flow control.
 It is RECOMMENDED that an application set conservative limits and only resort to expiration when data is absolutely no longer needed.
 
-A group is never expired until at least the next group (by sequence number) has been received or queued.
-Once a newer group exists, the group's age is measured two ways, and it is expired once **either** measure exceeds the relevant `Max Age`:
+A group is never expired until a later group (by sequence number) has presented a frame.
+Once one has, the group's **timestamp age** is the difference between the *newest* frame timestamp of the latest group that has at least one frame, and this group's **reach**, defined below; the group is expired once that age meets the relevant `Max Age`.
+Timestamps are the only measure: they are consistent across relays and unaffected by buffering or jitter.
+Wall-clock reclamation of idle content is the retention cache's own policy (`Publisher Max Age`, or any implementation-defined bound), not part of this rule.
 
-- **Timestamp age**: the difference between this group's first frame timestamp and the first frame timestamp of the latest group that has at least one frame. This measure is consistent across relays and unaffected by buffering or jitter.
-- **Wall-clock age**: the difference between when this group's first byte arrived (subscriber) or was queued (publisher) and the same instant for the latest group.
+A group is expired only once it **provably cannot overlap the Max Age window**: every frame it could still present is older than the budget allows.
+Being behind is not itself a reason to expire anything.
+[Prioritization](#prioritization) already transmits newer groups first, so an older group consumes only whatever capacity is left over; it therefore closes the gap faster than the live edge advances, and a receiver that is behind can converge without losing content.
+What cannot be recovered is a group with nothing left worth delivering, and that is what expiration removes.
 
-The two backstop each other: a publisher cannot keep stale groups alive with fresh-looking timestamps, and a burst of groups arriving together does not reset their age.
-A group that contains zero frames has no timestamp, so only the wall-clock age applies; this avoids stalling expiration on empty groups sent as keep-alives or gap markers.
+A group's **reach** is the first frame timestamp of the next group by sequence number, or unbounded when no later group has presented a frame.
+A group cannot present past where its successor begins, so this is the furthest it could still reach.
+Its own frames do not bound it: frame durations are not carried on the wire, so a group's last frame timestamp is where that frame *starts* presenting, not where the group ends.
+A group whose successor has not presented a frame is therefore never expired, because nothing yet proves where it stops.
+The group itself needs no timestamp: a zero-frame group (a keep-alive or gap marker) is bounded by its successor's first frame the same way.
+
+Reach is an exclusive bound, so a timestamp age **equal** to Max Age already expires the group: the freshest frame it could still hold sits strictly below its reach, and is therefore strictly older than the budget.
+A Max Age of zero follows from the same rule without a special case.
+
+Measuring in timestamps rather than arrival means a burst of groups delivered together still reads as its true age, so catching up never resets the clock.
 
 An expired group SHOULD be reset at the QUIC level to avoid consuming flow control.
 
@@ -936,7 +945,6 @@ SUBSCRIBE Message {
   Track Name (s)
   Epoch (i)
   Subscriber Priority (8)
-  Subscriber Ordered (8)
   Subscriber Max Age (i)
   Group Start (i)
   Group End (i)
@@ -956,11 +964,6 @@ Echoing the Epoch of the advertisement acted on closes the race where a SUBSCRIB
 **Subscriber Priority**:
 The priority of the subscription within the session, represented as a u8.
 The publisher SHOULD transmit *higher* values first during congestion.
-See the [Prioritization](#prioritization) section for more information.
-
-**Subscriber Ordered**:
-A single byte representing whether groups are transmitted in ascending (0x1) or descending (0x0) order.
-The publisher SHOULD transmit *older* groups first during congestion if true.
 See the [Prioritization](#prioritization) section for more information.
 
 **Subscriber Max Age**:
@@ -1009,7 +1012,6 @@ The start and end group can be changed in either direction (growing or shrinking
 SUBSCRIBE_UPDATE Message {
   Message Length (i)
   Subscriber Priority (8)
-  Subscriber Ordered (8)
   Subscriber Max Age (i)
   Group Start (i)
   Group End (i)
@@ -1053,7 +1055,6 @@ TRACK_INFO Message {
   Message Length (i)
   Epoch (i)
   Publisher Priority (8)
-  Publisher Ordered (8)
   Publisher Max Age (i)
   Timescale (i)
 }
@@ -1069,10 +1070,6 @@ Subscribers key their TRACK_INFO cache by it, and a SUBSCRIBE or FETCH that will
 
 **Publisher Priority**:
 The publisher's priority for this Track, represented as a u8, used only to resolve ties between subscriptions of equal subscriber priority.
-See the [Prioritization](#prioritization) section for more information.
-
-**Publisher Ordered**:
-The publisher's group ordering preference (ascending `0x1` or descending `0x0`), used only to resolve ties.
 See the [Prioritization](#prioritization) section for more information.
 
 **Publisher Max Age**:
@@ -1358,6 +1355,9 @@ The `Message Length` describes the payload size on the wire.
 - Exempted a ceiling-cost serving path from the actively-carrying cost discount: a relay whose serving path costs the saturation ceiling (primarily a session that received a GOAWAY) advertises the ceiling instead of 0, so the drain propagates downstream instead of being re-masked by each carrying hop. Keyed on the value, not the reason, which does not travel on the wire.
 - Added the Error Codes section, defining separate session and stream code spaces and listing the codes moq-lite uses, reused unchanged from moq-transport. Codes 64+ are the application's; 32-63 are reserved and MUST NOT be interpreted, pending a future revision. Previously the codes were unspecified, so an endpoint could neither send one a peer would understand nor safely interpret one it received. Note this renumbers every code an existing implementation sent, and that a stream reset of 0x0 is now INTERNAL_ERROR rather than a cancellation (CANCELLED is 0x1).
 - Renamed `Subscriber Max Latency` to `Subscriber Max Age` and `Publisher Max Latency` to `Publisher Max Age`.
+- Redefined timestamp age so a group is expired only once it provably cannot overlap the Max Age window. Age is now measured from a group's *reach* (the first frame timestamp of its successor, which is the furthest it could still present) to the newest frame of the latest group, and an age equal to Max Age expires it, since reach is an exclusive bound. Previously age ran from the group's own first frame, which expired a group whose later frames were still well inside the budget. A group whose successor has not yet presented a frame is never expired, because frame durations are not on the wire and nothing else proves where it ends.
+- Removed the wall-clock age measure from expiration: timestamps are the only input, and wall-clock reclamation of idle content is the retention cache's own policy (`Publisher Max Age`) rather than part of the subscription rule. A zero-frame group needs no measure of its own, since its reach is bounded by its successor's first frame like any other group.
+- Removed `Subscriber Ordered` from SUBSCRIBE and SUBSCRIBE_UPDATE, and `Publisher Ordered` from TRACK_INFO and SUBSCRIBE_OK. Group order within a Track is now normatively newest-first, with no field to invert it: a subscriber that wants sequence order reads in sequence order, which costs the network nothing and does not let one subscriber's preference reach a Track a relay is fanning out to many. Note this removes a byte from the middle of each message, so a lite-06 peer cannot parse a lite-05 one's SUBSCRIBE (the earlier drafts keep the byte, and an implementation serving them SHOULD write 0 and ignore what it reads).
 - Made `Group Start` an absolute floor (the raw minimum group sequence, default 0) rather than the sequence + 1 with 0 meaning the latest group. The start resolves from `Subscriber Max Age` instead: the oldest group at or above the floor within the budget, so a subscriber that buffers is handed the head of what it can still play. A zero budget still resolves to the latest group, which was the only start the old encoding could ask for by default.
 
 ## moq-lite-05

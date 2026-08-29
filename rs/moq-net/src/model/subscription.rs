@@ -11,10 +11,6 @@ use std::{task::Poll, time::Duration};
 pub struct Subscription {
 	/// Delivery priority. Higher values preempt lower ones when bandwidth is constrained.
 	pub priority: u8,
-	/// Whether groups are prioritized in sequence order. Groups may always arrive
-	/// out-of-order (or not at all) over the network. Defaults to `false`; the
-	/// aggregate is ordered only when every live subscriber asks for it.
-	pub ordered: bool,
 	/// How old a group may get before this subscriber gives up on it.
 	///
 	/// [`Duration::ZERO`] (the default) skips immediately: group 8 arriving means group 7
@@ -42,10 +38,12 @@ pub struct Subscription {
 	///
 	/// # How age is measured
 	///
-	/// By both presentation time and wall-clock arrival, with either able to expire the
-	/// group. Presentation time compares a group's first timestamp against the newest
-	/// one above it, so a backlog delivered as a burst still reads as its true age.
-	/// Wall-clock backstops an empty or stalled group that has supplied no timestamp.
+	/// In presentation time only. A group is measured by its *reach*, where its immediate
+	/// successor begins, against the newest frame of the latest group: it cannot present
+	/// past its successor, so once everything it could still hold falls outside the budget
+	/// it is provably useless. The candidate needs no timestamp of its own, so an empty or
+	/// stalled group is bounded by its stamped successor the same way. Wall-clock
+	/// reclamation of idle content is the cache's own policy, not this budget's.
 	///
 	/// Protocols whose wire can't carry a timestamp (pre-Lite05 moq-lite, moq-transport
 	/// without the Timestamp property) have their frames stamped on receipt, which makes
@@ -88,7 +86,6 @@ impl Default for Subscription {
 	fn default() -> Self {
 		Self {
 			priority: 0,
-			ordered: false,
 			max_age: Duration::ZERO,
 			start: None,
 			end: None,
@@ -100,13 +97,6 @@ impl Subscription {
 	/// Set the delivery priority, returning `self` for chaining.
 	pub fn with_priority(mut self, priority: u8) -> Self {
 		self.priority = priority;
-		self
-	}
-
-	/// Set whether groups are prioritized in sequence order, returning `self` for
-	/// chaining. Groups may always arrive out-of-order (or not at all) over the network.
-	pub fn with_ordered(mut self, ordered: bool) -> Self {
-		self.ordered = ordered;
 		self
 	}
 
@@ -148,7 +138,6 @@ impl Subscription {
 		let merged = Subscription {
 			priority: self.priority.max(combined.priority),
 			// Sequence-first prioritization is enabled only when every subscriber wants it.
-			ordered: self.ordered && combined.ordered,
 			max_age: self.max_age.max(combined.max_age),
 			// Bounds fold as whole positions. Two subscribers starting in the same group
 			// are separated only by their frame, so folding group and frame independently
@@ -274,25 +263,6 @@ mod tests {
 			}
 		}
 		combined
-	}
-
-	#[test]
-	fn combined_ordered_stays_ordered_for_multiple_ordered_viewers() {
-		let subscription = Subscription::default().with_ordered(true);
-
-		let combined = combine(&[subscription.clone(), subscription.clone(), subscription]).unwrap();
-
-		assert!(combined.ordered);
-	}
-
-	#[test]
-	fn combined_any_unordered_viewer_disables_ordered() {
-		let unordered = Subscription::default().with_ordered(false);
-		let ordered = Subscription::default().with_ordered(true);
-
-		let combined = combine(&[unordered, ordered]).unwrap();
-
-		assert!(!combined.ordered);
 	}
 
 	/// The exclusive representation runs out at both extremes, and `Option` says so

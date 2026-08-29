@@ -1046,7 +1046,8 @@ mod tests {
 			.expect("the opaque track is published")
 			.subscribe(moq_net::track::Subscription::default().with_max_age(std::time::Duration::from_secs(1)))
 			.await
-			.expect("subscribe to the opaque track");
+			.expect("subscribe to the opaque track")
+			.ordered();
 
 		let mut group = subscriber.next_group().await.unwrap().expect("a first group");
 		let frame = group.read_frame().await.unwrap().expect("a frame in the first group");
@@ -1163,7 +1164,8 @@ mod tests {
 			.expect("the opaque track is published")
 			.subscribe(None)
 			.await
-			.expect("subscribe to the opaque track");
+			.expect("subscribe to the opaque track")
+			.ordered();
 		let mut group = subscriber.next_group().await.unwrap().expect("a group");
 		let frame = group.read_frame().await.unwrap().expect("a frame");
 		assert_eq!(frame.payload.as_ref(), b"no pts", "the unstamped buffer was published");
