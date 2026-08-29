@@ -31,6 +31,77 @@ async function structure(track: Track.Subscriber): Promise<number[]> {
 	return counts;
 }
 
+test("a cut makes the next update a snapshot group", async () => {
+	const track = new Track.Producer("test");
+	const producer = new Producer<Value>({ track, deltaRatio: 100 });
+	producer.update({ a: 1, b: 1 });
+	producer.update({ a: 1, b: 2 });
+	producer.cut();
+	producer.update({ a: 1, b: 3 });
+	producer.finish();
+
+	// The ratio would have kept every update in one group; the cut rolled it anyway. The replacement
+	// opens with a full snapshot, so it is one frame rather than a delta appended to the first group.
+	expect(await structure(track.subscribe({ maxAge: REPLAY_LATENCY }))).toEqual([2, 1]);
+	expect((await drain(track.subscribe({ maxAge: REPLAY_LATENCY }))).at(-1)).toEqual({ a: 1, b: 3 });
+});
+
+test("a cut republishes an unchanged value", async () => {
+	const track = new Track.Producer("test");
+	const producer = new Producer<Value>({ track, deltaRatio: 100 });
+	producer.update({ a: 1 });
+	producer.cut();
+
+	// An unchanged value normally writes nothing. After a cut it must still open the replacement
+	// group, or the value would only exist in a group no new consumer reads.
+	producer.update({ a: 1 });
+	producer.finish();
+
+	expect(await structure(track.subscribe({ maxAge: REPLAY_LATENCY }))).toEqual([1, 1]);
+});
+
+test("a cut opens no replacement group", async () => {
+	const track = new Track.Producer("test");
+	const producer = new Producer<Value>({ track, deltaRatio: 100 });
+	producer.update({ a: 1 });
+	producer.cut();
+	producer.finish();
+
+	// Cutting closes the open group and stops there: no empty group for a consumer to advance into.
+	expect(await structure(track.subscribe({ maxAge: REPLAY_LATENCY }))).toEqual([1]);
+});
+
+test("a cut is idempotent", async () => {
+	const track = new Track.Producer("test");
+	const producer = new Producer<Value>({ track, deltaRatio: 100 });
+
+	// Nothing published yet, so there is no group to cut.
+	producer.cut();
+	producer.cut();
+	producer.update({ a: 1 });
+
+	// And a repeated cut rolls once, not once per call.
+	producer.cut();
+	producer.cut();
+	producer.update({ a: 2 });
+	producer.finish();
+
+	expect(await structure(track.subscribe({ maxAge: REPLAY_LATENCY }))).toEqual([1, 1]);
+});
+
+test("a cut is inert without deltas", async () => {
+	const track = new Track.Producer("test");
+	const producer = new Producer<Value>({ track, deltaRatio: 0 });
+	producer.update({ a: 1 });
+
+	// With deltas off every frame already closes its own group, so there is never one to cut.
+	producer.cut();
+	producer.update({ a: 2 });
+	producer.finish();
+
+	expect(await structure(track.subscribe({ maxAge: REPLAY_LATENCY }))).toEqual([1, 1]);
+});
+
 test("deltas off: a snapshot group per change", async () => {
 	const track = new Track.Producer("test");
 	const producer = new Producer<Value>({ track, deltaRatio: 0 });

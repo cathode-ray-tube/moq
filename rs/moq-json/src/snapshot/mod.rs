@@ -16,6 +16,11 @@
 //! Deltas are controlled by [`ProducerConfig::delta_ratio`]. A ratio of `0` disables them, so every
 //! change is a fresh snapshot group, matching a plain "one JSON blob per group" track.
 //!
+//! The encoder rolls a group on its own budget, but a caller can roll one for its own reasons with
+//! [`Producer::cut`]: it closes the open group and leaves the next update to open the replacement
+//! with a full snapshot, so the deltas already written stop being provisional without publishing an
+//! empty group.
+//!
 //! # Choosing a layer
 //!
 //! [`Producer`] and [`Consumer`] own a track: hand one a
@@ -88,6 +93,84 @@ mod test {
 			out.push(value);
 		}
 		out
+	}
+
+	#[test]
+	fn a_cut_makes_the_next_update_a_snapshot_group() {
+		let (mut producer, track) = producer(cfg(100));
+		producer.update(&json!({ "a": 1, "b": 1 })).unwrap();
+		producer.update(&json!({ "a": 1, "b": 2 })).unwrap();
+		producer.cut().unwrap();
+		producer.update(&json!({ "a": 1, "b": 3 })).unwrap();
+		producer.finish().unwrap();
+
+		// The ratio would have kept every update in one group; the cut rolled it anyway. A consumer
+		// joining at the new group reads the whole value from its first frame, with none of the deltas
+		// that preceded the cut.
+		assert_eq!(track.latest(), Some(1));
+		assert_eq!(drain(track).last().unwrap(), &json!({ "a": 1, "b": 3 }));
+	}
+
+	#[test]
+	fn a_cut_republishes_an_unchanged_value() {
+		let (mut producer, track) = producer(cfg(100));
+		producer.update(&json!({ "a": 1 })).unwrap();
+		producer.cut().unwrap();
+
+		// An unchanged value normally writes nothing. After a cut it must still open the replacement
+		// group, or the value would only exist in a group no new consumer reads.
+		producer.update(&json!({ "a": 1 })).unwrap();
+		producer.finish().unwrap();
+
+		assert_eq!(track.latest(), Some(1));
+		assert_eq!(drain(track), vec![json!({ "a": 1 })]);
+	}
+
+	#[test]
+	fn a_cut_opens_no_replacement_group() {
+		let (mut producer, track) = producer(cfg(100));
+		producer.update(&json!({ "a": 1 })).unwrap();
+		producer.cut().unwrap();
+		producer.finish().unwrap();
+
+		// Cutting closes the open group and stops there: no empty group for a consumer to advance into
+		// and wait on.
+		assert_eq!(track.latest(), Some(0));
+		assert_eq!(drain(track), vec![json!({ "a": 1 })]);
+	}
+
+	#[test]
+	fn a_cut_is_idempotent() {
+		let (mut producer, track) = producer(cfg(100));
+
+		// Nothing published yet, so there is no group to cut.
+		producer.cut().unwrap();
+		producer.cut().unwrap();
+		producer.update(&json!({ "a": 1 })).unwrap();
+		assert_eq!(track.latest(), Some(0));
+
+		// And a repeated cut rolls once, not once per call.
+		producer.cut().unwrap();
+		producer.cut().unwrap();
+		producer.update(&json!({ "a": 2 })).unwrap();
+		producer.finish().unwrap();
+
+		assert_eq!(track.latest(), Some(1));
+		assert_eq!(drain(track), vec![json!({ "a": 2 })]);
+	}
+
+	#[test]
+	fn a_cut_is_inert_without_deltas() {
+		let (mut producer, track) = producer(cfg(0));
+		producer.update(&json!({ "a": 1 })).unwrap();
+
+		// With deltas off every frame already closes its own group, so there is never one to cut.
+		producer.cut().unwrap();
+		producer.update(&json!({ "a": 2 })).unwrap();
+		producer.finish().unwrap();
+
+		assert_eq!(track.latest(), Some(1));
+		assert_eq!(drain(track), vec![json!({ "a": 2 })]);
 	}
 
 	#[test]
