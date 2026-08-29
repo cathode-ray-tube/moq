@@ -955,12 +955,12 @@ export class Publisher {
 						if (timestamps) {
 							// Convert each frame to the track's advertised timescale.
 							const ts = BigInt(Math.round(read.frame.timestamp.as(timescale)));
-							await hooks.guardGroup(group, stream.u62(zigzag(ts - prevTs)), read.position);
+							await hooks.guardGroup(group, stream.u62(zigzag(ts - prevTs)));
 							prevTs = ts;
 						}
 
-						await hooks.guardGroup(group, stream.u53(read.frame.payload.byteLength), read.position);
-						await hooks.guardGroup(group, stream.write(read.frame.payload), read.position);
+						await hooks.guardGroup(group, stream.u53(read.frame.payload.byteLength));
+						await hooks.guardGroup(group, stream.write(read.frame.payload));
 					} finally {
 						read.complete();
 					}

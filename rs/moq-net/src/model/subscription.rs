@@ -38,13 +38,12 @@ pub struct Subscription {
 	///
 	/// # How age is measured
 	///
-	/// By both presentation time and wall-clock arrival, with either able to expire the
-	/// group. Presentation time compares where the group's unread content *ends* against
-	/// where the newest group above it begins, so a backlog delivered as a burst still
-	/// reads as its true age while a long group whose tail reaches the live edge does not.
-	/// A group already handed out is measured at its reader's position, so a reader that
-	/// keeps up is never convicted. Wall-clock backstops an empty or stalled group that
-	/// has supplied no timestamp.
+	/// In presentation time only. A group is measured by its *reach*, where its immediate
+	/// successor begins, against the newest frame of the latest group: it cannot present
+	/// past its successor, so once everything it could still hold falls outside the budget
+	/// it is provably useless. The candidate needs no timestamp of its own, so an empty or
+	/// stalled group is bounded by its stamped successor the same way. Wall-clock
+	/// reclamation of idle content is the cache's own policy, not this budget's.
 	///
 	/// Protocols whose wire can't carry a timestamp (pre-Lite05 moq-lite, moq-transport
 	/// without the Timestamp property) have their frames stamped on receipt, which makes

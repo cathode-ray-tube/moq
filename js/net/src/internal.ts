@@ -26,22 +26,12 @@ export type Recv =
 	/** The track aborted. */
 	| { kind: "error"; error: Error };
 
-/** Where a group cursor sits while measuring drift against the live edge. */
-export interface GroupPosition {
-	/** Presentation timestamp of the next or in-flight frame. */
-	presentation?: Timestamp;
-	/** Monotonic arrival time of the next or in-flight frame. */
-	activity?: number;
-}
-
-/** A package-internal frame read paired with its guarded cursor position. */
+/** A package-internal frame read the wire publisher completes once written. */
 export interface ReadGroupFrame {
 	/** Frame sequence within the group. */
 	sequence: number;
 	/** Frame returned to the publisher. */
 	frame: Frame;
-	/** Cursor position held while the frame is in flight. */
-	position: GroupPosition;
 	/** Mark the frame delivered or deliberately skipped by the wire publisher. */
 	complete(): void;
 }
@@ -89,11 +79,11 @@ export const hooks: {
 	/** Keep applying a subscription's drift policy after it hands a group out. */
 	expireGroup: (
 		group: GroupConsumer,
-		expiry: { expired: (at: GroupPosition) => boolean; changed: readonly Getter<unknown>[] },
+		expiry: { expired: () => boolean; changed: readonly Getter<unknown>[] },
 	) => void;
 	/** Stop an in-flight group operation if the handed-out group expires. */
-	guardGroup: <T>(group: GroupConsumer, operation: Promise<T>, at?: GroupPosition) => Promise<T>;
-	/** Read a frame with the cursor position needed to guard its wire write. */
+	guardGroup: <T>(group: GroupConsumer, operation: Promise<T>) => Promise<T>;
+	/** Read a frame the wire publisher completes (or skips) once written. */
 	readGroupFrame: (group: GroupConsumer) => Promise<ReadGroupFrame | undefined>;
 	/** Make an evicted mirror terminal while its track timeline still contains it. */
 	evictGroup: (group: GroupConsumer) => void;

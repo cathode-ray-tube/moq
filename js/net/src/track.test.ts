@@ -432,7 +432,9 @@ test("the budget is clamped to the publisher's window", async () => {
 	expect((await track.recvGroup())?.sequence).toBe(1);
 });
 
-test("wall-clock age expires a group stalled before its first frame", async () => {
+// The stalled group needs no timestamp of its own: its reach is where its stamped
+// successor begins, which the zero budget already puts out of range.
+test("a stamped successor expires a group stalled before its first frame", async () => {
 	const clock = mockMonotonicTime(10_000);
 	try {
 		const producer = new TrackProducer("test").accept({ maxAge: 5000 });
@@ -614,7 +616,7 @@ test("a guarded write keeps the position of the frame removed from the buffer", 
 	const operation = new Promise<void>((resolve) => {
 		release = resolve;
 	});
-	const guarded = hooks.guardGroup(group, operation, read.position);
+	const guarded = hooks.guardGroup(group, operation);
 
 	producer.writeFrame({ payload: enc.encode("edge"), timestamp: Timestamp.fromMillis(1_000) });
 	// A group beyond the edge, so group 0's reach (1s) is provably behind it: a group is
@@ -643,7 +645,7 @@ test("clean source closure stays provisional while a frame write can expire", as
 	const operation = new Promise<void>((resolve) => {
 		release = resolve;
 	});
-	const guarded = hooks.guardGroup(group, operation, read.position);
+	const guarded = hooks.guardGroup(group, operation);
 
 	const edge = producer.appendGroup();
 	edge.writeFrame({ payload: enc.encode("edge"), timestamp: Timestamp.fromMillis(1_000) });
@@ -672,7 +674,11 @@ test("a drained group finishes cleanly after the live edge advances", async () =
 	expect(group.done).toBe(true);
 });
 
-test("retention eviction preserves expiry for a handed-out group", async () => {
+// Retention is the wall-clock half of the split: it reclaims idle content on its own
+// schedule, and a reader that loses unread frames to it sees a gap. The subscription
+// budget is timestamp-only and says nothing here (the empty successor has no timestamp
+// to bound the held group with).
+test("retention eviction surfaces as a gap for a handed-out group", async () => {
 	const clock = mockMonotonicTime(10_000);
 	try {
 		const producer = new TrackProducer("test").accept({ maxAge: 100 });
@@ -689,7 +695,7 @@ test("retention eviction preserves expiry for a handed-out group", async () => {
 		clock.set(10_200);
 		producer.appendGroup();
 
-		await expect(group.readFrame()).rejects.toThrow("latency budget");
+		await expect(group.readFrame()).rejects.toThrow(Lagged);
 	} finally {
 		clock.restore();
 	}
@@ -742,7 +748,7 @@ test("retention pruning preserves clean EOF for a drained mirror", async () => {
 	}
 });
 
-test("system clock changes do not affect wall-clock latency", async () => {
+test("system clock changes do not affect the latency budget", async () => {
 	const clock = mockMonotonicTime(10_000);
 	setSystemTime(new Date(10_000));
 	try {

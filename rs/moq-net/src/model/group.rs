@@ -137,11 +137,6 @@ pub(crate) struct GroupState {
 	// against. Kept alongside `timestamp` for the same reasons.
 	latest: Option<Timestamp>,
 
-	// When the group last accepted a frame. The wall-clock half of the same question:
-	// a group is silent from here, not from whenever it was created. `None` while it
-	// has produced nothing, where the track's arrival time is the only thing to go on.
-	pub(crate) activity: Option<crate::runtime::Instant>,
-
 	// Once finalized, the total number of frames the group will ever contain. Recorded
 	// at finish so the count outlives an abort that clears the cache.
 	pub(crate) fin: Option<usize>,
@@ -249,13 +244,11 @@ impl GroupState {
 		}
 	}
 
-	/// Record where the group starts and currently ends in presentation time, plus
-	/// when it last produced. `timestamp` keeps the first frame only; `latest` and
-	/// `activity` follow every frame.
+	/// Record where the group starts and currently ends in presentation time.
+	/// `timestamp` keeps the first frame only; `latest` follows every frame.
 	fn stamp(&mut self, timestamp: Timestamp) {
 		self.timestamp.get_or_insert(timestamp);
 		self.latest = Some(timestamp);
-		self.activity = Some(crate::model::clock::now());
 	}
 
 	/// Evict completed frames from the front until within the byte budget.
@@ -990,9 +983,9 @@ pub struct Consumer {
 
 /// Subscriber-specific policy for expiring a group after it was handed out.
 pub(crate) trait Expiry: Send + Sync {
-	/// Return whether a reader sitting at `at` is stale, registering `waiter` for
-	/// anything that could change the answer while the group remains live.
-	fn is_expired(&self, waiter: &kio::Waiter, at: Position) -> bool;
+	/// Return whether the group is stale, registering `waiter` for anything that
+	/// could change the answer while the group remains live.
+	fn is_expired(&self, waiter: &kio::Waiter) -> bool;
 }
 
 // `Plain` is the hot path and carries an inline frame prefetch, so boxing it to even the
@@ -1185,15 +1178,13 @@ impl Consumer {
 
 	/// Keep checking expiry while a wire publisher still owns buffered group data.
 	pub(crate) fn poll_expired_while_pending(&mut self, waiter: &kio::Waiter, pending: bool) -> bool {
-		if !self.expired && (pending || self.expiry_pending()) {
-			// Resolved here rather than up front: the sticky flag above answers most
-			// calls without touching the group's state at all.
-			let at = self.position();
-			if self.expiry.as_ref().is_some_and(|expiry| expiry.is_expired(waiter, at)) {
-				self.expired = true;
-				if !self.stale_counted.swap(true, Ordering::Relaxed) {
-					self.stale_stats.stale(self.unread_content());
-				}
+		if !self.expired
+			&& (pending || self.expiry_pending())
+			&& self.expiry.as_ref().is_some_and(|expiry| expiry.is_expired(waiter))
+		{
+			self.expired = true;
+			if !self.stale_counted.swap(true, Ordering::Relaxed) {
+				self.stale_stats.stale(self.unread_content());
 			}
 		}
 		self.expired
@@ -1211,16 +1202,6 @@ impl Consumer {
 	/// Whether this cursor failed because its subscription max age budget expired.
 	pub(crate) fn latency_expired(&self) -> bool {
 		self.expired
-	}
-
-	/// When this cursor's group last produced, for a drift budget to age it against
-	/// the live edge instead of when the group first arrived.
-	pub(crate) fn position(&self) -> Position {
-		match &self.inner {
-			ConsumerKind::Plain(plain) => plain.position(),
-			// A spliced group's route-specific cursors carry their own policy.
-			ConsumerKind::Spliced(_) => Position::default(),
-		}
 	}
 
 	/// Whether the group has been aborted (including pool eviction); the abort
@@ -1464,22 +1445,7 @@ impl Consumer {
 	}
 }
 
-/// When a group cursor last saw producer activity.
-///
-/// `None` means the group has presented nothing (an empty or stalled group),
-/// where the track falls back to when the group arrived.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct Position {
-	pub(crate) activity: Option<crate::runtime::Instant>,
-}
-
 impl Plain {
-	fn position(&self) -> Position {
-		let state = self.state.read();
-		Position {
-			activity: state.activity,
-		}
-	}
 
 	/// Whether this cursor still has unread content or may receive another frame.
 	fn expiry_pending(&self) -> bool {

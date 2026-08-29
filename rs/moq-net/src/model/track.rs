@@ -224,10 +224,6 @@ pub(crate) struct TrackState {
 struct Slot {
 	group: group::Producer,
 
-	// When this group entered the track at this hop. This is the wall-clock
-	// backstop for groups whose first frame has not supplied a timestamp yet.
-	arrived: crate::runtime::Instant,
-
 	// Incarnation stamp, echoed by this slot's arrival entry (if any). A re-served
 	// sequence (an aborted group re-created by the publisher or re-fetched as
 	// backfill) gets a fresh stamp, so a historical arrival entry can't resolve to
@@ -429,11 +425,12 @@ impl TrackState {
 		self.info.as_ref().map(|info| info.max_age)
 	}
 
-	/// The live edges a subscription bounded at `cap` measures drift against: the
-	/// highest-sequence group for wall-clock age, plus the highest one that has
-	/// presented a frame for timestamp age.
+	/// The live edge a subscription bounded at `cap` measures drift against: the
+	/// highest-sequence group that has presented a frame, or `None` while nothing
+	/// stamped is servable (an unstamped track drives no expiry at all; the cache's
+	/// own wall-clock policy is what bounds it).
 	///
-	/// One scan answers a whole poll. Each highest-sequence anchor in range is above
+	/// One scan answers a whole poll. The highest-sequence anchor in range is above
 	/// every candidate below it and above none at or past it. Recomputing per candidate
 	/// would make walking a backlog of N groups off in one poll cost O(N^2).
 	///
@@ -443,7 +440,6 @@ impl TrackState {
 	/// Fetched backfill is absent from `arrival`, so it cannot age subscription content
 	/// as though it were a live replacement.
 	fn live_edge(&self, cap: Option<u64>) -> Option<Edge> {
-		let mut wall: Option<WallEdge> = None;
 		let mut presentation: Option<PresentationEdge> = None;
 		let mut stamped: Vec<(u64, Timestamp)> = Vec::new();
 		for slot in self.lookup.values() {
@@ -453,13 +449,6 @@ impl TrackState {
 			let group = &slot.group;
 			if cap.is_some_and(|cap| group.sequence > cap) || group.is_aborted() {
 				continue;
-			}
-			if wall.is_none_or(|edge| group.sequence > edge.sequence) {
-				wall = Some(WallEdge {
-					sequence: group.sequence,
-					stamp: slot.stamp,
-					arrived: slot.arrived,
-				});
 			}
 			if let Some(timestamp) = group.timestamp() {
 				// The suffix table bounds a candidate's reach, so it wants where each group
@@ -479,8 +468,7 @@ impl TrackState {
 		// Sequence order, so a candidate's immediate successor is one lookup away.
 		stamped.sort_unstable_by_key(|(sequence, _)| *sequence);
 
-		wall.map(|wall| Edge {
-			wall,
+		presentation.map(|presentation| Edge {
 			presentation,
 			suffix: stamped.into(),
 		})
@@ -498,8 +486,10 @@ impl TrackState {
 	///
 	/// A group's reach is bounded by its nearest successor: it cannot present past where
 	/// the next group begins. Its own frames say nothing, since a frame's duration is not
-	/// on the wire and its last timestamp is where that frame *starts*. Wall-clock arrival
-	/// backstops the whole thing for an empty group that has supplied no timestamp at all.
+	/// on the wire and its last timestamp is where that frame *starts*. The candidate
+	/// itself needs no timestamp: an empty group is bounded by its stamped successor the
+	/// same way. Only timestamps drive expiry; wall-clock reclamation of idle content is
+	/// the cache's own policy, not the budget's.
 	///
 	/// The bound is exclusive, so the comparison is `>=` rather than `>`: the freshest frame
 	/// a group could still hold sits just *below* its reach, so an age equal to the budget
@@ -509,46 +499,27 @@ impl TrackState {
 	/// The edge must sit strictly above the candidate. The live edge is never late
 	/// against itself, and backfill or the tail of a rewound timeline can carry a high
 	/// timestamp on a low sequence without being an edge at all.
-	fn is_stale(&self, sequence: u64, at: Option<group::Position>, edge: Option<&Edge>, budget: Duration) -> bool {
+	fn is_stale(&self, sequence: u64, edge: Option<&Edge>, budget: Duration) -> bool {
 		let Some(edge) = edge else {
 			return false;
 		};
-		let Some(slot) = self.lookup.get(&sequence) else {
+		if !self.lookup.contains_key(&sequence) {
 			return false;
-		};
+		}
 
-		// Where the candidate can still reach, which is a property of what follows it
-		// rather than of the reader or of the group's own frames.
-		let at = at.unwrap_or_default();
-		let arrived = at.activity.unwrap_or(slot.arrived);
-
-		// The anchors were resolved under an earlier lock, so confirm each still names
+		// The anchor was resolved under an earlier lock, so confirm it still names
 		// the same servable incarnation before it convicts a candidate. Failing safe
 		// (delivering) is right, since the next poll resolves fresh anchors.
-		let wall_stale = edge.wall.sequence > sequence
+		let live_edge = &edge.presentation;
+		let reach = edge.reach(sequence);
+		live_edge.sequence > sequence
 			&& self
 				.lookup
-				.get(&edge.wall.sequence)
-				.is_some_and(|live| live.stamp == edge.wall.stamp && !live.group.is_aborted())
-			&& edge
-				.wall
-				.arrived
-				.checked_duration_since(arrived)
-				.is_some_and(|age| age >= budget);
-
-		let reach = edge.reach(sequence);
-		let presentation_stale = edge.presentation.is_some_and(|live_edge| {
-			live_edge.sequence > sequence
-				&& self
-					.lookup
-					.get(&live_edge.sequence)
-					.is_some_and(|live| live.stamp == live_edge.stamp && !live.group.is_aborted())
-				&& reach.is_some_and(
-					|reach| matches!(live_edge.timestamp.checked_sub(reach), Ok(age) if Duration::from(age) >= budget),
-				)
-		});
-
-		wall_stale || presentation_stale
+				.get(&live_edge.sequence)
+				.is_some_and(|live| live.stamp == live_edge.stamp && !live.group.is_aborted())
+			&& reach.is_some_and(
+				|reach| matches!(live_edge.timestamp.checked_sub(reach), Ok(age) if Duration::from(age) >= budget),
+			)
 	}
 
 	/// Resolve a one-shot fetch from the track side: the cached group, or an [`Error`]
@@ -734,7 +705,6 @@ impl TrackState {
 			sequence,
 			Slot {
 				group: group.clone(),
-				arrived: crate::model::clock::now(),
 				stamp,
 				visible,
 			},
@@ -2657,7 +2627,7 @@ struct GroupExpiry {
 }
 
 impl group::Expiry for GroupExpiry {
-	fn is_expired(&self, waiter: &kio::Waiter, at: group::Position) -> bool {
+	fn is_expired(&self, waiter: &kio::Waiter) -> bool {
 		let mut max_age = Duration::default();
 		let _ = self.subscription.poll(waiter, |subscription| {
 			max_age = subscription.max_age;
@@ -2676,7 +2646,7 @@ impl group::Expiry for GroupExpiry {
 			let budget = clamp_max_age(max_age, state.max_age_bound());
 			loop {
 				let edge = state.live_edge(cap);
-				expired = state.is_stale(self.sequence, Some(at), edge.as_ref(), budget);
+				expired = state.is_stale(self.sequence, edge.as_ref(), budget);
 				if expired {
 					break;
 				}
@@ -2697,8 +2667,7 @@ impl group::Expiry for GroupExpiry {
 				}
 				let presentation_sequence = edge
 					.as_ref()
-					.and_then(|edge| edge.presentation)
-					.map_or(self.sequence, |edge| edge.sequence.max(self.sequence));
+					.map_or(self.sequence, |edge| edge.presentation.sequence.max(self.sequence));
 				for slot in state.lookup.values() {
 					let group = &slot.group;
 					if slot.visible
@@ -2730,8 +2699,7 @@ impl group::Expiry for GroupExpiry {
 /// from whatever may occupy its sequence by the time a candidate is judged.
 #[derive(Clone)]
 struct Edge {
-	wall: WallEdge,
-	presentation: Option<PresentationEdge>,
+	presentation: PresentationEdge,
 	/// Every servable stamped group, sorted by sequence, paired with its own first frame
 	/// timestamp. A candidate's reach is where its immediate successor begins, so `reach()`
 	/// finds that one entry rather than rescanning, keeping a backlog walk linear.
@@ -2759,16 +2727,6 @@ impl Edge {
 		let index = self.suffix.partition_point(|(seq, _)| *seq <= sequence);
 		self.suffix.get(index).map(|(_, timestamp)| *timestamp)
 	}
-}
-
-/// The newest servable group, including an empty group with no media timestamp.
-#[derive(Clone, Copy)]
-struct WallEdge {
-	sequence: u64,
-	/// The slot incarnation this arrival time was read from, so an eviction or a re-served
-	/// sequence between resolving the anchor and using it is detectable.
-	stamp: u32,
-	arrived: crate::runtime::Instant,
 }
 
 /// The newest servable group that has presented at least one frame.
@@ -2880,12 +2838,7 @@ impl PlainSubscriber {
 	/// for this poll.
 	fn poll_stale(&self, group: &group::Consumer, drift: &Drift, waiter: &kio::Waiter) -> Poll<Result<bool>> {
 		self.poll(waiter, move |state| {
-			Poll::Ready(Ok(state.is_stale(
-				group.sequence,
-				None,
-				drift.edge.as_ref(),
-				drift.budget,
-			)))
+			Poll::Ready(Ok(state.is_stale(group.sequence, drift.edge.as_ref(), drift.budget)))
 		})
 	}
 
@@ -4537,15 +4490,15 @@ mod test {
 	}
 
 	#[tokio::test]
-	async fn wall_clock_expires_an_unstamped_group() {
+	async fn a_stamped_successor_expires_an_unstamped_group() {
 		let mut producer = track_producer("test", None);
 		let mut subscriber = producer.subscribe(None);
 		producer.append_group().unwrap(); // seq 0 stalls before its first frame
 
-		crate::model::clock::advance(Duration::from_secs(1));
 		append_at(&mut producer, 1000); // seq 1 proves the live feed moved on
 
-		// With the real-time budget, wall-clock age backstops the missing timestamp.
+		// The candidate needs no timestamp of its own: its reach is where its stamped
+		// successor begins, which the zero budget already puts out of range.
 		assert_eq!(drain(&mut subscriber), vec![1]);
 	}
 
@@ -5052,7 +5005,7 @@ mod test {
 			edge: state.live_edge(None),
 		};
 		assert!(
-			state.is_stale(0, None, drift.edge.as_ref(), drift.budget),
+			state.is_stale(0, drift.edge.as_ref(), drift.budget),
 			"stale against a live edge"
 		);
 		drop(state);
@@ -5063,7 +5016,7 @@ mod test {
 
 		let state = producer.state.read();
 		assert!(
-			!state.is_stale(0, None, drift.edge.as_ref(), drift.budget),
+			!state.is_stale(0, drift.edge.as_ref(), drift.budget),
 			"a vanished edge is no reason to drop what is left"
 		);
 	}

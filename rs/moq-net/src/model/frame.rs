@@ -603,10 +603,7 @@ impl Consumer {
 		let Some(expiry) = &self.expiry else {
 			return false;
 		};
-		let at = group::Position {
-			activity: self.state.read().activity,
-		};
-		if !expiry.policy.is_expired(waiter, at) {
+		if !expiry.policy.is_expired(waiter) {
 			return false;
 		}
 

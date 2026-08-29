@@ -6,14 +6,7 @@
 import { type Dispose, type GetPromise, type Getter, Once, Signal } from "@moq/signals";
 import type { Datagram } from "./datagram.ts";
 import { type Frame, type Consumer as GroupConsumer, Producer as GroupProducer, Lagged } from "./group.ts";
-import {
-	type GroupPosition,
-	hooks,
-	type Recv,
-	type TrackRequestOptions,
-	type TrackSequence,
-	type TrackSequences,
-} from "./internal.ts";
+import { hooks, type Recv, type TrackRequestOptions, type TrackSequence, type TrackSequences } from "./internal.ts";
 import { Timescale, type Timestamp } from "./time.ts";
 
 export type { Datagram } from "./datagram.ts";
@@ -728,18 +721,15 @@ export class Subscriber {
 
 	#drift(): {
 		budget: number;
-		wall?: { sequence: number; time: number };
 		presentation?: { sequence: number; timestamp: Timestamp };
 		suffix: { sequence: number; reach: number }[];
 	} {
 		const { end } = this.#cursor.peek();
-		let wall: { sequence: number; time: number } | undefined;
 		let presentation: { sequence: number; timestamp: Timestamp } | undefined;
 		const suffix: { sequence: number; reach: number }[] = [];
-		for (const { group, time } of this.#state.timeline.values()) {
+		for (const { group } of this.#state.timeline.values()) {
 			if (end !== undefined && group.sequence > end) continue;
 			if (group.closed.peek() instanceof Error) continue;
-			if (!wall || group.sequence > wall.sequence) wall = { sequence: group.sequence, time };
 			const timestamp = hooks.groupTimestamp(group);
 			if (timestamp !== undefined) {
 				// The table bounds a candidate's reach, so it wants where each group
@@ -766,7 +756,6 @@ export class Subscriber {
 					? requested
 					: Math.min(requested, retained)
 				: Number.POSITIVE_INFINITY,
-			wall,
 			presentation,
 			suffix,
 		};
@@ -798,43 +787,36 @@ export class Subscriber {
 	//
 	// A group's reach is bounded by its nearest successor: it cannot present past where the
 	// next group begins. Its own frames say nothing, since a frame's duration is not on the
-	// wire. The bound is exclusive, so the comparison is `>=`: the freshest frame a group
-	// could still hold sits just below its reach, so an age equal to the budget already puts
-	// every frame in it strictly past the budget. A zero budget falls out for free.
-	//
-	// `at.activity` is where a handed-out group's reader last made progress, backstopping
-	// an empty group that has supplied no timestamp at all.
+	// wire, and the candidate needs no timestamp of its own: an empty group is bounded by
+	// its stamped successor the same way. The bound is exclusive, so the comparison is `>=`:
+	// the freshest frame a group could still hold sits just below its reach, so an age equal
+	// to the budget already puts every frame in it strictly past the budget. A zero budget
+	// falls out for free. Only timestamps drive expiry; wall-clock reclamation of idle
+	// content is the cache's own policy, not the budget's.
 	#isStale(
 		group: GroupConsumer,
 		drift: {
 			budget: number;
-			wall?: { sequence: number; time: number };
 			presentation?: { sequence: number; timestamp: Timestamp };
 			suffix: { sequence: number; reach: number }[];
 		},
-		at?: GroupPosition,
 	): boolean {
 		const candidate = this.#state.timeline.get(group.sequence);
 		if (candidate?.group !== group) return false;
 
-		const time = at?.activity ?? candidate.time;
-		const wallStale =
-			drift.wall !== undefined && drift.wall.sequence > group.sequence && drift.wall.time - time >= drift.budget;
-
 		const reach = Subscriber.#reach(drift.suffix, group.sequence);
-		const presentationStale =
+		return (
 			drift.presentation !== undefined &&
 			drift.presentation.sequence > group.sequence &&
 			reach !== undefined &&
-			drift.presentation.timestamp.asMillis() - reach >= drift.budget;
-
-		return wallStale || presentationStale;
+			drift.presentation.timestamp.asMillis() - reach >= drift.budget
+		);
 	}
 
 	#guard(group: GroupConsumer): GroupConsumer {
 		if (!this.#enforceLatency) return group;
 		hooks.expireGroup(group, {
-			expired: (at) => this.#isStale(group, this.#drift(), at),
+			expired: () => this.#isStale(group, this.#drift()),
 			changed: [
 				this.#state.groups,
 				this.#state.timelineChanged,
@@ -959,8 +941,8 @@ export class Subscriber {
 	 * Honors the floor set by {@link startAt} and the cap set by {@link endAt}: a group
 	 * beyond the cap stays buffered (not dropped) and is offered once the cap rises, even
 	 * after a clean close, without blocking in-range groups that arrive behind it.
-	 * A group whose presentation time or wall-clock arrival is further behind the live edge
-	 * than this subscriber's `maxAge` is skipped. The default of zero takes the live edge.
+	 * A group whose presentation time is further behind the live edge than this
+	 * subscriber's `maxAge` is skipped. The default of zero takes the live edge.
 	 * The budget remains attached after return, so a pending frame read rejects if a stalled
 	 * group becomes stale while newer data advances.
 	 *

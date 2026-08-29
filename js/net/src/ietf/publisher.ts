@@ -302,7 +302,6 @@ export class Publisher {
 						await hooks.guardGroup(
 							group,
 							obj.encode(stream, header.flags, timescale, this.#session.version),
-							read.position,
 						);
 					} finally {
 						read.complete();
