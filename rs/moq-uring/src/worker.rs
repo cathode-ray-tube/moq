@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use io_uring::{EnterFlags, IoUring, opcode, types};
 
@@ -27,6 +27,15 @@ const SQ_ENTRIES: u32 = 256;
 /// state.
 const CQ_ENTRIES: u32 = 4096;
 
+/// Maximum completions copied at once while teardown is deadline-bounded.
+const TEARDOWN_CQE_BATCH: usize = 64;
+
+/// Extra mandatory submit attempts allowed after interrupted enters.
+const TEARDOWN_EINTR_RETRIES: usize = 8;
+
+/// Maximum time spent staging cancellations and draining completions.
+const TEARDOWN_TIMEOUT: Duration = Duration::from_millis(3200);
+
 /// Worker construction knobs.
 ///
 /// Currently empty: the worker sizes its ring internally, with a completion
@@ -45,12 +54,14 @@ pub struct Config {}
 /// (any `Waker` this worker minted) are an atomic store plus, only while the
 /// worker is parked, one futex syscall.
 ///
-/// Dropping the worker submits the SQEs its last turn staged and waits for
-/// their completions, so a datagram already handed to a [`udp::Socket`] still
-/// goes out. It runs no tasks, though, so work a task has merely been asked
-/// for is not performed: a QUIC close is queued on its connection and framed
-/// by the driver task, so keep driving until the close is published rather
-/// than stopping the worker on the call that asked for it.
+/// Dropping the worker makes a bounded attempt to submit the SQEs its last
+/// turn staged and drain their completions. A datagram already handed to a
+/// [`udp::Socket`] is included in that submission attempt, while operation
+/// storage that the kernel might still access is safely leaked if teardown
+/// cannot finish. It runs no tasks, though, so work a task has merely been
+/// asked for is not performed: a QUIC close is queued on its connection and
+/// framed by the driver task, so keep driving until the close is published
+/// rather than stopping the worker on the call that asked for it.
 pub struct Worker {
 	shared: Rc<Shared>,
 	tasks: kio::Tasks<Task>,
@@ -152,30 +163,56 @@ impl Worker {
 
 	/// Submit staged SQEs and dispatch every pending completion.
 	fn pump(&mut self) -> Result<(), Error> {
+		self.pump_inner(None)
+	}
+
+	/// Pump submission and completion batches until `deadline`.
+	fn pump_until(&mut self, deadline: Instant) -> Result<(), Error> {
+		self.pump_inner(Some(deadline))
+	}
+
+	fn pump_inner(&mut self, deadline: Option<Instant>) -> Result<(), Error> {
 		self.submit()?;
 		loop {
+			if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+				return Ok(());
+			}
 			// Copy the completions out so dispatch can borrow the ring (to
 			// re-arm receives, push cancels, and so on). Completions spilled
 			// by `Shared::push` predate the CQ's, so they dispatch first.
 			let cqes: Vec<Cqe> = {
 				let mut ring = self.shared.ring.borrow_mut();
 				let mut spill = self.shared.spill.borrow_mut();
-				spill
-					.drain(..)
-					.chain(ring.completion().map(|entry| Cqe {
-						user_data: entry.user_data(),
-						result: entry.result(),
-						flags: entry.flags(),
-					}))
-					.collect()
+				let limit = deadline.map_or(usize::MAX, |_| TEARDOWN_CQE_BATCH);
+				let spilled = spill.len().min(limit);
+				let mut cqes: Vec<_> = spill.drain(..spilled).collect();
+				cqes.extend(ring.completion().take(limit - spilled).map(|entry| Cqe {
+					user_data: entry.user_data(),
+					result: entry.result(),
+					flags: entry.flags(),
+				}));
+				cqes
 			};
 			if cqes.is_empty() {
 				return Ok(());
 			}
-			for cqe in cqes {
-				self.dispatch(cqe);
+			if !self.dispatch_batch(cqes, deadline, Instant::now) {
+				return Ok(());
 			}
 		}
+	}
+
+	/// Dispatch a completion batch while its teardown budget remains.
+	fn dispatch_batch(&mut self, cqes: Vec<Cqe>, deadline: Option<Instant>, mut now: impl FnMut() -> Instant) -> bool {
+		for cqe in cqes {
+			if deadline.is_some_and(|deadline| now() >= deadline) {
+				// Drop this batch's remaining CQEs. Worker::drop will leak their
+				// op state, which is safe even if the kernel already finished it.
+				return false;
+			}
+			self.dispatch(cqe);
+		}
+		true
 	}
 
 	fn submit(&mut self) -> Result<(), Error> {
@@ -184,10 +221,65 @@ impl Worker {
 			return Ok(());
 		}
 		match ring.submit() {
+			// A partial submit leaves the rest staged for the next pump.
 			Ok(_) => Ok(()),
+			// A signal interrupted the enter before it consumed anything. The
+			// next worker turn retries the same staged SQEs.
+			Err(err) if err.raw_os_error() == Some(libc::EINTR) => Ok(()),
 			// The completion queue overflowed; the caller reaps and retries.
 			Err(err) if err.raw_os_error() == Some(libc::EBUSY) => Ok(()),
 			Err(err) => Err(err.into()),
+		}
+	}
+
+	/// Submit every residual SQE without waiting for completions.
+	fn submit_teardown(&mut self) -> Result<(), Error> {
+		let mut ring = self.shared.ring.borrow_mut();
+		let mut interruptions = 0;
+		loop {
+			if ring.submission().is_empty() {
+				return Ok(());
+			}
+			match ring.submit() {
+				// Keep submitting after partial progress. Returning zero while SQEs
+				// remain would otherwise spin forever.
+				Ok(0) => {
+					return Err(std::io::Error::other("io_uring teardown submission made no progress").into());
+				}
+				Ok(_) => {}
+				Err(err) => retry_teardown_submit(&mut interruptions, err)?,
+			}
+		}
+	}
+
+	/// Submit residual SQEs, then drain completions within `deadline`.
+	fn drain_teardown(&mut self, deadline: Instant) {
+		// Cancellation staging can consume the whole deadline. Existing SQEs,
+		// especially sends, must still reach the kernel before it gates draining.
+		let submission_failed = self.submit_teardown().is_err();
+		if !submission_failed {
+			loop {
+				if self.shared.ops.borrow().is_empty() {
+					return;
+				}
+				if Instant::now() >= deadline || self.pump_until(deadline).is_err() {
+					break;
+				}
+				let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+					break;
+				};
+				let ring = self.shared.ring.borrow_mut();
+				let wait = remaining.min(std::time::Duration::from_millis(50));
+				let ts = types::Timespec::from(wait);
+				let args = types::SubmitArgs::new().timespec(&ts);
+				let _ = ring.submitter().submit_with_args(1, &args);
+			}
+		}
+		if !self.shared.ops.borrow().is_empty() {
+			// Leak the operations (and what they own) rather than free memory
+			// the kernel may still touch.
+			tracing::error!("dropping an io_uring worker with operations stuck in flight; leaking them");
+			std::mem::forget(std::mem::take(&mut *self.shared.ops.borrow_mut()));
 		}
 	}
 
@@ -311,34 +403,32 @@ impl Drop for Worker {
 		// Handles may outlive us; everything they try from here on fails
 		// instead of pending on a loop that will never run again.
 		self.shared.stopped.set(true);
+		// One deadline bounds cancellation staging and draining together.
+		let deadline = Instant::now() + TEARDOWN_TIMEOUT;
 		// The kernel may still write into provided buffers and read send
-		// headers owned by the ops slab. Cancel everything and wait for the
-		// terminal completions before any of that memory frees.
-		{
-			let ring = self.shared.ring.borrow_mut();
-			let timeout = types::Timespec::new().sec(1);
-			let _ = ring
-				.submitter()
-				.register_sync_cancel(Some(timeout), types::CancelBuilder::any());
-		}
-		for _ in 0..64 {
-			if self.pump().is_err() {
+		// headers owned by the ops slab. Queue cancels behind every staged
+		// receive and the futex, so partial submissions cannot strand an
+		// uncancelled operation. Sends are deliberately left alone: a datagram
+		// staged by the final worker turn still has to reach the wire.
+		let cancel: Vec<u64> = self
+			.shared
+			.ops
+			.borrow()
+			.iter()
+			.filter_map(|(key, op)| matches!(op, Op::Recv { .. } | Op::FutexWait).then_some(key as u64))
+			.collect();
+		let mut cancellation_failed = false;
+		for key in cancel {
+			if Instant::now() >= deadline {
+				cancellation_failed = true;
 				break;
 			}
-			if self.shared.ops.borrow().is_empty() {
-				return;
-			}
-			let ring = self.shared.ring.borrow_mut();
-			let ts = types::Timespec::new().nsec(50_000_000);
-			let args = types::SubmitArgs::new().timespec(&ts);
-			let _ = ring.submitter().submit_with_args(1, &args);
+			cancellation_failed |= self.shared.cancel_until(key, deadline).is_err();
 		}
-		if !self.shared.ops.borrow().is_empty() {
-			// Leak the operations (and what they own) rather than free memory
-			// the kernel may still touch.
-			tracing::error!("dropping an io_uring worker with operations stuck in flight; leaking them");
-			std::mem::forget(std::mem::replace(&mut *self.shared.ops.borrow_mut(), slab::Slab::new()));
+		if cancellation_failed {
+			tracing::error!("failed to queue one or more io_uring teardown cancellations");
 		}
+		self.drain_teardown(deadline);
 	}
 }
 
@@ -460,6 +550,15 @@ fn abs_timespec(at: Instant) -> types::Timespec {
 	types::Timespec::new().sec(secs).nsec((nanos % 1_000_000_000) as u32)
 }
 
+/// Accept a bounded number of interrupted teardown submissions.
+fn retry_teardown_submit(interruptions: &mut usize, err: std::io::Error) -> std::io::Result<()> {
+	if err.raw_os_error() != Some(libc::EINTR) || *interruptions >= TEARDOWN_EINTR_RETRIES {
+		return Err(err);
+	}
+	*interruptions += 1;
+	Ok(())
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -565,6 +664,7 @@ mod tests {
 		let handle = worker.handle();
 		let bind = || std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
 		let sock = handle.udp(bind(), udp::Config::default()).expect("socket");
+		let shared = sock.downgrade();
 		let to = sock.local_addr().expect("addr");
 		let Poll::Ready(Ok(tx)) = sock.poll_acquire(&kio::Waiter::noop()) else {
 			panic!("no tx buffer");
@@ -579,6 +679,92 @@ mod tests {
 		assert!(tx.send(1200, to, 1200).is_err());
 		// And a late spawn is dropped rather than parked forever.
 		handle.spawn(async {});
+		drop(sock);
+		assert!(shared.upgrade().is_none(), "the worker leaked its staged receive");
+	}
+
+	#[test]
+	fn teardown_stops_between_completions_at_the_deadline() {
+		let Some(mut worker) = worker() else { return };
+		let first = worker.shared.insert(Op::Cancel);
+		let second = worker.shared.insert(Op::Cancel);
+		let cqe = |user_data| Cqe {
+			user_data,
+			result: 0,
+			flags: 0,
+		};
+		let before = Instant::now();
+		let deadline = before + Duration::from_millis(1);
+		let mut now = [before, deadline].into_iter();
+
+		assert!(
+			!worker.dispatch_batch(vec![cqe(first), cqe(second)], Some(deadline), || {
+				now.next().expect("one deadline check per completion")
+			})
+		);
+		assert!(!worker.shared.ops.borrow().contains(first as usize));
+		assert!(worker.shared.ops.borrow().contains(second as usize));
+		worker.shared.ops.borrow_mut().remove(second as usize);
+	}
+
+	#[test]
+	fn expired_teardown_submits_residual_sqes() {
+		let Some(mut worker) = worker() else { return };
+		// A NOP needs no slab-owned memory, so it can observe the SQ directly.
+		for _ in 0..SQ_ENTRIES {
+			worker.shared.push(&opcode::Nop::new().build()).expect("stage NOP");
+		}
+		assert_eq!(worker.shared.ring.borrow_mut().submission().len(), SQ_ENTRIES as usize);
+
+		worker.drain_teardown(Instant::now());
+		assert!(worker.shared.ring.borrow_mut().submission().is_empty());
+	}
+
+	#[test]
+	fn teardown_submit_interrupt_budget_is_finite() {
+		let interrupted = || std::io::Error::from_raw_os_error(libc::EINTR);
+		let mut interruptions = 0;
+		for _ in 0..TEARDOWN_EINTR_RETRIES {
+			retry_teardown_submit(&mut interruptions, interrupted()).expect("retry interrupted submit");
+		}
+		assert_eq!(interruptions, TEARDOWN_EINTR_RETRIES);
+		assert_eq!(
+			retry_teardown_submit(&mut interruptions, interrupted())
+				.expect_err("interrupt budget must be finite")
+				.raw_os_error(),
+			Some(libc::EINTR)
+		);
+	}
+
+	#[test]
+	fn dropped_worker_drains_more_receives_than_the_submission_queue() {
+		let Some(worker) = worker() else { return };
+		let handle = worker.handle();
+		let config = udp::Config {
+			gro: false,
+			gso: false,
+			multishot: false,
+			rx_buffers_max: 1,
+			rx_buffer_len: 2048,
+			tx_buffers_max: 1,
+			tx_buffer_len: 2048,
+		};
+		let mut sockets = Vec::new();
+		let mut shared = Vec::new();
+		for _ in 0..=SQ_ENTRIES {
+			let sock = handle
+				.udp(std::net::UdpSocket::bind("127.0.0.1:0").expect("bind"), config.clone())
+				.expect("socket");
+			shared.push(sock.downgrade());
+			sockets.push(sock);
+		}
+
+		drop(worker);
+		drop(sockets);
+		assert!(
+			shared.iter().all(|shared| shared.upgrade().is_none()),
+			"the worker leaked a receive staged across submission batches"
+		);
 	}
 
 	#[test]

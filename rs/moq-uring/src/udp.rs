@@ -386,6 +386,12 @@ pub struct Socket {
 }
 
 impl Socket {
+	/// A test-only observer for whether every kernel operation released this socket.
+	#[cfg(test)]
+	pub(crate) fn downgrade(&self) -> Weak<SockShared> {
+		Rc::downgrade(&self.shared)
+	}
+
 	pub(crate) fn bind(shared: &Rc<Shared>, io: UdpSocket, config: Config) -> Result<Self, Error> {
 		let floor = if config.gro { MAX_RECV + RECV_OVERHEAD } else { 2048 };
 		if config.rx_buffer_len < floor || config.rx_buffers_max == 0 || config.tx_buffers_max == 0 {
@@ -595,11 +601,7 @@ impl Drop for Socket {
 			drop(rx);
 			// Fire-and-forget: the cancel's own CQE is consumed by the worker,
 			// and the receive's terminal CQE releases the socket state.
-			let cancel_key = shared.insert(Op::Cancel);
-			let entry = opcode::AsyncCancel::new(key).build().user_data(cancel_key);
-			if shared.push(&entry).is_err() {
-				shared.ops.borrow_mut().remove(cancel_key as usize);
-			}
+			let _ = shared.cancel(key);
 		}
 	}
 }
@@ -691,9 +693,9 @@ impl TxBuf {
 	/// surfaces on the next pool acquire.
 	///
 	/// This only stages an SQE, so the datagram reaches the kernel when the
-	/// worker next enters the ring. Stopping the worker in between does not
-	/// lose it: [`crate::Worker`]'s drop submits whatever is still staged and
-	/// waits for the completions.
+	/// worker next enters the ring. Dropping the worker makes a bounded attempt
+	/// to submit staged datagrams and drain their completions, but does not
+	/// guarantee kernel completion or delivery.
 	pub fn send(mut self, len: usize, to: SocketAddr, segment: usize) -> io::Result<()> {
 		// `UDP_SEGMENT` is a u16, so an oversized segment would silently
 		// truncate into a tiny stride and explode the implied segment count.
