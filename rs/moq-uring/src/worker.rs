@@ -30,6 +30,9 @@ const CQ_ENTRIES: u32 = 4096;
 /// Maximum completions copied at once while teardown is deadline-bounded.
 const TEARDOWN_CQE_BATCH: usize = 64;
 
+/// Extra mandatory submit attempts allowed after interrupted enters.
+const TEARDOWN_EINTR_RETRIES: usize = 8;
+
 /// Worker construction knobs.
 ///
 /// Currently empty: the worker sizes its ring internally, with a completion
@@ -227,6 +230,7 @@ impl Worker {
 	/// Submit every residual SQE without waiting for completions.
 	fn submit_teardown(&mut self) -> Result<(), Error> {
 		let mut ring = self.shared.ring.borrow_mut();
+		let mut interruptions = 0;
 		loop {
 			if ring.submission().is_empty() {
 				return Ok(());
@@ -238,8 +242,7 @@ impl Worker {
 					return Err(std::io::Error::other("io_uring teardown submission made no progress").into());
 				}
 				Ok(_) => {}
-				Err(err) if err.raw_os_error() == Some(libc::EINTR) => {}
-				Err(err) => return Err(err.into()),
+				Err(err) => retry_teardown_submit(&mut interruptions, err)?,
 			}
 		}
 	}
@@ -542,6 +545,15 @@ fn abs_timespec(at: Instant) -> types::Timespec {
 	types::Timespec::new().sec(secs).nsec((nanos % 1_000_000_000) as u32)
 }
 
+/// Accept a bounded number of interrupted teardown submissions.
+fn retry_teardown_submit(interruptions: &mut usize, err: std::io::Error) -> std::io::Result<()> {
+	if err.raw_os_error() != Some(libc::EINTR) || *interruptions >= TEARDOWN_EINTR_RETRIES {
+		return Err(err);
+	}
+	*interruptions += 1;
+	Ok(())
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -701,6 +713,22 @@ mod tests {
 
 		worker.drain_teardown(Instant::now());
 		assert!(worker.shared.ring.borrow_mut().submission().is_empty());
+	}
+
+	#[test]
+	fn teardown_submit_interrupt_budget_is_finite() {
+		let interrupted = || std::io::Error::from_raw_os_error(libc::EINTR);
+		let mut interruptions = 0;
+		for _ in 0..TEARDOWN_EINTR_RETRIES {
+			retry_teardown_submit(&mut interruptions, interrupted()).expect("retry interrupted submit");
+		}
+		assert_eq!(interruptions, TEARDOWN_EINTR_RETRIES);
+		assert_eq!(
+			retry_teardown_submit(&mut interruptions, interrupted())
+				.expect_err("interrupt budget must be finite")
+				.raw_os_error(),
+			Some(libc::EINTR)
+		);
 	}
 
 	#[test]
