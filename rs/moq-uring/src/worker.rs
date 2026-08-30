@@ -224,6 +224,37 @@ impl Worker {
 		}
 	}
 
+	/// Submit residual SQEs once, then drain completions within `deadline`.
+	fn drain_teardown(&mut self, deadline: Instant) {
+		// Cancellation staging can consume the whole deadline. Existing SQEs,
+		// especially sends, are still owed one non-waiting submission attempt.
+		let submission_failed = self.submit().is_err();
+		if !submission_failed {
+			loop {
+				if self.shared.ops.borrow().is_empty() {
+					return;
+				}
+				if Instant::now() >= deadline || self.pump_until(deadline).is_err() {
+					break;
+				}
+				let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+					break;
+				};
+				let ring = self.shared.ring.borrow_mut();
+				let wait = remaining.min(std::time::Duration::from_millis(50));
+				let ts = types::Timespec::from(wait);
+				let args = types::SubmitArgs::new().timespec(&ts);
+				let _ = ring.submitter().submit_with_args(1, &args);
+			}
+		}
+		if !self.shared.ops.borrow().is_empty() {
+			// Leak the operations (and what they own) rather than free memory
+			// the kernel may still touch.
+			tracing::error!("dropping an io_uring worker with operations stuck in flight; leaking them");
+			std::mem::forget(std::mem::take(&mut *self.shared.ops.borrow_mut()));
+		}
+	}
+
 	/// Route one completion to its operation.
 	fn dispatch(&mut self, cqe: Cqe) {
 		let key = cqe.user_data as usize;
@@ -369,28 +400,7 @@ impl Drop for Worker {
 		if cancellation_failed {
 			tracing::error!("failed to queue one or more io_uring teardown cancellations");
 		}
-		loop {
-			if Instant::now() >= deadline || self.pump_until(deadline).is_err() {
-				break;
-			}
-			if self.shared.ops.borrow().is_empty() {
-				return;
-			}
-			let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-				break;
-			};
-			let ring = self.shared.ring.borrow_mut();
-			let wait = remaining.min(std::time::Duration::from_millis(50));
-			let ts = types::Timespec::from(wait);
-			let args = types::SubmitArgs::new().timespec(&ts);
-			let _ = ring.submitter().submit_with_args(1, &args);
-		}
-		if !self.shared.ops.borrow().is_empty() {
-			// Leak the operations (and what they own) rather than free memory
-			// the kernel may still touch.
-			tracing::error!("dropping an io_uring worker with operations stuck in flight; leaking them");
-			std::mem::forget(std::mem::take(&mut *self.shared.ops.borrow_mut()));
-		}
+		self.drain_teardown(deadline);
 	}
 }
 
@@ -658,6 +668,17 @@ mod tests {
 		assert!(!worker.shared.ops.borrow().contains(first as usize));
 		assert!(worker.shared.ops.borrow().contains(second as usize));
 		worker.shared.ops.borrow_mut().remove(second as usize);
+	}
+
+	#[test]
+	fn expired_teardown_submits_residual_sqes() {
+		let Some(mut worker) = worker() else { return };
+		// A NOP needs no slab-owned memory, so it can observe the SQ directly.
+		worker.shared.push(&opcode::Nop::new().build()).expect("stage NOP");
+		assert_eq!(worker.shared.ring.borrow_mut().submission().len(), 1);
+
+		worker.drain_teardown(Instant::now());
+		assert!(worker.shared.ring.borrow_mut().submission().is_empty());
 	}
 
 	#[test]
