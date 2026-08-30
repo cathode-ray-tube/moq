@@ -601,11 +601,7 @@ impl Drop for Socket {
 			drop(rx);
 			// Fire-and-forget: the cancel's own CQE is consumed by the worker,
 			// and the receive's terminal CQE releases the socket state.
-			let cancel_key = shared.insert(Op::Cancel);
-			let entry = opcode::AsyncCancel::new(key).build().user_data(cancel_key);
-			if shared.push(&entry).is_err() {
-				shared.ops.borrow_mut().remove(cancel_key as usize);
-			}
+			let _ = shared.cancel(key);
 		}
 	}
 }

@@ -10,8 +10,9 @@ use std::collections::VecDeque;
 use std::io;
 use std::rc::Rc;
 use std::task::Poll;
+use std::time::Instant;
 
-use io_uring::{IoUring, squeue};
+use io_uring::{IoUring, opcode, squeue};
 
 use crate::park::Unpark;
 use crate::{timer, udp};
@@ -76,8 +77,23 @@ impl Shared {
 
 	/// Stage one SQE, submitting inline to make room when the queue is full.
 	pub fn push(&self, entry: &squeue::Entry) -> io::Result<()> {
+		self.push_inner(entry, None)
+	}
+
+	/// Stage one SQE before `deadline`, submitting inline to make room.
+	fn push_until(&self, entry: &squeue::Entry, deadline: Instant) -> io::Result<()> {
+		self.push_inner(entry, Some(deadline))
+	}
+
+	fn push_inner(&self, entry: &squeue::Entry, deadline: Option<Instant>) -> io::Result<()> {
 		let mut ring = self.ring.borrow_mut();
 		loop {
+			if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+				return Err(io::Error::new(
+					io::ErrorKind::TimedOut,
+					"io_uring submission deadline elapsed",
+				));
+			}
 			{
 				let mut sq = ring.submission();
 				// SAFETY: every entry's referenced memory (headers, buffers,
@@ -88,6 +104,11 @@ impl Shared {
 				}
 			}
 			if let Err(err) = ring.submit() {
+				// A deadline-bounded teardown can safely retry an interrupted
+				// enter; ordinary callers surface it to their worker.
+				if deadline.is_some() && err.raw_os_error() == Some(libc::EINTR) {
+					continue;
+				}
 				// EBUSY: the CQ is full, the kernel could not flush its
 				// overflow backlog into it, and it consumed none of our SQEs.
 				// Only kernels before 5.13 report this (newer ones just grow
@@ -114,6 +135,30 @@ impl Shared {
 				}
 			}
 		}
+	}
+
+	/// Stage a cancellation after the operation it targets.
+	pub fn cancel(&self, target: u64) -> io::Result<()> {
+		self.cancel_inner(target, None)
+	}
+
+	/// Stage a cancellation after its target before `deadline`.
+	pub fn cancel_until(&self, target: u64, deadline: Instant) -> io::Result<()> {
+		self.cancel_inner(target, Some(deadline))
+	}
+
+	fn cancel_inner(&self, target: u64, deadline: Option<Instant>) -> io::Result<()> {
+		let key = self.insert(Op::Cancel);
+		let entry = opcode::AsyncCancel::new(target).build().user_data(key);
+		let result = match deadline {
+			Some(deadline) => self.push_until(&entry, deadline),
+			None => self.push(&entry),
+		};
+		if let Err(err) = result {
+			self.ops.borrow_mut().remove(key as usize);
+			return Err(err);
+		}
+		Ok(())
 	}
 
 	/// Insert an op and return its `user_data` key.

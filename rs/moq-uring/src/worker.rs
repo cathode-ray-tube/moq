@@ -152,8 +152,20 @@ impl Worker {
 
 	/// Submit staged SQEs and dispatch every pending completion.
 	fn pump(&mut self) -> Result<(), Error> {
+		self.pump_inner(None)
+	}
+
+	/// Pump submission and completion batches until `deadline`.
+	fn pump_until(&mut self, deadline: Instant) -> Result<(), Error> {
+		self.pump_inner(Some(deadline))
+	}
+
+	fn pump_inner(&mut self, deadline: Option<Instant>) -> Result<(), Error> {
 		self.submit()?;
 		loop {
+			if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+				return Ok(());
+			}
 			// Copy the completions out so dispatch can borrow the ring (to
 			// re-arm receives, push cancels, and so on). Completions spilled
 			// by `Shared::push` predate the CQ's, so they dispatch first.
@@ -184,7 +196,11 @@ impl Worker {
 			return Ok(());
 		}
 		match ring.submit() {
+			// A partial submit leaves the rest staged for the next pump.
 			Ok(_) => Ok(()),
+			// A signal interrupted the enter before it consumed anything. The
+			// next worker turn retries the same staged SQEs.
+			Err(err) if err.raw_os_error() == Some(libc::EINTR) => Ok(()),
 			// The completion queue overflowed; the caller reaps and retries.
 			Err(err) if err.raw_os_error() == Some(libc::EBUSY) => Ok(()),
 			Err(err) => Err(err.into()),
@@ -311,12 +327,13 @@ impl Drop for Worker {
 		// Handles may outlive us; everything they try from here on fails
 		// instead of pending on a loop that will never run again.
 		self.shared.stopped.set(true);
+		// One deadline bounds cancellation staging and draining together.
+		let deadline = Instant::now() + std::time::Duration::from_millis(3200);
 		// The kernel may still write into provided buffers and read send
-		// headers owned by the ops slab. Submit first so cancellation covers
-		// receives that were only staged. Cancel only operations that can wait
-		// forever: sends still have to complete so a datagram staged by the
-		// final worker turn reaches the wire.
-		let _ = self.submit();
+		// headers owned by the ops slab. Queue cancels behind every staged
+		// receive and the futex, so partial submissions cannot strand an
+		// uncancelled operation. Sends are deliberately left alone: a datagram
+		// staged by the final worker turn still has to reach the wire.
 		let cancel: Vec<u64> = self
 			.shared
 			.ops
@@ -324,24 +341,30 @@ impl Drop for Worker {
 			.iter()
 			.filter_map(|(key, op)| matches!(op, Op::Recv { .. } | Op::FutexWait).then_some(key as u64))
 			.collect();
-		{
-			let ring = self.shared.ring.borrow_mut();
-			let timeout = types::Timespec::new().sec(1);
-			for key in cancel {
-				let _ = ring
-					.submitter()
-					.register_sync_cancel(Some(timeout), types::CancelBuilder::user_data(key));
+		let mut cancellation_failed = false;
+		for key in cancel {
+			if Instant::now() >= deadline {
+				cancellation_failed = true;
+				break;
 			}
+			cancellation_failed |= self.shared.cancel_until(key, deadline).is_err();
 		}
-		for _ in 0..64 {
-			if self.pump().is_err() {
+		if cancellation_failed {
+			tracing::error!("failed to queue one or more io_uring teardown cancellations");
+		}
+		loop {
+			if Instant::now() >= deadline || self.pump_until(deadline).is_err() {
 				break;
 			}
 			if self.shared.ops.borrow().is_empty() {
 				return;
 			}
+			let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+				break;
+			};
 			let ring = self.shared.ring.borrow_mut();
-			let ts = types::Timespec::new().nsec(50_000_000);
+			let wait = remaining.min(std::time::Duration::from_millis(50));
+			let ts = types::Timespec::from(wait);
 			let args = types::SubmitArgs::new().timespec(&ts);
 			let _ = ring.submitter().submit_with_args(1, &args);
 		}
@@ -594,6 +617,37 @@ mod tests {
 		handle.spawn(async {});
 		drop(sock);
 		assert!(shared.upgrade().is_none(), "the worker leaked its staged receive");
+	}
+
+	#[test]
+	fn dropped_worker_drains_more_receives_than_the_submission_queue() {
+		let Some(worker) = worker() else { return };
+		let handle = worker.handle();
+		let config = udp::Config {
+			gro: false,
+			gso: false,
+			multishot: false,
+			rx_buffers_max: 1,
+			rx_buffer_len: 2048,
+			tx_buffers_max: 1,
+			tx_buffer_len: 2048,
+		};
+		let mut sockets = Vec::new();
+		let mut shared = Vec::new();
+		for _ in 0..=SQ_ENTRIES {
+			let sock = handle
+				.udp(std::net::UdpSocket::bind("127.0.0.1:0").expect("bind"), config.clone())
+				.expect("socket");
+			shared.push(sock.downgrade());
+			sockets.push(sock);
+		}
+
+		drop(worker);
+		drop(sockets);
+		assert!(
+			shared.iter().all(|shared| shared.upgrade().is_none()),
+			"the worker leaked a receive staged across submission batches"
+		);
 	}
 
 	#[test]
