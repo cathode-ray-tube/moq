@@ -147,7 +147,7 @@ Opinionated helpers to configure a Quinn QUIC endpoint.
 
 ### moq-cli
 
-Command-line tool for media operations (binary name: `moq-cli`).
+Command-line tool for media operations (binary name: `moq`).
 
 **Features:**
 
