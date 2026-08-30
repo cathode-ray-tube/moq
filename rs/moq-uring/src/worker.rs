@@ -27,6 +27,9 @@ const SQ_ENTRIES: u32 = 256;
 /// state.
 const CQ_ENTRIES: u32 = 4096;
 
+/// Maximum completions copied at once while teardown is deadline-bounded.
+const TEARDOWN_CQE_BATCH: usize = 64;
+
 /// Worker construction knobs.
 ///
 /// Currently empty: the worker sizes its ring internally, with a completion
@@ -172,22 +175,36 @@ impl Worker {
 			let cqes: Vec<Cqe> = {
 				let mut ring = self.shared.ring.borrow_mut();
 				let mut spill = self.shared.spill.borrow_mut();
-				spill
-					.drain(..)
-					.chain(ring.completion().map(|entry| Cqe {
-						user_data: entry.user_data(),
-						result: entry.result(),
-						flags: entry.flags(),
-					}))
-					.collect()
+				let limit = deadline.map_or(usize::MAX, |_| TEARDOWN_CQE_BATCH);
+				let spilled = spill.len().min(limit);
+				let mut cqes: Vec<_> = spill.drain(..spilled).collect();
+				cqes.extend(ring.completion().take(limit - spilled).map(|entry| Cqe {
+					user_data: entry.user_data(),
+					result: entry.result(),
+					flags: entry.flags(),
+				}));
+				cqes
 			};
 			if cqes.is_empty() {
 				return Ok(());
 			}
-			for cqe in cqes {
-				self.dispatch(cqe);
+			if !self.dispatch_batch(cqes, deadline, Instant::now) {
+				return Ok(());
 			}
 		}
+	}
+
+	/// Dispatch a completion batch while its teardown budget remains.
+	fn dispatch_batch(&mut self, cqes: Vec<Cqe>, deadline: Option<Instant>, mut now: impl FnMut() -> Instant) -> bool {
+		for cqe in cqes {
+			if deadline.is_some_and(|deadline| now() >= deadline) {
+				// Drop this batch's remaining CQEs. Worker::drop will leak their
+				// op state, which is safe even if the kernel already finished it.
+				return false;
+			}
+			self.dispatch(cqe);
+		}
+		true
 	}
 
 	fn submit(&mut self) -> Result<(), Error> {
@@ -617,6 +634,30 @@ mod tests {
 		handle.spawn(async {});
 		drop(sock);
 		assert!(shared.upgrade().is_none(), "the worker leaked its staged receive");
+	}
+
+	#[test]
+	fn teardown_stops_between_completions_at_the_deadline() {
+		let Some(mut worker) = worker() else { return };
+		let first = worker.shared.insert(Op::Cancel);
+		let second = worker.shared.insert(Op::Cancel);
+		let cqe = |user_data| Cqe {
+			user_data,
+			result: 0,
+			flags: 0,
+		};
+		let before = Instant::now();
+		let deadline = before + Duration::from_millis(1);
+		let mut now = [before, deadline].into_iter();
+
+		assert!(
+			!worker.dispatch_batch(vec![cqe(first), cqe(second)], Some(deadline), || {
+				now.next().expect("one deadline check per completion")
+			})
+		);
+		assert!(!worker.shared.ops.borrow().contains(first as usize));
+		assert!(worker.shared.ops.borrow().contains(second as usize));
+		worker.shared.ops.borrow_mut().remove(second as usize);
 	}
 
 	#[test]
