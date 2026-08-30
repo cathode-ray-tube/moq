@@ -224,11 +224,31 @@ impl Worker {
 		}
 	}
 
-	/// Submit residual SQEs once, then drain completions within `deadline`.
+	/// Submit every residual SQE without waiting for completions.
+	fn submit_teardown(&mut self) -> Result<(), Error> {
+		let mut ring = self.shared.ring.borrow_mut();
+		loop {
+			if ring.submission().is_empty() {
+				return Ok(());
+			}
+			match ring.submit() {
+				// Keep submitting after partial progress. Returning zero while SQEs
+				// remain would otherwise spin forever.
+				Ok(0) => {
+					return Err(std::io::Error::other("io_uring teardown submission made no progress").into());
+				}
+				Ok(_) => {}
+				Err(err) if err.raw_os_error() == Some(libc::EINTR) => {}
+				Err(err) => return Err(err.into()),
+			}
+		}
+	}
+
+	/// Submit residual SQEs, then drain completions within `deadline`.
 	fn drain_teardown(&mut self, deadline: Instant) {
 		// Cancellation staging can consume the whole deadline. Existing SQEs,
-		// especially sends, are still owed one non-waiting submission attempt.
-		let submission_failed = self.submit().is_err();
+		// especially sends, must still reach the kernel before it gates draining.
+		let submission_failed = self.submit_teardown().is_err();
 		if !submission_failed {
 			loop {
 				if self.shared.ops.borrow().is_empty() {
@@ -674,8 +694,10 @@ mod tests {
 	fn expired_teardown_submits_residual_sqes() {
 		let Some(mut worker) = worker() else { return };
 		// A NOP needs no slab-owned memory, so it can observe the SQ directly.
-		worker.shared.push(&opcode::Nop::new().build()).expect("stage NOP");
-		assert_eq!(worker.shared.ring.borrow_mut().submission().len(), 1);
+		for _ in 0..SQ_ENTRIES {
+			worker.shared.push(&opcode::Nop::new().build()).expect("stage NOP");
+		}
+		assert_eq!(worker.shared.ring.borrow_mut().submission().len(), SQ_ENTRIES as usize);
 
 		worker.drain_teardown(Instant::now());
 		assert!(worker.shared.ring.borrow_mut().submission().is_empty());
