@@ -312,14 +312,26 @@ impl Drop for Worker {
 		// instead of pending on a loop that will never run again.
 		self.shared.stopped.set(true);
 		// The kernel may still write into provided buffers and read send
-		// headers owned by the ops slab. Cancel everything and wait for the
-		// terminal completions before any of that memory frees.
+		// headers owned by the ops slab. Submit first so cancellation covers
+		// receives that were only staged. Cancel only operations that can wait
+		// forever: sends still have to complete so a datagram staged by the
+		// final worker turn reaches the wire.
+		let _ = self.submit();
+		let cancel: Vec<u64> = self
+			.shared
+			.ops
+			.borrow()
+			.iter()
+			.filter_map(|(key, op)| matches!(op, Op::Recv { .. } | Op::FutexWait).then_some(key as u64))
+			.collect();
 		{
 			let ring = self.shared.ring.borrow_mut();
 			let timeout = types::Timespec::new().sec(1);
-			let _ = ring
-				.submitter()
-				.register_sync_cancel(Some(timeout), types::CancelBuilder::any());
+			for key in cancel {
+				let _ = ring
+					.submitter()
+					.register_sync_cancel(Some(timeout), types::CancelBuilder::user_data(key));
+			}
 		}
 		for _ in 0..64 {
 			if self.pump().is_err() {
@@ -337,7 +349,7 @@ impl Drop for Worker {
 			// Leak the operations (and what they own) rather than free memory
 			// the kernel may still touch.
 			tracing::error!("dropping an io_uring worker with operations stuck in flight; leaking them");
-			std::mem::forget(std::mem::replace(&mut *self.shared.ops.borrow_mut(), slab::Slab::new()));
+			std::mem::forget(std::mem::take(&mut *self.shared.ops.borrow_mut()));
 		}
 	}
 }
@@ -565,6 +577,7 @@ mod tests {
 		let handle = worker.handle();
 		let bind = || std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
 		let sock = handle.udp(bind(), udp::Config::default()).expect("socket");
+		let shared = sock.downgrade();
 		let to = sock.local_addr().expect("addr");
 		let Poll::Ready(Ok(tx)) = sock.poll_acquire(&kio::Waiter::noop()) else {
 			panic!("no tx buffer");
@@ -579,6 +592,8 @@ mod tests {
 		assert!(tx.send(1200, to, 1200).is_err());
 		// And a late spawn is dropped rather than parked forever.
 		handle.spawn(async {});
+		drop(sock);
+		assert!(shared.upgrade().is_none(), "the worker leaked its staged receive");
 	}
 
 	#[test]

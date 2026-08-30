@@ -386,6 +386,12 @@ pub struct Socket {
 }
 
 impl Socket {
+	/// A test-only observer for whether every kernel operation released this socket.
+	#[cfg(test)]
+	pub(crate) fn downgrade(&self) -> Weak<SockShared> {
+		Rc::downgrade(&self.shared)
+	}
+
 	pub(crate) fn bind(shared: &Rc<Shared>, io: UdpSocket, config: Config) -> Result<Self, Error> {
 		let floor = if config.gro { MAX_RECV + RECV_OVERHEAD } else { 2048 };
 		if config.rx_buffer_len < floor || config.rx_buffers_max == 0 || config.tx_buffers_max == 0 {
