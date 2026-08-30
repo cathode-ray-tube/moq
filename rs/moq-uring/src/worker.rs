@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use io_uring::{EnterFlags, IoUring, opcode, types};
 
@@ -33,6 +33,9 @@ const TEARDOWN_CQE_BATCH: usize = 64;
 /// Extra mandatory submit attempts allowed after interrupted enters.
 const TEARDOWN_EINTR_RETRIES: usize = 8;
 
+/// Maximum time spent staging cancellations and draining completions.
+const TEARDOWN_TIMEOUT: Duration = Duration::from_millis(3200);
+
 /// Worker construction knobs.
 ///
 /// Currently empty: the worker sizes its ring internally, with a completion
@@ -51,12 +54,14 @@ pub struct Config {}
 /// (any `Waker` this worker minted) are an atomic store plus, only while the
 /// worker is parked, one futex syscall.
 ///
-/// Dropping the worker submits the SQEs its last turn staged and waits for
-/// their completions, so a datagram already handed to a [`udp::Socket`] still
-/// goes out. It runs no tasks, though, so work a task has merely been asked
-/// for is not performed: a QUIC close is queued on its connection and framed
-/// by the driver task, so keep driving until the close is published rather
-/// than stopping the worker on the call that asked for it.
+/// Dropping the worker makes a bounded attempt to submit the SQEs its last
+/// turn staged and drain their completions. A datagram already handed to a
+/// [`udp::Socket`] is included in that submission attempt, while operation
+/// storage that the kernel might still access is safely leaked if teardown
+/// cannot finish. It runs no tasks, though, so work a task has merely been
+/// asked for is not performed: a QUIC close is queued on its connection and
+/// framed by the driver task, so keep driving until the close is published
+/// rather than stopping the worker on the call that asked for it.
 pub struct Worker {
 	shared: Rc<Shared>,
 	tasks: kio::Tasks<Task>,
@@ -399,7 +404,7 @@ impl Drop for Worker {
 		// instead of pending on a loop that will never run again.
 		self.shared.stopped.set(true);
 		// One deadline bounds cancellation staging and draining together.
-		let deadline = Instant::now() + std::time::Duration::from_millis(3200);
+		let deadline = Instant::now() + TEARDOWN_TIMEOUT;
 		// The kernel may still write into provided buffers and read send
 		// headers owned by the ops slab. Queue cancels behind every staged
 		// receive and the futex, so partial submissions cannot strand an
