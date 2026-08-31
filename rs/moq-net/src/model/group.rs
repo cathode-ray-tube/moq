@@ -667,6 +667,9 @@ impl Producer {
 		if let Ok(mut state) = self.state.write() {
 			state.charge.record_write();
 		}
+		// The payload was charged when the frame opened, but a long streamed frame
+		// still counts as track activity for the independent expiry time gate.
+		self.cache.settle();
 	}
 
 	/// Commit the in-flight frame as a completed frame (called by [`frame::Producer::finish`]).
@@ -786,6 +789,11 @@ impl Producer {
 		self.state.read().charge.accessed()
 	}
 
+	/// Coarse clock tick of the group's last cache access, used by age expiry.
+	pub(crate) fn cache_accessed_tick(&self) -> u64 {
+		self.state.read().charge.accessed_tick()
+	}
+
 	/// Enter the group into the evictable population: demoted from the live edge,
 	/// or inserted behind it. Idempotent; a no-op once the group is closed.
 	pub(crate) fn cache_demote(&self) {
@@ -814,7 +822,7 @@ impl Producer {
 				end: None,
 				prefetch: Prefetch::default(),
 				last_refresh: crate::model::clock::now(),
-				max_age: self.track.max_age,
+				refresh_interval: self.cache.pool().refresh_interval().min(self.track.max_age / 2),
 			}),
 			// Untagged: a tagged track attaches the egress meter via `with_meter`
 			// when it hands the consumer to a subscriber/fetch.
@@ -1014,12 +1022,13 @@ struct Plain {
 
 	// When this consumer last stamped the group's access time. The prefetch bounds
 	// a batch by frame count, not elapsed time, so pops re-stamp on a time bound
-	// (see [`Self::refresh_if_stale`]) or a slow reader could go a full retention
+	// (see [`Self::refresh_if_stale`]) or a slow reader could go a full LRU
 	// window without an access and be expired mid-read.
 	last_refresh: crate::runtime::Instant,
 
-	// The publisher's retention window, used to bound refreshes on the prefetch path.
-	max_age: std::time::Duration,
+	// The shorter of half the immutable pool expiry and half the publisher's
+	// media-retention window.
+	refresh_interval: std::time::Duration,
 }
 
 impl Clone for Plain {
@@ -1032,7 +1041,7 @@ impl Clone for Plain {
 			end: self.end,
 			prefetch: Prefetch::default(),
 			last_refresh: self.last_refresh,
-			max_age: self.max_age,
+			refresh_interval: self.refresh_interval,
 		}
 	}
 }
@@ -1465,16 +1474,16 @@ impl Plain {
 	}
 
 	/// Re-stamp the group's access time from the lock-free prefetch path once half
-	/// the retention window has passed since this consumer last stamped it. The
+	/// the shorter of its track retention or the pool's idle window has passed. The
 	/// batch bounds frames, not elapsed time, so without this a reader pacing
-	/// through a batch could be expired while demonstrably active. Half the window
-	/// keeps the stamp comfortably inside it while staying rare on the hot path.
+	/// through a batch could be expired or evicted while demonstrably active.
 	fn refresh_if_stale(&mut self) {
-		if crate::model::clock::now().duration_since(self.last_refresh) * 2 < self.max_age {
+		let now = crate::model::clock::now();
+		if now.duration_since(self.last_refresh) < self.refresh_interval {
 			return;
 		}
 		self.state.read().charge.refresh();
-		self.last_refresh = crate::model::clock::now();
+		self.last_refresh = now;
 	}
 	// A helper to automatically apply Dropped if the state is closed without an error.
 	fn poll<F, R>(&self, waiter: &kio::Waiter, f: F) -> Poll<Result<R>>
@@ -1937,6 +1946,45 @@ mod test {
 
 		let end = c2.next_frame().now_or_never().unwrap().unwrap();
 		assert!(end.is_none());
+	}
+
+	fn prefetched_consumer(pool: &cache::Pool, max_age: std::time::Duration) -> (Producer, Consumer) {
+		let cache = cache::Track::new(pool.clone(), kio::Weak::new());
+		let track = track::Info::default().with_max_age(max_age);
+		let mut producer = Producer::new(Info { sequence: 0 }, track, cache);
+		producer.write_frame(Timestamp::ZERO, Bytes::from_static(b"a")).unwrap();
+		producer.write_frame(Timestamp::ZERO, Bytes::from_static(b"b")).unwrap();
+		producer.finish().unwrap();
+
+		let mut consumer = producer.consume();
+		consumer.read_frame().now_or_never().unwrap().unwrap().unwrap();
+		(producer, consumer)
+	}
+
+	#[test]
+	fn prefetch_refresh_honors_pool_expiry() {
+		let config = cache::Config::default().with_expiry(std::time::Duration::from_secs(1));
+		let pool = cache::Pool::new(config);
+		let (producer, mut consumer) = prefetched_consumer(&pool, std::time::Duration::MAX);
+		let before = producer.cache_accessed();
+
+		crate::model::clock::advance(std::time::Duration::from_millis(600));
+		consumer.read_frame().now_or_never().unwrap().unwrap().unwrap();
+
+		assert!(producer.cache_accessed() > before, "the pool cadence is used");
+	}
+
+	#[test]
+	fn prefetch_refresh_honors_track_max_age() {
+		let config = cache::Config::default().with_expiry(std::time::Duration::from_secs(30));
+		let pool = cache::Pool::new(config);
+		let (producer, mut consumer) = prefetched_consumer(&pool, std::time::Duration::from_secs(1));
+		let before = producer.cache_accessed();
+
+		crate::model::clock::advance(std::time::Duration::from_millis(600));
+		consumer.read_frame().now_or_never().unwrap().unwrap().unwrap();
+
+		assert!(producer.cache_accessed() > before, "the track cadence remains in force");
 	}
 
 	/// Reading more than one prefetch batch drains every frame in order across the
