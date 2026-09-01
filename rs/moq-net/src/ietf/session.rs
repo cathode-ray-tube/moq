@@ -102,7 +102,7 @@ where
 		// detection works. Read BEFORE the placeholders below: their ids are random and
 		// identify nothing, so declaring one would compare incoming paths against an
 		// identity no other session shares.
-		let self_hop = self_hop(publish.as_ref(), subscribe.as_ref());
+		let self_origin = self_origin(publish.as_ref(), subscribe.as_ref());
 
 		// moq-transport threads concrete origins through the publisher/subscriber.
 		// An unset half gets an empty origin: an empty publish origin announces
@@ -151,7 +151,7 @@ where
 					control,
 					peer_hop,
 					peer_setup.clone(),
-					self_hop,
+					self_origin,
 					cost,
 					version,
 					tasks.clone(),
@@ -276,7 +276,7 @@ where
 					let session = session.clone();
 					let goaway = goaway.clone();
 					async move {
-						if let Err(err) = run_setup(runtime, session, version, path, self_hop, cost, goaway).await {
+						if let Err(err) = run_setup(runtime, session, version, path, self_origin, cost, goaway).await {
 							tracing::warn!(%err, "setup send error");
 						}
 						std::future::pending::<()>().await;
@@ -301,7 +301,7 @@ where
 					control,
 					peer_hop,
 					peer_setup.clone(),
-					self_hop,
+					self_origin,
 					cost,
 					version,
 					tasks,
@@ -437,10 +437,10 @@ pub struct PeerSetup<S: crate::transport::poll::Session> {
 
 /// The Hop ID this session declares and detects loops against.
 ///
-/// Both halves of a session share the process's Hop ID, so either one names
+/// Both halves of a session share the process's origin identity, so either one names
 /// it; the publish half is just the usual one to be set. A session with neither half
 /// has no content to route, so a throwaway id is all it can offer.
-fn self_hop(publish: Option<&origin::Consumer>, subscribe: Option<&origin::Producer>) -> Hop {
+fn self_origin(publish: Option<&origin::Consumer>, subscribe: Option<&origin::Producer>) -> Hop {
 	publish
 		.map(|origin| **origin)
 		.or_else(|| subscribe.map(|origin| **origin))
@@ -511,7 +511,7 @@ fn peer_from_params(params: &ietf::Parameters, version: Version) -> Result<peer:
 /// also our GOAWAY channel, so a fired drain trigger encodes the GOAWAY here.
 ///
 /// `path` is the request path we advertise (clients on URL-less transports); a
-/// server passes `None`. `self_hop` and `cost` are the MoQ Cluster options, which
+/// server passes `None`. `self_origin` and `cost` are the MoQ Cluster options, which
 /// declare our identity and (client-only) what this link costs to cross. The MoQ Solicit
 /// declaration is unconditional, so it takes no argument.
 async fn run_setup<S: crate::transport::poll::Session, R: crate::runtime::Runtime>(
@@ -519,7 +519,7 @@ async fn run_setup<S: crate::transport::poll::Session, R: crate::runtime::Runtim
 	mut session: S,
 	version: Version,
 	path: Option<String>,
-	self_hop: Hop,
+	self_origin: Hop,
 	cost: Option<u64>,
 	goaway: crate::goaway::Protocol,
 ) -> Result<(), Error> {
@@ -533,7 +533,7 @@ async fn run_setup<S: crate::transport::poll::Session, R: crate::runtime::Runtim
 	if let Some(path) = path {
 		parameters.set_bytes(ietf::ParameterBytes::Path, path.into_bytes());
 	}
-	cluster::peer_into_setup(&mut parameters, self_hop, cost, version);
+	cluster::peer_into_setup(&mut parameters, self_origin, cost, version);
 	solicit::into_setup(&mut parameters, version);
 	let parameters = parameters.encode_bytes(version)?;
 
@@ -1028,9 +1028,7 @@ mod tests {
 	/// enough: the question is only whether the bytes went out unasked.
 	async fn announce_occurrences(peer_declared: Option<peer::Peer>) -> usize {
 		let origin = crate::origin::Info::new(crate::Hop::new(1).unwrap()).produce();
-		let _cam = origin
-			.create_broadcast("solo-cam", crate::broadcast::Route::new().with_announce(true))
-			.unwrap();
+		let _cam = origin.announce("solo-cam", crate::origin::Route::default()).unwrap();
 
 		// An open gate: an unsolicited PUBLISH_NAMESPACE can reach the wire.
 		let gate = kio::Producer::new(true);
@@ -1116,14 +1114,14 @@ mod tests {
 		let ours = crate::Hop::new(42).unwrap();
 
 		let publish = crate::origin::Info::new(ours).produce();
-		assert_eq!(self_hop(Some(&publish.consume()), None), ours, "the publish half");
+		assert_eq!(self_origin(Some(&publish.consume()), None), ours, "the publish half");
 
 		let subscribe = crate::origin::Info::new(ours).produce();
-		assert_eq!(self_hop(None, Some(&subscribe)), ours, "the subscribe half alone");
+		assert_eq!(self_origin(None, Some(&subscribe)), ours, "the subscribe half alone");
 
 		// Neither half: nothing to route, so any id will do as long as it is ours.
 		let publish = crate::origin::Info::new(ours).produce();
-		assert_eq!(self_hop(Some(&publish.consume()), Some(&subscribe)), ours);
+		assert_eq!(self_origin(Some(&publish.consume()), Some(&subscribe)), ours);
 	}
 
 	/// Drive `start` against a peer whose incoming streams die before their first

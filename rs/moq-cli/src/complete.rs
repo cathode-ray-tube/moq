@@ -486,13 +486,13 @@ fn broadcasts(_ctx: CompleteCtx<'_>) -> CompletionFuture<'static> {
 		let mut until = deadline;
 		while let Ok(Some(update)) = timeout_at(until, announced.next()).await {
 			until = deadline.min(Instant::now() + SETTLE);
-			let path = update.path.to_string();
+			let path = update.prefix.to_string();
 			// The root broadcast is the connection path itself, which an unset
 			// `--broadcast` already names; there is no word to insert for it.
 			if path.is_empty() {
 				continue;
 			}
-			match update.broadcast.is_some() {
+			match update.active {
 				true => live.insert(path),
 				false => live.remove(&path),
 			};
@@ -579,11 +579,11 @@ async fn catalog(
 	path: &str,
 	format: CatalogFormat,
 ) -> Option<moq_mux::catalog::hang::Catalog> {
-	// `announced_broadcast` rather than a plain lookup: the announcement is still in
-	// flight right after connecting, and asking on the spot reports a live broadcast
-	// as unroutable.
+	// Wait for a covering route rather than asking on the spot: the announcement is
+	// still in flight right after connecting, and an immediate request reports a live
+	// broadcast as unroutable.
 	let consumer = origin.consume();
-	consumer.announced_broadcast(path).await?;
+	consumer.routed(path).await?;
 
 	let mut stream = moq_mux::Source::new(consumer, path).catalog(format).await.ok()?;
 	stream.next().await.ok()?
@@ -773,8 +773,8 @@ mod tests {
 	#[tokio::test]
 	async fn the_environment_cannot_ask_for_a_moq_side() {
 		let origin = moq_tokio::origin::spawn(moq_net::Hop::random());
-		let route = moq_net::broadcast::Route::new().with_announce(true);
-		let _alpha = origin.create_broadcast("alpha", route).expect("alpha");
+		let _alpha = origin.create_broadcast("alpha").expect("alpha");
+		let _announce_alpha = origin.announce("alpha", Default::default()).expect("alpha");
 		let connect = relay(&origin);
 
 		// The same reachable relay, named only by the environment.
@@ -868,9 +868,10 @@ mod tests {
 	async fn a_relay_on_the_line_answers_broadcast() {
 		let _env = EnvGuard::clear(&["MOQ_CONNECT"]);
 		let origin = moq_tokio::origin::spawn(moq_net::Hop::random());
-		let route = moq_net::broadcast::Route::new().with_announce(true);
-		let _alpha = origin.create_broadcast("alpha", route.clone()).expect("alpha");
-		let _nested = origin.create_broadcast("room/beta", route).expect("beta");
+		let _alpha = origin.create_broadcast("alpha").expect("alpha");
+		let _announce_alpha = origin.announce("alpha", Default::default()).expect("alpha");
+		let _nested = origin.create_broadcast("room/beta").expect("beta");
+		let _announce_nested = origin.announce("room/beta", Default::default()).expect("beta");
 
 		let connect = relay(&origin);
 		let found = complete(&format!("moq {connect} --broadcast ")).await;
@@ -892,13 +893,13 @@ mod tests {
 		use hang::catalog::{AudioCodec, AudioConfig, H264, VideoConfig};
 
 		let origin = moq_tokio::origin::spawn(moq_net::Hop::random());
-		let route = moq_net::broadcast::Route::new().with_announce(true);
 
 		// Two broadcasts with different renditions, so a completer reading the wrong
 		// one fails loudly instead of matching by luck.
 		let mut keep = Vec::new();
 		for (path, video, audio) in [("wanted", "hd", "stereo"), ("other", "sd", "mono")] {
-			let mut broadcast = origin.create_broadcast(path, route.clone()).expect("broadcast");
+			let mut broadcast = origin.create_broadcast(path).expect("broadcast");
+			let announcement = origin.announce(path, Default::default()).expect("broadcast");
 			let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).expect("catalog");
 			let mut edit = catalog.lock();
 			edit.video.renditions.insert(
@@ -914,7 +915,7 @@ mod tests {
 				.renditions
 				.insert(audio.to_string(), AudioConfig::new(AudioCodec::Opus, 48_000, 2));
 			edit.commit().expect("publish the catalog");
-			keep.push((broadcast, catalog));
+			keep.push((broadcast, catalog, announcement));
 		}
 
 		// The global names `other`; the stage overrides it, exactly as the invocation
@@ -938,8 +939,8 @@ mod tests {
 	async fn the_catalog_format_on_the_line_is_honored() {
 		let _env = EnvGuard::clear(&["MOQ_CONNECT"]);
 		let origin = moq_tokio::origin::spawn(moq_net::Hop::random());
-		let route = moq_net::broadcast::Route::new().with_announce(true);
-		let mut broadcast = origin.create_broadcast("room", route).expect("broadcast");
+		let mut broadcast = origin.create_broadcast("room").expect("broadcast");
+		let _announce_broadcast = origin.announce("room", Default::default()).expect("broadcast");
 
 		let mut track = broadcast
 			.create_track(moq_msf::DEFAULT_NAME, moq_net::track::Info::default())

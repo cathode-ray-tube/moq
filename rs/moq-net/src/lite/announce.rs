@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
-use crate::{Hop, Hops, Path, broadcast::Cost, coding::*};
+use crate::{Hop, Hops, Path, coding::*, origin::Cost};
 
 use super::{Message, Version};
 
@@ -336,14 +336,14 @@ impl Message for AnnounceInit<'_> {
 /// Sent by the publisher as the first message on an announce stream, before any
 /// individual Announce messages. Lite05+ only; the successor to [`AnnounceInit`].
 ///
-/// `hop` is the responder's session Hop ID. In Lite05 the publisher no
+/// `origin` is the responder's session origin id. In Lite05 the publisher no
 /// longer stamps it onto each Announce's hop chain; the subscriber appends it on
 /// receipt instead. `active` is the number of currently-active broadcasts the
 /// publisher sends as the initial set immediately after this message, letting the
 /// receiver block until the initial set has arrived.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AnnounceOk {
-	pub hop: Hop,
+	pub origin: Hop,
 	pub active: u64,
 }
 
@@ -353,9 +353,9 @@ impl Message for AnnounceOk {
 			return Err(DecodeError::Version);
 		}
 
-		let hop = Hop::decode(r, version)?;
+		let origin = Hop::decode(r, version)?;
 		let active = u64::decode(r, version)?;
-		Ok(Self { hop, active })
+		Ok(Self { origin, active })
 	}
 
 	fn encode_msg<W: bytes::BufMut>(&self, w: &mut W, version: Version) -> Result<(), EncodeError> {
@@ -363,7 +363,7 @@ impl Message for AnnounceOk {
 			return Err(EncodeError::Version);
 		}
 
-		self.hop.encode(w, version)?;
+		self.origin.encode(w, version)?;
 		self.active.encode(w, version)
 	}
 }
@@ -436,7 +436,7 @@ mod tests {
 	#[test]
 	fn announce_ok_round_trip() {
 		let msg = AnnounceOk {
-			hop: Hop::new(42).unwrap(),
+			origin: Hop::new(42).unwrap(),
 			active: 3,
 		};
 		assert_eq!(round_trip(&msg), msg);
@@ -445,7 +445,7 @@ mod tests {
 	#[test]
 	fn announce_ok_zero_active() {
 		let msg = AnnounceOk {
-			hop: Hop::new(7).unwrap(),
+			origin: Hop::new(7).unwrap(),
 			active: 0,
 		};
 		assert_eq!(round_trip(&msg), msg);
@@ -568,7 +568,7 @@ mod tests {
 	#[test]
 	fn charged_cost_stays_encodable() {
 		let mut buf = Vec::new();
-		Cost::new(crate::broadcast::MAX_COST)
+		Cost::new(crate::origin::MAX_COST)
 			.charged(1)
 			.encode(&mut buf, Version::Lite06Wip)
 			.expect("a charged cost must stay encodable");
@@ -596,7 +596,7 @@ mod tests {
 		}
 	}
 
-	// Lite04/05 carry the subscriber's Hop ID so the publisher can skip reflected
+	// Lite04/05 carry the subscriber's origin id so the publisher can skip reflected
 	// announces before they hit the wire.
 	#[test]
 	fn announce_request_carries_exclude_hop_on_lite05() {
@@ -631,7 +631,7 @@ mod tests {
 	#[test]
 	fn announce_ok_rejects_old_versions() {
 		let msg = AnnounceOk {
-			hop: Hop::new(1).unwrap(),
+			origin: Hop::new(1).unwrap(),
 			active: 0,
 		};
 		let mut buf = bytes::BytesMut::new();
@@ -646,19 +646,19 @@ mod tests {
 		// Encode a well-formed message then patch the origin to 0 on the wire.
 		let mut buf = bytes::BytesMut::new();
 		AnnounceOk {
-			hop: Hop::new(1).unwrap(),
+			origin: Hop::new(1).unwrap(),
 			active: 0,
 		}
 		.encode(&mut buf, Version::Lite05)
 		.unwrap();
-		// Hop ID 1 sits right after the size prefix; rewrite it to 0.
+		// origin id 1 sits right after the size prefix; rewrite it to 0.
 		let bytes = &buf[..];
 		let mut patched = bytes.to_vec();
 		// size(1 byte) | origin varint(1 byte = 0x01) | active varint(1 byte)
 		patched[1] = 0x00;
 		let mut slice = &patched[..];
 		let got = AnnounceOk::decode(&mut slice, Version::Lite05).unwrap();
-		assert_eq!(got.hop.id(), 0);
+		assert_eq!(got.origin.id(), 0);
 		assert_eq!(got.active, 0);
 	}
 }

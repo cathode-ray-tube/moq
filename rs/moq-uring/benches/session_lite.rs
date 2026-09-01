@@ -147,8 +147,9 @@ mod linux {
 				});
 			});
 
-			let mut broadcast = pub_origin
-				.create_broadcast("bench", moq_net::broadcast::Route::new().with_announce(true))
+			let mut broadcast = pub_origin.create_broadcast("bench").expect("create broadcast");
+			let _announce_broadcast = pub_origin
+				.announce("bench", Default::default())
 				.expect("create broadcast");
 			let mut track = broadcast.create_track("data", None).expect("create track");
 
@@ -192,11 +193,11 @@ mod linux {
 						.connect_lite(handle.clone(), quic::web::Session::raw(conn))
 						.await
 						.expect("connect_lite");
-					let bc = sub_origin
-						.consume()
-						.announced_broadcast("bench")
-						.await
-						.expect("broadcast announced");
+					let bc = {
+						let consumer = sub_origin.consume();
+						consumer.routed("bench").await.expect("broadcast announced");
+						consumer.request_broadcast("bench").await.expect("broadcast resolves")
+					};
 					let sub = bc
 						.track("data")
 						.expect("track")

@@ -136,9 +136,8 @@ async fn uring_workers_serve_webtransport_and_raw_quic() {
 	let raw_url: url::Url = format!("moql://127.0.0.1:{port}/uring").parse().expect("parse url");
 
 	let origin = moq_tokio::origin::spawn(Hop::random());
-	let mut broadcast = origin
-		.create_broadcast("test", moq_net::broadcast::Route::new().with_announce(true))
-		.expect("create broadcast");
+	let mut broadcast = origin.create_broadcast("test").expect("create broadcast");
+	let _announce_broadcast = origin.announce("test", Default::default()).expect("create broadcast");
 	let mut track = broadcast.create_track("video", None).expect("create track");
 	let mut group = track.append_group().expect("append group");
 	group
@@ -152,18 +151,23 @@ async fn uring_workers_serve_webtransport_and_raw_quic() {
 	let mut subscribers = Vec::new();
 	for url in [&wt_url, &raw_url, &wt_url, &raw_url] {
 		let origin = moq_tokio::origin::spawn(Hop::random());
-		let announced = origin.consume().announced();
+		let consumer = origin.consume();
+		let announced = consumer.announced();
 		let connection = connect(client().with_subscriber(origin), url.clone()).await;
-		subscribers.push((connection, announced));
+		subscribers.push((connection, consumer, announced));
 	}
 
-	for (index, (_connection, announced)) in subscribers.iter_mut().enumerate() {
-		let moq_net::announce::Update { path, broadcast } = tokio::time::timeout(TIMEOUT, announced.next())
+	for (index, (_connection, consumer, announced)) in subscribers.iter_mut().enumerate() {
+		let update = tokio::time::timeout(TIMEOUT, announced.next())
 			.await
 			.unwrap_or_else(|_| panic!("subscriber {index} announcement timeout"))
 			.expect("origin closed");
-		assert_eq!(path.as_str(), "test");
-		let broadcast = broadcast.expect("expected announce, got unannounce");
+		assert_eq!(update.prefix.as_path().as_str(), "test");
+		assert!(update.active, "expected announce, got retraction");
+		let broadcast = tokio::time::timeout(TIMEOUT, consumer.request_broadcast("test"))
+			.await
+			.unwrap_or_else(|_| panic!("subscriber {index} request timeout"))
+			.expect("announced broadcast resolves");
 
 		let mut subscription = broadcast
 			.track("video")
@@ -294,9 +298,8 @@ async fn an_mtls_client_authenticates_without_a_token() {
 	// connecting proves nothing.
 	let url: url::Url = format!("moql://127.0.0.1:{port}/mtls").parse().expect("parse url");
 	let origin = moq_tokio::origin::spawn(Hop::random());
-	let mut broadcast = origin
-		.create_broadcast("test", moq_net::broadcast::Route::new().with_announce(true))
-		.expect("create broadcast");
+	let mut broadcast = origin.create_broadcast("test").expect("create broadcast");
+	let _announce_broadcast = origin.announce("test", Default::default()).expect("create broadcast");
 	let mut track = broadcast.create_track("video", None).expect("create track");
 	let mut group = track.append_group().expect("append group");
 	group
@@ -306,18 +309,20 @@ async fn an_mtls_client_authenticates_without_a_token() {
 	let publisher = connect(client().with_publisher(&origin), url.clone()).await;
 
 	let subscriber_origin = moq_tokio::origin::spawn(Hop::random());
-	let mut announced = subscriber_origin.consume().announced();
+	let consumer = subscriber_origin.consume();
+	let mut announced = consumer.announced();
 	let subscriber = connect(client().with_subscriber(subscriber_origin), url).await;
 
-	let moq_net::announce::Update {
-		path,
-		broadcast: announced,
-	} = tokio::time::timeout(TIMEOUT, announced.next())
+	let update = tokio::time::timeout(TIMEOUT, announced.next())
 		.await
 		.expect("announcement timeout")
 		.expect("origin closed");
-	assert_eq!(path.as_str(), "test");
-	let announced = announced.expect("expected announce, got unannounce");
+	assert_eq!(update.prefix.as_path().as_str(), "test");
+	assert!(update.active, "expected announce, got retraction");
+	let announced = tokio::time::timeout(TIMEOUT, consumer.request_broadcast("test"))
+		.await
+		.expect("request timeout")
+		.expect("announced broadcast resolves");
 	let mut subscription = announced
 		.track("video")
 		.unwrap()

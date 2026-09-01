@@ -416,9 +416,8 @@ mod tests {
 	#[tokio::test]
 	async fn escaping_broadcast_reference_is_not_advertised() {
 		let origin = produce_origin();
-		let _broadcast = origin
-			.create_broadcast("a/pub", moq_net::broadcast::Route::new().with_announce(true))
-			.expect("publish allowed");
+		let _broadcast = origin.create_broadcast("a/pub").expect("publish allowed");
+		let _announce_broadcast = origin.announce("a/pub", Default::default()).expect("publish allowed");
 		settle().await;
 		let source = moq_mux::Source::new(origin.consume(), "a/pub");
 		let upstream = Upstream {
@@ -442,9 +441,8 @@ mod tests {
 	#[tokio::test]
 	async fn serves_playlist_and_segments_from_the_timeline() {
 		let origin = produce_origin();
-		let mut broadcast = origin
-			.create_broadcast("live", moq_net::broadcast::Route::new().with_announce(true))
-			.expect("publish allowed");
+		let mut broadcast = origin.create_broadcast("live").expect("publish allowed");
+		let _announce_broadcast = origin.announce("live", Default::default()).expect("publish allowed");
 		settle().await;
 		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 
@@ -519,9 +517,8 @@ mod tests {
 	#[tokio::test]
 	async fn serves_dash_manifest_and_time_addressed_segments() {
 		let origin = produce_origin();
-		let mut broadcast = origin
-			.create_broadcast("live", moq_net::broadcast::Route::new().with_announce(true))
-			.expect("publish allowed");
+		let mut broadcast = origin.create_broadcast("live").expect("publish allowed");
+		let _announce_broadcast = origin.announce("live", Default::default()).expect("publish allowed");
 		settle().await;
 		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 
@@ -600,9 +597,8 @@ mod tests {
 	#[tokio::test]
 	async fn dash_manifest_turns_static_when_finished() {
 		let origin = produce_origin();
-		let mut broadcast = origin
-			.create_broadcast("live", moq_net::broadcast::Route::new().with_announce(true))
-			.expect("publish allowed");
+		let mut broadcast = origin.create_broadcast("live").expect("publish allowed");
+		let _announce_broadcast = origin.announce("live", Default::default()).expect("publish allowed");
 		settle().await;
 		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 
@@ -661,9 +657,8 @@ mod tests {
 	#[tokio::test]
 	async fn target_duration_covers_the_window_without_a_declared_bound() {
 		let origin = produce_origin();
-		let mut broadcast = origin
-			.create_broadcast("live", moq_net::broadcast::Route::new().with_announce(true))
-			.expect("publish allowed");
+		let mut broadcast = origin.create_broadcast("live").expect("publish allowed");
+		let _announce_broadcast = origin.announce("live", Default::default()).expect("publish allowed");
 		settle().await;
 		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 
@@ -698,9 +693,8 @@ mod tests {
 	#[tokio::test]
 	async fn audio_and_video_segments_are_aligned() {
 		let origin = produce_origin();
-		let mut broadcast = origin
-			.create_broadcast("live", moq_net::broadcast::Route::new().with_announce(true))
-			.expect("publish allowed");
+		let mut broadcast = origin.create_broadcast("live").expect("publish allowed");
+		let _announce_broadcast = origin.announce("live", Default::default()).expect("publish allowed");
 		settle().await;
 		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 
@@ -783,9 +777,8 @@ mod tests {
 	#[tokio::test]
 	async fn dropping_the_broadcaster_keeps_a_cursor_drainable() {
 		let origin = produce_origin();
-		let mut broadcast = origin
-			.create_broadcast("live", moq_net::broadcast::Route::new().with_announce(true))
-			.expect("publish allowed");
+		let mut broadcast = origin.create_broadcast("live").expect("publish allowed");
+		let _announce_broadcast = origin.announce("live", Default::default()).expect("publish allowed");
 		settle().await;
 		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 
@@ -853,9 +846,8 @@ mod tests {
 			origin: &moq_net::origin::Producer,
 			payload: &'static [u8],
 		) -> (Box<dyn std::any::Any>, hang::catalog::VideoConfig) {
-			let mut broadcast = origin
-				.create_broadcast("live", moq_net::broadcast::Route::new().with_announce(true))
-				.expect("publish allowed");
+			let mut broadcast = origin.create_broadcast("live").expect("publish allowed");
+			let _announce_broadcast = origin.announce("live", Default::default()).expect("publish allowed");
 			let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 
 			let reserved = catalog.reserve();
@@ -962,9 +954,8 @@ mod tests {
 	#[tokio::test]
 	async fn removing_a_rendition_ends_its_segment_cursor() {
 		let origin = produce_origin();
-		let broadcast = origin
-			.create_broadcast("live", moq_net::broadcast::Route::new().with_announce(true))
-			.expect("publish allowed");
+		let broadcast = origin.create_broadcast("live").expect("publish allowed");
+		let _announce_broadcast = origin.announce("live", Default::default()).expect("publish allowed");
 		let source = moq_mux::Source::new(origin.consume(), "live");
 		settle().await;
 		let upstream = Upstream {
@@ -1003,9 +994,8 @@ mod tests {
 	#[tokio::test]
 	async fn dropping_the_broadcaster_releases_its_renditions() {
 		let origin = produce_origin();
-		let mut broadcast = origin
-			.create_broadcast("live", moq_net::broadcast::Route::new().with_announce(true))
-			.expect("publish allowed");
+		let mut broadcast = origin.create_broadcast("live").expect("publish allowed");
+		let _announce_broadcast = origin.announce("live", Default::default()).expect("publish allowed");
 		settle().await;
 		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 
@@ -1060,9 +1050,8 @@ mod tests {
 	#[tokio::test]
 	async fn record_cursors_yield_renditions_and_segments() {
 		let origin = produce_origin();
-		let mut broadcast = origin
-			.create_broadcast("live", moq_net::broadcast::Route::new().with_announce(true))
-			.expect("publish allowed");
+		let mut broadcast = origin.create_broadcast("live").expect("publish allowed");
+		let _announce_broadcast = origin.announce("live", Default::default()).expect("publish allowed");
 		settle().await;
 		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 

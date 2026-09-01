@@ -8,7 +8,6 @@ use crate::audio::{
 };
 use crate::consumer::MoqBroadcastConsumer;
 use crate::consumer::MoqFetchGroupOptions;
-use crate::consumer::MoqRouteWatch;
 use crate::consumer::MoqSubscription;
 use crate::error::MoqError;
 use crate::json::{MoqJsonSnapshotConfig, MoqJsonStreamConfig};
@@ -1010,6 +1009,36 @@ fn audio_rejects_bad_init_bytes() {
 	);
 }
 
+/// A route can cover the awaited path while nothing serves it (an advertise-only
+/// announce with no fallback), and it can retract before the resolution lands.
+/// That churn must keep the wait alive rather than surface as a spurious
+/// Unroutable; the wait resolves once something real serves the path.
+#[tokio::test]
+async fn announced_broadcast_survives_an_unservable_route() {
+	let origin = MoqOriginProducer::new(MoqOriginOptions::default());
+	let consumer = origin.consume();
+
+	// Advertise-only: covers the path, serves nothing (and no dynamic fallback).
+	let route = origin.announce("live".into(), MoqRoute::default()).unwrap();
+
+	let announced = consumer.announced_broadcast("live".into()).unwrap();
+	let pending = tokio::spawn(async move { announced.available().await });
+
+	// Give the wait time to observe the unservable coverage; it must ride it out.
+	tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+	assert!(!pending.is_finished(), "an unservable route must not resolve the wait");
+
+	// The cover retracts (failover churn), then the real broadcast lands.
+	route.cancel();
+	let broadcast = origin.create_broadcast("live".into()).unwrap();
+	tokio::time::timeout(TIMEOUT, pending)
+		.await
+		.expect("timed out waiting for the real broadcast")
+		.expect("task")
+		.expect("resolves once something serves the path");
+	broadcast.finish().unwrap();
+}
+
 #[tokio::test]
 async fn create_broadcast_announces() {
 	let origin = MoqOriginProducer::new(MoqOriginOptions::default());
@@ -1115,7 +1144,7 @@ async fn announced_broadcasts_resolve_siblings_under_the_prefix() {
 			.unwrap()
 			.expect("the origin should keep announcing");
 		if announcement.path() == "pub" {
-			break announcement.broadcast();
+			break await_announced(&consumer, "a/pub").await;
 		}
 	};
 
@@ -1200,31 +1229,25 @@ async fn set_announce_toggles_announcement() {
 	let consumer = origin.consume();
 	let broadcast = origin.create_broadcast("live".into()).unwrap();
 
-	let announced = consumer.announced_broadcast("live".into()).unwrap();
-	let bc = tokio::time::timeout(TIMEOUT, announced.available())
-		.await
-		.expect("timed out waiting for the announcement")
-		.unwrap();
-
-	// The consumer observes the live flag through the route. Skip intermediate
-	// updates and wait for the flag itself, since route propagation is asynchronous.
-	async fn wait_live(watch: &MoqRouteWatch, announce: bool) {
+	// The consumer observes the flag through the announce stream: an active
+	// announcement, then its retraction.
+	let announced = consumer.announced("".into()).unwrap();
+	async fn wait_live(announced: &MoqAnnounced, announce: bool) {
 		loop {
-			let route = tokio::time::timeout(TIMEOUT, watch.next())
+			let announcement = tokio::time::timeout(TIMEOUT, announced.next())
 				.await
-				.expect("timed out waiting for a route update")
+				.expect("timed out waiting for an announce update")
 				.unwrap()
-				.expect("broadcast ended while waiting for a route");
-			if route.announce == announce {
+				.expect("origin ended while waiting for an announce update");
+			if announcement.path() == "live" && announcement.active() == announce {
 				return;
 			}
 		}
 	}
-	let watch = bc.route_updates();
-	wait_live(&watch, true).await;
+	wait_live(&announced, true).await;
 
 	broadcast.set_announce(false).unwrap();
-	wait_live(&watch, false).await;
+	wait_live(&announced, false).await;
 
 	// Non-live: unannounced, but still reachable by exact path.
 	tokio::time::timeout(TIMEOUT, consumer.request_broadcast("live".into()))
@@ -1280,7 +1303,7 @@ async fn local_publish_consume_audio() {
 
 	assert_eq!(announcement.path(), "live");
 
-	let broadcast_consumer = announcement.broadcast();
+	let broadcast_consumer = await_announced(&consumer, &announcement.path()).await;
 	let catalog_consumer = broadcast_consumer.subscribe_catalog().await.unwrap();
 
 	let catalog = tokio::time::timeout(TIMEOUT, catalog_consumer.next())
@@ -1337,7 +1360,7 @@ async fn video_publish_consume() {
 		.unwrap()
 		.expect("expected announcement");
 
-	let broadcast_consumer = announcement.broadcast();
+	let broadcast_consumer = await_announced(&consumer, &announcement.path()).await;
 	let catalog_consumer = broadcast_consumer.subscribe_catalog().await.unwrap();
 
 	let catalog = tokio::time::timeout(TIMEOUT, catalog_consumer.next())
@@ -1447,7 +1470,7 @@ async fn video_raw_publish_consume() {
 		.unwrap()
 		.expect("expected announcement");
 
-	let broadcast_consumer = announcement.broadcast();
+	let broadcast_consumer = await_announced(&consumer, &announcement.path()).await;
 	let catalog_consumer = broadcast_consumer.subscribe_catalog().await.unwrap();
 	let catalog = tokio::time::timeout(TIMEOUT, catalog_consumer.next())
 		.await
@@ -1561,7 +1584,11 @@ async fn video_raw_publish_from_many_threads() {
 		.expect("timed out")
 		.unwrap()
 		.expect("expected announcement");
-	let catalog_consumer = announcement.broadcast().subscribe_catalog().await.unwrap();
+	let catalog_consumer = await_announced(&consumer, &announcement.path())
+		.await
+		.subscribe_catalog()
+		.await
+		.unwrap();
 	let catalog = tokio::time::timeout(TIMEOUT, catalog_consumer.next())
 		.await
 		.expect("timed out")
@@ -1654,7 +1681,7 @@ async fn multiple_frames_ordering() {
 		.unwrap()
 		.unwrap();
 
-	let broadcast_consumer = announcement.broadcast();
+	let broadcast_consumer = await_announced(&consumer, &announcement.path()).await;
 	let catalog_consumer = broadcast_consumer.subscribe_catalog().await.unwrap();
 	let catalog = tokio::time::timeout(TIMEOUT, catalog_consumer.next())
 		.await
@@ -1711,7 +1738,7 @@ async fn catalog_update_on_new_track() {
 		.unwrap()
 		.unwrap();
 
-	let broadcast_consumer = announcement.broadcast();
+	let broadcast_consumer = await_announced(&consumer, &announcement.path()).await;
 	let catalog_consumer = broadcast_consumer.subscribe_catalog().await.unwrap();
 
 	let catalog1 = tokio::time::timeout(TIMEOUT, catalog_consumer.next())
@@ -1765,7 +1792,11 @@ async fn announced_broadcast() {
 		.expect("expected announcement");
 
 	assert_eq!(announcement.path(), "test/broadcast");
-	let _catalog = announcement.broadcast().subscribe_catalog().await.unwrap();
+	let _catalog = await_announced(&consumer, &announcement.path())
+		.await
+		.subscribe_catalog()
+		.await
+		.unwrap();
 	// Finish so consumers observe a deliberate end (the canonical end for a
 	// publisher; dropping without finish reads as a failure).
 	_broadcast.finish().unwrap();
@@ -1981,7 +2012,7 @@ fn without_runtime() {
 		let announced = consumer.announced("".into()).unwrap();
 		let announcement = pollster::block_on(announced.next()).unwrap().unwrap();
 		assert_eq!(announcement.path(), "test");
-		let _bc = announcement.broadcast();
+		let _bc = pollster::block_on(consumer.request_broadcast("test".into())).unwrap();
 
 		let client = MoqClient::new();
 		client.set_tls_disable_verify(true);
@@ -2059,7 +2090,7 @@ async fn server_client_roundtrip() {
 	assert_eq!(announcement.path(), "hello");
 
 	// Subscribe to the audio track and verify a frame round-trips.
-	let bc = announcement.broadcast();
+	let bc = await_announced(&consumer, "hello").await;
 	let catalog_consumer = bc.subscribe_catalog().await.unwrap();
 	let catalog = tokio::time::timeout(TIMEOUT, catalog_consumer.next())
 		.await

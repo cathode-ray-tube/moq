@@ -51,8 +51,8 @@ pub(crate) struct Snapshot {
 pub(crate) struct Node {
 	/// Canonical URL advertised for the node.
 	pub node: String,
-	/// The node's [`Hop`](moq_net::Hop) id from its announcement, when available.
-	pub hop_id: Option<String>,
+	/// Hop identity from the node's announcement, when available.
+	pub origin_id: Option<String>,
 	/// Selected route for the node's internal advertisement.
 	pub announced: Option<Announcement>,
 	/// Established direct connections to this node.
@@ -62,7 +62,7 @@ pub(crate) struct Node {
 /// The selected route for a node advertisement.
 #[derive(Debug, Serialize)]
 pub(crate) struct Announcement {
-	/// Hop ids in traversal order, oldest first.
+	/// Hop identities in traversal order, oldest first.
 	pub hops: Vec<String>,
 	/// Number of hops in the selected route.
 	pub hop_count: usize,
@@ -95,7 +95,7 @@ pub(crate) enum Direction {
 }
 
 struct NodeBuilder {
-	hop_id: Option<String>,
+	origin_id: Option<String>,
 	announced: Option<Announcement>,
 	connections: Vec<Connection>,
 }
@@ -106,7 +106,7 @@ struct Announced {
 	nodes: BTreeMap<String, NodeBuilder>,
 	/// Hop id to the single node advertising it, or `None` once more than one
 	/// does and the id no longer identifies a peer.
-	hops: HashMap<u64, Option<String>>,
+	origins: HashMap<u64, Option<String>>,
 }
 
 /// Removes a live connection from the topology view when its session ends.
@@ -169,20 +169,22 @@ impl Nodes {
 		let mut scanned = Announced::default();
 
 		while let Some(update) = announced.try_next() {
-			// The origin delivers a re-announce as unannounce-then-announce, so an
-			// unannounce can land mid-drain. Skip it rather than end the scan, which
+			// A retraction can land mid-drain (a re-announce is a metadata update,
+			// not a retract-and-announce). Skip it rather than end the scan, which
 			// would drop every node still queued behind it.
-			let Some(broadcast) = update.broadcast else { continue };
+			if !update.active {
+				continue;
+			}
 
-			let key = canonical_announced_node(update.path.as_str());
-			let route = broadcast.route();
-			let hop_ids = route.hops.iter().map(|hop| hop.id()).collect::<Vec<_>>();
+			let key = canonical_announced_node(update.prefix.as_path().as_str());
+			let route = update.route;
+			let hop_ids = route.hops.iter().map(|origin| origin.id()).collect::<Vec<_>>();
 			// An advertisement with no hops never crossed a link, so it is our own.
-			let hop_id = hop_ids.first().copied().unwrap_or_else(|| self.origin.id());
+			let origin_id = hop_ids.first().copied().unwrap_or_else(|| self.origin.id());
 
 			scanned
-				.hops
-				.entry(hop_id)
+				.origins
+				.entry(origin_id)
 				.and_modify(|current| {
 					if current.as_deref() != Some(&key) {
 						*current = None;
@@ -193,10 +195,10 @@ impl Nodes {
 			scanned.nodes.insert(
 				key,
 				NodeBuilder {
-					hop_id: Some(hop_id.to_string()),
+					origin_id: Some(origin_id.to_string()),
 					announced: Some(Announcement {
 						hop_count: hop_ids.len(),
-						hops: hop_ids.into_iter().map(|hop| hop.to_string()).collect(),
+						hops: hop_ids.into_iter().map(|origin| origin.to_string()).collect(),
 						cost: route.cost.warm,
 						cold_cost: route.cost.cold,
 					}),
@@ -209,7 +211,7 @@ impl Nodes {
 	}
 
 	pub(crate) fn snapshot(&self) -> Snapshot {
-		let Announced { mut nodes, hops } = self.announced();
+		let Announced { mut nodes, origins } = self.announced();
 
 		let connections = self
 			.connections
@@ -221,15 +223,15 @@ impl Nodes {
 		for (&id, connection) in connections {
 			let key = match &connection.target {
 				ConnectionTarget::Node(node) => canonical_node(node),
-				ConnectionTarget::Hop(hop) => {
-					let Some(Some(node)) = hops.get(&hop.id()) else {
+				ConnectionTarget::Hop(origin) => {
+					let Some(Some(node)) = origins.get(&origin.id()) else {
 						continue;
 					};
 					node.clone()
 				}
 			};
 			let node = nodes.entry(key).or_insert_with(|| NodeBuilder {
-				hop_id: None,
+				origin_id: None,
 				announced: None,
 				connections: Vec::new(),
 			});
@@ -244,7 +246,7 @@ impl Nodes {
 				.into_iter()
 				.map(|(key, node)| Node {
 					node: key,
-					hop_id: node.hop_id,
+					origin_id: node.origin_id,
 					announced: node.announced,
 					connections: node.connections,
 				})
@@ -275,14 +277,14 @@ fn canonical_announced_node(node: &str) -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use moq_net::{Hop, Hops, broadcast};
+	use moq_net::{Hop, Hops};
 
 	async fn announced_node(
 		origin: &moq_net::origin::Producer,
 		node: &str,
 		hops: &[u64],
 		cost: u64,
-	) -> broadcast::Producer {
+	) -> moq_net::announce::Producer {
 		let hops = Hops::try_from(
 			hops.iter()
 				.map(|id| Hop::new(*id).expect("valid test origin"))
@@ -290,15 +292,11 @@ mod tests {
 		)
 		.unwrap();
 		let path = moq_net::Path::new(MESH_PREFIX).join(node);
-		let broadcast = origin
-			.create_broadcast(&path, broadcast::Route::announced().with_hops(hops).with_cost(cost))
+		let announcement = origin
+			.announce(&path, moq_net::origin::Route::default().with_hops(hops).with_cost(cost))
 			.unwrap();
-		origin
-			.consume()
-			.announced_broadcast(&path)
-			.await
-			.expect("test node announced");
-		broadcast
+		origin.consume().routed(&path).await.expect("test node announced");
+		announcement
 	}
 
 	#[tokio::test]
@@ -315,7 +313,7 @@ mod tests {
 		assert_eq!(snapshot.nodes.len(), 1);
 		let node = &snapshot.nodes[0];
 		assert_eq!(node.node, "https://relay-b.example/");
-		assert_eq!(node.hop_id.as_deref(), Some("9007199254740993"));
+		assert_eq!(node.origin_id.as_deref(), Some("9007199254740993"));
 		assert_eq!(node.announced.as_ref().unwrap().hops, vec!["9007199254740993"]);
 		assert_eq!(node.announced.as_ref().unwrap().hop_count, 1);
 		assert_eq!(node.announced.as_ref().unwrap().cost, 7);
@@ -328,7 +326,7 @@ mod tests {
 			serde_json::json!({
 				"nodes": [{
 					"node": "https://relay-b.example/",
-					"hop_id": "9007199254740993",
+					"origin_id": "9007199254740993",
 					"announced": { "hops": ["9007199254740993"], "hop_count": 1, "cost": 7, "cold_cost": 7 },
 					"connections": [
 						{ "id": 0, "direction": "outbound" },
@@ -376,7 +374,7 @@ mod tests {
 	async fn scan_skips_an_unannounce_queued_ahead_of_another_node() {
 		let origin = moq_tokio::origin::spawn(Hop::new(100).unwrap());
 		let nodes = Nodes::new(origin.clone());
-		let mut first = announced_node(&origin, "https://relay-a.example/", &[200], 1).await;
+		let first = announced_node(&origin, "https://relay-a.example/", &[200], 1).await;
 		let _second = announced_node(&origin, "https://relay-b.example/", &[300], 1).await;
 
 		let consumer = origin.consume().with_root(MESH_PREFIX).expect("mesh prefix is in root");
@@ -386,13 +384,10 @@ mod tests {
 		// bare unannounce ahead of relay-b's still-pending announce.
 		let first_update = announced.try_next().expect("replayed announce");
 		assert_eq!(
-			canonical_announced_node(first_update.path.as_str()),
+			canonical_announced_node(first_update.prefix.as_path().as_str()),
 			"https://relay-a.example/"
 		);
-		first.finish();
-		// The origin retires a finished source on a spawned task; time is paused, so
-		// this advances the clock instantly.
-		tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+		drop(first);
 
 		let scanned = nodes.scan_announced(&mut announced);
 		assert!(
@@ -402,7 +397,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn duplicate_hop_ids_do_not_resolve_inbound_connections() {
+	async fn duplicate_origin_ids_do_not_resolve_inbound_connections() {
 		let origin = moq_tokio::origin::spawn(Hop::new(100).unwrap());
 		let nodes = Nodes::new(origin.clone());
 		let _first = announced_node(&origin, "https://relay-b.example/", &[200], 1).await;

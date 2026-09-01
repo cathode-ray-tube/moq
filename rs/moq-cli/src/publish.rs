@@ -213,11 +213,16 @@ pub struct Publish {
 	// tracks and importers don't. Only the capture path also writes through it.
 	#[cfg_attr(not(feature = "capture"), allow(dead_code))]
 	broadcast: moq_net::broadcast::Producer,
+	// Keeps the broadcast's exact-path route advertised for the same lifetime.
+	// Attached after construction so the announce lands with the tracks in place.
+	_announcement: Option<moq_net::announce::Producer>,
 }
 
 impl Publish {
 	/// Build a publisher decoding the given container format from stdin into
-	/// `broadcast` (typically created on the origin that announces it).
+	/// `broadcast`. Announce the path afterwards (see [`Self::with_announcement`]):
+	/// this constructor creates the catalog tracks, so announcing after it lands
+	/// the advertisement with the tracks already in place.
 	pub fn new(
 		mut broadcast: moq_net::broadcast::Producer,
 		format: &PublishFormat,
@@ -236,6 +241,7 @@ impl Publish {
 			return Ok(Self {
 				source: Source::Stream(PublishDecoder::Ts(Box::new(ts))),
 				broadcast,
+				_announcement: None,
 			});
 		}
 
@@ -261,7 +267,11 @@ impl Publish {
 			}
 		};
 
-		Ok(Self { source, broadcast })
+		Ok(Self {
+			source,
+			broadcast,
+			_announcement: None,
+		})
 	}
 
 	/// Build a publisher capturing local devices (camera/screen and microphone).
@@ -290,7 +300,17 @@ impl Publish {
 		Ok(Self {
 			source: Source::Capture { catalog, video, audio },
 			broadcast,
+			_announcement: None,
 		})
+	}
+
+	/// Hold the broadcast's advertisement for this publisher's lifetime.
+	///
+	/// Announce after construction, so the route lands with the catalog tracks
+	/// already in place.
+	pub fn with_announcement(mut self, announcement: moq_net::announce::Producer) -> Self {
+		self._announcement = Some(announcement);
+		self
 	}
 
 	/// Drive the source until stdin EOF (or the capture devices stop).
@@ -503,9 +523,8 @@ mod tests {
 	async fn manufacture_input() -> Vec<u8> {
 		// Create the broadcast on a throwaway origin so the exporter can resolve it by path.
 		let origin = moq_tokio::origin::spawn(moq_net::Hop::random());
-		let mut broadcast = origin
-			.create_broadcast("cli", moq_net::broadcast::Route::new().with_announce(true))
-			.unwrap();
+		let mut broadcast = origin.create_broadcast("cli").unwrap();
+		let _announce_broadcast = origin.announce("cli", Default::default()).unwrap();
 		settle().await;
 		let mut catalog =
 			moq_mux::catalog::Producer::with_catalog(&mut broadcast, Catalog::<tscat::Ext>::default()).unwrap();
@@ -595,9 +614,7 @@ mod tests {
 		// streams land in the broadcast instead of being dropped by the media-only path.
 		// The broadcast is created on a throwaway origin so the exporter can resolve it by path.
 		let origin = moq_tokio::origin::spawn(moq_net::Hop::random());
-		let broadcast = origin
-			.create_broadcast("cli", moq_net::broadcast::Route::new().with_announce(true))
-			.unwrap();
+		let broadcast = origin.create_broadcast("cli").unwrap();
 		settle().await;
 		let mut publish = Publish::new(broadcast, &PublishFormat::Ts, None).unwrap();
 		#[allow(irrefutable_let_patterns)]

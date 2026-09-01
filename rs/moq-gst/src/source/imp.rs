@@ -367,12 +367,13 @@ async fn run_session(
 		.established()
 		.await?;
 
-	// Wait for the broadcast to be announced. Synchronous lookup would race the gossip of
-	// announcements that happens after the session is established.
+	// Wait for a route to cover the broadcast. Synchronous lookup would race the gossip
+	// of announcements that happens after the session is established.
 	tracing::info!(broadcast = %settings.broadcast, "waiting for broadcast to be announced");
 	let broadcast = tokio::select! {
-		broadcast = origin_consumer.announced_broadcast(&settings.broadcast) => broadcast
-			.context("broadcast not allowed or origin closed")?,
+		routed = origin_consumer.routed_broadcast(&settings.broadcast) => {
+			routed.context("broadcast unavailable")?
+		}
 		_ = shutdown.changed() => return Ok(()),
 	};
 

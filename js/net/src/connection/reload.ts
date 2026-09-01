@@ -375,8 +375,8 @@ export class Reload {
 					for (;;) {
 						const entry = await Promise.race([effect.cancel, upstream.next()]);
 						if (!entry) break;
-						if (entry.active) active.add(entry.path);
-						else active.delete(entry.path);
+						if (entry.active) active.add(entry.prefix);
+						else active.delete(entry.prefix);
 						producer.append(entry);
 					}
 				} catch {
@@ -385,8 +385,8 @@ export class Reload {
 					// Retract everything from the connection that just went away, so a per-broadcast
 					// watcher tears down instead of clinging to the dead route.
 					if (!closed) {
-						for (const path of active) {
-							producer.append({ path, active: false });
+						for (const prefix of active) {
+							producer.append({ prefix, active: false });
 						}
 					}
 				}
