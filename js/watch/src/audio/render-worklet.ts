@@ -15,7 +15,8 @@ class Render extends AudioWorkletProcessor {
 			const msg = event.data;
 			if (msg.type === "init-shared") {
 				console.log("[audio-worklet] init-shared: using SharedArrayBuffer path");
-				this.#backend = new SharedRingBuffer(msg);
+				const previous = this.#backend instanceof SharedRingBuffer ? this.#backend : undefined;
+				this.#backend = new SharedRingBuffer(msg, previous);
 				this.#underflow = 0;
 			} else if (msg.type === "init-post") {
 				console.log("[audio-worklet] init-post: using postMessage path");
@@ -27,6 +28,9 @@ class Render extends AudioWorkletProcessor {
 			} else if (msg.type === "latency") {
 				// Only meaningful in post mode.
 				if (this.#backend instanceof AudioRingBuffer) this.#backend.resize(msg.latency);
+			} else if (msg.type === "truncate") {
+				// Only meaningful in post mode; shared mode truncates via the control array.
+				if (this.#backend instanceof AudioRingBuffer) this.#backend.truncate(msg.timestamp);
 			} else if (msg.type === "reset") {
 				// Only meaningful in post mode; shared mode resets via the control array.
 				if (this.#backend instanceof AudioRingBuffer) this.#backend.reset();

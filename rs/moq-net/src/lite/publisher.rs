@@ -70,10 +70,10 @@ pub(super) struct Publisher<S: web_transport_trait::Session> {
 	// peer from a source whose chain excludes them, keeping the data plane on
 	// the same split-horizon rule as the announces we send them.
 	peer_setup: super::PeerSetup,
-	// The identity assigned to the peer by `Client::with_peer_origin`, standing
-	// in wherever the peer declines to declare one. The data-plane half (serving
-	// from a chain that excludes it) is applied by the client on the origin
-	// handle itself; here it only backs the announce filter.
+	// The identity assigned to the peer by the caller (`Client::with_peer_origin`, or
+	// the per-session default a server hands every request), standing in wherever the
+	// peer declines to declare one. Backs both the announce filter and the serving
+	// origin, so a peer that names itself nowhere on the wire is still split-horizoned.
 	peer_origin: Option<Origin>,
 	// The excluded origin handle, resolved once: the peer sends exactly one
 	// SETUP, so its declared id never changes for the session.
@@ -101,23 +101,25 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 	}
 
 	/// The origin to resolve a peer-requested broadcast from: excludes routes
-	/// through the peer when its SETUP declared an origin id, so a subscription
-	/// is never served data that flowed through the subscriber. The first call
-	/// waits for the peer's SETUP (sent at startup on every lite-05+ session,
-	/// well before it could learn of anything to subscribe to); the result is
-	/// cached, since the peer sends exactly one SETUP per session.
+	/// through the peer, so a subscription is never served data that flowed
+	/// through the subscriber. The identity is the one the peer declared in its
+	/// SETUP, or the one the caller assigned it when it declared none, the same
+	/// order the announce filter applies. The first call waits for the peer's
+	/// SETUP (sent at startup on every lite-05+ session, well before it could
+	/// learn of anything to subscribe to); the result is cached, since the peer
+	/// sends exactly one SETUP per session.
 	async fn serving_origin(&self) -> origin::Consumer {
 		if let Some(origin) = self.serving.get() {
 			return origin.clone();
 		}
-		// Pre-SETUP versions never declare an id; there is nothing to exclude.
-		let origin = if !self.version.has_setup_stream() {
-			self.origin.clone()
-		} else {
-			match self.peer_setup.origin().await {
-				Some(peer) => self.origin.clone().excluding(peer),
-				None => self.origin.clone(),
-			}
+		// Pre-SETUP versions never declare an id, so only the assigned one applies.
+		let declared = match self.version.has_setup_stream() {
+			true => self.peer_setup.origin().await,
+			false => None,
+		};
+		let origin = match declared.or(self.peer_origin) {
+			Some(peer) => self.origin.clone().excluding(peer),
+			None => self.origin.clone(),
 		};
 		// A concurrent first call may have won the race; either value is
 		// identical, so keep whichever landed.
@@ -1115,9 +1117,34 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		// Stream every frame in order. The delta-timestamp baseline resets to 0, so the
 		// first served frame's delta is its absolute timestamp (the subscriber decodes
 		// against the same baseline).
+		//
+		// A fetched group is usually cached whole, so the batch takes it under one lock;
+		// a fetch that catches the live edge falls back to streaming the open tail.
 		let mut prev_ts: u64 = 0;
-		while let Some(mut frame) = group.next_frame().await? {
-			write_fetch_frame(&mut stream.writer, &mut frame, timescale, &mut prev_ts).await?;
+		let mut buf: frame::Buffer = frame::Buffer::new();
+		loop {
+			let step = kio::wait(|waiter| match group.poll_read_frames(waiter, &mut buf) {
+				Poll::Pending => group
+					.poll_next_frame(waiter)
+					.map_ok(|frame| frame.map_or(Step::Done, Step::Partial)),
+				res => res.map_ok(|count| if count == 0 { Step::Done } else { Step::Batch }),
+			})
+			.await?;
+
+			match step {
+				Step::Batch => {
+					for i in 0..buf.filled().len() {
+						let frame = buf.filled()[i].clone();
+						write_fetch_frame(&mut stream.writer, frame, timescale, &mut prev_ts).await?;
+						// One stamp per batch isn't enough for a slow peer; see `write_group`.
+						group.keep_alive();
+					}
+				}
+				Step::Partial(mut frame) => {
+					write_fetch_partial(&mut stream.writer, &mut frame, timescale, &mut prev_ts).await?;
+				}
+				Step::Done => break,
+			}
 		}
 
 		stream.writer.finish()?;
@@ -1794,7 +1821,7 @@ mod announce_test {
 /// the decode in the subscriber's `run_group`.
 async fn encode_frame_timing<W: web_transport_trait::SendStream>(
 	writer: &mut Writer<W, Version>,
-	frame: &frame::Consumer,
+	timestamp: crate::Timestamp,
 	timescale: Option<crate::Timescale>,
 	prev_ts: &mut u64,
 ) -> Result<(), Error> {
@@ -1802,8 +1829,7 @@ async fn encode_frame_timing<W: web_transport_trait::SendStream>(
 		return Ok(());
 	}
 
-	let ts = frame.timestamp.value();
-	encode_zigzag_delta(writer, ts, prev_ts).await?;
+	encode_zigzag_delta(writer, timestamp.value(), prev_ts).await?;
 
 	Ok(())
 }
@@ -1829,13 +1855,31 @@ async fn encode_zigzag_delta<W: web_transport_trait::SendStream>(
 /// per-frame encoding in [`Subscription::serve_frame`] without the priority
 /// machinery, since a one-shot fetch carries a single static priority set on the
 /// stream up front.
+/// Write one already-complete frame of a fetched group.
 async fn write_fetch_frame<W: web_transport_trait::SendStream>(
+	writer: &mut Writer<W, Version>,
+	frame: frame::Frame,
+	timescale: Option<crate::Timescale>,
+	prev_ts: &mut u64,
+) -> Result<(), Error> {
+	encode_frame_timing(writer, frame.timestamp, timescale, prev_ts).await?;
+
+	writer.encode(&(frame.payload.len() as u64)).await?;
+	if !frame.payload.is_empty() {
+		writer.write_chunk(frame.payload).await?;
+	}
+
+	Ok(())
+}
+
+/// Write one in-flight frame of a fetched group, streaming its chunks as they land.
+async fn write_fetch_partial<W: web_transport_trait::SendStream>(
 	writer: &mut Writer<W, Version>,
 	frame: &mut frame::Consumer,
 	timescale: Option<crate::Timescale>,
 	prev_ts: &mut u64,
 ) -> Result<(), Error> {
-	encode_frame_timing(writer, frame, timescale, prev_ts).await?;
+	encode_frame_timing(writer, frame.timestamp, timescale, prev_ts).await?;
 
 	writer.encode(&frame.size).await?;
 	while let Some(chunk) = frame.read_chunk().await? {
@@ -1845,13 +1889,20 @@ async fn write_fetch_frame<W: web_transport_trait::SendStream>(
 	Ok(())
 }
 
+/// What a group has next for [`Publisher::next_frames`]: a batch of complete frames
+/// waiting in the buffer, a consumer for the in-flight tail, or the end of the group.
+enum Step {
+	/// The buffer was refilled; its frames are the next ones to send.
+	Batch,
+	/// Nothing is complete yet, so stream the open tail chunk by chunk.
+	Partial(frame::Consumer),
+	/// The group ended.
+	Done,
+}
+
 /// What [`recv_next`] pulled from the one subscriber: the next group to serve, the next
 /// best-effort datagram to forward, the track declaring its exclusive final sequence, or
 /// the track finishing (the live edge having reached that boundary).
-// A `group::Consumer` carries an inline frame prefetch, so the `Group` variant dwarfs the
-// others. This is a transient, one-at-a-time return value, so the padding is never held in
-// bulk; boxing would only add a per-group allocation.
-#[allow(clippy::large_enum_variant)]
 enum Recv {
 	Group(group::Consumer),
 	Datagram(crate::Datagram),
@@ -2126,8 +2177,25 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 		// frame's delta is absolute (against an implicit prev value of 0), every
 		// subsequent delta is signed against the previous frame.
 		let mut prev_ts: u64 = 0;
-		while let Some(frame) = self.next_frame(stream, priority, group).await? {
-			self.serve_frame(stream, priority, frame, &mut prev_ts).await?;
+		let mut buf = frame::Buffer::new();
+		loop {
+			match self.next_frames(stream, priority, group, &mut buf).await? {
+				Step::Batch => {
+					for i in 0..buf.filled().len() {
+						// Index rather than iterate: the writes below borrow `self`
+						// mutably, and a live `buf.filled()` iterator would pin `buf`
+						// across them for no reason.
+						let frame = buf.filled()[i].clone();
+						self.serve_whole_frame(stream, priority, frame, &mut prev_ts).await?;
+						// The fill stamped the group once. A flow-controlled peer can
+						// take longer than `latency_max` to accept one batch, so keep
+						// stamping or the rest of the group expires mid-serve.
+						group.keep_alive();
+					}
+				}
+				Step::Partial(frame) => self.serve_frame(stream, priority, frame, &mut prev_ts).await?,
+				Step::Done => break,
+			}
 		}
 
 		Ok(())
@@ -2173,7 +2241,7 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 		mut frame: frame::Consumer,
 		prev_ts: &mut u64,
 	) -> Result<(), Error> {
-		encode_frame_timing(stream, &frame, self.timescale, prev_ts).await?;
+		encode_frame_timing(stream, frame.timestamp, self.timescale, prev_ts).await?;
 
 		stream.encode(&frame.size).await?;
 
@@ -2184,22 +2252,50 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 		Ok(())
 	}
 
-	/// Await the next frame in the group, applying any priority changes that
-	/// arrive meanwhile. Errors with [`Error::Cancel`] if the peer closes first.
-	async fn next_frame(
+	/// Await whatever the group has next: a batch of already-complete frames, or a
+	/// consumer for the in-flight tail when nothing is complete yet.
+	///
+	/// A subscriber catching up on a cached group takes the whole backlog under one
+	/// lock instead of one wait per frame. At the live edge the batch comes up empty
+	/// and the tail streams chunk by chunk, exactly as it did before, so forwarding
+	/// never waits for a frame to complete.
+	async fn next_frames(
 		&mut self,
 		stream: &mut Writer<S::SendStream, Version>,
 		priority: &mut PriorityHandle,
 		group: &mut group::Consumer,
-	) -> Result<Option<frame::Consumer>, Error> {
+		buf: &mut frame::Buffer,
+	) -> Result<Step, Error> {
 		Self::serve_step(
 			stream,
 			priority,
 			&self.track_priority,
 			&mut self.track_priority_seen,
-			|waiter| group.poll_next_frame(waiter),
+			|waiter| match group.poll_read_frames(waiter, buf) {
+				// Nothing complete: the tail is either in flight or the group ended.
+				Poll::Pending => group
+					.poll_next_frame(waiter)
+					.map_ok(|frame| frame.map_or(Step::Done, Step::Partial)),
+				res => res.map_ok(|count| if count == 0 { Step::Done } else { Step::Batch }),
+			},
 		)
 		.await
+	}
+
+	/// Send one already-complete frame: the timestamp, the size, then the payload.
+	async fn serve_whole_frame(
+		&mut self,
+		stream: &mut Writer<S::SendStream, Version>,
+		priority: &mut PriorityHandle,
+		frame: frame::Frame,
+		prev_ts: &mut u64,
+	) -> Result<(), Error> {
+		encode_frame_timing(stream, frame.timestamp, self.timescale, prev_ts).await?;
+		stream.encode(&(frame.payload.len() as u64)).await?;
+		if !frame.payload.is_empty() {
+			self.write_chunk(stream, priority, frame.payload).await?;
+		}
+		Ok(())
 	}
 
 	/// Await the next chunk of `frame`, applying priority changes meanwhile.
@@ -2347,6 +2443,140 @@ mod serve_group_test {
 		assert_eq!(log.resets(), vec![Error::Old.to_code()]);
 	}
 
+	/// `write_group` takes two routes to the wire: complete frames come out of a batch
+	/// read via `serve_whole_frame`, while an in-flight frame streams chunk by chunk
+	/// via `serve_frame`. The two must encode identically, or a subscriber catching up
+	/// sees different bytes than one at the live edge.
+	#[tokio::test]
+	async fn batched_and_streamed_frames_encode_identically() {
+		const FRAMES: usize = 12;
+		const PAYLOAD: usize = 7;
+
+		fn subscription(log: &Log) -> Subscription<SinkSession> {
+			let track_priority = kio::Producer::new(0u8);
+			Subscription {
+				session: SinkSession::new(log.clone()),
+				id: 0,
+				track_name: "test".into(),
+				priority: PriorityQueue::default(),
+				track_priority: track_priority.consume(),
+				track_priority_seen: 0,
+				version: Version::Lite06Wip,
+				timescale: Some(crate::Timescale::default()),
+			}
+		}
+
+		fn payload(i: usize) -> Vec<u8> {
+			vec![i as u8; PAYLOAD]
+		}
+
+		fn timestamp(i: usize) -> Timestamp {
+			Timestamp::from_millis(i as u64 * 10).unwrap()
+		}
+
+		// Every frame complete before serving starts: the batch read takes them all.
+		let batched = {
+			let log = Log::default();
+			let subscription = subscription(&log);
+			let mut track = track::Producer::new(Arc::new(broadcast::Info::default()), "test", None);
+			let mut group = track.create_group(group::Info { sequence: 0 }).unwrap();
+			for i in 0..FRAMES {
+				group.write_frame(timestamp(i), payload(i).as_slice()).unwrap();
+			}
+			let consumer = group.consume();
+			group.finish().unwrap();
+
+			let handle = subscription.priority.insert(Priority::new(0, 0));
+			subscription.serve_group(0, handle, consumer).await.unwrap();
+			log.writes.lock().unwrap().clone()
+		};
+
+		// Every frame still open when the publisher reaches it, so each one streams a
+		// chunk at a time down the `Step::Partial` path.
+		let streamed = {
+			let log = Log::default();
+			let subscription = subscription(&log);
+			let mut track = track::Producer::new(Arc::new(broadcast::Info::default()), "test", None);
+			let mut group = track.create_group(group::Info { sequence: 0 }).unwrap();
+			let consumer = group.consume();
+
+			let handle = subscription.priority.insert(Priority::new(0, 0));
+			let mut serve = std::pin::pin!(subscription.serve_group(0, handle, consumer));
+			// Past the group header, parked with nothing to send.
+			assert!(futures::poll!(serve.as_mut()).is_pending());
+
+			for i in 0..FRAMES {
+				{
+					let mut frame = group
+						.create_frame(frame::Info {
+							size: PAYLOAD as u64,
+							timestamp: timestamp(i),
+						})
+						.unwrap();
+					// The publisher is parked on this frame, so each chunk is forwarded
+					// before the next one is written.
+					for byte in payload(i) {
+						frame.write(&[byte][..]).unwrap();
+						assert!(futures::poll!(serve.as_mut()).is_pending());
+					}
+					frame.finish().unwrap();
+				}
+				assert!(futures::poll!(serve.as_mut()).is_pending());
+			}
+
+			group.finish().unwrap();
+			serve.await.unwrap();
+			log.writes.lock().unwrap().clone()
+		};
+
+		assert!(!batched.is_empty(), "the group produced no bytes");
+		assert_eq!(batched, streamed, "batched and streamed writes must encode the same");
+	}
+
+	/// A frame still being written must reach the wire as it fills rather than waiting
+	/// for the whole thing: the batch read has to yield to the open tail.
+	#[tokio::test]
+	async fn an_open_frame_streams_before_it_completes() {
+		let log = Log::default();
+		let session = SinkSession::new(log.clone());
+
+		let track_priority = kio::Producer::new(0u8);
+		let subscription = Subscription {
+			session,
+			id: 0,
+			track_name: "test".into(),
+			priority: PriorityQueue::default(),
+			track_priority: track_priority.consume(),
+			track_priority_seen: 0,
+			version: Version::Lite06Wip,
+			timescale: Some(crate::Timescale::default()),
+		};
+
+		let mut track = track::Producer::new(Arc::new(broadcast::Info::default()), "test", None);
+		let mut group = track.create_group(group::Info { sequence: 0 }).unwrap();
+		let consumer = group.consume();
+
+		// A large frame, opened but far from complete.
+		let mut frame = group
+			.create_frame(frame::Info {
+				size: 4096,
+				timestamp: Timestamp::from_millis(0).unwrap(),
+			})
+			.unwrap();
+		frame.write(&[7u8; 512][..]).unwrap();
+
+		let handle = subscription.priority.insert(Priority::new(0, 0));
+		let mut serve = std::pin::pin!(subscription.serve_group(0, handle, consumer));
+		// Let it run until it blocks on the rest of the frame.
+		assert!(futures::poll!(serve.as_mut()).is_pending());
+
+		let written = log.writes.lock().unwrap().len();
+		assert!(
+			written >= 512,
+			"the open frame's first chunk must be forwarded before it completes, wrote {written}"
+		);
+	}
+
 	/// A group that completes cleanly must not reset at all. The completion path
 	/// consumes the writer via `close()`; leaving the writer to drop after `finish()`
 	/// would fire the Drop fallback and tack a spurious Cancel reset onto a stream
@@ -2390,12 +2620,174 @@ mod serve_group_test {
 			"rank 0 must reach the transport as send order 255: {priorities:?}",
 		);
 	}
+
+	/// A subscriber that stops reading must not pin the group it was being served.
+	///
+	/// The publisher stamps the group's cache access once per frame, immediately
+	/// before writing it, so a delivery in progress gets a full `latency_max` of
+	/// grace per frame handed out. Nothing re-stamps inside the write itself: a peer
+	/// whose flow control window stays shut for longer than the whole retention
+	/// window lets the group expire mid-stream and the stream resets with `Old`.
+	/// That is the point. Holding the group for as long as a wedged peer refuses to
+	/// read would let any subscriber pin cache indefinitely.
+	///
+	/// A batch read takes up to `frame::Buffer` frames out of the group at once and
+	/// owns their payloads, so the grace is that many frames rather than one. It is
+	/// still bounded: the tail past the buffer goes with the group, which is why the
+	/// group here runs longer than one batch.
+	#[tokio::test(start_paused = true)]
+	async fn stalled_write_releases_the_group() {
+		let gate = kio::Producer::new(true);
+		let session = SinkSession::gated_uni(gate.consume());
+		let log = session.log.clone();
+
+		let track_priority = kio::Producer::new(0u8);
+		let subscription = Subscription {
+			session,
+			id: 0,
+			track_name: "test".into(),
+			priority: PriorityQueue::default(),
+			track_priority: track_priority.consume(),
+			track_priority_seen: 0,
+			version: Version::Lite06Wip,
+			timescale: Some(crate::Timescale::default()),
+		};
+
+		let mut track = track::Producer::new(Arc::new(broadcast::Info::default()), "test", None);
+		let mut group = track.create_group(group::Info { sequence: 0 }).unwrap();
+		group
+			.write_frame(Timestamp::from_millis(0).unwrap(), b"first".as_slice())
+			.unwrap();
+
+		// The live edge moves on, so the served group is demoted and expirable.
+		track
+			.create_group(group::Info { sequence: 1 })
+			.unwrap()
+			.finish()
+			.unwrap();
+
+		let handle = subscription.priority.insert(Priority::new(0, 0));
+		let mut serve = std::pin::pin!(subscription.serve_group(0, handle, group.consume()));
+
+		// Write the header and the first frame, leaving the task awaiting the next.
+		assert!(futures::poll!(serve.as_mut()).is_pending());
+
+		// From here every write blocks, the way a shut flow control window does.
+		*gate.write().ok().expect("gate open") = false;
+
+		group
+			.write_frame(Timestamp::from_millis(10).unwrap(), b"second".as_slice())
+			.unwrap();
+		// Enough filler to overrun the publisher's batch, so the tail below is left in
+		// the group rather than taken along with "second".
+		let batch = <frame::Buffer>::new().capacity();
+		for i in 0..batch {
+			group
+				.write_frame(Timestamp::from_millis(11 + i as u64).unwrap(), b"pad".as_slice())
+				.unwrap();
+		}
+		group
+			.write_frame(Timestamp::from_millis(20).unwrap(), b"third".as_slice())
+			.unwrap();
+		group.finish().unwrap();
+
+		// The publisher takes a batch ending at the filler (stamping the group) and
+		// blocks writing "second".
+		assert!(futures::poll!(serve.as_mut()).is_pending());
+
+		// The write stays blocked well past the retention window while the source
+		// keeps publishing, which is what runs the expiry scan.
+		for sequence in 2..8u64 {
+			tokio::time::advance(crate::track::DEFAULT_LATENCY_MAX / 2).await;
+			track.create_group(group::Info { sequence }).unwrap().finish().unwrap();
+			assert!(futures::poll!(serve.as_mut()).is_pending());
+		}
+
+		*gate.write().ok().expect("gate open") = true;
+		let res = serve.await;
+		assert!(
+			matches!(res, Err(Error::Old)),
+			"a wedged peer must not hold an expired group open: {res:?}"
+		);
+
+		// The reason reaches the peer, so it reads as a truncated group rather than
+		// a routine cancel and it can re-request the sequence.
+		assert_eq!(log.resets(), vec![Error::Old.to_code()]);
+
+		// Only the untaken tail is lost: the frames already handed to the publisher
+		// own their payloads, so the release can't reclaim them mid-write.
+		let writes = log.writes.lock().unwrap();
+		assert!(
+			writes.windows(b"second".len()).any(|w| w == b"second"),
+			"the in-flight batch still reached the wire"
+		);
+		assert!(
+			!writes.windows(b"third".len()).any(|w| w == b"third"),
+			"the untaken tail was released with the group"
+		);
+	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::lite::test_transport::SinkSession;
+
+	/// A peer that declares no origin in its SETUP is split-horizoned by the identity
+	/// the caller assigned it, on the data plane and not just the announce filter.
+	/// Otherwise it can subscribe its way back to content that already flowed through
+	/// it, which is the loop the announce filter exists to prevent.
+	#[tokio::test(start_paused = true)]
+	async fn serving_origin_falls_back_to_the_assigned_identity() {
+		let assigned = crate::Origin::new(777).unwrap();
+		let upstream = crate::Origin::new(778).unwrap();
+		let origin = crate::origin::Info::new(crate::Origin::new(1).unwrap()).produce();
+
+		let mut echoed_hops = OriginList::new();
+		echoed_hops.push(assigned).unwrap();
+		let _echoed = origin
+			.create_broadcast(
+				"echoed",
+				crate::broadcast::Route::new()
+					.with_hops(echoed_hops)
+					.with_announce(true),
+			)
+			.unwrap();
+
+		let mut local_hops = OriginList::new();
+		local_hops.push(upstream).unwrap();
+		let _local = origin
+			.create_broadcast(
+				"local",
+				crate::broadcast::Route::new().with_hops(local_hops).with_announce(true),
+			)
+			.unwrap();
+
+		// Broadcast visibility is deferred until the executor ticks.
+		tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+		// A SETUP that declares no origin of its own, so only the assigned one applies.
+		let peer_setup = crate::lite::PeerSetup::default();
+		peer_setup.set(crate::lite::Setup::default());
+
+		let publisher = Publisher::new(PublisherConfig {
+			session: SinkSession::new(Default::default()),
+			origin: origin.consume(),
+			version: Version::Lite06Wip,
+			peer_setup,
+			peer_origin: Some(assigned),
+		});
+
+		let serving = publisher.serving_origin().await;
+		assert!(
+			serving.get_broadcast("echoed").is_none(),
+			"served the peer its own route"
+		);
+		assert!(
+			serving.get_broadcast("local").is_some(),
+			"withheld an independent route"
+		);
+	}
 
 	/// Lite01/02 send the initial active set as ANNOUNCE_INIT. It must apply the
 	/// same per-peer route selection as the live loop: a broadcast whose only

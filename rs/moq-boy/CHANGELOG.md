@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.11](https://github.com/moq-dev/moq/compare/moq-boy-v0.4.10...moq-boy-v0.4.11) - 2026-08-26
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, moq-native, moq-video, hang, moq-json, moq-audio
+
+## [0.4.10](https://github.com/moq-dev/moq/compare/moq-boy-v0.4.9...moq-boy-v0.4.10) - 2026-08-24
+
+### Other
+
+- updated the following local packages: moq-audio, moq-video, moq-json
+
 ## [0.4.9](https://github.com/moq-dev/moq/compare/moq-boy-v0.4.8...moq-boy-v0.4.9) - 2026-08-20
 
 ### Added

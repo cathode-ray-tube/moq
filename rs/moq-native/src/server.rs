@@ -99,6 +99,11 @@ impl ServerConfig {
 		}
 	}
 
+	/// Whether a QUIC, TCP, or Unix bind is explicitly configured.
+	pub fn has_explicit_bind(&self) -> bool {
+		self.bind.is_some() || self.has_stream_listener()
+	}
+
 	/// Whether a `tcp`/`unix` stream listener is configured.
 	///
 	/// When true and [`bind`](Self::bind) is unset, the server runs stream-only
@@ -1105,6 +1110,25 @@ impl Request {
 		}
 	}
 
+	/// Assign the identity this peer's routes are attributed to; see
+	/// [`moq_net::Request::with_peer_origin`]. Derive it from [`Self::peer_identity`],
+	/// never from something coarser.
+	pub fn with_peer_origin(self, origin: moq_net::Origin) -> Self {
+		let Request {
+			transport,
+			url,
+			identity,
+			kind,
+		} = self;
+		let kind = request_map!(kind, request => request.with_peer_origin(origin));
+		Request {
+			transport,
+			url,
+			identity,
+			kind,
+		}
+	}
+
 	/// Attach a per-connection [`moq_net::stats::Session`] context to this session.
 	pub fn with_stats(self, stats: moq_net::stats::Session) -> Self {
 		let Request {
@@ -1496,6 +1520,7 @@ uid = [1001, 1002]
 		assert_eq!(config.unix.bind.as_deref(), Some(std::path::Path::new("/run/moq.sock")));
 		assert_eq!(config.unix.allow.as_ref().expect("allow").uid, vec![1001, 1002]);
 		assert!(config.has_stream_listener());
+		assert!(config.has_explicit_bind());
 	}
 
 	#[cfg(all(feature = "uds", unix))]
@@ -1505,9 +1530,11 @@ uid = [1001, 1002]
 		let mut config = ServerConfig::default();
 		config.unix.bind = Some(PathBuf::from("/run/moq.sock"));
 		assert!(config.has_stream_listener());
+		assert!(config.has_explicit_bind());
 		assert!(config.bind.is_none());
 
 		// The default (nothing configured) still runs QUIC.
 		assert!(!ServerConfig::default().has_stream_listener());
+		assert!(!ServerConfig::default().has_explicit_bind());
 	}
 }

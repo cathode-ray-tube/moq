@@ -24,7 +24,7 @@ jobs:
           determinate: false
 
       - name: Update flake.lock
-        uses: DeterminateSystems/update-flake-lock@0281a39e4c38fabb75c9d1377e541666db300909 # main
+        uses: DeterminateSystems/update-flake-lock@f21d5f4a9e57815a4941a2e7c3860f4664cb3a96 # main
         with:
           pr-title: "Update flake.lock"
           pr-labels: |

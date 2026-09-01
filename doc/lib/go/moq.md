@@ -179,7 +179,7 @@ err := broadcast.SetVideoProperties(moq.VideoProperties{
 
 ## Error handling
 
-A server can reject the connection on auth grounds: `ErrMoqErrorUnauthorized` (HTTP 401) or `ErrMoqErrorForbidden` (HTTP 403). These are terminal: retrying without new credentials won't help, so handle them separately from a transient transport failure. The `moq.IsAuthError` helper catches both:
+A server can reject the connection on auth grounds: `moq.ErrUnauthorized` (HTTP 401) or `moq.ErrForbidden` (HTTP 403). These are terminal: retrying without new credentials won't help, so handle them separately from a transient transport failure. The `moq.IsAuthError` helper catches both:
 
 ```go
 session, err := client.Connect("https://relay.example.com")
@@ -220,6 +220,7 @@ If a producer is collected without `Finish()`, the underlying library logs a war
 `PublishMedia` takes frames you already encoded. To hand over raw pixels or PCM instead and let the codec run inside the bindings, use `PublishVideo` / `PublishAudio`. Pixel format, resolution, and framerate are fixed at publish time, so each frame carries only its pixels and a timestamp:
 
 ```go
+track := "camera"
 video, err := broadcast.PublishVideo(
     moq.VideoEncoderInput{
         Format:    moq.VideoPixelFormatRgba,
@@ -229,6 +230,7 @@ video, err := broadcast.PublishVideo(
     },
     moq.VideoEncoderOutput{
         Codec: moq.VideoCodecH264,
+        Track: &track,
         Kind:  moq.AutoEncoder(),
     },
 )
@@ -243,7 +245,9 @@ video.Finish()
 
 `AutoEncoder()` prefers a hardware encoder and falls back to software; `SoftwareEncoder()`, `HardwareEncoder()`, and `NamedEncoder("videotoolbox")` pin the choice. The bindings compile VideoToolbox (macOS), Media Foundation (Windows), NVENC (Linux, NVIDIA), and openh264 (software, everywhere). A hardware encoder that is compiled in but can't open, because there is no GPU or because its driver libraries aren't on the loader path, logs a warning naming the reason and falls through to software, so a host that quietly encodes on the CPU says so. `SetBitrate` retunes the live encoder without forcing a keyframe, cheap enough to drive from a congestion controller.
 
-The track is named after the codec (`.avc3` / `.hev1`) and its catalog rendition is published immediately, read out of the encoder itself, so subscribers discover it through the catalog rather than a name you pick, and can find it before the first frame exists. `Cut()` starts a new group at the next frame, which is optional: the encoder keyframes every `Gop` frames on its own, and each of those cuts a group.
+Set `Track` to choose the track name; omit it to derive one from the codec (`.avc3` / `.hev1`). The catalog rendition is published immediately so subscribers can discover it before the first frame exists. `Used(ctx)` and `Unused(ctx)` monitor subscriber demand. Call `Cut()` before the first frame after an idle gap so the resumed stream starts with a keyframe in a new group.
+
+Raw audio takes an explicit track name at publish time. Read it back through `audio.Name()`; `audio.Used(ctx)` and `audio.Unused(ctx)` monitor subscriber demand so capture and encoding can stay idle when nobody is listening. Call `audio.ResetEpoch()` before the first frame after resuming so its timestamp preserves the idle gap.
 
 ## Raw Track Controls
 
@@ -445,6 +449,12 @@ for request, err := range dynamic.Requests(ctx) {
 		log.Fatal(err)
 	}
 	if err := track.WriteFrame(moq.Frame{Payload: []byte("ready")}); err != nil {
+		log.Fatal(err)
+	}
+	if err := track.Finish(); err != nil {
+		log.Fatal(err)
+	}
+	if err := broadcast.Finish(); err != nil {
 		log.Fatal(err)
 	}
 }

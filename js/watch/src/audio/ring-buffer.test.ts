@@ -661,6 +661,30 @@ describe("decoded rate must match the ring (#2352)", () => {
 	});
 });
 
+describe("live anchoring", () => {
+	// The SharedArrayBuffer ring anchors in both modes; this keeps the postMessage fallback
+	// in step. Without anchoring, a first frame at a large timestamp gap-filled the whole ring
+	// with zeros, un-stalled on that overflow, and left the playhead a floor before the frame.
+	it("anchors a live ring to the first frame instead of gap-filling from zero", () => {
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 100 as Time.Milli });
+		expect(buffer.capacity).toBe(100);
+
+		write(buffer, 2000 as Time.Milli, 40, { channels: 1, value: 0.5 });
+		// Still short of the floor, so nothing plays yet and the ring holds only real samples.
+		expect(buffer.stalled).toBe(true);
+		expect(buffer.length).toBe(40);
+		expect(Time.Milli.fromMicro(buffer.timestamp)).toBe(2000 as Time.Milli);
+
+		write(buffer, 2040 as Time.Milli, 60, { channels: 1, value: 0.5 });
+		expect(buffer.stalled).toBe(false);
+
+		// Playback starts on the first real sample, not on gap-filled silence.
+		const output = read(buffer, 40, 1);
+		expect(output[0].length).toBe(40);
+		expect(output[0][0]).toBeCloseTo(0.5, 5);
+	});
+});
+
 describe("buffered mode", () => {
 	function createBuffered(latency: number) {
 		return new AudioRingBuffer({ rate: 1000, channels: 1, latency: latency as Time.Milli, buffered: true });
@@ -713,6 +737,37 @@ describe("buffered mode", () => {
 
 		expect(Time.Milli.fromMicro(buffer.timestamp)).toBe(100 as Time.Milli);
 		expect(read(buffer, 100, 1)[0][0]).toBeCloseTo(0.2, 5);
+	});
+
+	it("truncate drops the write-ahead tail a successor supersedes", () => {
+		// 600ms floor at 1000Hz -> 1200-sample ring, holding a 1s write-ahead utterance.
+		const buffer = createBuffered(600);
+		for (let i = 0; i < 10; i++) {
+			write(buffer, (2000 + i * 100) as Time.Milli, 100, { channels: 1, value: 0.1 });
+		}
+		read(buffer, 100, 1); // playhead at 2100
+
+		// A successor track takes over at 2200 with 100ms of its own audio. Writing it only overwrites
+		// [2200, 2300); without the truncate, [2300, 3000) of the old track still plays after it.
+		buffer.truncate(Time.Micro.fromMilli(2200 as Time.Milli));
+		write(buffer, 2200 as Time.Milli, 100, { channels: 1, value: 0.9 });
+
+		expect(buffer.stalled).toBe(false); // truncate keeps playing, unlike reset()
+		expect(read(buffer, 100, 1)[0][0]).toBeCloseTo(0.1, 5); // [2100, 2200) was already due
+		expect(read(buffer, 100, 1)[0][0]).toBeCloseTo(0.9, 5); // the successor
+		expect(read(buffer, 100, 1)[0].length).toBe(0); // and nothing after it
+	});
+
+	it("truncate never rewinds past the playhead", () => {
+		const buffer = createBuffered(600);
+		write(buffer, 2000 as Time.Milli, 1000, { channels: 1, value: 0.1 });
+		read(buffer, 100, 1); // playhead at 2100
+
+		// A successor whose first frame predates the playhead: those samples are already due, so the
+		// write index floors there rather than going backwards.
+		buffer.truncate(Time.Micro.fromMilli(1000 as Time.Milli));
+		expect(buffer.length).toBe(0);
+		expect(read(buffer, 100, 1)[0].length).toBe(0);
 	});
 });
 

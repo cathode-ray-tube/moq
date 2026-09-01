@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.14](https://github.com/moq-dev/moq/compare/moq-cli-v0.9.13...moq-cli-v0.9.14) - 2026-08-26
+
+### Other
+
+- updated the following local packages: moq-mux, moq-native, moq-video, moq-rtmp, moq-srt, hang, moq-audio, moq-hls, moq-rtc, moq-transcode
+
+## [0.9.13](https://github.com/moq-dev/moq/compare/moq-cli-v0.9.12...moq-cli-v0.9.13) - 2026-08-24
+
+### Added
+
+- *(audio)* decode AAC-LC ([#2968](https://github.com/moq-dev/moq/pull/2968))
+
+### Fixed
+
+- *(moq-cli)* pace the TS stdout export on each frame's timestamp ([#3006](https://github.com/moq-dev/moq/pull/3006))
+
 ## [0.9.12](https://github.com/moq-dev/moq/compare/moq-cli-v0.9.11...moq-cli-v0.9.12) - 2026-08-20
 
 ### Added

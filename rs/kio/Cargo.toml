@@ -5,7 +5,7 @@ authors = ["Luke Curley"]
 repository = "https://github.com/moq-dev/moq"
 license = "MIT OR Apache-2.0"
 
-version = "0.5.5"
+version = "0.5.6"
 edition = "2024"
 rust-version.workspace = true
 
@@ -38,4 +38,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [[bench]]
 name = "waiter"
+harness = false
+
+[[bench]]
+name = "channel"
 harness = false

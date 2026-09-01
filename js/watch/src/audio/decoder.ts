@@ -8,9 +8,11 @@ import { base64ToBytes } from "../base64";
 
 import { type Bound, latencyBounds, type Sync } from "../sync";
 import { type AudioBuffer, createAudioBuffer } from "./buffer";
+import { Handover } from "./handover";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
 import RenderWorklet from "./render-worklet.ts?worklet";
 import type { Source } from "./source";
+import { subscribe } from "./subscription";
 import { type DecodedSpan, Terminal } from "./terminal";
 import { unlockOnGesture } from "./unlock";
 import { Warmup } from "./warmup";
@@ -87,21 +89,12 @@ export class Decoder {
 	// Ordered discontinuity and endpoint state from the container consumer.
 	#terminal = new Terminal();
 
-	// How much buffered audio the container consumer retains before skipping
-	// ahead. This must be the latency CEILING (maxBuffer), not the floor
-	// (buffer): in buffered playback the producer writes faster than real-time
-	// with future PTS, so the group span legitimately exceeds the floor and
-	// would otherwise be skipped. When collapsed, maxBuffer equals the floor.
-	//
-	// Held in a plain Signal driven by a running effect (below) rather than a
-	// lazy `computed`: the container consumer only `.peek()`s this (it never
-	// subscribes), and an unsubscribed computed peeks as `undefined`, which
-	// would make the consumer's threshold NaN and skip every group.
-	#consumerLatency = new Signal<Time.Milli>(Time.Milli.zero);
-
 	// The latency floor as of the last settled change, to detect a floor *increase* (needs a deeper
 	// cushion) versus a decrease or a real-time RTT wiggle. See #runLatencyReanchor.
 	#prevFloor?: Bound;
+
+	// Which subscription the ring's buffered samples came from. See #runDecoder.
+	#handover = new Handover();
 
 	#signals = new Effect();
 
@@ -112,10 +105,6 @@ export class Decoder {
 
 		this.source = source;
 		this.sync = sync;
-
-		this.#signals.run((effect) => {
-			this.#consumerLatency.set(effect.get(this.sync.out.maxBuffer));
-		});
 
 		this.#signals.run(this.#runWorklet.bind(this));
 		this.#signals.run(this.#runEnabled.bind(this));
@@ -270,8 +259,16 @@ export class Decoder {
 		const active = broadcast.relativeBroadcast(effect, config.broadcast);
 		if (!active) return;
 
-		const sub = active.track(track).subscribe({ priority: Catalog.PRIORITY.audio });
-		effect.cleanup(() => sub.close());
+		// The ring outlives this effect (it's keyed on the sample rate and channel count), so a
+		// replacement subscription (a rendition swap, a republished broadcast, a reconnect) inherits
+		// whatever its predecessor decoded. Samples are timestamp indexed, so the replacement
+		// overwrites the slots it lands on, but a publisher writing ahead of real-time leaves seconds
+		// of tail beyond them. Drop that once the replacement's first frame says where it starts.
+		this.#handover.opened();
+
+		// The Sync ceiling is the maximum age of a non-latest group before both the network and
+		// container consumers skip it. Omitting startGroup keeps a new subscription at the live edge.
+		const sub = subscribe(effect, { broadcast: active, track, maxLatency: this.sync.out.maxBuffer });
 
 		if (config.container.kind === "cmaf") {
 			this.#runCmafDecoder(effect, sub, config);
@@ -289,7 +286,7 @@ export class Decoder {
 		// TODO include JITTER_UNDERHEAD
 		const consumer = new Container.Consumer(sub, {
 			format,
-			latency: this.#consumerLatency,
+			latency: this.sync.out.maxBuffer,
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -394,7 +391,7 @@ export class Decoder {
 
 		const consumer = new Container.Consumer(sub, {
 			format: new Container.Cmaf.Format(init),
-			latency: this.#consumerLatency,
+			latency: this.sync.out.maxBuffer,
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -492,6 +489,13 @@ export class Decoder {
 		const durationMilli = Time.Milli.fromMicro(durationMicro);
 		const end = Time.Milli.add(timestampMilli, durationMilli);
 
+		// A new subscription has taken over the timeline: drop the previous one's write-ahead tail
+		// rather than letting it play out after this frame. See #runDecoder.
+		if (this.#handover.takeover()) {
+			ring.truncate(timestamp);
+			this.#truncateDecodeBuffered(timestampMilli);
+		}
+
 		// Add to decode buffer
 		this.#addDecodeBuffered(timestampMilli, end);
 
@@ -527,6 +531,15 @@ export class Decoder {
 
 			current.push({ start, end });
 			current.sort((a, b) => a.start - b.start);
+		});
+	}
+
+	// Drop reported decode ranges at or after `timestamp`, mirroring a ring truncation.
+	#truncateDecodeBuffered(timestamp: Time.Milli): void {
+		this.#decodeBuffered.mutate((current) => {
+			while (current.length > 0 && current[current.length - 1].start >= timestamp) current.pop();
+			const last = current[current.length - 1];
+			if (last && last.end > timestamp) last.end = timestamp;
 		});
 	}
 

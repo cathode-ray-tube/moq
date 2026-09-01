@@ -16,17 +16,27 @@ nix develop --command just fix          # Auto-fix lint/formatting, same scope
 nix develop --command just check-all    # Same as check, over every package
 nix develop --command just fix-all      # Same as fix, over every package
 nix develop --command just build        # Build all packages
+nix develop --command just bench        # Benchmark the current tree
+nix develop --command just bench BASE   # Compare BASE with the current tree
 ```
 
 Use the Nix dev shell for project commands so local runs match CI tooling. If Nix is unavailable, use `cargo` or `bun` directly.
 
-`just check`, `just test`, and `just fix` all diff the branch against its base and touch only the crates that changed plus everything depending on them, which is what keeps them fast when several worktrees are building at once. They skip a language entirely when the diff doesn't touch it. Reach for `just check-all` / `just test all` / `just fix-all` when you want the unscoped suite. See [Workflow](#workflow) for how the base is resolved.
+`just bench` runs every Criterion target plus fixed video and 1:N fanout
+workloads against a temporary local relay. Pass a commit or ref to benchmark that
+revision first and print base-to-current changes. Timing changes are informational;
+benchmark crashes, zero delivery, and invalid samples still fail the command. Relay
+CPU and RSS are included on Linux, where `moq-bench-host` can read `/proc`.
+
+`just check`, `just test`, and `just fix` all diff the branch against its base and touch only the crates that changed plus everything depending on them, which is what keeps them fast when several worktrees are building at once. They skip a language entirely when the diff doesn't touch it. Reach for `just check-all` / `just test all` / `just fix-all` when you want the unscoped suite. They also switch to it themselves once the changed-file list outgrows what a single argv/env string can hold (64 KiB, roughly 1500 paths), because the list is passed to each per-language recipe as one argument. See [Workflow](#workflow) for how the base is resolved.
 
 To force a base, `just check origin/dev` and `just fix origin/dev` take it positionally. `just test` can't: it's a module, so `just test origin/dev` looks for a *recipe* named `origin/dev`. Name the recipe to get past that: `just test default origin/dev`.
 
 **CI runs exactly these recipes: `just check` and `just test`, with `MOQ_STRICT=1`.** There is no separate `just ci`, so there is no second definition of "checked" to drift from this one. The split is by cost, not by environment: `check` lints and compiles (plus `tsc -b` and the Python docs, which catch what `--noEmit` and autodoc can't), while `test` links and runs the test binaries, which is the expensive half. They run as concurrent jobs in `check.yml`, because clippy emits rmeta without codegen while nextest codegens and links, so there is nearly nothing for one to reuse from the other.
 
-The Rust build cache is written by `main` and read by pull requests, never the other way around (`.github/workflows/cache.yml`). Actions scopes cache reads to the current branch plus the default branch, so a PR-only workflow can never leave anything a *later* PR can restore. Both jobs in `check.yml` therefore restore under `shared-key: rust` with `save-if: false`. Don't add a save to a PR job: each one is gigabytes, the repository budget is 10 GB, and PR-scoped entries evict each other while remaining unreadable to everyone else.
+The Rust build cache is written by `main` and read by pull requests, never the other way around (`.github/workflows/cache.yml`). Actions scopes cache reads to the current branch plus the default branch, so a PR-only workflow can never leave anything a *later* PR can restore, while each entry is gigabytes against a 10 GB repository budget. That is why `main` is the single writer, and why the PR jobs must stay restore-only even though the cache action already refuses to publish from a pull request. Don't add a second target-directory cache on top: it spends the same budget twice and hides whether the first one restored anything.
+
+The main Rust check, test, OBS, and WASM jobs go through `.github/actions/rust-cache`, which owns their Swatinem action pin and cache policy. CI uses plain Cargo and restores the `target/` cache warmed by `main`; pull requests never write cache entries. Compiling recipes also accept `RUST_CARGO`, so local development can swap a `target/` per worktree for a compatible shared-store wrapper such as mr boxington. `rs/justfile` documents the three recipes that deliberately ignore it.
 
 `MOQ_STRICT` is the one thing CI does differently. Every tool the checks use is guarded with `command -v` so an incomplete local toolchain checks less instead of failing; in CI that would be a green run that silently checked nothing, so the variable turns the required set into an up-front precondition (`_tools` in the root justfile). Required is per scope, mirroring what the diff actually dispatches, so a docs-only PR doesn't have to have gradle.
 
@@ -79,10 +89,17 @@ Language-specific conventions, crate/package maps, and patterns live in nested `
 - **`rs/CLAUDE.md`** - Rust workspace: crate map, Producer/Consumer model, `poll_*` plumbing, error handling, config/TOML merge, Version matching, testing.
 - **`js/CLAUDE.md`** - TypeScript/JS workspace: package map, the signals + Effect reactivity model and its lifecycle rules, Web Components UI, `bun`/Biome tooling.
 - **`py/CLAUDE.md`** - Python wrappers: the `moq-ffi` (generated bindings) vs `moq-rs` (ergonomic) split and the `moq` public surface.
+- **`quest/AGENTS.md`** - long-term project memory: quests.
 
 The `swift/`, `kt/`, and `go/` directories are thin wrappers over `rs/moq-ffi`; see each directory's `README.md` rather than a dedicated guide.
 
 This root file holds only cross-cutting rules that apply everywhere (writing style, root-cause and maintainability rules, cross-package sync, public-API scrutiny, comment/doc conventions). When editing any of these guides, reference code by file path and symbol name, never by line number; line numbers rot with every edit. The mechanics of landing a change (branch targeting, commit messages, PR descriptions, reviews, releases) live in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+History belongs in commits and PRs; pending work belongs in a quest. Read
+[`quest/AGENTS.md`](quest/AGENTS.md) whenever work mentions a quest or
+questline, and use the `$plan-quest` or `$start-quest` skills when available.
+GitHub issues remain the public front door, while quests carry durable plans
+and dependency edges alongside the code.
 
 ## Dependencies
 
@@ -204,7 +221,7 @@ For wire, `moq-ffi`, or gateway changes, also run the cross-language interop mat
 
 ## Branch Targeting
 
-PRs target `main` by default, however large the change: bug fixes, new behavior, additive APIs, docs, refactors, and wire-protocol work. `dev` is reserved for one thing, a semver break in a published API: a renamed, removed, or signature-changed `pub`/exported item in the core libraries or language wrappers. Adding an item is additive, so it goes to `main`. When in doubt, target `main`. Full rules in [CONTRIBUTING.md](CONTRIBUTING.md#branch-targeting).
+PRs target `main` by default, however large the change: bug fixes, new behavior, additive APIs, docs, refactors, and wire-protocol work. `dev` is reserved for one thing, a semver break in a published API: a renamed, removed, or signature-changed `pub`/exported item, or anything else that stops existing caller code compiling, in any package someone can depend on a released version of. Adding an item is additive, so it goes to `main`. `0.0.x` packages are exempt, since every `0.0.x` release is already its own incompatible version, so break those on `main` too. Check the version, not the crate name. Full rules in [CONTRIBUTING.md](CONTRIBUTING.md#branch-targeting).
 
 ## Workflow
 

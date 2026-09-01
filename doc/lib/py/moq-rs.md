@@ -101,6 +101,7 @@ video = broadcast.publish_video(
     ),
     moq.VideoEncoderOutput(
         codec=moq.VideoCodec.H264,
+        track="camera",
         kind=moq.VideoEncoderKind.AUTO(),
     ),
 )
@@ -111,7 +112,9 @@ video.finish()
 
 `VideoEncoderKind.AUTO()` prefers a hardware encoder and falls back to software; `SOFTWARE()`, `HARDWARE()`, and `NAMED("videotoolbox")` pin the choice (each variant is a class, so call it). The bindings compile VideoToolbox (macOS), Media Foundation (Windows), NVENC (Linux, NVIDIA), and openh264 (software, everywhere). A hardware encoder that is compiled in but can't open, because there is no GPU or because its driver libraries aren't on the loader path, logs a warning naming the reason and falls through to software, so a host that quietly encodes on the CPU says so. `set_bitrate` retunes the live encoder without forcing a keyframe, cheap enough to drive from a congestion controller.
 
-The track is named after the codec (`.avc3` / `.hev1`) and its catalog rendition is published immediately, read out of the encoder itself, so subscribers discover it through the catalog rather than a name you pick, and can find it before the first frame exists. `cut()` starts a new group at the next frame, which is optional: the encoder keyframes every `gop` frames on its own, and each of those cuts a group.
+Set `track` to choose the track name; omit it to derive one from the codec (`.avc3` / `.hev1`). The catalog rendition is published immediately so subscribers can discover it before the first frame exists. `await video.used()` and `await video.unused()` monitor subscriber demand. Call `cut()` before the first frame after an idle gap so the resumed stream starts with a keyframe in a new group.
+
+Raw audio takes an explicit track name at publish time. Read it back through `audio.name`; `await audio.used()` and `await audio.unused()` monitor subscriber demand so capture and encoding can stay idle when nobody is listening. Call `audio.reset_epoch()` before the first frame after resuming so its timestamp preserves the idle gap.
 
 `publish_media` fills the catalog by parsing the codec bitstream. For a video format you can pass a `VideoHint` to supply fields the stream can't reveal (such as `bitrate`), or to publish the catalog before the first keyframe:
 
@@ -307,6 +310,10 @@ async for request in dynamic:
         track = broadcast.publish_track("status")
         request.accept(broadcast)
         track.write_frame(b"ready", 0)
+        track.finish()
+        broadcast.finish()
+    else:
+        request.abort(404)
 ```
 
 The served broadcast is not announced. It only resolves consumers that call `request_broadcast(path)`. Each request arrives as a `BroadcastRequest`; call `accept(broadcast)` to serve it, or `abort(code)` to fail the requester.
@@ -322,14 +329,22 @@ async for announcement in client.announced("live/"):
 # Or wait for a specific path to be announced:
 broadcast = await client.announced_broadcast("live/cam1")
 
-# Or request a path: resolves to the announced broadcast, falls back to a dynamic
-# handler if the origin has one, else raises. Does not wait for a future announce.
+# Or request a path: resolves an existing exact-path broadcast, announced or not,
+# then falls back to a dynamic handler. Does not wait for a future announcement.
 broadcast = await client.request_broadcast("live/cam1")
 ```
 
-Announcements arrive over the session after it connects, so `request_broadcast` on its own races them: right after connecting it can raise for a broadcast that is live. Await `announced_broadcast(path)` first when you know the path you want; `request_broadcast` is for a path a dynamic handler serves, or one you already know is announced.
+Announcements arrive over the session after it connects, so `request_broadcast` on its own races them: right after connecting it can raise for a broadcast that is live but not reachable locally yet. Await `announced_broadcast(path)` first when you know the path you want; use `request_broadcast` for a path already reachable locally, whether announced or not, or one a dynamic handler serves.
 
-Each broadcast carries a `Route`: `route.hops` is the chain of relay origin ids (as `list[int]`) the broadcast passed through to reach you, oldest first, and `route.cost` is the publisher's advertised preference (lower wins). The route is dynamic; `await broadcast.route_changed()` returns the current route first, then blocks for each change (e.g. an upstream failover), and returns `None` once the broadcast ends. A publisher advertises its own route with `producer.set_route(moq.Route(hops=[], cost=10))`, for example a standby transcoder that lowers its cost to 0 once it is warm.
+Each broadcast carries a `Route`: `route.hops` is the chain of relay origin ids (as `list[int]`) the broadcast passed through to reach you, oldest first, and `route.cost` is the publisher's advertised preference (lower wins). The route is dynamic. Iterate `broadcast.route_updates()` to receive the current route first, then each change (e.g. an upstream failover), until the broadcast ends:
+
+```python
+async with broadcast.route_updates() as routes:
+    async for route in routes:
+        print(route.hops, route.cost)
+```
+
+For one-at-a-time compatibility, `await broadcast.route_changed()` uses one cached watch and returns `None` once the broadcast ends. A publisher advertises its own route with `producer.set_route(moq.Route(hops=[], cost=10))`, for example a standby transcoder that lowers its cost to 0 once it is warm.
 
 ## Examples
 

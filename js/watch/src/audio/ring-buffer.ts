@@ -9,7 +9,7 @@ export class AudioRingBuffer {
 	readonly channels: number;
 	#stalled = true;
 
-	// Buffered mode: anchor to the first sample, play through without skipping ahead.
+	// Buffered mode: play through everything buffered without skipping ahead.
 	readonly #buffered: boolean;
 	// Un-stall threshold in samples (how much to buffer before playback starts).
 	#latencySamples: number;
@@ -104,9 +104,10 @@ export class AudioRingBuffer {
 		let start = Math.round(Time.Second.fromMicro(timestamp) * this.rate);
 		let samples = data[0].length;
 
-		// Buffered mode: anchor both indices to the first sample so we play from its
-		// timestamp instead of gap-filling silence from index 0 to a large timestamp.
-		if (this.#buffered && !this.#anchored) {
+		// Anchor both indices to the first sample so we play from its timestamp instead of
+		// gap-filling silence from index 0 to a large timestamp, which would both waste the
+		// ring on zeros and report a playhead a floor behind the first real sample.
+		if (!this.#anchored) {
 			this.#readIndex = start;
 			this.#writeIndex = start;
 			this.#anchored = true;
@@ -175,6 +176,19 @@ export class AudioRingBuffer {
 		if (this.#buffered && this.length >= this.#latencySamples) {
 			this.#stalled = false;
 		}
+	}
+
+	/**
+	 * Drop buffered samples at or after `timestamp`, keeping whatever is already due.
+	 *
+	 * A successor track overwrites the slots its own samples land on, but anything the previous
+	 * track wrote beyond them would otherwise still play once the successor runs out.
+	 */
+	truncate(timestamp: Time.Micro): void {
+		const target = Math.round(Time.Second.fromMicro(timestamp) * this.rate);
+		if (target >= this.#writeIndex) return;
+		// Never retreat past the playhead: those samples are already due.
+		this.#writeIndex = Math.max(target, this.#readIndex);
 	}
 
 	// Flush all buffered samples and re-stall, ready to anchor the next utterance.

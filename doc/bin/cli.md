@@ -51,10 +51,10 @@ Multi-arch images (`linux/amd64` and `linux/arm64`) are published to [Docker Hub
 ```bash
 git clone https://github.com/moq-dev/moq
 cd moq
-cargo build --release --bin moq-cli
+cargo build --release -p moq-cli --bin moq
 ```
 
-The binary will be in `target/release/moq-cli`.
+The binary will be in `target/release/moq`.
 
 ### Heap profiling
 
@@ -84,8 +84,12 @@ moq <MoQ side>  play [playback options]
   - `--client-connect <url>` dials a relay. The URL path is the relay auth path
     (e.g. `/anon`), `?jwt=<token>` supplies a token, and `--broadcast` names the
     broadcast.
-  - `--server-bind <addr>` hosts MoQ sessions directly (with `--tls-generate` /
-    `--tls-cert` + `--tls-key`).
+  - `--server-bind <addr>` hosts encrypted QUIC/WebTransport sessions directly
+    (with `--tls-generate` / `--tls-cert` + `--tls-key`).
+  - `--server-tcp-bind <addr>` hosts plaintext qmux over TCP. Bind it only to
+    loopback or a trusted private network.
+  - `--server-unix-bind <path>` hosts qmux over a Unix socket. Restrict access
+    through its parent directory or an explicit peer-credential allowlist.
 
   Both may be given at once (dial a relay *and* accept incoming sessions).
   `--origin <id>` pins the process's origin id (default: fresh and random per
@@ -754,7 +758,7 @@ curl http://relay.example.com:4443/announced/
 
 - The relay needs a valid TLS certificate
 - For development, use the fingerprint method
-- See [TLS Setup](/bin/relay/#tls-setup)
+- See [Production TLS setup](/setup/prod#networking-and-tls)
 
 ### "Permission denied"
 

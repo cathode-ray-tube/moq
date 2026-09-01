@@ -493,6 +493,27 @@ impl Consumer {
 	pub fn latest(&self) -> Option<u64> {
 		self.state.read().latest()
 	}
+
+	/// The newest segment's newest cached group, resolved synchronously; see
+	/// [`track::Consumer::peek_latest`].
+	pub(crate) fn peek_latest(&self) -> Option<group::Consumer> {
+		let track = self.state.read().segments.last().map(|segment| segment.track.clone())?;
+		track.peek_latest()
+	}
+
+	/// A cached group by sequence from the newest segment; see
+	/// [`track::Consumer::peek_group`].
+	pub(crate) fn peek_group(&self, sequence: u64) -> Option<group::Consumer> {
+		let track = self.state.read().segments.last().map(|segment| segment.track.clone())?;
+		track.peek_group(sequence)
+	}
+
+	/// The nearest cached group below `sequence` in the newest segment; see
+	/// [`track::Consumer::peek_before`].
+	pub(crate) fn peek_before(&self, sequence: u64) -> Option<group::Consumer> {
+		let track = self.state.read().segments.last().map(|segment| segment.track.clone())?;
+		track.peek_before(sequence)
+	}
 }
 
 /// The pollable state of a [`Consumer::fetch_group`]; awaited via the
@@ -950,6 +971,8 @@ impl Subscriber {
 				&& !beyond_cap(sequence)
 			{
 				let group = seg.parked.remove(&sequence).expect("parked key just observed");
+				// A re-offer is a delivery: stamp it like a fresh hand-out.
+				group.cache_refresh();
 				self.next_sequence = self.next_sequence.max(sequence.saturating_add(1));
 				return Poll::Ready(Ok(Some(group)));
 			}

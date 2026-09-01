@@ -7,11 +7,11 @@ description: GStreamer plugin for MoQ
 
 A GStreamer plugin for publishing and consuming MoQ streams.
 
-::: warning Work in Progress
-This plugin is currently under development, but it works okay.
+::: warning Active development
+The plugin is usable, but its API may still change.
 :::
 
-## Overview
+## Elements and properties
 
 The GStreamer plugin provides two elements:
 
@@ -29,6 +29,25 @@ Both elements support the following properties:
 ::: info
 For `http://` URLs, `moq-native` automatically fetches the server's certificate fingerprint from `/certificate.sha256` and verifies TLS against it. You don't need `tls-disable-verify` for local development.
 :::
+
+`moqsink` additionally supports these QUIC connection properties:
+
+| Property            | Type   | Description                                                     |
+| ------------------- | ------ | --------------------------------------------------------------- |
+| `quic-idle-timeout` | uint64 | Idle timeout in milliseconds (default 30000; 0 disables locally) |
+| `quic-keep-alive`   | uint64 | Keep-alive interval in milliseconds (default 5000; 0 disables)   |
+
+An idle timeout of `0` disables it locally.
+These values apply only to QUIC connections. WebSocket fallback uses its own heartbeat policy.
+The iroh backend applies the idle timeout but ignores keep-alive because it has no keep-alive setting.
+
+```bash
+gst-launch-1.0 -e \
+  videotestsrc is-live=true ! x264enc tune=zerolatency ! h264parse \
+    ! video/x-h264,stream-format=byte-stream,alignment=au ! mux.sink_0 \
+  moqsink name=mux url=http://localhost:4443 broadcast=test \
+    quic-idle-timeout=15000 quic-keep-alive=3000
+```
 
 `moqsink` additionally exposes these read-only properties for monitoring. Each emits a `notify`
 signal when it changes, so you can poll it via `g_object_get` or connect to `notify::<property>`:
@@ -141,7 +160,7 @@ nix shell github:moq-dev/moq#moq-gst --command gst-launch-1.0 -v -e \
 cargo build -p moq-gst
 ```
 
-This produces a shared library (cdylib) in `target/debug/`. GStreamer needs to find this plugin via the `GST_PLUGIN_PATH_1_0` environment variable — the `just` commands below handle this automatically.
+This produces a shared library (cdylib) in `target/debug/`. GStreamer needs to find this plugin via the `GST_PLUGIN_PATH_1_0` environment variable; the `just` commands below handle this automatically.
 
 ## Running Locally
 
@@ -253,6 +272,21 @@ gst-launch-1.0 -v -e \
     sink_0::track=camera sink_1::track=commentary
 ```
 
+Media tracks use the legacy Hang container by default. Set a pad's `container=loc` before its CAPS
+event to publish that track as Low Overhead Container and advertise LOC in the catalog:
+
+```bash
+gst-launch-1.0 -v -e \
+  videotestsrc is-live=true ! x264enc tune=zerolatency ! h264parse \
+    ! video/x-h264,stream-format=byte-stream,alignment=au ! mux.sink_0 \
+  moqsink name=mux url=http://localhost:4443 broadcast=bbb.hang sink_0::container=loc
+```
+
+Set the property on each media pad that should use LOC; other pads remain Legacy.
+
+Like `track`, `container` is writable in any state until the pad's CAPS event reserves the track.
+It is fixed for that producer and becomes writable again after returning to `READY`.
+
 `track` is writable in any state until the pad's CAPS event reserves the track, so a pad requested
 while the pipeline runs can still be named before its first buffer. From then on it reads back the
 reserved name, the generated one included, and further writes are ignored with a warning; stopping the
@@ -260,8 +294,24 @@ element (back to `READY`) releases the reservation and makes it writable again. 
 the generated name. A name another pad already holds invalidates only that pad, so the rest of the
 broadcast keeps publishing.
 
+Each pad also reports what its track is doing, so a publication can be diagnosed without reading the
+logs or asking a consumer:
+
+| Property      | Type   | Description                                       |
+| ------------- | ------ | ------------------------------------------------- |
+| `track-status` | enum   | `pending` until CAPS builds a producer, `active` once the broadcast reserved the track, `ended` when it was finalized, `error` when the pad was invalidated |
+| `track-error` | string | Why the pad was invalidated, null when it was not  |
+
+Both emit `notify`, so an application can connect to `notify::track-status` rather than poll. `active`
+means the producer exists and the track is registered, not merely that the pad was requested, and a
+pad that sent EOS stays `active` until every pad has ended and the producers are finalized. `error`
+is terminal: it survives EOS, and clears when the pad is released or the element goes back to
+`READY`. A pad still waiting for CAPS is `pending` with no error, because nothing has failed yet.
+Connection loss is the element's own `status`.
+
 A pad negotiated as `application/octet-stream` publishes application data instead of media. The bytes
-go out exactly as they arrive: no codec, no container, no interpretation.
+go out exactly as they arrive: no codec, no media container, no interpretation. A data pad's
+`container` property has no effect.
 
 ```bash
 gst-launch-1.0 -v -e \

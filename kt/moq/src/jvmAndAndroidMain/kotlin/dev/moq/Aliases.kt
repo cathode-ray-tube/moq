@@ -21,7 +21,7 @@ typealias Request = uniffi.moq.MoqRequest
 typealias OriginProducer = uniffi.moq.MoqOriginProducer
 /** Options for creating an origin, such as its total cache budget. */
 typealias OriginOptions = uniffi.moq.MoqOriginOptions
-/** The subscribe side of an origin: discover and request announced broadcasts. */
+/** The subscribe side of an origin: discover and request published broadcasts. */
 typealias OriginConsumer = uniffi.moq.MoqOriginConsumer
 /** A stream of broadcasts requested by subscribers, for serving unannounced paths on demand. */
 typealias OriginDynamic = uniffi.moq.MoqOriginDynamic
@@ -67,7 +67,7 @@ typealias MediaStreamProducer = uniffi.moq.MoqMediaStreamProducer
 typealias MediaConsumer = uniffi.moq.MoqMediaConsumer
 /** A finite fetched media group: yields container-decoded frames until the group ends. */
 typealias MediaGroupConsumer = uniffi.moq.MoqMediaGroupConsumer
-/** The write side of a raw-audio track; PCM written here is encoded inside the FFI boundary. */
+/** A demand-observable raw-audio track producer with explicit timeline re-anchoring after idle gaps. */
 typealias AudioProducer = uniffi.moq.MoqAudioProducer
 /** The read side of a raw-audio track: yields decoded PCM frames. */
 typealias AudioConsumer = uniffi.moq.MoqAudioConsumer
@@ -133,7 +133,7 @@ typealias VideoCodec = uniffi.moq.MoqVideoCodec
 typealias VideoPixelFormat = uniffi.moq.MoqVideoPixelFormat
 /** The pixel layout, resolution, and framerate the caller feeds a [VideoProducer]. */
 typealias VideoEncoderInput = uniffi.moq.MoqVideoEncoderInput
-/** The codec-side encoder configuration: codec, bitrate, keyframe interval, and backend preference. */
+/** The video track name, codec, bitrate, keyframe interval, and backend preference. */
 typealias VideoEncoderOutput = uniffi.moq.MoqVideoEncoderOutput
 /** Which encoder implementation to use: automatic, hardware, software, or one named backend. */
 typealias VideoEncoderKind = uniffi.moq.MoqVideoEncoderKind

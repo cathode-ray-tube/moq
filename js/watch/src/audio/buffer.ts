@@ -1,6 +1,6 @@
 import { Time } from "@moq/net";
 import { Effect, type Getter, Signal } from "@moq/signals";
-import type { Data, InitPost, InitShared, Latency, Reset, State } from "./render";
+import type { Data, InitPost, InitShared, Latency, Reset, State, Truncate } from "./render";
 import { allocSharedRingBuffer, SharedRingBuffer } from "./shared-ring-buffer";
 
 /**
@@ -78,6 +78,15 @@ export interface AudioBuffer {
 	reset(): void;
 
 	/**
+	 * Drop buffered samples at or after `timestamp`, keeping what is already due.
+	 *
+	 * Used when a new track takes over the timeline: its samples overwrite the slots they land on,
+	 * but the previous track's write-ahead tail would otherwise play once the new audio runs out.
+	 * Unlike `reset()` this keeps playing, so there's no gap at the handover.
+	 */
+	truncate(timestamp: Time.Micro): void;
+
+	/**
 	 * Resolve once the playhead is near enough to decode a frame at `timestamp`. In buffered mode this
 	 * applies backpressure: it stays pending while decoding `timestamp` would run more than the latency
 	 * floor ahead of the playhead, so the caller holds the (encoded) frame instead of decoding it too
@@ -119,7 +128,10 @@ export function createAudioBuffer(
 		console.log("[audio] using SharedArrayBuffer audio buffer");
 		return new SharedAudioBuffer(worklet, channels, rate, latencySamples, buffered);
 	}
-	console.log("[audio] using postMessage audio buffer (SharedArrayBuffer unavailable)");
+	console.warn(
+		"[audio] SharedArrayBuffer unavailable, falling back to the higher latency postMessage audio buffer. " +
+			"Serve the page cross-origin isolated (Cross-Origin-Opener-Policy: same-origin, Cross-Origin-Embedder-Policy: require-corp) to avoid this.",
+	);
 	return new PostAudioBuffer(worklet, channels, rate, latencySamples, buffered);
 }
 
@@ -187,6 +199,10 @@ class SharedAudioBuffer implements AudioBuffer {
 		} else {
 			this.#ring.setLatency(samples);
 		}
+	}
+
+	truncate(timestamp: Time.Micro): void {
+		this.#ring.truncate(timestamp);
 	}
 
 	reset(): void {
@@ -265,6 +281,11 @@ class PostAudioBuffer implements AudioBuffer {
 
 		const latency = Time.Milli.fromSecond((samples / this.rate) as Time.Second);
 		const msg: Latency = { type: "latency", latency };
+		this.#worklet.port.postMessage(msg);
+	}
+
+	truncate(timestamp: Time.Micro): void {
+		const msg: Truncate = { type: "truncate", timestamp };
 		this.#worklet.port.postMessage(msg);
 	}
 

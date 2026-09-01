@@ -29,7 +29,7 @@ use crate::payload::{
 pub use super::subscription::Subscription;
 
 use std::{
-	collections::{BTreeMap, HashMap, VecDeque},
+	collections::{BTreeMap, VecDeque},
 	sync::Arc,
 	sync::OnceLock,
 	sync::atomic::{AtomicBool, Ordering},
@@ -154,7 +154,11 @@ pub(crate) struct TrackState {
 	// Cached groups by sequence: the single source of truth for what is cached. The
 	// two orderings below hold bare sequences and validate against this map, so a
 	// removed or replaced group turns their entries into discarded-on-pop hints.
-	lookup: HashMap<u64, Slot>,
+	//
+	// Ordered rather than hashed so `poll_next_in_range` can seek to the first
+	// cached sequence at or above a subscriber's cursor. A hash map forces a full
+	// scan per delivery, making a drain of N cached groups quadratic.
+	lookup: BTreeMap<u64, Slot>,
 
 	// Publisher-produced groups in arrival order as (sequence, stamp), walked by
 	// subscriptions; an entry only resolves while its stamp matches the slot's.
@@ -286,6 +290,9 @@ impl TrackState {
 				&& slot.stamp == *stamp
 				&& !slot.group.is_aborted()
 			{
+				// Delivery is a cache access: stamp it so expiry and the eviction
+				// walk don't kill a group a subscriber is about to read.
+				slot.group.cache_refresh();
 				return Poll::Ready(Ok(Some((slot.group.consume(), self.offset + i))));
 			}
 		}
@@ -413,26 +420,18 @@ impl TrackState {
 			return Poll::Pending;
 		}
 
-		let mut best: Option<&group::Producer> = None;
-		for slot in self.lookup.values() {
-			let group = &slot.group;
-			if group.sequence < next_sequence {
-				continue;
-			}
-			if let Some(end) = end_sequence
-				&& group.sequence > end
-			{
-				continue;
-			}
-			if group.is_aborted() {
-				continue;
-			}
-			if best.is_none_or(|b| group.sequence < b.sequence) {
-				best = Some(group);
-			}
-		}
+		// Seek straight to the cursor: only aborted groups (waiting on the next
+		// eviction scan to reclaim their slots) are stepped over.
+		let best = self
+			.lookup
+			.range(next_sequence..)
+			.map(|(_, slot)| &slot.group)
+			.take_while(|group| end_sequence.is_none_or(|end| group.sequence <= end))
+			.find(|group| !group.is_aborted());
 
 		if let Some(group) = best {
+			// Delivery is a cache access, same as the arrival-order path.
+			group.cache_refresh();
 			return Poll::Ready(Ok(Some(group.consume())));
 		}
 
@@ -448,19 +447,6 @@ impl TrackState {
 			return Poll::Ready(Ok(None));
 		}
 		Poll::Pending
-	}
-
-	/// Find a cached group by sequence; an aborted (evicted) group is a miss, so a
-	/// fetch re-fetches it. Synchronous, never blocks. Test hook for `peek_group`;
-	/// the real fetch path is [`Self::poll_fetch_cached`], which also refreshes the
-	/// group.
-	#[cfg(test)]
-	fn cached_group(&self, sequence: u64) -> Option<group::Consumer> {
-		let slot = self.lookup.get(&sequence)?;
-		if slot.group.is_aborted() {
-			return None;
-		}
-		Some(slot.group.consume())
 	}
 
 	/// The publisher's latency window, or `None` while the info is unknown (an
@@ -500,9 +486,9 @@ impl TrackState {
 	///
 	/// One bounded, rotating scan over the eviction order, which holds every cached
 	/// group except the protected latest. The cursor persists across calls, so
-	/// entries beyond one scan window can't be starved by fresh (recently fetched
-	/// or written) entries in front of them: every position is revisited within a
-	/// few writes. Expiry throughput is therefore EVICT_SCAN groups per write; the
+	/// entries beyond one scan window can't be starved by fresh (recently read,
+	/// fetched, or written) entries in front of them: every position is revisited
+	/// within a few writes. Expiry throughput is therefore EVICT_SCAN groups per write; the
 	/// byte budget reclaims the remainder under memory pressure.
 	fn evict_expired(&mut self, max_age: Duration) {
 		let now = self.cache.pool().now();
@@ -760,9 +746,9 @@ impl TrackState {
 			}
 
 			scanned += 1;
-			// Protected: accessed more recently than the average (a fresh insert or
-			// a FETCH hit, which also covers a backfill still being filled). Rotate
-			// to the back.
+			// Protected: accessed more recently than the average (a fresh insert,
+			// an active reader, or a FETCH hit, which also covers a backfill still
+			// being filled). Rotate to the back.
 			if slot.group.cache_accessed() > average {
 				self.evict.push_back((sequence, stamp));
 				continue;
@@ -1048,7 +1034,7 @@ impl Producer {
 	/// a presentation time, pass [`Timestamp::now`] explicitly.
 	pub fn write_frame<B: crate::IntoBytes>(&mut self, timestamp: Timestamp, frame: B) -> Result<()> {
 		let frame = crate::IntoBytes::into_bytes(frame);
-		if frame.len() as u64 > group::MAX_GROUP_CACHE {
+		if frame.len() as u64 > group::MAX_CACHE_BYTES {
 			return Err(Error::FrameTooLarge);
 		}
 		let mut group = self.append_group()?;
@@ -1746,16 +1732,53 @@ impl Consumer {
 		})
 	}
 
-	// Peek at a cached group by sequence without blocking, or `None` if it isn't in the
-	// cache. A test hook for asserting cache state; the library reads
-	// `TrackState::cached_group` directly, and callers want `fetch_group`.
-	#[cfg(test)]
+	/// The newest group, when it is already cached: resolved synchronously, without
+	/// counting as a fetch or a delivery. The IETF publisher snapshots its frame count to
+	/// resolve Largest Object; a group that is not immediately available reads as no edge.
+	pub(crate) fn peek_latest(&self) -> Option<group::Consumer> {
+		match &self.inner {
+			ConsumerKind::Plain(state) => {
+				let sequence = state.read().max_sequence?;
+				self.peek_group(sequence)
+			}
+			ConsumerKind::Spliced(resume) => resume.peek_latest(),
+		}
+	}
+
+	/// The nearest cached group below `sequence`, under the same terms as
+	/// [`Self::peek_group`]. Walks the cache's own order, so gaps in the group numbering
+	/// are crossed and aborted (evicted) entries are skipped.
+	pub(crate) fn peek_before(&self, sequence: u64) -> Option<group::Consumer> {
+		match &self.inner {
+			ConsumerKind::Plain(state) => {
+				let state = state.read();
+				state
+					.lookup
+					.range(..sequence)
+					.rev()
+					.map(|(_, slot)| &slot.group)
+					.find(|group| !group.is_aborted())
+					.map(|group| group.consume())
+			}
+			ConsumerKind::Spliced(resume) => resume.peek_before(sequence),
+		}
+	}
+
+	/// A cached group by sequence, under the same terms as [`Self::peek_latest`]. Unlike a
+	/// fetch, a peek does not refresh the group's cache standing, so it never keeps a
+	/// group alive over one a subscriber actually read; an aborted (evicted) group is a
+	/// miss.
 	pub(crate) fn peek_group(&self, sequence: u64) -> Option<group::Consumer> {
 		match &self.inner {
-			ConsumerKind::Plain(state) => state.read().cached_group(sequence),
-			// Spliced tracks have no cache of their own; peek the newest segment
-			// via `fetch_group` instead.
-			ConsumerKind::Spliced(_) => None,
+			ConsumerKind::Plain(state) => {
+				let state = state.read();
+				let slot = state.lookup.get(&sequence)?;
+				if slot.group.is_aborted() {
+					return None;
+				}
+				Some(slot.group.consume())
+			}
+			ConsumerKind::Spliced(resume) => resume.peek_group(sequence),
 		}
 	}
 
@@ -2254,7 +2277,10 @@ impl PlainSubscriber {
 		if let Some(&sequence) = self.parked.keys().next()
 			&& self.end_sequence.is_none_or(|end| sequence <= end)
 		{
-			return Poll::Ready(Ok(self.parked.remove(&sequence)));
+			let group = self.parked.remove(&sequence).expect("parked key just observed");
+			// A re-offer is a delivery: stamp it like a fresh hand-out.
+			group.cache_refresh();
+			return Poll::Ready(Ok(Some(group)));
 		}
 
 		loop {
@@ -3093,6 +3119,211 @@ mod test {
 		let _next = producer.create_group(group::Info { sequence: 1 }).unwrap();
 
 		assert!(consumer.next_frame().await.unwrap().is_none());
+	}
+
+	/// An actively-read group is not expired out from under its reader: every frame
+	/// read restarts the retention clock. A group nobody reads still ages out on
+	/// schedule, so reclamation stays intact.
+	#[tokio::test]
+	async fn active_reader_survives_expiry() {
+		tokio::time::pause();
+
+		let mut producer = track_producer("test", None);
+		let mut subscriber = producer.subscribe(None);
+
+		// A finished group with one frame per step of the read loop below.
+		let mut group = producer.create_group(0u64.into()).unwrap();
+		for _ in 0..10 {
+			group.write_frame(Timestamp::ZERO, b"x".as_slice()).unwrap();
+		}
+		group.finish().unwrap();
+		let mut reading = subscriber.assert_group();
+
+		// A sibling written at the same time that nobody ever reads.
+		producer.create_group(1u64.into()).unwrap().finish().unwrap();
+
+		// Each step stays well inside the retention window, but the whole read
+		// spans several windows. New groups keep the expiry scan running.
+		for seq in 2..12u64 {
+			tokio::time::advance(DEFAULT_LATENCY_MAX / 2).await;
+			let frame = reading.next_frame().await;
+			assert!(
+				matches!(frame, Ok(Some(_))),
+				"an actively-read group must not expire mid-read (step {seq})"
+			);
+			producer.create_group(seq.into()).unwrap().finish().unwrap();
+		}
+
+		let state = producer.state.read();
+		assert!(state.lookup.contains_key(&0), "the read group survived");
+		assert!(!state.lookup.contains_key(&1), "the unread group still expired");
+	}
+
+	/// A whole-frame read is a cache access: a reader that paces through a group
+	/// slower than the retention window must keep it alive rather than watch it
+	/// expire out from under itself.
+	#[tokio::test]
+	async fn slow_frame_reader_survives_expiry() {
+		tokio::time::pause();
+
+		let mut producer = track_producer("test", None);
+		let mut subscriber = producer.subscribe(None);
+
+		let mut group = producer.create_group(0u64.into()).unwrap();
+		for _ in 0..20 {
+			group.write_frame(Timestamp::ZERO, b"x".as_slice()).unwrap();
+		}
+		group.finish().unwrap();
+		let mut reading = subscriber.assert_group();
+
+		// One whole-frame read per half-window; new groups keep the expiry scan running.
+		for seq in 1..20u64 {
+			tokio::time::advance(DEFAULT_LATENCY_MAX / 2).await;
+			let frame = reading.read_frame().await;
+			assert!(
+				matches!(frame, Ok(Some(_))),
+				"a slow reader must not expire mid-read (step {seq})"
+			);
+			producer.create_group(seq.into()).unwrap().finish().unwrap();
+		}
+	}
+
+	/// A batch read stamps the group once per fill, which bounds frames rather than
+	/// elapsed time. A reader pacing through one batch slower than the retention
+	/// window keeps it alive with `keep_alive`, the way the publishers do while
+	/// writing a batch to a flow-controlled peer.
+	#[tokio::test]
+	async fn slow_batch_reader_survives_expiry_with_keep_alive() {
+		tokio::time::pause();
+
+		let mut producer = track_producer("test", None);
+		let mut subscriber = producer.subscribe(None);
+
+		let mut group = producer.create_group(0u64.into()).unwrap();
+		for _ in 0..20 {
+			group.write_frame(Timestamp::ZERO, b"x".as_slice()).unwrap();
+		}
+		group.finish().unwrap();
+		let mut reading = subscriber.assert_group();
+
+		// A short buffer, so the reader still has frames outstanding while it works
+		// through the batch and nothing else re-stamps the group.
+		let mut buf = crate::frame::Buffer::<8>::new();
+		let count = reading.read_frames(&mut buf).await.unwrap().len();
+		assert_eq!(count, 8, "the batch is bounded by the buffer");
+
+		for step in 0..8u64 {
+			tokio::time::advance(DEFAULT_LATENCY_MAX / 2).await;
+			reading.keep_alive();
+			// New groups keep the expiry scan running.
+			producer.create_group((step + 1).into()).unwrap().finish().unwrap();
+		}
+
+		// The group outlived the drain, so the rest of it is still readable.
+		let rest = reading
+			.read_frames(&mut buf)
+			.await
+			.expect("a batch reader that kept the group alive must not be expired");
+		assert_eq!(rest.len(), 8, "the next batch picks up where the last one stopped");
+	}
+
+	/// Receiving a group is itself a cache access: a subscriber that takes
+	/// delivery just before the group would age out still gets to read it a full
+	/// window later.
+	#[tokio::test]
+	async fn delivery_restarts_the_expiry_clock() {
+		tokio::time::pause();
+
+		let mut producer = track_producer("test", None);
+		let mut subscriber = producer.subscribe(None);
+
+		let mut group = producer.create_group(0u64.into()).unwrap();
+		group.write_frame(Timestamp::ZERO, b"x".as_slice()).unwrap();
+		group.finish().unwrap();
+		// A second group so seq 0 leaves the protected live edge.
+		producer.create_group(1u64.into()).unwrap().finish().unwrap();
+
+		// Deliver just inside the window: the delivery stamps the group.
+		tokio::time::advance(DEFAULT_LATENCY_MAX - Duration::from_secs(1)).await;
+		let mut reading = subscriber.assert_group();
+
+		// Almost another full window passes: far beyond the write, inside the
+		// delivery stamp. The new group runs the expiry scan.
+		tokio::time::advance(DEFAULT_LATENCY_MAX - Duration::from_secs(1)).await;
+		producer.create_group(2u64.into()).unwrap().finish().unwrap();
+
+		let frame = reading.read_frame().await.unwrap();
+		assert!(frame.is_some(), "a just-delivered group must not expire unread");
+	}
+
+	/// Streaming chunks into an in-flight frame is a write access: a straggler
+	/// group (behind the live edge) trickling a large frame across several
+	/// retention windows must not be expired mid-write.
+	#[tokio::test]
+	async fn streaming_frame_writes_keep_the_group_alive() {
+		tokio::time::pause();
+
+		let mut producer = track_producer("test", None);
+		let mut straggler = producer.create_group(0u64.into()).unwrap();
+		// The live edge moves on, so the straggler is demoted and expirable.
+		producer.create_group(1u64.into()).unwrap().finish().unwrap();
+
+		let mut frame = straggler
+			.create_frame(frame::Info {
+				size: 10,
+				timestamp: Timestamp::ZERO,
+			})
+			.unwrap();
+		// One chunk per half-window; the whole frame spans several windows. New
+		// groups keep the expiry scan running.
+		for seq in 2..12u64 {
+			tokio::time::advance(DEFAULT_LATENCY_MAX / 2).await;
+			frame.write(bytes::Bytes::from_static(b"x")).unwrap();
+			producer.create_group(seq.into()).unwrap().finish().unwrap();
+		}
+		frame.finish().unwrap();
+		straggler.finish().unwrap();
+
+		let state = producer.state.read();
+		assert!(
+			state.lookup.contains_key(&0),
+			"a group streaming a frame survives expiry"
+		);
+	}
+
+	/// Re-offering a parked group (once the cap rises) is a delivery: it restarts
+	/// the expiry clock so the subscriber gets to read what it was just handed.
+	#[tokio::test]
+	async fn parked_reoffer_restarts_the_expiry_clock() {
+		tokio::time::pause();
+
+		let mut producer = track_producer("test", None);
+		let mut subscriber = producer.subscribe(None);
+		subscriber.end_at(0);
+
+		for seq in 0..2u64 {
+			let mut group = producer.create_group(seq.into()).unwrap();
+			group.write_frame(Timestamp::ZERO, b"x".as_slice()).unwrap();
+			group.finish().unwrap();
+		}
+
+		// Group 0 is in range; group 1 is beyond the cap and parks.
+		assert_eq!(subscriber.assert_group().sequence, 0);
+		subscriber.assert_no_group();
+
+		// Just inside the window, the cap rises and the re-offer stamps group 1.
+		tokio::time::advance(DEFAULT_LATENCY_MAX - Duration::from_secs(1)).await;
+		subscriber.end_at(1);
+		let mut reading = subscriber.assert_group();
+		assert_eq!(reading.sequence, 1);
+
+		// Almost another full window passes: far beyond the write, inside the
+		// re-offer stamp. The new group runs the expiry scan.
+		tokio::time::advance(DEFAULT_LATENCY_MAX - Duration::from_secs(1)).await;
+		producer.create_group(2u64.into()).unwrap().finish().unwrap();
+
+		let frame = reading.read_frame().await.unwrap();
+		assert!(frame.is_some(), "a just-re-offered group must not expire unread");
 	}
 
 	#[tokio::test]
@@ -4100,7 +4331,7 @@ mod test {
 	#[test]
 	fn write_frame_rejects_an_oversized_frame_before_appending_its_group() {
 		let mut producer = track_producer("test", None);
-		let frame = bytes::Bytes::from(vec![0; group::MAX_GROUP_CACHE as usize + 1]);
+		let frame = bytes::Bytes::from(vec![0; group::MAX_CACHE_BYTES as usize + 1]);
 
 		assert!(matches!(
 			producer.write_frame(Timestamp::ZERO, frame),

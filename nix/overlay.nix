@@ -14,8 +14,18 @@ let
   # Helper function to get crate info from Cargo.toml
   crateInfo = cargoTomlPath: craneLib.crateNameFromCargoToml { cargoToml = cargoTomlPath; };
 
+  # moq-video embeds a vendored PTX kernel at compile time, so every package
+  # source that may pull it in must preserve PTX alongside Cargo's sources.
+  filterCargoSources =
+    path: type: (final.lib.hasSuffix ".ptx" path) || (craneLib.filterCargoSources path type);
+  cleanCargoSource = final.lib.cleanSourceWith {
+    src = ../.;
+    name = "source";
+    filter = filterCargoSources;
+  };
+
   moqRelayArgs = crateInfo ../rs/moq-relay/Cargo.toml // {
-    src = craneLib.cleanCargoSource ../.;
+    src = cleanCargoSource;
     cargoExtraArgs = "-p moq-relay --features jemalloc";
     # Enable frame pointers for profiling support (negligible overhead on x86_64).
     # This also ensures the CDN build matches what Cachix caches.
@@ -41,8 +51,7 @@ let
     src = final.lib.cleanSourceWith {
       src = ../.;
       name = "source";
-      filter =
-        path: type: (final.lib.hasInfix "/test_data/" path) || (craneLib.filterCargoSources path type);
+      filter = path: type: (final.lib.hasInfix "/test_data/" path) || (filterCargoSources path type);
     };
     cargoExtraArgs = "-p moq-cli --features jemalloc";
     # Enable frame pointers so jemalloc profiles resolve complete call stacks.
@@ -55,7 +64,7 @@ let
   };
 
   moqTokenCliArgs = crateInfo ../rs/moq-token-cli/Cargo.toml // {
-    src = craneLib.cleanCargoSource ../.;
+    src = cleanCargoSource;
     cargoExtraArgs = "-p moq-token-cli";
     # The crate is `moq-token-cli`, but its `[[bin]]` ships as `moq-token`.
     meta.mainProgram = "moq-token";
@@ -63,7 +72,7 @@ let
   moqTokenPackage = craneLib.buildPackage moqTokenCliArgs;
 
   moqBenchArgs = crateInfo ../rs/moq-bench/Cargo.toml // {
-    src = craneLib.cleanCargoSource ../.;
+    src = cleanCargoSource;
     cargoExtraArgs = "-p moq-bench";
   };
 
@@ -99,17 +108,15 @@ let
     # generate the pkgconfig file. craneLib.cleanCargoSource's default filter
     # drops both, which makes build.rs skip pkgconfig generation (see the
     # `if let Ok(template)` in rs/libmoq/build.rs) or fail reading the lib list,
-    # and the installPhase's `cp .../moq.pc` then fails. moq-video's Linux NVDEC
-    # path also includes a vendored PTX kernel at compile time.
+    # and the installPhase's `cp .../moq.pc` then fails.
     src = final.lib.cleanSourceWith {
       src = ../.;
       name = "source";
       filter =
         path: type:
         (final.lib.hasSuffix ".pc.in" path)
-        || (final.lib.hasSuffix ".ptx" path)
         || (final.lib.hasInfix "/rs/libmoq/native-libs/" path)
-        || (craneLib.filterCargoSources path type);
+        || (filterCargoSources path type);
     };
     cargoExtraArgs = "-p libmoq";
     doCheck = false;
@@ -178,7 +185,7 @@ let
   };
 
   moqGstPluginArgs = crateInfo ../rs/moq-gst/Cargo.toml // {
-    src = craneLib.cleanCargoSource ../.;
+    src = cleanCargoSource;
     cargoExtraArgs = "-p moq-gst";
     doCheck = false;
 
@@ -250,13 +257,13 @@ let
     '';
   };
 
-  # CI checks run as plain cargo via `just check` (clippy / doc) and `just test`
-  # (nextest), not
-  # through crane/`nix flake check`. The self-hosted runner caches compilation
-  # per-crate with sccache (wired into the runner environment, not here), so a
-  # Cargo.lock change recompiles only the changed crate + its reverse-deps.
-  # ./target stays ephemeral (wiped per job) -- the persistent CARGO_TARGET_DIR
-  # growth that the old crane checks were introduced to fix doesn't recur.
+  # CI checks run via `just check` (clippy / doc) and `just test` (nextest), not
+  # through crane/`nix flake check`. CI and local commands default to plain
+  # Cargo; local development can select a compatible wrapper with RUST_CARGO.
+  # Which compiler cache backs CI is a workflow concern
+  # (`.github/actions/rust-cache`), not configured here.
+  # ./target stays per-job -- the persistent CARGO_TARGET_DIR growth that the old
+  # crane checks were introduced to fix doesn't recur.
   # Release artifacts still build via crane `buildPackage` below.
 in
 {
@@ -272,7 +279,7 @@ in
   moq-boy = craneLib.buildPackage (
     crateInfo ../rs/moq-boy/Cargo.toml
     // {
-      src = craneLib.cleanCargoSource ../.;
+      src = cleanCargoSource;
       cargoExtraArgs = "-p moq-boy --features jemalloc";
       nativeBuildInputs = with final; [
         pkg-config

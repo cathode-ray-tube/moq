@@ -434,30 +434,29 @@
 
         formatter = pkgs.nixfmt-tree;
 
-        # Heavy Rust CI (clippy / doc / test) runs as plain cargo via `just
-        # check` and `just test` (see rs/justfile), no longer through crane.
+        # Heavy Rust CI (clippy / doc / test) runs via `just check` and `just
+        # test` (see rs/justfile). CI and local commands default to plain Cargo;
+        # local development can select a compatible wrapper with RUST_CARGO.
+        # Neither path goes through crane.
         # `nix flake check` is kept -- it still validates flake eval + builds the
         # dev shell -- but no longer compiles the workspace, so it's cheap
         # enough that `just check` runs it on any Nix/Rust input change. Release
         # artifacts still build via crane `buildPackage` (see `packages` above /
         # release-*.yml).
         #
-        # On the self-hosted runner those cargo checks transparently reuse a
-        # per-crate compiler cache (rustc is wrapped by sccache via the runner
-        # environment), so a Cargo.lock change recompiles only the changed crate
-        # + its reverse-deps. That's a runner-side concern -- nothing here or in
-        # the workflows configures it.
+        # Which compiler cache those runs get is a workflow concern
+        # (`.github/actions/rust-cache`); nothing here configures it.
         checks = {
-          libmoq-source-assets = pkgs.runCommand "libmoq-source-assets" { } ''
+          package-source-assets = pkgs.runCommand "package-source-assets" { } ''
             for asset in \
               rs/libmoq/moq.pc.in \
               rs/libmoq/native-libs/apple.txt \
               rs/libmoq/native-libs/linux.txt \
-              rs/libmoq/native-libs/windows.txt \
-              rs/moq-video/src/frame/nv12_resize.ptx
+              rs/libmoq/native-libs/windows.txt
             do
               test -f "${overlayPkgs.libmoq.src}/$asset"
             done
+            test -f "${overlayPkgs.moq-boy.src}/rs/moq-video/src/frame/nv12_resize.ptx"
             touch "$out"
           '';
         };
