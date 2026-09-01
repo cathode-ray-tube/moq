@@ -210,9 +210,9 @@ async fn serve_metrics(State(state): State<InternalState>) -> Response {
 
 /// Cluster nodes currently visible through gossip or a direct outbound dial.
 ///
-/// Inbound connections appear only after their SETUP origin identity resolves
-/// to a unique `.internal/origins` node advertisement. Sessions without a
-/// unique match are omitted.
+/// Inbound connections appear only after their SETUP Hop ID resolves to a
+/// unique `.internal/origins` node advertisement. Sessions without a unique
+/// match are omitted.
 async fn serve_nodes(State(state): State<InternalState>) -> Json<crate::nodes::Snapshot> {
 	Json(state.nodes.map(|nodes| nodes.snapshot()).unwrap_or_default())
 }
@@ -558,7 +558,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn nodes_endpoint_uses_the_attached_cluster_registry() {
-		let origin = moq_tokio::origin::spawn(moq_net::Origin::new(100).unwrap());
+		let origin = moq_tokio::origin::spawn(moq_net::Hop::new(100).unwrap());
 		let nodes = crate::nodes::Nodes::new(origin);
 		let _connection = nodes.connect_outbound(0, "https://relay-b.example/");
 		let state = InternalState {
@@ -577,14 +577,14 @@ mod tests {
 	#[tokio::test(start_paused = true)]
 	async fn metrics_render_exposition() {
 		use moq_net::stats::{Registry, Tier};
-		use moq_net::{Origin, Timestamp, broadcast};
+		use moq_net::{Hop, Timestamp, broadcast};
 
 		let stats = Registry::new(Default::default());
 
 		// Default-tier egress: an untagged local publisher writes, a tagged egress
 		// consumer reads it out, so publisher `bytes` advance on the default tier.
 		let default_ctx = stats.tier(Tier::default()).session("acme");
-		let pub_origin = moq_tokio::origin::spawn(Origin::random());
+		let pub_origin = moq_tokio::origin::spawn(Hop::random());
 		let egress = pub_origin.consume().with_stats(default_ctx.clone());
 		let mut announced = egress.announced();
 		let mut pub_source = pub_origin
@@ -595,7 +595,7 @@ mod tests {
 		// Named-tier ingress: a tagged ingress producer writes, so subscriber
 		// `bytes` advance on the regional tier.
 		let regional_ctx = stats.tier(Tier::new("region/sjc")).session("peer");
-		let sub_origin = moq_tokio::origin::spawn(Origin::random()).with_stats(regional_ctx.clone());
+		let sub_origin = moq_tokio::origin::spawn(Hop::random()).with_stats(regional_ctx.clone());
 		let mut sub_source = sub_origin
 			.create_broadcast("demo/x", broadcast::Route::announced())
 			.unwrap();
