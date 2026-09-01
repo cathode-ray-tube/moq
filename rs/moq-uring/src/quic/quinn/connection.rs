@@ -716,13 +716,27 @@ impl Driver {
 		state.fail(Error::App { code, reason });
 	}
 
-	/// Stage at most one GSO train, then yield so another connection sharing
-	/// the socket gets a chance at the transmit pool. Ignores quinn's pacing
-	/// hint; the congestion controller still bounds each train.
+	/// Stage one GSO train, then yield so another connection sharing the
+	/// socket gets a chance at the transmit pool.
 	fn flush(&mut self, waiter: &kio::Waiter) -> Poll<Error> {
+		match self.flush_one(waiter) {
+			Poll::Ready(Ok(())) => {}
+			Poll::Ready(Err(err)) => return Poll::Ready(err),
+			// Backpressure, or nothing left to stage.
+			Poll::Pending => return Poll::Pending,
+		}
+		// Requeue behind the other ready tasks. If quinn is drained, the next
+		// poll costs one empty acquire and then parks normally.
+		waiter.waker().wake_by_ref();
+		Poll::Pending
+	}
+
+	/// Fill one transmit buffer and stage it. Ignores quinn's pacing hint;
+	/// the congestion controller still bounds each train.
+	fn flush_one(&mut self, waiter: &kio::Waiter) -> Poll<Result<(), Error>> {
 		let mut tx = match self.socket.poll_acquire(waiter) {
 			Poll::Ready(Ok(tx)) => tx,
-			Poll::Ready(Err(err)) => return Poll::Ready(Error::Io(err.to_string())),
+			Poll::Ready(Err(err)) => return Poll::Ready(Err(Error::Io(err.to_string()))),
 			// Backpressure: a completed send re-polls us.
 			Poll::Pending => {
 				self.blocked = true;
@@ -733,10 +747,10 @@ impl Driver {
 
 		let segments = (tx.len() / SEGMENT).min(TRAIN_SEGMENTS);
 		if segments == 0 {
-			return Poll::Ready(Error::Io(format!(
+			return Poll::Ready(Err(Error::Io(format!(
 				"transmit buffer of {} bytes holds no {SEGMENT} byte segment",
 				tx.len()
-			)));
+			))));
 		}
 
 		self.scratch.clear();
@@ -756,14 +770,11 @@ impl Driver {
 		// stride has to match what quinn actually packed.
 		let segment = transmit.segment_size.unwrap_or(transmit.size);
 		if let Err(err) = tx.send(transmit.size, transmit.destination, segment) {
-			return Poll::Ready(Error::Io(err.to_string()));
+			return Poll::Ready(Err(Error::Io(err.to_string())));
 		}
 		// A flush frees datagram-send queue space.
 		self.shared.state.borrow_mut().datagram_send_waiters.wake();
-		// Requeue behind the other ready tasks. If quinn is drained, the next
-		// poll costs one empty acquire and then parks normally.
-		waiter.waker().wake_by_ref();
-		Poll::Pending
+		Poll::Ready(Ok(()))
 	}
 }
 

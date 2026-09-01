@@ -775,13 +775,27 @@ impl Driver {
 		}
 	}
 
-	/// Stage at most one GSO train, then yield so another connection sharing the
-	/// socket gets a chance at the transmit pool. Ignores quiche's pacing hint;
-	/// the congestion controller still bounds each train.
+	/// Stage one GSO train, then yield so another connection sharing the
+	/// socket gets a chance at the transmit pool.
 	fn flush(&mut self, waiter: &kio::Waiter) -> Poll<Error> {
+		match self.flush_one(waiter) {
+			Poll::Ready(Ok(())) => {}
+			Poll::Ready(Err(err)) => return Poll::Ready(err),
+			// Backpressure, or nothing left to stage.
+			Poll::Pending => return Poll::Pending,
+		}
+		// Requeue behind the other ready tasks. If quiche is drained, the next
+		// poll costs one empty acquire and then parks normally.
+		waiter.waker().wake_by_ref();
+		Poll::Pending
+	}
+
+	/// Fill one transmit buffer and stage it. Ignores quiche's pacing hint;
+	/// the congestion controller still bounds each train.
+	fn flush_one(&mut self, waiter: &kio::Waiter) -> Poll<Result<(), Error>> {
 		let mut tx = match self.socket.poll_acquire(waiter) {
 			Poll::Ready(Ok(tx)) => tx,
-			Poll::Ready(Err(err)) => return Poll::Ready(Error::Io(err.to_string())),
+			Poll::Ready(Err(err)) => return Poll::Ready(Err(Error::Io(err.to_string()))),
 			// Backpressure: a completed send re-polls us.
 			Poll::Pending => return Poll::Pending,
 		};
@@ -817,7 +831,7 @@ impl Driver {
 						}
 					}
 					Err(quiche::Error::Done) => break,
-					Err(err) => return Poll::Ready(err.into()),
+					Err(err) => return Poll::Ready(Err(err.into())),
 				}
 			}
 		}
@@ -827,12 +841,9 @@ impl Driver {
 			return Poll::Pending;
 		};
 		if let Err(err) = tx.send(filled, to, SEGMENT) {
-			return Poll::Ready(Error::Io(err.to_string()));
+			return Poll::Ready(Err(Error::Io(err.to_string())));
 		}
-		// Requeue behind the other ready tasks. If quiche is drained, the next
-		// poll costs one empty acquire and then parks normally.
-		waiter.waker().wake_by_ref();
-		Poll::Pending
+		Poll::Ready(Ok(()))
 	}
 
 	/// Re-arm the keep-alive timer, if this connection asked for one.

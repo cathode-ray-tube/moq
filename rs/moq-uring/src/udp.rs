@@ -226,7 +226,7 @@ fn grow_tx(tx: &mut Tx, config: &Config) -> bool {
 	};
 	while tx.bufs.len() < usize::from(target) {
 		tx.free.push(tx.bufs.len() as u16);
-		tx.bufs.push(vec![0u8; config.tx_buffer_len].into_boxed_slice());
+		tx.bufs.push(TxSlot::new(config.tx_buffer_len));
 	}
 	true
 }
@@ -301,11 +301,31 @@ struct Rx {
 
 /// Send-side state.
 struct Tx {
-	bufs: Vec<Box<[u8]>>,
+	bufs: Vec<TxSlot>,
 	free: Vec<u16>,
 	waiters: kio::WaiterList,
 	/// Terminal failure, surfaced by `poll_acquire`.
 	error: Option<i32>,
+}
+
+/// Stable storage reused by every checkout of one transmit slot: the payload
+/// the kernel reads and the `sendmsg` headers pointing into it.
+struct TxSlot {
+	data: Box<[u8]>,
+	headers: Vec<SendHdr>,
+	/// Sends staged from this slot that the kernel has not completed. The slot
+	/// returns to the free list when it hits zero.
+	in_flight: usize,
+}
+
+impl TxSlot {
+	fn new(len: usize) -> Self {
+		Self {
+			data: vec![0u8; len].into_boxed_slice(),
+			headers: Vec::new(),
+			in_flight: 0,
+		}
+	}
 }
 
 /// Everything both the [`Socket`] handle and in-flight ops keep alive.
@@ -347,8 +367,24 @@ impl SockShared {
 
 	fn release_tx(&self, id: u16) {
 		let mut tx = self.tx.borrow_mut();
+		debug_assert_eq!(tx.bufs[id as usize].in_flight, 0);
 		tx.free.push(id);
 		tx.waiters.wake();
+	}
+
+	fn stage_tx(&self, id: u16) {
+		self.tx.borrow_mut().bufs[id as usize].in_flight += 1;
+	}
+
+	fn complete_tx(&self, id: u16) {
+		let mut tx = self.tx.borrow_mut();
+		let slot = &mut tx.bufs[id as usize];
+		debug_assert!(slot.in_flight > 0);
+		slot.in_flight -= 1;
+		if slot.in_flight == 0 {
+			tx.free.push(id);
+			tx.waiters.wake();
+		}
 	}
 
 	fn fail_rx(&self, code: i32) {
@@ -481,9 +517,7 @@ impl Socket {
 
 		let tx_count = INITIAL_TX_BUFFERS.min(config.tx_buffers_max);
 		let tx = Tx {
-			bufs: (0..tx_count)
-				.map(|_| vec![0u8; config.tx_buffer_len].into_boxed_slice())
-				.collect(),
+			bufs: (0..tx_count).map(|_| TxSlot::new(config.tx_buffer_len)).collect(),
 			free: (0..tx_count).collect(),
 			waiters: kio::WaiterList::new(),
 			error: None,
@@ -570,11 +604,11 @@ impl Socket {
 			grow_tx(&mut tx, &self.shared.config);
 		}
 		if let Some(id) = tx.free.pop() {
-			let buf = &mut tx.bufs[id as usize];
+			let slot = &mut tx.bufs[id as usize];
 			// SAFETY: `id` was exclusively checked out of the free list; the
 			// allocation is stable (see TxBuf).
-			let ptr = unsafe { NonNull::new_unchecked(buf.as_mut_ptr()) };
-			let cap = buf.len();
+			let ptr = unsafe { NonNull::new_unchecked(slot.data.as_mut_ptr()) };
+			let cap = slot.data.len();
 			return Poll::Ready(Ok(TxBuf {
 				sock: self.shared.clone(),
 				id,
@@ -732,21 +766,32 @@ impl TxBuf {
 
 		self.armed = true;
 		let sock = self.sock.clone();
-		let lease = Rc::new(TxLease {
+		let base = self.ptr.as_ptr();
+		let headers = {
+			let mut tx = sock.tx.borrow_mut();
+			let headers = &mut tx.bufs[self.id as usize].headers;
+			if headers.len() < segments {
+				headers.resize_with(segments, SendHdr::zeroed);
+			}
+			// SAFETY: the slot is checked out, so it cannot be sent from again
+			// (and its headers cannot grow again) until every send below
+			// completes and returns it to the free list.
+			unsafe { NonNull::new_unchecked(headers.as_mut_ptr()) }
+		};
+		let staging = Staging {
 			sock: sock.clone(),
 			id: self.id,
-		});
-		let base = self.ptr.as_ptr();
+			headers,
+		};
 
 		if sock.config.gso {
-			send_one(&shared, &sock, &lease, base, len, to, Some(segment as u16))?;
+			send_one(&shared, &staging, 0, base, len, to, Some(segment as u16))?;
 		} else {
-			let mut offset = 0;
-			while offset < len {
+			for index in 0..segments {
+				let offset = index * segment;
 				let chunk = segment.min(len - offset);
 				// SAFETY: offset stays within the leased buffer.
-				send_one(&shared, &sock, &lease, unsafe { base.add(offset) }, chunk, to, None)?;
-				offset += chunk;
+				send_one(&shared, &staging, index, unsafe { base.add(offset) }, chunk, to, None)?;
 			}
 		}
 		Ok(())
@@ -783,19 +828,6 @@ impl std::fmt::Debug for TxBuf {
 	}
 }
 
-/// The claim on one send-staging buffer, shared by the sends flying from it;
-/// the last completion releases the buffer.
-pub(crate) struct TxLease {
-	sock: Rc<SockShared>,
-	id: u16,
-}
-
-impl Drop for TxLease {
-	fn drop(&mut self) {
-		self.sock.release_tx(self.id);
-	}
-}
-
 /// Control-message space, aligned like `cmsghdr` demands.
 #[repr(C, align(8))]
 struct Control([u8; CONTROL_LEN]);
@@ -808,25 +840,48 @@ struct SendHdr {
 	control: Control,
 }
 
-/// One in-flight `sendmsg`; the slab entry owns everything the kernel reads.
+impl SendHdr {
+	fn zeroed() -> Self {
+		// SAFETY: all-zero is valid for these C structs.
+		unsafe { std::mem::zeroed() }
+	}
+}
+
+/// What every send from one [`TxBuf::send`] call stages against.
+struct Staging {
+	sock: Rc<SockShared>,
+	id: u16,
+	/// The slot's headers, one per datagram this call stages.
+	headers: NonNull<SendHdr>,
+}
+
+/// One in-flight `sendmsg`. The socket owns the header and payload it points
+/// the kernel at; dropping this releases the claim on that transmit slot.
 pub(crate) struct SendOp {
-	lease: Rc<TxLease>,
-	/// Boxed so the pointers inside stay put; referenced by the SQE.
-	_hdr: Box<SendHdr>,
+	sock: Rc<SockShared>,
+	id: u16,
 	expect: usize,
+}
+
+impl Drop for SendOp {
+	fn drop(&mut self) {
+		self.sock.complete_tx(self.id);
+	}
 }
 
 fn send_one(
 	shared: &Rc<Shared>,
-	sock: &Rc<SockShared>,
-	lease: &Rc<TxLease>,
+	staging: &Staging,
+	index: usize,
 	base: *mut u8,
 	len: usize,
 	to: SocketAddr,
 	segment: Option<u16>,
 ) -> io::Result<()> {
-	// SAFETY: all-zero is valid for these C structs.
-	let mut hdr: Box<SendHdr> = Box::new(unsafe { std::mem::zeroed() });
+	// SAFETY: `index` is within the headers `TxBuf::send` reserved, and every
+	// operation gets its own.
+	let hdr = unsafe { &mut *staging.headers.as_ptr().add(index) };
+	*hdr = SendHdr::zeroed();
 	hdr.iov = libc::iovec {
 		iov_base: base.cast(),
 		iov_len: len,
@@ -850,20 +905,18 @@ fn send_one(
 			std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<u16>(), segment);
 		}
 	}
+	let hdr_ptr = &raw const hdr.hdr;
 
+	// Count the send before the slab owns it, so the `SendOp` below is the only
+	// thing that can release the slot. Completions only run from the worker's
+	// pump, so the count cannot reach zero while this call is still staging.
+	staging.sock.stage_tx(staging.id);
 	let key = shared.insert(Op::Send(SendOp {
-		lease: lease.clone(),
+		sock: staging.sock.clone(),
+		id: staging.id,
 		expect: len,
-		_hdr: hdr,
 	}));
-	let hdr_ptr = {
-		let ops = shared.ops.borrow();
-		match &ops[key as usize] {
-			Op::Send(op) => &raw const op._hdr.hdr,
-			_ => unreachable!(),
-		}
-	};
-	let entry = opcode::SendMsg::new(types::Fd(sock.io.as_raw_fd()), hdr_ptr)
+	let entry = opcode::SendMsg::new(types::Fd(staging.sock.io.as_raw_fd()), hdr_ptr)
 		.build()
 		.user_data(key);
 	if let Err(err) = shared.push(&entry) {
@@ -1118,11 +1171,11 @@ pub(crate) fn on_send(op: SendOp, cqe: Cqe) {
 			return;
 		}
 		if code != libc::ECANCELED {
-			op.lease.sock.fail_tx(code);
+			op.sock.fail_tx(code);
 		}
 	} else if cqe.result as usize != op.expect {
 		tracing::warn!(sent = cqe.result, expected = op.expect, "short UDP send");
-		op.lease.sock.fail_tx(libc::EIO);
+		op.sock.fail_tx(libc::EIO);
 	}
 }
 
