@@ -8,10 +8,11 @@ import { Stream } from "../stream.ts";
 import { Timestamp } from "../time.ts";
 import { NativeSession, type Session } from "./adapter.ts";
 import type * as Cluster from "./cluster.ts";
+import { PublishDone } from "./publish.ts";
 import { PublishNamespace } from "./publish_namespace.ts";
 import { Publisher } from "./publisher.ts";
 import { RequestError, RequestOk } from "./request.ts";
-import { Subscribe } from "./subscribe.ts";
+import { Subscribe, SubscribeOk } from "./subscribe.ts";
 import { SubscribeNamespace } from "./subscribe_namespace.ts";
 import { ALPN, Version } from "./version.ts";
 
@@ -540,5 +541,51 @@ test("an advertisement carries our hop id once the peer declared one", async () 
 		}
 
 		origin.close();
+	}
+});
+
+test("subscription completion sends PUBLISH_DONE on every supported draft", async () => {
+	const versions = [
+		Version.DRAFT_14,
+		Version.DRAFT_15,
+		Version.DRAFT_16,
+		Version.DRAFT_17,
+		Version.DRAFT_18,
+		Version.DRAFT_19,
+	] as const;
+
+	for (const version of versions) {
+		for (const abort of [undefined, new Error("failed")]) {
+			const pair = createMockTransportPair(ALPN.DRAFT_19);
+			const session = new NativeSession(pair.server, version, true);
+			const path = Path.from("test");
+			const { pub, origin } = publisher(pair.server, { session });
+			const broadcast = origin.publish(path);
+			const track = broadcast.createTrack("video");
+
+			const client = await Stream.open(pair.client, { version });
+			const server = await Stream.accept(pair.server, version);
+			if (!server) throw new Error("publisher never accepted the subscribe stream");
+
+			const requestId = 7n;
+			const running = pub.runSubscribe(
+				new Subscribe({ requestId, trackNamespace: path, trackName: "video", subscriberPriority: 0 }),
+				server,
+			);
+
+			expect(await client.reader.u53()).toBe(SubscribeOk.id);
+			await SubscribeOk.decode(client.reader, version);
+			track.close(abort);
+
+			expect(await client.reader.u53()).toBe(PublishDone.id);
+			const done = await PublishDone.decode(client.reader, version);
+			expect(done.requestId).toBe(version <= Version.DRAFT_16 ? requestId : undefined);
+			expect(done.statusCode).toBe(abort ? 0x0 : 0x2);
+
+			await running;
+			client.close();
+			broadcast.close();
+			origin.close();
+		}
 	}
 });

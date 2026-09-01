@@ -277,6 +277,30 @@ test("PublishDone: with error", async () => {
 	expect(decoded.reasonPhrase).toBe("error");
 });
 
+test("PublishDone: preserves unknown statuses across supported versions", async () => {
+	const versions = [
+		Version.DRAFT_14,
+		Version.DRAFT_15,
+		Version.DRAFT_16,
+		Version.DRAFT_17,
+		Version.DRAFT_18,
+		Version.DRAFT_19,
+	] as const;
+
+	for (const version of versions) {
+		const legacy = version === Version.DRAFT_14 || version === Version.DRAFT_15 || version === Version.DRAFT_16;
+		const msg = new PublishDone({
+			requestId: legacy ? 10n : undefined,
+			statusCode: 0xface,
+			reasonPhrase: "extension",
+		});
+
+		const encoded = await encodeVersioned(msg, version);
+		const decoded = await decodeVersioned(encoded, PublishDone.decode, version);
+		expect(decoded.statusCode).toBe(0xface);
+	}
+});
+
 // Announce/PublishNamespace tests
 test("PublishNamespace: round trip", async () => {
 	const msg = new Announce.PublishNamespace({ requestId: 1n, trackNamespace: Path.from("test/broadcast") });
@@ -947,6 +971,17 @@ async function decodeNamespace(bytes: Uint8Array): Promise<Path.Valid> {
 	return await Namespace.decode(reader);
 }
 
+// Helper to encode raw IETF namespace tuple fields
+async function encodeNamespaceTuple(parts: string[]): Promise<Uint8Array> {
+	const { stream, written } = createTestWritableStream();
+	const writer = new Writer(stream);
+	await writer.u53(parts.length);
+	for (const part of parts) await writer.string(part);
+	writer.close();
+	await writer.closed;
+	return concatChunks(written);
+}
+
 test("Namespace: empty encodes as zero-length tuple", async () => {
 	const bytes = await encodeNamespace(Path.empty());
 
@@ -987,6 +1022,30 @@ test("Namespace: multi-part encodes correct count", async () => {
 
 	// First byte should be varint 3 (three parts)
 	expect(bytes[0]).toBe(0x03);
+});
+
+test("Namespace: slash in tuple part is escaped", async () => {
+	const tuple = await encodeNamespaceTuple(["foo/bar", "baz"]);
+	const decoded = await decodeNamespace(tuple);
+
+	expect(decoded).toBe("foo\\/bar/baz" as Path.Valid);
+	expect(await encodeNamespace(decoded)).toEqual(tuple);
+});
+
+test("Namespace: literal backslash round trips", async () => {
+	const tuple = await encodeNamespaceTuple(["foo\\bar/baz", "qux"]);
+	const decoded = await decodeNamespace(tuple);
+
+	expect(decoded).toBe("foo\\\\bar\\/baz/qux" as Path.Valid);
+	expect(await encodeNamespace(decoded)).toEqual(tuple);
+});
+
+test("Namespace: slashes at tuple part boundaries round trip", async () => {
+	const tuple = await encodeNamespaceTuple(["/foo", "bar/", "/baz/"]);
+	const decoded = await decodeNamespace(tuple);
+
+	expect(decoded).toBe("\\/foo/bar\\//\\/baz\\/" as Path.Valid);
+	expect(await encodeNamespace(decoded)).toEqual(tuple);
 });
 
 test("Namespace: Subscribe with empty namespace round trip", async () => {
@@ -1152,14 +1211,14 @@ test("Publish v18: round trip", async () => {
 });
 
 test("PublishDone v18: no requestId", async () => {
-	const msg = new PublishDone({ statusCode: 200, reasonPhrase: "OK" });
+	const msg = new PublishDone({ statusCode: 2, reasonPhrase: "track ended" });
 
 	const encoded = await encodeVersioned(msg, Version.DRAFT_18);
 	const decoded = await decodeVersioned(encoded, PublishDone.decode, Version.DRAFT_18);
 
 	expect(decoded.requestId).toBe(undefined);
-	expect(decoded.statusCode).toBe(200);
-	expect(decoded.reasonPhrase).toBe("OK");
+	expect(decoded.statusCode).toBe(2);
+	expect(decoded.reasonPhrase).toBe("track ended");
 });
 
 test("RequestOk v18: no requestId (regression: don't treat Draft18 as legacy)", async () => {

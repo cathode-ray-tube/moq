@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import * as z from "zod/mini";
+import * as z from "@zod/mini";
 import { RootSchema } from "./root.ts";
 
 // The base catalog carries the media sections (`video`/`audio`) and the data track sections

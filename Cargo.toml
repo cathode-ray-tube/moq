@@ -32,6 +32,7 @@ members = [
     "rs/moq-uring",
     "rs/moq-video",
     "rs/moq-wasm",
+    "rs/quest",
 ]
 default-members = [
     "rs/kio",
@@ -66,6 +67,7 @@ default-members = [
     "rs/moq-uring",
     "rs/moq-video",
     # "rs/moq-wasm",  # wasm32-unknown-unknown target only
+    "rs/quest",
 ]
 resolver = "2"
 
@@ -88,6 +90,7 @@ axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.23"
 block2 = "0.6.2"
 bytes = "1"
+clap = { version = "4", features = ["derive"] }
 criterion = "0.8"
 # CUDA driver bindings for the NVENC/NVDEC path. dlopen'd at runtime
 # (`fallback-dynamic-loading`), so nothing links against libcuda at build time.
@@ -164,6 +167,7 @@ objc2-foundation = "0.3.2"
 objc2-screen-capture-kit = "0.3.2"
 percent-encoding = "2"
 pollster = "1.0"
+pulldown-cmark = { version = "0.13", default-features = false }
 qmux = { version = "0.5.1", default-features = false }
 rand = "0.10.1"
 # default-features off so each consumer picks its own TLS backend and body
@@ -175,6 +179,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_with = "3"
 sha2 = "0.11"
+slab = "0.4.12"
 socket2 = "0.6"
 subtle = "2.6"
 tempfile = "3"

@@ -1,6 +1,6 @@
 import { DEFAULT_MAX_FRAME_SIZE, Encoder as Flate } from "@moq/flate";
 import { Group } from "@moq/net";
-import type * as z from "zod/mini";
+import type * as z from "@zod/mini";
 
 import { deepEqual, diff } from "../diff.ts";
 
