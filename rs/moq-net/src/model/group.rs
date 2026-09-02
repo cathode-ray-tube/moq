@@ -702,6 +702,17 @@ impl Producer {
 		state.partial = None;
 		state.frames.push_back(frame);
 		state.committed = state.next_index;
+		// Completing the frame is a write access like any chunk, and the only one the
+		// payload is guaranteed to get: the wire ingest defers its chunk notifications
+		// to the poll boundary, so a tail that arrives and completes in one turn never
+		// reaches [`Self::frame_notify`]. Without this, a group whose payload streamed
+		// in across an idle gap would expire the instant it finished.
+		let now = state.charge.record_write();
+		drop(state);
+
+		// With the group lock released (lock order is track then group), settle
+		// eviction debt and age idle content out, reusing the tick above.
+		self.cache.settle(now);
 		Ok(())
 	}
 

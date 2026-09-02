@@ -1758,21 +1758,7 @@ impl GroupIngest {
 					}
 				}
 				IngestPhase::Payload { frame } => {
-					let failed = loop {
-						if frame.remaining() == 0 {
-							break None;
-						}
-						match reader.poll_read_chunk(&mut cx, frame.remaining()) {
-							Poll::Pending => return Poll::Pending,
-							Poll::Ready(Ok(Some(chunk))) if !chunk.is_empty() => {
-								if let Err(err) = frame.write(chunk) {
-									break Some(err);
-								}
-							}
-							Poll::Ready(Ok(_)) => break Some(Error::WrongSize),
-							Poll::Ready(Err(err)) => break Some(err),
-						}
-					};
+					let failed = ready!(reader.poll_read_frame(&mut cx, frame)).err();
 
 					let IngestPhase::Payload { frame } = std::mem::replace(&mut self.phase, IngestPhase::Delta) else {
 						unreachable!()
