@@ -1,22 +1,6 @@
-// TODO(container-writer):
-// The fMP4 encoder currently uses `group.frame_count()` to generate the CMAF
-// fragment sequence number. The new `FrameWriter` abstraction does not expose
-// that value, so the fMP4 write path cannot yet be migrated without changing
-// the writer API or moving sequence-number state elsewhere.
-//
-// When revisiting this migration:
-//
-// 1. Decide where the next CMAF fragment sequence number is owned.
-// 2. Preserve the existing `group.frame_count()` behavior or replace it with
-//    equivalent state that remains correct across buffered writes and group
-//    boundaries.
-// 3. Change `encode()` to build the complete moof+mdat payload before sending
-//    it through `FrameWriter::write_frame()`.
-// 4. Ensure the fragment timestamp remains `frames[0].timestamp`.
-// 5. Update the `Container for Wire` implementation and all callers together.
-//
-// Until then, leave the fMP4 `write()` and `encode()` path using the existing
-// `moq_net::group::Producer` API.
+//TODO: if moq_net::group::Producer::frame_count() is not public or does not represent the next fragment sequence number,
+// the sequence number must instead be tracked in fmp4::Wire or supplied through the writer API. 
+// The original direct-Producer implementation relied on that value, so the abstraction must preserve access to it somewhere.
 
 //! Fragmented MP4 (fMP4 / CMAF).
 //!
@@ -55,6 +39,7 @@ use mp4_atom::Atom;
 use moq_net::Timestamp;
 
 use crate::container::{Container, Frame};
+use crate::container::FrameWriter;
 
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
@@ -254,10 +239,25 @@ impl Wire {
 impl Container for Wire {
 	type Error = Error;
 
-	fn write(&self, group: &mut moq_net::group::Producer, frames: &[Frame]) -> std::result::Result<(), Self::Error> {
+	fn write<W>(
+		&self,
+		output: &mut W,
+		frames: &[Frame],
+	) -> Result<(), Self::Error>
+	where
+		W: FrameWriter<Error = Self::Error>,
+	{
 		let timescale = moq_net::Timescale::new(self.trak.mdia.mdhd.timescale as u64)?;
 		let track_id = self.trak.tkhd.track_id;
-		encode(group, frames, timescale, track_id)
+		let sequence_number = output.next_sequence_number();
+
+		encode(
+			output,
+			frames,
+			timescale,
+			track_id,
+			sequence_number,
+		)
 	}
 
 	fn poll_read(
@@ -271,10 +271,14 @@ impl Container for Wire {
 			return Poll::Ready(Ok(None));
 		};
 
-		let timescale = moq_net::Timescale::new(self.trak.mdia.mdhd.timescale as u64)?;
+		let timescale = moq_net::Timescale::new(
+			self.trak.mdia.mdhd.timescale as u64,
+		)?;
+
 		Poll::Ready(Ok(Some(decode(frame.payload, timescale)?)))
 	}
 }
+
 
 pub(crate) fn decode(data: Bytes, timescale: moq_net::Timescale) -> Result<Vec<Frame>> {
 	use mp4_atom::DecodeMaybe;
@@ -363,34 +367,35 @@ pub(crate) fn decode(data: Bytes, timescale: moq_net::Timescale) -> Result<Vec<F
 	Ok(frames)
 }
 
-pub(crate) fn encode(
-	group: &mut moq_net::group::Producer,
+pub(crate) fn encode<W>(
+	output: &mut W,
 	frames: &[Frame],
 	timescale: moq_net::Timescale,
 	track_id: u32,
-) -> Result<()> {
+	sequence_number: u32,
+) -> Result<()>
+where
+	W: FrameWriter<Error = Error>,
+{
 	if frames.is_empty() {
 		return Ok(());
 	}
 
-	let sequence_number = group.frame_count() as u32;
 	let info = FragmentInfo {
 		track_id,
 		timescale,
 		sequence_number,
 	};
+
 	let bytes = encode_fragment(info, frames)?;
+
 	// The fragment may carry several samples; the net frame's timestamp is the
 	// fragment's earliest presentation time so a relay can order it.
-	let mut writer = group.create_frame(moq_net::frame::Info {
-		size: bytes.len() as u64,
-		timestamp: frames[0].timestamp,
-	})?;
-	writer.write(bytes)?;
-	writer.finish()?;
+	output.write_frame(frames[0].timestamp, bytes)?;
 
 	Ok(())
 }
+
 
 /// Which track a fragment belongs to, and where it sits in that track.
 ///
