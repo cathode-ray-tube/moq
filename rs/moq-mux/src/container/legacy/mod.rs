@@ -19,16 +19,30 @@ impl Container for Wire {
 		frame.payload.is_empty().then_some(frame.timestamp)
 	}
 
-	fn write(&self, group: &mut moq_net::group::Producer, frames: &[Frame]) -> Result<(), Self::Error> {
-		for frame in frames {
-			let hang_frame = hang::container::Frame {
-				timestamp: frame.timestamp,
-				payload: frame.payload.clone(),
-			};
-			hang_frame.write_to(group)?;
-		}
-		Ok(())
+	fn write<W>(
+	&self,
+	output: &mut W,
+	frames: &[Frame],
+) -> Result<(), Self::Error>
+where
+	W: crate::container::FrameWriter<Error = Self::Error>,
+{
+	for frame in frames {
+		let mut payload = bytes::BytesMut::new();
+
+		let hang_frame = hang::container::Frame {
+			timestamp: frame.timestamp,
+			payload: frame.payload.clone(),
+		};
+
+		hang_frame.encode(&mut payload)?;
+
+		output.write_frame(frame.timestamp, payload.freeze())?;
 	}
+
+	Ok(())
+}
+
 
 	fn poll_read(
 		&self,
