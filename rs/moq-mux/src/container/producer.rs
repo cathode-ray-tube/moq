@@ -1,3 +1,32 @@
+// TODO(encryption):
+// Replace the plain MoqFrameWriter used by write() and flush() with the
+// encryption-aware writer once the encrypted frame format and configuration
+// are finalized.
+//
+// The intended writer chain is:
+//
+//     Sframe {
+//         inner: MoqFrameWriter { group },
+//     }
+//
+// For unencrypted tracks, continue using:
+//
+//     MoqFrameWriter { group }
+//
+// Before enabling Sframe, implement the following:
+//
+// 1. Define the encrypted payload format and versioning.
+// 2. Add the encryption key/configuration to the producer or its track context.
+// 3. Implement encrypt() in container/writer.rs.
+// 4. Decide whether encryption metadata belongs in the catalog/init segment.
+// 5. Ensure each encrypted frame has the required nonce/counter and
+//    authentication tag.
+// 6. Add tests covering successful encryption, decryption, tampered payloads,
+//    key rotation, and buffered flushes.
+//
+// Both the immediate write path and flush() must use the same writer chain so
+// buffered and unbuffered frames are encrypted consistently.
+
 use super::{Container, Frame};
 
 /// A producer for media tracks that manages group boundaries.
@@ -138,76 +167,98 @@ impl<C: Container> Producer<C> {
 	}
 
 	/// Write a frame to the track.
-	///
-	/// A keyframe closes any open group and starts a new one. A non-keyframe extends the current
-	/// group; if no group is open it returns [`MissingKeyframe`](super::MissingKeyframe), so a caller
-	/// joining mid-stream can skip frames until the first keyframe. A source where every frame is
-	/// independently decodable (audio) marks only the first frame of each group a keyframe (see
-	/// [`needs_keyframe`](Self::needs_keyframe)) so the group spans more than one frame.
-	pub fn write(&mut self, frame: Frame) -> Result<(), C::Error> {
-		// A keyframe cuts the previous group, using its timestamp as the boundary
-		// where the previous group's content ends.
-		if frame.keyframe {
-			self.cut(Some(frame.timestamp))?;
-		}
-
-		// Start a new group if needed; the first frame of a group must be a keyframe.
-		if self.group.is_none() {
-			if !frame.keyframe {
-				// No group yet and this delta can't anchor one. The caller (e.g. a
-				// mid-stream join) decides whether to skip until the first keyframe.
-				return Err(super::MissingKeyframe.into());
-			}
-			let group = match self.pending_sequence.take() {
-				Some(sequence) => self.inner.create_group(moq_net::group::Info { sequence })?,
-				None => self.inner.append_group()?,
-			};
-
-			// Report the group the moment it opens: its start is this frame's timestamp. The
-			// timeline absorbs publish failures itself (it is an optional sidecar),
-			// so reporting can't abort the media write.
-			if let Some(recorder) = self.recorder.as_mut() {
-				recorder.record(group.sequence, frame.timestamp, frame.keyframe);
-			}
-
-			self.group = Some(group);
-		}
-
-		// Buffer or write the frame.
-		if self.buffer_duration.is_zero() {
-			let group = self.group.as_mut().unwrap();
-			let (timestamp, duration, bytes) = (frame.timestamp, frame.duration, frame.payload.len());
-			self.container.write(group, &[frame])?;
-
-			// Only what the container accepted is measured. A rejected frame (too large for the
-			// group, a timestamp that won't convert) leaves the producer usable, and the estimate's
-			// extrema never fall, so counting one would inflate the catalog for good.
-			self.estimator.write(timestamp, bytes);
-			self.observe_end(timestamp, duration);
-		} else {
-			// Buffered frames are measured on the way in instead. The flush that eventually writes
-			// them takes the track down with it when it fails, so there is nothing to unwind.
-			self.estimator.write(frame.timestamp, frame.payload.len());
-			self.observe_end(frame.timestamp, frame.duration);
-			self.buffer.push(frame);
-
-			// Flush if the buffered span has reached the buffer duration. Compute
-			// min/max across the buffer rather than first/last: frames within a track
-			// are in *decode* order, and B-frames have non-monotonic PTS, so
-			// `last - first` can shrink as a B-frame lands between two earlier-PTS
-			// frames. The min/max pair captures the actual presentation span.
-			if self.buffer.len() >= 2 {
-				let mut iter = self.buffer.iter().map(|f| std::time::Duration::from(f.timestamp));
-				let first = iter.next().unwrap();
-				let (min, max) = iter.fold((first, first), |(min, max), d| (min.min(d), max.max(d)));
-				if max.saturating_sub(min) >= self.buffer_duration {
-					self.flush(None)?;
-				}
-			}
-		}
-
-		Ok(())
+///
+/// A keyframe closes any open group and starts a new one. A non-keyframe extends the current
+/// group; if no group is open it returns [`MissingKeyframe`](super::MissingKeyframe), so a caller
+/// joining mid-stream can skip frames until the first keyframe. A source where every frame is
+/// independently decodable (audio) marks only the first frame of each group a keyframe (see
+/// [`needs_keyframe`](Self::needs_keyframe)) so the group spans more than one frame.
+pub fn write(&mut self, frame: Frame) -> Result<(), C::Error> {
+	// A keyframe cuts the previous group, using its timestamp as the boundary
+	// where the previous group's content ends.
+	if frame.keyframe {
+		self.cut(Some(frame.timestamp))?;
 	}
+
+	// Start a new group if needed; the first frame of a group must be a keyframe.
+	if self.group.is_none() {
+		if !frame.keyframe {
+			// No group yet and this delta can't anchor one. The caller (e.g. a
+			// mid-stream join) decides whether to skip until the first keyframe.
+			return Err(super::MissingKeyframe.into());
+		}
+
+		let group = match self.pending_sequence.take() {
+			Some(sequence) => {
+				self.inner.create_group(moq_net::group::Info { sequence })?
+			}
+			None => self.inner.append_group()?,
+		};
+
+		// Report the group the moment it opens: its start is this frame's timestamp.
+		// The timeline absorbs publish failures itself, so reporting can't abort
+		// the media write.
+		if let Some(recorder) = self.recorder.as_mut() {
+			recorder.record(group.sequence, frame.timestamp, frame.keyframe);
+		}
+
+		self.group = Some(group);
+	}
+
+	// Buffer or write the frame.
+	if self.buffer_duration.is_zero() {
+		let group = self.group.as_mut().unwrap();
+
+		let (timestamp, duration, bytes) = (
+			frame.timestamp,
+			frame.duration,
+			frame.payload.len(),
+		);
+
+		let mut output = crate::container::MoqFrameWriter { group };
+
+		self.container.write(&mut output, &[frame])?;
+
+		// Only what the container accepted is measured. A rejected frame
+		// leaves the producer usable, and the estimate's extrema never fall,
+		// so counting one would inflate the catalog for good.
+		self.estimator.write(timestamp, bytes);
+		self.observe_end(timestamp, duration);
+	} else {
+		// Buffered frames are measured on the way in instead. The flush that
+		// eventually writes them takes the track down with it when it fails,
+		// so there is nothing to unwind.
+		self.estimator.write(frame.timestamp, frame.payload.len());
+		self.observe_end(frame.timestamp, frame.duration);
+		self.buffer.push(frame);
+
+		// Flush if the buffered span has reached the buffer duration. Compute
+		// min/max across the buffer rather than first/last because frames are
+		// in decode order and B-frames can have non-monotonic PTS.
+		if self.buffer.len() >= 2 {
+			let mut iter = self
+				.buffer
+				.iter()
+				.map(|f| std::time::Duration::from(f.timestamp));
+
+			let first = iter.next().unwrap();
+
+			let (min, max) = iter.fold(
+				(first, first),
+				|(min, max), duration| {
+					(min.min(duration), max.max(duration))
+				},
+			);
+
+			if max.saturating_sub(min) >= self.buffer_duration {
+				self.flush(None)?;
+			}
+		}
+	}
+
+	Ok(())
+}
+
 
 	/// Cut the current group, flushing buffered frames and closing it.
 	///
@@ -305,43 +356,52 @@ impl<C: Container> Producer<C> {
 	}
 
 	/// Flush any buffered frames into the current group without closing it.
-	///
-	/// Backfills the per-sample duration the source didn't provide. A CMAF fragment
-	/// reconstructs each sample's DTS by accumulating durations, so every non-final
-	/// sample packed into one fragment needs one or the decoder collapses their
-	/// timestamps. Frames are in decode order, so a sample's duration is the gap to the
-	/// next buffered sample; the final sample borrows `next` (the timestamp of the
-	/// keyframe that rolled the group over), which is already in hand so this adds no
-	/// latency. Frames that already carry a duration (e.g. fMP4 passthrough) keep it,
-	/// and a backwards gap (a B-frame whose successor presents earlier) is left unset.
-	/// Containers that don't use per-frame durations (Legacy, LOC) ignore the field.
-	fn flush(&mut self, next: Option<moq_net::Timestamp>) -> Result<(), C::Error> {
-		if self.buffer.is_empty() {
-			return Ok(());
-		}
-
-		for i in 0..self.buffer.len() {
-			if self.buffer[i].duration.is_some() {
-				continue;
-			}
-			let boundary = self.buffer.get(i + 1).map(|f| f.timestamp).or(next);
-			if let Some(boundary) = boundary
-				&& let Ok(duration) = boundary.checked_sub(self.buffer[i].timestamp)
-			{
-				self.buffer[i].duration = Some(duration);
-			}
-		}
-
-		let group = match &mut self.group {
-			Some(group) => group,
-			None => return Ok(()),
-		};
-
-		self.container.write(group, &self.buffer)?;
-		self.buffer.clear();
-
-		Ok(())
+///
+/// Backfills the per-sample duration the source didn't provide. A CMAF fragment
+/// reconstructs each sample's DTS by accumulating durations, so every non-final
+/// sample packed into one fragment needs one or the decoder collapses their
+/// timestamps. Frames are in decode order, so a sample's duration is the gap to the
+/// next buffered sample; the final sample borrows `next` (the timestamp of the
+/// keyframe that rolled the group over), which is already in hand so this adds no
+/// latency. Frames that already carry a duration (e.g. fMP4 passthrough) keep it,
+/// and a backwards gap (a B-frame whose successor presents earlier) is left unset.
+/// Containers that don't use per-frame durations (Legacy, LOC) ignore the field.
+fn flush(&mut self, next: Option<moq_net::Timestamp>) -> Result<(), C::Error> {
+	if self.buffer.is_empty() {
+		return Ok(());
 	}
+
+	for i in 0..self.buffer.len() {
+		if self.buffer[i].duration.is_some() {
+			continue;
+		}
+
+		let boundary = self
+			.buffer
+			.get(i + 1)
+			.map(|frame| frame.timestamp)
+			.or(next);
+
+		if let Some(boundary) = boundary
+			&& let Ok(duration) = boundary.checked_sub(self.buffer[i].timestamp)
+		{
+			self.buffer[i].duration = Some(duration);
+		}
+	}
+
+	let group = match &mut self.group {
+		Some(group) => group,
+		None => return Ok(()),
+	};
+
+	let mut output = crate::container::MoqFrameWriter { group };
+
+	self.container.write(&mut output, &self.buffer)?;
+	self.buffer.clear();
+
+	Ok(())
+}
+
 
 	/// Finish the track, flushing any buffered frames and closing any open group.
 	pub fn finish(&mut self) -> Result<(), C::Error> {
