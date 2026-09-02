@@ -3,7 +3,6 @@ use bytes::Bytes;
 use super::FrameWriter;
 use crate::Error;
 
-/// Adapter that writes encoded container payloads into a MoQ producer.
 pub struct MoqFrameWriter<'a> {
 	pub group: &'a mut moq_net::group::Producer,
 }
@@ -27,9 +26,12 @@ impl FrameWriter for MoqFrameWriter<'_> {
 
 		Ok(())
 	}
+
+	fn next_sequence_number(&self) -> u32 {
+		self.group.frame_count() as u32
+	}
 }
 
-/// Frame-writer decorator for encrypted payloads.
 pub struct Sframe<W> {
 	pub inner: W,
 }
@@ -48,13 +50,13 @@ where
 		let encrypted = encrypt(&payload)?;
 		self.inner.write_frame(timestamp, encrypted)
 	}
+
+	fn next_sequence_number(&self) -> u32 {
+		self.inner.next_sequence_number()
+	}
 }
 
 fn encrypt(payload: &Bytes) -> Result<Bytes, Error> {
-	// Replace this with the project's actual SFrame encoder.
-	//
-	// `todo!()` is intentional until the encryption key, nonce, authentication
-	// tag, and wire-format configuration are available.
 	let _ = payload;
 	todo!("implement SFrame payload encryption")
 }
