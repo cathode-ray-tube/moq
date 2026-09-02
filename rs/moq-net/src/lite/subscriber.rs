@@ -412,15 +412,24 @@ impl<S: crate::transport::poll::Session> Subscriber<S> {
 		Ok(true)
 	}
 
+	/// Remove a subscription, releasing the session's handle on its producer.
+	fn remove_subscribe(&self, id: u64) {
+		self.subscribes.lock().remove(&id);
+	}
+
 	/// Decode one datagram body and hand it to the matching subscription's producer.
 	fn route_datagram(&self, payload: bytes::Bytes) -> Result<(), Error> {
 		let mut buf = payload;
 		let dg = lite::Datagram::decode(&mut buf, self.version)?;
 
-		let mut entry = match self.subscribes.lock().get(&dg.subscribe) {
-			Some(entry) => entry.clone(),
+		// Write through the map rather than cloning the entry out: a `TrackEntry` clone
+		// is a handful of atomic bumps on every datagram, and a producer held past its
+		// removal would keep the track (its cached groups, its stats subscription) alive.
+		// The group path already writes to a producer under this lock.
+		let mut subscribes = self.subscribes.lock();
+		let Some(entry) = subscribes.get_mut(&dg.subscribe) else {
 			// Unknown or already-closed subscription: drop the datagram.
-			None => return Ok(()),
+			return Ok(());
 		};
 
 		// Datagrams are lite-05+, which always negotiates a timescale; default defensively.
@@ -1316,11 +1325,75 @@ impl<S: crate::transport::poll::Session> kio::Task for SourceServe<S> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::coding::Decode;
+	use crate::coding::{Decode, Encode};
 	use crate::lite::test_transport::SinkSession;
 	use crate::model::ProduceTest;
+	use futures::FutureExt;
 
 	const VERSION: Version = Version::Lite05;
+
+	/// Removing a subscription both stops delivery and releases the session's handle
+	/// on the producer, so the track (its cached groups, its stats subscription) ends
+	/// rather than outliving the subscription it belonged to.
+	#[test]
+	fn unsubscribe_drops_the_datagram_and_releases_the_producer() {
+		let origin = origin::Info::new(crate::Hop::new(1).unwrap()).produce();
+		let subscriber = Subscriber::new(SubscriberConfig {
+			session: SinkSession::default(),
+			origin,
+			recv_bandwidth: None,
+			version: VERSION,
+			peer_setup: Default::default(),
+			peer_hop: None,
+			cost: None,
+			going_away: Default::default(),
+		});
+
+		let mut broadcast = crate::broadcast::Info::new().produce();
+		// The broadcast keeps only a weak handle, so the map below owns the only strong
+		// `track::Producer`: dropping it is what ends the track.
+		let producer = broadcast.create_track("datagrams", None).unwrap();
+		let mut received = producer.subscribe(None);
+		subscriber.subscribes.lock().insert(
+			7,
+			TrackEntry {
+				producer,
+				timescale: Some(Timescale::default()),
+			},
+		);
+
+		let payload = |sequence| {
+			lite::Datagram {
+				subscribe: 7,
+				sequence,
+				timestamp: sequence,
+				payload: bytes::Bytes::from_static(b"x"),
+			}
+			.encode_bytes(VERSION)
+			.unwrap()
+		};
+		subscriber.route_datagram(payload(1)).unwrap();
+		assert_eq!(
+			received
+				.recv_datagram()
+				.now_or_never()
+				.unwrap()
+				.unwrap()
+				.unwrap()
+				.sequence,
+			1
+		);
+
+		subscriber.remove_subscribe(7);
+		subscriber.route_datagram(payload(2)).unwrap();
+		// Dropping the last producer is an abrupt teardown, so the track resolves with
+		// `Dropped` rather than parking. A route that outlived the removal would keep the
+		// producer alive and leave this pending forever.
+		assert!(
+			matches!(received.recv_datagram().now_or_never(), Some(Err(Error::Dropped))),
+			"the track outlived its subscription"
+		);
+	}
 
 	/// `establish` puts exactly one SUBSCRIBE on the wire, and the id is registered
 	/// before any of it reaches the transport.
@@ -2530,7 +2603,7 @@ impl<S: crate::transport::poll::Session> TrackServe<S> {
 				// reads, and the upstream counts it as a live viewer of the broadcast.
 				// A returning subscriber re-establishes from the current demand.
 				if let Sub::Active(active) = sub {
-					self.subscriber.subscribes.lock().remove(&active.id);
+					self.subscriber.remove_subscribe(active.id);
 					let _ = active.stream.writer.finish();
 					tracing::info!(track = %self.name, "subscribe canceled (idle)");
 					*sub = Sub::None;
@@ -2608,7 +2681,7 @@ impl<S: crate::transport::poll::Session> TrackServe<S> {
 				Ok(())
 			}
 			Err(err) => {
-				self.subscriber.subscribes.lock().remove(&id);
+				self.subscriber.remove_subscribe(id);
 				Err(err)
 			}
 		}
@@ -2632,7 +2705,7 @@ impl<S: crate::transport::poll::Session> TrackServe<S> {
 				match kio::wait(move |waiter| est.poll(waiter)).await {
 					Ok(active) => *sub = Sub::Active(active),
 					Err(err) => {
-						self.subscriber.subscribes.lock().remove(&id);
+						self.subscriber.remove_subscribe(id);
 						return Err(err);
 					}
 				}
@@ -2847,7 +2920,7 @@ impl<S: crate::transport::poll::Session> kio::Task for TrackServeRun<S> {
 					};
 
 					if let Sub::Active(active) = &mut serve_loop.sub {
-						self.serve.subscriber.subscribes.lock().remove(&active.id);
+						self.serve.subscriber.remove_subscribe(active.id);
 						let _ = active.stream.writer.finish();
 					}
 
@@ -3015,7 +3088,7 @@ impl<S: crate::transport::poll::Session> ServeLoop<S> {
 						Err(err) => {
 							// Opening the upstream failed (usually the session dying): hand
 							// the track back for another route to resume.
-							serve.subscriber.subscribes.lock().remove(&id);
+							serve.subscriber.remove_subscribe(id);
 							return Poll::Ready(Teardown::GiveBack(err));
 						}
 					}
@@ -3031,7 +3104,7 @@ impl<S: crate::transport::poll::Session> ServeLoop<S> {
 							Poll::Ready(Err(err)) => {
 								// The stream is broken; drop it (the writer resets) and
 								// hand the track back.
-								serve.subscriber.subscribes.lock().remove(&active.id);
+								serve.subscriber.remove_subscribe(active.id);
 								self.sub = Sub::None;
 								return Poll::Ready(Teardown::GiveBack(err));
 							}
