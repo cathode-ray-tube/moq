@@ -10,14 +10,12 @@
 //! track; [`catalog::hang::Container`](crate::catalog::hang::Container)
 //! dispatches the right implementation at runtime.
 
-use std::task::Poll;
-
-use bytes::Bytes;
-
 mod consumer;
 mod group;
 mod producer;
 mod source;
+mod writer;
+
 #[cfg(test)]
 pub(crate) mod test_util;
 
@@ -31,7 +29,9 @@ pub mod ts;
 pub use consumer::Consumer;
 pub use group::GroupConsumer;
 pub use producer::Producer;
+pub use writer::{FrameWriter, MoqFrameWriter, Sframe};
 pub(crate) use source::ExportSource;
+
 
 /// A decoded media frame: timestamp, payload bytes, keyframe flag.
 ///
@@ -82,6 +82,21 @@ pub struct Frame {
 #[error("missing keyframe: a group must open on a keyframe")]
 pub struct MissingKeyframe;
 
+/// Writes an encoded media payload to the underlying MoQ frame stream.
+///
+/// Container implementations use this abstraction instead of writing
+/// directly to a [`moq_net::group::Producer`]. This allows callers to
+/// insert decorators such as encryption before data reaches the network.
+pub trait FrameWriter {
+	type Error;
+
+	fn write_frame(
+		&mut self,
+		timestamp: moq_net::Timestamp,
+		payload: Bytes,
+	) -> Result<(), Self::Error>;
+}
+
 /// Encode and decode media frames over a moq-lite group.
 ///
 /// Implementors decide how many [`Frame`]s map onto one moq-lite frame:
@@ -93,8 +108,17 @@ pub trait Container {
 	/// reject a group that doesn't open on a keyframe).
 	type Error: std::error::Error + Send + Sync + Unpin + From<moq_net::Error> + From<MissingKeyframe>;
 
-	/// Encode one or more frames into a single moq-lite frame appended to `group`.
-	fn write(&self, group: &mut moq_net::group::Producer, frames: &[Frame]) -> Result<(), Self::Error>;
+	/// Encode one or more frames and send them through `output`.
+///
+/// The writer may be decorated—for example, with an encryption layer—before
+/// ultimately writing to the MoQ producer.
+fn write<W>(
+	&self,
+	output: &mut W,
+	frames: &[Frame],
+) -> Result<(), Self::Error>
+where
+	W: FrameWriter<Error = Self::Error>;
 
 	/// Poll the next moq-lite frame from `group` and decode it into media
 	/// frames. A single call may produce multiple media frames (e.g. all samples
