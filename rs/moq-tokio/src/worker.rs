@@ -23,7 +23,7 @@
 //! // The group owns the threads, so keep it alive as long as you want the
 //! // port served.
 //! for (server, spawner) in workers.split() {
-//!     spawner.run(async move {
+//!     spawner.run(|| async move {
 //!         let _ = server.listen().await;
 //!     });
 //! }
@@ -252,9 +252,9 @@ impl Workers {
 	/// So dropping one of these servers, or letting the future built from it
 	/// return while its siblings serve, corrupts steering for the rest. Run all of
 	/// them, and treat the first one that finishes as the end of the group. The
-	/// type system does not enforce this yet, because doing so means handing the
-	/// group a closure to build each future from, and this crate keeps callbacks
-	/// out of its public API. Tracked in
+	/// type system does not enforce this yet: doing so means the group owns every
+	/// server and ends them together, which is a bigger reshape than the
+	/// per-worker builder [`Spawner::run`] takes. Tracked in
 	/// <https://github.com/moq-dev/moq/issues/2964>.
 	pub fn split(&mut self) -> Vec<(Server, Spawner<'_>)> {
 		self.workers
@@ -266,6 +266,7 @@ impl Workers {
 					Spawner {
 						index: worker.index,
 						handle: &worker.handle,
+						spawn: &worker.spawn,
 					},
 				))
 			})
@@ -334,20 +335,51 @@ fn join(threads: Vec<(u16, std::thread::JoinHandle<()>)>) {
 pub struct Spawner<'a> {
 	index: u16,
 	handle: &'a tokio::runtime::Handle,
+	spawn: &'a tokio::sync::mpsc::UnboundedSender<Spawn>,
 }
 
 impl Spawner<'_> {
-	/// Drive `future` on this worker's thread, where its QUIC driver lives.
+	/// Build and drive a future on this worker's thread, where its QUIC driver lives.
+	///
+	/// The factory crosses the thread boundary, then creates the future inside
+	/// the worker's local task set, so the future itself may be `!Send`. It is a
+	/// builder rather than a hook: it runs once, to make the future, and nothing
+	/// calls back into it afterwards.
 	///
 	/// The returned handle reports what the future returned, so a caller can end
-	/// the process on a worker that fails. Dropping the handle does *not* stop the
-	/// future, since it runs on a thread of its own; stopping the group does.
-	pub fn run<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+	/// the process on a worker that fails, and stands in for the worker-local task
+	/// itself: a panic in the factory or the future surfaces through it, and
+	/// [`abort`](tokio::task::JoinHandle::abort) cancels the task on the worker.
+	/// Dropping the handle does *not* stop the future, since it runs on a thread
+	/// of its own; stopping the group does.
+	pub fn run<M, F>(&self, make: M) -> tokio::task::JoinHandle<F::Output>
 	where
-		F: Future + Send + 'static,
+		M: FnOnce() -> F + Send + 'static,
+		F: Future + 'static,
 		F::Output: Send + 'static,
 	{
-		self.handle.spawn(future)
+		let (task_tx, task_rx) = tokio::sync::oneshot::channel();
+		let spawn = Box::new(move || {
+			// The factory runs inside the task, not as the argument to the spawn:
+			// panicking while building the future is then the task's panic, not the
+			// worker thread's.
+			let task = AbortOnDrop(tokio::task::spawn_local(async move { make().await }));
+			// The guard travels with the handle, so every way of losing it from here
+			// on (a failed send, a caller that aborts while it is still in flight,
+			// the forwarding task below being cancelled) cancels the task instead of
+			// detaching it onto the worker.
+			let _ = task_tx.send(task);
+		});
+		let _ = self.spawn.send(spawn);
+
+		self.handle.spawn(async move {
+			let mut task = task_rx.await.expect("worker stopped before spawning task");
+			match (&mut task.0).await {
+				Ok(output) => output,
+				Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+				Err(err) => panic!("worker-local task cancelled: {err}"),
+			}
+		})
 	}
 
 	/// This worker's position in the group, from zero.
@@ -367,6 +399,7 @@ struct Worker {
 	server: Option<Server>,
 	index: u16,
 	handle: tokio::runtime::Handle,
+	spawn: tokio::sync::mpsc::UnboundedSender<Spawn>,
 	thread: Option<std::thread::JoinHandle<()>>,
 	stop: Option<tokio::sync::oneshot::Sender<()>>,
 	addr: SocketAddr,
@@ -384,10 +417,11 @@ impl Worker {
 		let index = shard.index();
 		let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 		let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+		let (spawn_tx, spawn_rx) = tokio::sync::mpsc::unbounded_channel();
 
 		let thread = std::thread::Builder::new()
 			.name(format!("moq-quic-{index}"))
-			.spawn(move || run(shard, core, listen, quic, ready_tx, stop_rx))
+			.spawn(move || run(shard, core, listen, quic, ready_tx, stop_rx, spawn_rx))
 			.map_err(|err| Error::WorkerStart {
 				index,
 				source: Arc::new(err),
@@ -422,6 +456,7 @@ impl Worker {
 			server: Some(server),
 			index,
 			handle,
+			spawn: spawn_tx,
 			thread: Some(thread),
 			stop: Some(stop_tx),
 			addr,
@@ -456,6 +491,22 @@ struct Ready {
 	handle: tokio::runtime::Handle,
 }
 
+/// A future factory that is sent to and invoked by its worker thread.
+type Spawn = Box<dyn FnOnce() + Send + 'static>;
+
+/// Owns a worker-local task from the moment it is spawned, cancelling it if the
+/// handle standing for it is lost.
+///
+/// A bare [`tokio::task::JoinHandle`] detaches on drop, which would leave the
+/// task running unreachable on its worker until the whole group stopped.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+	fn drop(&mut self) {
+		self.0.abort();
+	}
+}
+
 /// One worker thread: pin, bind, report, then park until it is stopped.
 ///
 /// The runtime is built and entered here, and the [`Server`] is constructed
@@ -470,6 +521,7 @@ fn run(
 	quic: crate::quic::Config,
 	ready: std::sync::mpsc::Sender<Result<Ready>>,
 	stop: tokio::sync::oneshot::Receiver<()>,
+	mut spawn: tokio::sync::mpsc::UnboundedReceiver<Spawn>,
 ) {
 	let index = shard.index();
 	if let Some(core) = core {
@@ -517,8 +569,15 @@ fn run(
 
 	// Parked, not idle: the runtime has to keep turning for the endpoint driver
 	// and whatever the owner spawned. `stop` resolves when its sender drops.
-	runtime.block_on(async move {
-		let _ = stop.await;
+	let local = tokio::task::LocalSet::new();
+	local.block_on(&runtime, async move {
+		tokio::pin!(stop);
+		loop {
+			tokio::select! {
+				_ = &mut stop => break,
+				Some(spawn) = spawn.recv() => spawn(),
+			}
+		}
 	});
 	tracing::debug!(index, "QUIC worker stopped");
 }
