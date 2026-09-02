@@ -23,32 +23,32 @@ pub struct Wire;
 impl Container for Wire {
 	type Error = crate::Error;
 
-	fn write(
+	fn write<W>(
     &self,
-    group: &mut moq_net::group::Producer,
+    output: &mut W,
     frames: &[Frame],
-) -> Result<(), Self::Error> {
-    let mut writer = MoqFrameWriter { group };
-
+) -> Result<(), Self::Error>
+where
+    W: crate::container::FrameWriter<Error = Self::Error>,
+{
     for frame in frames {
-        // LOC's wire format omits the per-frame timescale by convention.
-        // Convert the timestamp to the catalog's default microsecond scale.
+        // LOC uses microsecond timestamps by convention when no per-frame
+        // timescale property is present.
         let timestamp = frame
             .timestamp
             .convert(DEFAULT_TIMESCALE)
             .map_err(hang::Error::from)?;
 
-        let data = moq_loc::encode(timestamp.value(), &frame.payload)?;
+        let payload = moq_loc::encode(timestamp.value(), &frame.payload)?;
 
-        // MoqFrameWriter handles create_frame, write, and finish.
-        //
-        // Use the original timestamp here because the MoQ frame timestamp
-        // should remain in the track's timescale.
-        writer.write_frame(frame.timestamp, data)?;
+        // The LOC timestamp is encoded inside the payload using the default
+        // timescale. The outer MoQ frame keeps the original track timestamp.
+        output.write_frame(frame.timestamp, payload)?;
     }
 
     Ok(())
 }
+
 
 
 	fn poll_read(
