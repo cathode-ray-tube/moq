@@ -15,6 +15,23 @@ pub(crate) fn message(err: impl std::error::Error) -> String {
 	out
 }
 
+/// Placeholder errors for the future encryption layer.
+///
+/// Keeping this type in `moq-mux` means the public error contract can include
+/// encryption failures before the actual encryption implementation exists.
+///
+/// To support different encryption libs, an adapter to map to this error behind a 
+/// Cargo feature could be used.
+#[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
+pub enum EncryptionError {
+    #[error("encryption is not implemented")]
+    NotImplemented,
+
+    #[error("{0}")]
+    Message(String),
+}
+
 /// Errors from moq-mux operations.
 ///
 /// Most variants are delegations to underlying layers: [`moq_net::Error`] for
@@ -149,6 +166,10 @@ pub enum Error {
 		/// The kind the constructor expected.
 		wanted: &'static str,
 	},
+
+     /// Error from the future encryption layer.
+    #[error("encryption: {0}")]
+    Encryption(#[from] EncryptionError),
 
 	/// A non-keyframe frame was received before any keyframe opened a group.
 	/// A track joining mid-stream should skip frames until the first keyframe.

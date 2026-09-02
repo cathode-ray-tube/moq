@@ -41,6 +41,9 @@ use moq_net::Timestamp;
 use crate::container::{Container, Frame};
 use crate::container::FrameWriter;
 
+/// Aliased as MuxError to avoid collision with local fmp4 error
+use crate::error::Error as MuxError;
+
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -237,47 +240,49 @@ impl Wire {
 }
 
 impl Container for Wire {
-	type Error = Error;
+    type Error = MuxError;
 
-	fn write<W>(
-		&self,
-		output: &mut W,
-		frames: &[Frame],
-	) -> Result<(), Self::Error>
-	where
-		W: FrameWriter<Error = Self::Error>,
-	{
-		let timescale = moq_net::Timescale::new(self.trak.mdia.mdhd.timescale as u64)?;
-		let track_id = self.trak.tkhd.track_id;
-		let sequence_number = output.next_sequence_number();
+    fn write<W>(
+        &self,
+        output: &mut W,
+        frames: &[Frame],
+    ) -> std::result::Result<(), Self::Error>
+    where
+        W: FrameWriter<Error = Self::Error>,
+    {
+        let timescale =
+            moq_net::Timescale::new(self.trak.mdia.mdhd.timescale as u64)?;
 
-		encode(
-			output,
-			frames,
-			timescale,
-			track_id,
-			sequence_number,
-		)
-	}
+        let track_id = self.trak.tkhd.track_id;
+        let sequence_number = output.next_sequence_number();
 
-	fn poll_read(
-		&self,
-		group: &mut moq_net::group::Consumer,
-		waiter: &kio::Waiter,
-	) -> Poll<std::result::Result<Option<Vec<Frame>>, Self::Error>> {
-		use std::task::ready;
+        encode(
+            output,
+            frames,
+            timescale,
+            track_id,
+            sequence_number,
+        )
+    }
 
-		let Some(frame) = ready!(group.poll_read_frame(waiter)?) else {
-			return Poll::Ready(Ok(None));
-		};
+    fn poll_read(
+        &self,
+        group: &mut moq_net::group::Consumer,
+        waiter: &kio::Waiter,
+    ) -> Poll<std::result::Result<Option<Vec<Frame>>, Self::Error>> {
+        use std::task::ready;
 
-		let timescale = moq_net::Timescale::new(
-			self.trak.mdia.mdhd.timescale as u64,
-		)?;
+        let Some(frame) = ready!(group.poll_read_frame(waiter)?) else {
+            return Poll::Ready(Ok(None));
+        };
 
-		Poll::Ready(Ok(Some(decode(frame.payload, timescale)?)))
-	}
+        let timescale =
+            moq_net::Timescale::new(self.trak.mdia.mdhd.timescale as u64)?;
+
+        Poll::Ready(Ok(Some(decode(frame.payload, timescale)?)))
+    }
 }
+
 
 
 pub(crate) fn decode(data: Bytes, timescale: moq_net::Timescale) -> Result<Vec<Frame>> {

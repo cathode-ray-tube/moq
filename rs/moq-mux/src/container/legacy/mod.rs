@@ -6,65 +6,70 @@
 
 use std::task::Poll;
 
-use crate::container::{Container, Frame};
-use crate::container::writer::{FrameWriter, MoqFrameWriter};
+use crate::container::{Container, Frame, FrameWriter};
 
 /// Hang Legacy wire format. Stateless; one instance serves every track.
 #[derive(Default)]
 pub struct Wire;
 
 impl Container for Wire {
-	type Error = crate::Error;
+    type Error = crate::Error;
 
-	fn end(&self, frame: &Frame) -> Option<moq_net::Timestamp> {
-		frame.payload.is_empty().then_some(frame.timestamp)
-	}
+    fn end(&self, frame: &Frame) -> Option<moq_net::Timestamp> {
+        frame.payload.is_empty().then_some(frame.timestamp)
+    }
 
-	fn write<W>(
-	&self,
-	output: &mut W,
-	frames: &[Frame],
-) -> Result<(), Self::Error>
-where
-	W: crate::container::FrameWriter<Error = Self::Error>,
-{
-	for frame in frames {
-		let mut payload = bytes::BytesMut::new();
+    fn write<W>(
+        &self,
+        output: &mut W,
+        frames: &[Frame],
+    ) -> Result<(), Self::Error>
+    where
+        W: FrameWriter<Error = Self::Error>,
+    {
+        for frame in frames {
+            let mut payload = bytes::BytesMut::new();
 
-		let hang_frame = hang::container::Frame {
-			timestamp: frame.timestamp,
-			payload: frame.payload.clone(),
-		};
+            let hang_frame = hang::container::Frame {
+                timestamp: frame.timestamp,
+                payload: frame.payload.clone(),
+            };
 
-		hang_frame.encode(&mut payload)?;
+            hang_frame.encode(&mut payload)?;
 
-		output.write_frame(frame.timestamp, payload.freeze())?;
-	}
+            output.write_frame(frame.timestamp, payload.freeze())?;
+        }
 
-	Ok(())
-}
+        Ok(())
+    }
 
+    fn poll_read(
+        &self,
+        group: &mut moq_net::group::Consumer,
+        waiter: &kio::Waiter,
+    ) -> Poll<Result<Option<Vec<Frame>>, Self::Error>> {
+        use std::task::ready;
 
-	fn poll_read(
-		&self,
-		group: &mut moq_net::group::Consumer,
-		waiter: &kio::Waiter,
-	) -> Poll<Result<Option<Vec<Frame>>, Self::Error>> {
-		use std::task::ready;
+        let Some(data) = ready!(
+            group
+                .poll_read_frame(waiter)
+                .map_err(hang::Error::from)?
+        ) else {
+            return Poll::Ready(Ok(None));
+        };
 
-		let Some(data) = ready!(group.poll_read_frame(waiter).map_err(hang::Error::from)?) else {
-			return Poll::Ready(Ok(None));
-		};
+        let hang_frame = hang::container::Frame::decode(data.payload)?;
 
-		let hang_frame = hang::container::Frame::decode(data.payload)?;
-		Poll::Ready(Ok(Some(vec![Frame {
-			timestamp: hang_frame.timestamp,
-			payload: hang_frame.payload,
-			// Legacy doesn't carry the keyframe bit on the wire; the
-			// wrapping Consumer fills it in from group position.
-			keyframe: false,
-			// Legacy carries no per-frame duration.
-			duration: None,
-		}])))
-	}
+        Poll::Ready(Ok(Some(vec![Frame {
+            timestamp: hang_frame.timestamp,
+            payload: hang_frame.payload,
+
+            // Legacy does not carry the keyframe bit on the wire; the
+            // wrapping Consumer fills it in from group position.
+            keyframe: false,
+
+            // Legacy carries no per-frame duration.
+            duration: None,
+        }])))
+    }
 }

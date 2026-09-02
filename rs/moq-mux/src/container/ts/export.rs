@@ -982,148 +982,207 @@ impl<E: catalog::Catalog> Export<E> {
 	}
 
 	/// Packetize one media frame into an output [`Frame`], re-emitting PAT/PMT
-	/// before video keyframes (and periodically) so receivers can tune in
-	/// mid-stream. The returned frame keeps the source `timestamp` and `keyframe`
-	/// flag so the caller can pace it.
-	fn write_frame(&mut self, name: &str, frame: Frame) -> anyhow::Result<Frame> {
-		let track = self.tracks.get(name).context("missing track")?;
-		let pid = track.pid;
-		let kind = track.kind.clone();
-		let is_video = matches!(kind, Kind::Video(_));
-		let timestamp = frame.timestamp;
-		let keyframe = frame.keyframe;
+/// before video keyframes (and periodically) so receivers can tune in
+/// mid-stream. The returned frame keeps the source `timestamp` and `keyframe`
+/// flag so the caller can pace it.
+fn write_frame(&mut self, name: &str, frame: Frame) -> anyhow::Result<Frame> {
+    let track = self.tracks.get(name).context("missing track")?;
+    let pid = track.pid;
+    let kind = track.kind.clone();
+    let is_video = matches!(kind, Kind::Video(_));
+    let timestamp = frame.timestamp;
+    let keyframe = frame.keyframe;
 
-		// Build the elementary-stream payload for this frame. Video needs the
-		// resolved avcC/hvcC to rewrite length-prefixed NALs as Annex-B. Section-framed
-		// verbatim streams carry no PES payload; the section is written separately below.
-		let es_payload = match &kind {
-			Kind::Video(stream_type) => Some(video_es_payload(*stream_type, track.source.description(), &frame)?),
-			Kind::Aac {
-				object_type,
-				sample_rate,
-				channel_count,
-			} => {
-				let header = adts::write_header(*object_type, *sample_rate, *channel_count, frame.payload.len())?;
-				let mut framed = Vec::with_capacity(7 + frame.payload.len());
-				framed.extend_from_slice(&header);
-				framed.extend_from_slice(&frame.payload);
-				Some(framed)
-			}
-			// Each moq Opus frame is one packet; prefix the Opus-in-TS control header.
-			Kind::Opus { .. } => Some(opus_es_payload(&frame.payload)),
-			// Legacy audio frames were ingested whole (framing header included), so
-			// they pass through untouched. PES-framed verbatim payloads likewise.
-			Kind::Mp2 { .. } | Kind::Ac3 | Kind::Eac3 => Some(frame.payload.to_vec()),
-			Kind::Verbatim {
-				framing: catalog::Framing::Pes,
-				..
-			} => Some(frame.payload.to_vec()),
-			Kind::Verbatim {
-				framing: catalog::Framing::Section,
-				..
-			} => None,
-		};
+    // Store every PES payload as an owned Vec<u8>. This avoids accidentally
+    // inferring an unsized [u8] type from one of the helper functions.
+    let es_payload: Option<Vec<u8>> = match &kind {
+        Kind::Video(stream_type) => Some(
+            video_es_payload(
+                *stream_type,
+                track.source.description(),
+                &frame,
+            )?
+            .to_vec(),
+        ),
 
-		// Author a monotonic decode timeline for reordered video (B-frames). Other kinds
-		// never reorder, so DTS == PTS and the PES stays PTS-only.
-		let dts = if is_video {
-			let pts = to_ticks(frame.timestamp);
-			let track = self.tracks.get_mut(name).context("missing track")?;
-			author_dts(pts, track.dts_reserve, &mut track.last_dts)
-		} else {
-			None
-		};
+        Kind::Aac {
+            object_type,
+            sample_rate,
+            channel_count,
+        } => {
+            let header = adts::write_header(
+                *object_type,
+                *sample_rate,
+                *channel_count,
+                frame.payload.len(),
+            )?;
 
-		let mut out = Vec::with_capacity(TsPacket::SIZE);
+            let mut framed = Vec::with_capacity(7 + frame.payload.len());
+            framed.extend_from_slice(&header);
+            framed.extend_from_slice(&frame.payload);
 
-		// Refresh PSI at keyframes or after the interval lapses.
-		if (is_video && frame.keyframe) || due(frame.timestamp, self.last_psi, PSI_INTERVAL) {
-			let psi = self.psi.as_ref().context("PSI not built")?;
-			let pmt_pid = psi.pmt_pid;
-			let pat = TsPayload::Pat(psi.pat.clone());
-			let pmt = TsPayload::Pmt(psi.pmt.clone());
-			self.write_packet(&mut out, Pid::PAT, None, pat)?;
-			self.write_packet(&mut out, pmt_pid, None, pmt)?;
-			self.last_psi = Some(frame.timestamp);
-		}
+            Some(framed)
+        }
 
-		// Emit each SI entry's sections verbatim: on the revision floor when the
-		// snapshot changed (`dirty`), else once its own repetition interval has
-		// elapsed since the entry last hit the wire. The interval is the table's
-		// repetition requirement, a *floor* between unchanged repeats rather than an
-		// emission grid: an SDT wants 2s where the PSI wants 500ms, and a TDT/TOT
-		// revision held to a 30s grid would deliver the clock up to a whole slot
-		// late and re-assert an already-sent time (#2934). Unknown tables have no
-		// declared interval and fall back to the PSI cadence. `Bytes` clones are
-		// refcount bumps, and only a due entry is collected at all.
-		let pending: Vec<(u16, Vec<Bytes>)> = self
-			.si
-			.iter_mut()
-			.filter(|(_, si)| !si.active.is_empty())
-			.filter(|(_, si)| {
-				let interval = si.interval.unwrap_or(PSI_INTERVAL);
-				// A revision waits only for the revision floor; an unchanged snapshot
-				// waits for the full interval. A deferred revision stays dirty and
-				// carries whatever `active` holds when it finally rides.
-				let due = if si.dirty {
-					SI_REVISION_INTERVAL.min(interval)
-				} else {
-					interval
-				};
-				si_due(frame.timestamp, si.last_emit, due)
-			})
-			.map(|((pid, _), si)| {
-				si.dirty = false;
-				// The anchor never moves backwards. A non-zero interval cannot regress
-				// it on its own (`si_due` saturates, admitting only timestamps strictly
-				// above it), but a zero-interval entry emits on every frame including
-				// reordered (B-frame) timestamps below the anchor, and a catalog update
-				// can raise the interval later; a regressed anchor would then credit
-				// the reorder span against the floor.
-				if si.last_emit.is_none_or(|last| frame.timestamp > last) {
-					si.last_emit = Some(frame.timestamp);
-				}
-				(*pid, si.active.sections().cloned().collect())
-			})
-			.collect();
-		for (pid, sections) in pending {
-			for section in &sections {
-				self.write_section(&mut out, pid, section)?;
-			}
-		}
+        // Each MOQT Opus frame is one packet; prefix the Opus-in-TS control
+        // header.
+        Kind::Opus { .. } => {
+            Some(opus_es_payload(&frame.payload).to_vec())
+        }
 
-		match es_payload {
-			// Section-framed verbatim (SCTE-35, ...) rides in private sections, not PES;
-			// carry the bytes verbatim.
-			None => self.write_section(&mut out, pid, &frame.payload)?,
-			Some(es_payload) => {
-				// Verbatim PES re-emits its original stream_id (falling back to
-				// private_stream_1 for an undecoded stream with none recorded); media
-				// derives it from is_video.
-				let stream_id = match &kind {
-					Kind::Verbatim { stream_id, .. } => Some(stream_id.unwrap_or(StreamId::PRIVATE_STREAM_1)),
-					// Opus is private-data PES, carried under private_stream_1 like ffmpeg.
-					Kind::Opus { .. } => Some(StreamId::PRIVATE_STREAM_1),
-					_ => None,
-				};
-				let unit = PesUnit {
-					pid,
-					is_video,
-					keyframe: frame.keyframe,
-					timestamp: frame.timestamp,
-					dts,
-					stream_id,
-				};
-				self.write_pes(&mut out, &unit, &es_payload)?;
-			}
-		}
-		Ok(Frame {
-			timestamp,
-			duration: None,
-			payload: Bytes::from(out),
-			keyframe,
-		})
-	}
+        // Legacy audio frames were ingested whole, including their framing
+        // header, so they pass through untouched. PES-framed verbatim payloads
+        // likewise pass through unchanged.
+        Kind::Mp2 { .. } | Kind::Ac3 | Kind::Eac3 => {
+            Some(frame.payload.to_vec())
+        }
+
+        Kind::Verbatim {
+            framing: catalog::Framing::Pes,
+            ..
+        } => Some(frame.payload.to_vec()),
+
+        Kind::Verbatim {
+            framing: catalog::Framing::Section,
+            ..
+        } => None,
+    };
+
+    // Author a monotonic decode timeline for reordered video, such as
+    // B-frames. Other kinds never reorder, so DTS == PTS and the PES remains
+    // PTS-only.
+    let dts = if is_video {
+        let pts = to_ticks(frame.timestamp);
+        let track = self
+            .tracks
+            .get_mut(name)
+            .context("missing track")?;
+
+        author_dts(
+            pts,
+            track.dts_reserve,
+            &mut track.last_dts,
+        )
+    } else {
+        None
+    };
+
+    let mut out = Vec::with_capacity(TsPacket::SIZE);
+
+    // Refresh PSI at keyframes or after the interval lapses.
+    if (is_video && frame.keyframe)
+        || due(frame.timestamp, self.last_psi, PSI_INTERVAL)
+    {
+        let psi = self.psi.as_ref().context("PSI not built")?;
+        let pmt_pid = psi.pmt_pid;
+
+        let pat = TsPayload::Pat(psi.pat.clone());
+        let pmt = TsPayload::Pmt(psi.pmt.clone());
+
+        self.write_packet(&mut out, Pid::PAT, None, pat)?;
+        self.write_packet(&mut out, pmt_pid, None, pmt)?;
+
+        self.last_psi = Some(frame.timestamp);
+    }
+
+    // Emit each SI entry's sections verbatim: on the revision floor when the
+    // snapshot changed (`dirty`), otherwise once its own repetition interval
+    // has elapsed since the entry last hit the wire.
+    let pending: Vec<(u16, Vec<Bytes>)> = self
+        .si
+        .iter_mut()
+        .filter(|(_, si)| !si.active.is_empty())
+        .filter(|(_, si)| {
+            let interval = si.interval.unwrap_or(PSI_INTERVAL);
+
+            // A revision waits only for the revision floor; an unchanged
+            // snapshot waits for the full interval.
+            let emit_interval = if si.dirty {
+                SI_REVISION_INTERVAL.min(interval)
+            } else {
+                interval
+            };
+
+            si_due(
+                frame.timestamp,
+                si.last_emit,
+                emit_interval,
+            )
+        })
+        .map(|((pid, _), si)| {
+            si.dirty = false;
+
+            // The anchor never moves backwards. A non-zero interval cannot
+            // regress it on its own because `si_due` admits only timestamps
+            // strictly above it. A zero-interval entry can emit on every frame,
+            // including reordered B-frame timestamps below the anchor.
+            if si
+                .last_emit
+                .is_none_or(|last| frame.timestamp > last)
+            {
+                si.last_emit = Some(frame.timestamp);
+            }
+
+            (
+                *pid,
+                si.active.sections().cloned().collect(),
+            )
+        })
+        .collect();
+
+    for (pid, sections) in pending {
+        for section in &sections {
+            self.write_section(&mut out, pid, section)?;
+        }
+    }
+
+    match es_payload {
+        // Section-framed verbatim streams, such as SCTE-35, ride in private
+        // sections rather than PES. Carry the bytes verbatim.
+        None => {
+            self.write_section(&mut out, pid, &frame.payload)?;
+        }
+
+        Some(es_payload) => {
+            // Verbatim PES re-emits its original stream_id, falling back to
+            // private_stream_1 for an undecoded stream with no recorded ID.
+            // Media derives its stream ID from whether it is video.
+            let stream_id = match &kind {
+                Kind::Verbatim { stream_id, .. } => Some(
+                    stream_id.unwrap_or(StreamId::PRIVATE_STREAM_1),
+                ),
+
+                // Opus is private-data PES carried under private_stream_1,
+                // like FFmpeg.
+                Kind::Opus { .. } => {
+                    Some(StreamId::PRIVATE_STREAM_1)
+                }
+
+                _ => None,
+            };
+
+            let unit = PesUnit {
+                pid,
+                is_video,
+                keyframe: frame.keyframe,
+                timestamp: frame.timestamp,
+                dts,
+                stream_id,
+            };
+
+            // Vec<u8> is automatically coerced to &[u8] here.
+            self.write_pes(&mut out, &unit, &es_payload)?;
+        }
+    }
+
+    Ok(Frame {
+        timestamp,
+        duration: None,
+        payload: Bytes::from(out),
+        keyframe,
+    })
+}
+
 
 	/// Emit the program clock: one adaptation-field-only packet on the PCR PID per
 	/// [`PCR_INTERVAL`] slot of the media timeline, each returned as its own
