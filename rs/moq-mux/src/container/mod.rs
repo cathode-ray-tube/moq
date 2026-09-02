@@ -95,6 +95,9 @@ pub trait FrameWriter {
 		timestamp: moq_net::Timestamp,
 		payload: Bytes,
 	) -> Result<(), Self::Error>;
+
+	/// Returns the sequence number to use for the next output frame.
+	fn next_sequence_number(&self) -> u32;
 }
 
 /// Encode and decode media frames over a moq-lite group.
