@@ -1,3 +1,23 @@
+// TODO(container-writer):
+// The fMP4 encoder currently uses `group.frame_count()` to generate the CMAF
+// fragment sequence number. The new `FrameWriter` abstraction does not expose
+// that value, so the fMP4 write path cannot yet be migrated without changing
+// the writer API or moving sequence-number state elsewhere.
+//
+// When revisiting this migration:
+//
+// 1. Decide where the next CMAF fragment sequence number is owned.
+// 2. Preserve the existing `group.frame_count()` behavior or replace it with
+//    equivalent state that remains correct across buffered writes and group
+//    boundaries.
+// 3. Change `encode()` to build the complete moof+mdat payload before sending
+//    it through `FrameWriter::write_frame()`.
+// 4. Ensure the fragment timestamp remains `frames[0].timestamp`.
+// 5. Update the `Container for Wire` implementation and all callers together.
+//
+// Until then, leave the fMP4 `write()` and `encode()` path using the existing
+// `moq_net::group::Producer` API.
+
 //! Fragmented MP4 (fMP4 / CMAF).
 //!
 //! A widely supported file format that's also a viable wire format.
