@@ -427,7 +427,7 @@ moq --connect https://relay.example.com/anon --broadcast cam.hang import capture
 # Pick devices, resolution, and bitrates:
 moq --connect https://relay.example.com/anon --broadcast cam.hang \
     import capture --camera 0 --width 1280 --height 720 --fps 30 --bitrate 3000000 \
-                   --microphone "MacBook Pro Microphone" --audio-bitrate 64000
+                   --microphone coreaudio:BuiltInMicrophoneDevice --audio-bitrate 64000
 
 # One medium only:
 moq --connect https://relay.example.com/anon --broadcast cam.hang import capture --no-audio
@@ -472,7 +472,7 @@ Microphones:
 ```
 
 ```bash
-# A single window, followed as it moves and resizes (macOS only):
+# Capture a single window (macOS, Windows, or X11):
 moq --connect https://relay.example.com/anon --broadcast win.hang \
     import capture --window 39193 --no-audio
 

@@ -20,7 +20,9 @@ dashboards, fleet rollout) stay downstream.
 - [Keyframe trigger](/quest/m2/keyframe-trigger.md) - an application can ask the built-in capture encoder for a keyframe
 - [QoS](/quest/m2/qos/README.md) - broadcast health counters: network backlog, publisher stats, viewer feedback
 - [Drain](/quest/m2/drain/README.md) - relay restarts drain sessions over GOAWAY instead of hard-dropping them
-- [Quiche](/quest/m2/quiche/README.md) - media-aware transport features in the moq-dev/quiche fork and their moq-uring adoption
+- [Custom QUIC](/quest/m2/quic/README.md) - a maintained Quinn-family fork
+  supplies reliable reset, hierarchical scheduling, qmux, and the next
+  moq-uring backend
 - [Relay memory](/quest/m2/relay-memory/README.md) - relay memory scales with what it serves, not what the fleet knows
 - [PoP skipping](/quest/m2/pop-skipping/README.md) - short cold paths for unpopular broadcasts without losing warm backhaul dedup
 - [E2EE](/quest/m2/e2ee/README.md) - TypeScript and Rust peers interoperate over encrypted broadcasts no relay can decrypt
@@ -40,6 +42,8 @@ dashboards, fleet rollout) stay downstream.
 - [iOS capture](/quest/m2/video-ios.md) - moq-video captures the camera and screen on iOS, reusing the VideoToolbox backend
 - [Android capture](/quest/m2/video-android.md) - Camera2, MediaProjection and MediaCodec, a whole NDK/JNI backend family
 - [VAAPI encode and decode](/quest/m2/video-vaapi.md) - DMA-BUF encode, a decoder we do not have, and dlopen loading, all gated on a moq-dev/vaapi release
+- [Dart on iOS](/quest/m2/dart-ios.md) - prove the shipped iOS native asset actually loads on a device, which no CI can
+- [Dart publish](/quest/m2/dart-publish.md) - the packages are built and dry-run clean but exist nowhere consumers can install from
 - [Dart codec parity](/quest/m2/dart-codecs.md) - Dart is the one binding that cannot originate media
 - [Direct3D11 render import](/quest/m2/render-d3d11.md) - Windows presents without downloading every frame to system memory
 - [#2147](/quest/m2/2147-moq-video-10-bit-hevc-and-av1-support-in-the-nvidia-codec.md) - moq-video: 10-bit HEVC and AV1 support in the NVIDIA codec path
@@ -48,7 +52,6 @@ dashboards, fleet rollout) stay downstream.
 - [#2907](/quest/m2/2907-bind-the-browser-through-moq-ffi-uniffi-instead-of-a.md) - Bind the browser through moq-ffi/UniFFI instead of a second hand-written wasm API
 - [#2822](/quest/m2/2822-moq-wasm-bind-the-datagram-path-append-datagram-recv.md) - moq-wasm: bind the datagram path (append_datagram / recv_datagram)
 - [#2835](/quest/m2/2835-moq-wasm-bind-track-dynamic-so-a-browser-publisher-can.md) - moq-wasm: bind track::Dynamic so a browser publisher can serve cache-miss fetches
-- [#3193](/quest/m2/3193-expose-a-cancellable-route-watch-api-in-python.md) - Expose a cancellable route watch API in Python
 - [#3189](/quest/m2/3189-add-uniffi-defaults-to-caller-constructed-configuration.md) - Add UniFFI defaults to caller-constructed configuration records
 - [Cluster flags](/quest/m2/cluster-flags.md) - a discovery mechanism carries its own prerequisites, so an incomplete cluster config cannot be expressed
 - [#3058](/quest/m2/3058-moq-relay-a-revalidation-re-check-cannot-update-a.md) - moq-relay: a revalidation re-check cannot update a session's tier, and changes its alias only by closing it
@@ -62,3 +65,5 @@ dashboards, fleet rollout) stay downstream.
 - [Windows capture parity](/quest/m2/capture-windows.md) - window, app, system-audio and cursor capture on Windows
 - [Linux capture parity](/quest/m2/capture-linux.md) - window capture, system audio, and a chosen display through the portal
 - [Capture ergonomics](/quest/m2/capture-ergonomics.md) - region capture, audio mixing, and validating format overrides
+- [X11 capture transport](/quest/m2/x11-capture-shm.md) - move X11 capture to shared memory and RandR events instead of a per-frame socket copy
+- [Capture frame buffers](/quest/m2/capture-frame-buffers.md) - stop rebuilding a full-frame buffer every tick in the X11 and Windows backends

@@ -1323,6 +1323,18 @@ impl Consumer {
 		}
 	}
 
+	/// Advance the read cursor to `index`, skipping every frame below it.
+	///
+	/// Unlike [`Self::start_at`], this does not clamp past an evicted requested
+	/// frame. An eviction confined below `index` is ignored, while an eviction at
+	/// or above it still surfaces as [`Error::Lagged`].
+	pub fn skip_to(&mut self, index: u64) {
+		match &mut self.inner {
+			ConsumerKind::Plain(plain) => plain.skip_to(index),
+			ConsumerKind::Spliced(spliced) => spliced.start_at(index),
+		}
+	}
+
 	/// Stop after frame `index` (inclusive), or remove the cap.
 	///
 	/// Reads past the cap end cleanly (`None`), as if the group finished there. Unlike
@@ -1561,6 +1573,15 @@ impl Plain {
 		}
 		self.index = index;
 		// The batch was drained from below the new cursor, so it can't be reused.
+		self.prefetch = Prefetch::default();
+	}
+
+	fn skip_to(&mut self, index: u64) {
+		let index = usize::try_from(index).unwrap_or(usize::MAX);
+		if index <= self.index {
+			return;
+		}
+		self.index = index;
 		self.prefetch = Prefetch::default();
 	}
 

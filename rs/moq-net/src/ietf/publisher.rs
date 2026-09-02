@@ -480,13 +480,14 @@ where
 			None => track::Position::after_group(end.group),
 		});
 		let _ = track.update(subscription);
+		let timescale = msg.properties_wanted.then(|| track.info().timescale);
 
 		// A fill reads the group cache through its own consumer, independent of the
 		// subscription's cursor.
 		let fill = msg
 			.fill
 			.filter(|_| Filter::is_draft20(self.version))
-			.map(|fill| (fill_range(fill, msg.filter, edge.largest), cache));
+			.map(|fill| (fill_range(fill, msg.filter, edge.largest), cache, timescale));
 
 		// Send SubscribeOk on the stream
 		stream.writer.encode(&ietf::SubscribeOk::ID).await?;
@@ -520,11 +521,12 @@ where
 		// The fill (when one was requested) runs alongside on its own fetch stream;
 		// its failures reset that stream and never touch the subscription.
 		let res = {
-			let mut track_serve = TrackServe::new(self.session.clone(), track, request_id, self.version, range);
+			let mut track_serve =
+				TrackServe::new(self.session.clone(), track, request_id, self.version, range, timescale);
 			let serve = async {
 				match fill {
-					Some((fill, cache)) => {
-						let fill = self.run_fill(request_id, priority, fill, cache);
+					Some((fill, cache, timescale)) => {
+						let fill = self.run_fill(request_id, priority, fill, cache, timescale);
 						let track = kio::wait(|waiter| track_serve.poll(waiter));
 						let (res, ()) = futures::join!(track, fill);
 						res
@@ -644,7 +646,14 @@ where
 	/// A fill is a promise once requested. An empty range opens no stream, but a range we
 	/// cannot serve still opens one and resets it right after the FETCH_HEADER, the
 	/// draft's fill-failure signal. Nothing here touches the subscription either way.
-	async fn run_fill(&self, request_id: RequestId, priority: u8, fill: FillServe, track: track::Consumer) {
+	async fn run_fill(
+		&self,
+		request_id: RequestId,
+		priority: u8,
+		fill: FillServe,
+		track: track::Consumer,
+		timescale: Option<Timescale>,
+	) {
 		if matches!(fill, FillServe::Empty) {
 			return;
 		}
@@ -677,7 +686,7 @@ where
 					},
 				)
 				.await?;
-			Self::write_fill_group(&mut stream, group, sequence, skip, until, self.version).await
+			Self::write_fill_group(&mut stream, group, sequence, skip, until, timescale, self.version).await
 		}
 		.await;
 
@@ -710,9 +719,9 @@ where
 		sequence: u64,
 		skip: u64,
 		until: Option<u64>,
+		timescale: Option<Timescale>,
 		version: Version,
 	) -> Result<(), Error> {
-		let timescale = group.timescale();
 		let mut index: u64 = 0;
 		let mut first = true;
 
@@ -841,7 +850,7 @@ where
 		object: u64,
 		first: bool,
 		timestamp: Timestamp,
-		timescale: Timescale,
+		timescale: Option<Timescale>,
 		version: Version,
 	) -> Result<(), Error> {
 		// Serialization Flags: the two low bits encode the subgroup (00 = subgroup
@@ -850,24 +859,27 @@ where
 		const GROUP_ID: u64 = 0x08;
 		const PRIORITY: u64 = 0x10;
 		const PROPERTIES: u64 = 0x20;
+		let properties = if timescale.is_some() { PROPERTIES } else { 0 };
 
 		if first {
 			// The first object must carry its absolute Group and Object IDs. Include the
 			// priority too: "same as the prior object" has no prior to refer to.
-			stream.encode(&(GROUP_ID | OBJECT_ID | PRIORITY | PROPERTIES)).await?;
+			stream.encode(&(GROUP_ID | OBJECT_ID | PRIORITY | properties)).await?;
 			stream.encode(&sequence).await?;
 			stream.encode(&object).await?;
 			stream.encode(&0u8).await?;
 		} else {
 			// Same group and priority; the Object ID is the prior one plus one.
-			stream.encode(&PROPERTIES).await?;
+			stream.encode(&properties).await?;
 		}
 
-		let mut ext = bytes::BytesMut::new();
-		ietf::encode_object_time(&mut ext, timestamp, timescale, version)?;
-		stream.encode(&(ext.len() as u64)).await?;
-		let mut ext = ext.freeze();
-		stream.write_all(&mut ext).await?;
+		if let Some(timescale) = timescale {
+			let mut ext = bytes::BytesMut::new();
+			ietf::encode_object_time(&mut ext, timestamp, timescale, version)?;
+			stream.encode(&(ext.len() as u64)).await?;
+			let mut ext = ext.freeze();
+			stream.write_all(&mut ext).await?;
+		}
 
 		Ok(())
 	}
@@ -1561,6 +1573,7 @@ struct TrackServe<S: crate::transport::poll::Session> {
 	request_id: RequestId,
 	version: Version,
 	range: ServeRange,
+	timescale: Option<Timescale>,
 	children: kio::Tasks<GroupServe<S>>,
 	/// The track finished: the in-flight group machines drain, then FIN.
 	draining: bool,
@@ -1573,6 +1586,7 @@ impl<S: crate::transport::poll::Session> TrackServe<S> {
 		request_id: RequestId,
 		version: Version,
 		range: ServeRange,
+		timescale: Option<Timescale>,
 	) -> Self {
 		match range.start {
 			Some(start) => track.start_at(start.group),
@@ -1590,6 +1604,7 @@ impl<S: crate::transport::poll::Session> TrackServe<S> {
 			request_id,
 			version,
 			range,
+			timescale,
 			children: kio::Tasks::new(),
 			draining: false,
 		}
@@ -1633,7 +1648,7 @@ impl<S: crate::transport::poll::Session> TrackServe<S> {
 						// Object Property) so moq-transport peers get the real PTS. The
 						// units are the track's, declared once in SUBSCRIBE_OK.
 						flags: ietf::GroupFlags {
-							has_extensions: true,
+							has_extensions: self.timescale.is_some(),
 							first_object: slice.skip == 0,
 							..Default::default()
 						},
@@ -1644,7 +1659,7 @@ impl<S: crate::transport::poll::Session> TrackServe<S> {
 						msg,
 						self.track.subscription().priority,
 						group,
-						self.track.info().timescale,
+						self.timescale,
 						self.version,
 						slice,
 					));
@@ -1670,7 +1685,7 @@ struct GroupServe<S: crate::transport::poll::Session> {
 	msg: ietf::GroupHeader,
 	priority: u8,
 	group: group::Consumer,
-	timescale: Timescale,
+	timescale: Option<Timescale>,
 	version: Version,
 	object_delta: u64,
 	state: GroupState<S>,
@@ -1714,11 +1729,11 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 		msg: ietf::GroupHeader,
 		priority: u8,
 		mut group: group::Consumer,
-		timescale: Timescale,
+		timescale: Option<Timescale>,
 		version: Version,
 		slice: GroupSlice,
 	) -> Self {
-		group.start_at(slice.skip);
+		group.skip_to(slice.skip);
 		group.end_at(slice.until.and_then(|until| until.checked_sub(1)));
 		let object_delta = group.index();
 		Self {
@@ -1912,7 +1927,7 @@ fn buffer_object<W: crate::transport::poll::SendStream>(
 	delta: u64,
 	has_extensions: bool,
 	frame: &frame::Consumer,
-	timescale: Timescale,
+	timescale: Option<Timescale>,
 	version: Version,
 ) -> Result<(), Error> {
 	buffer_object_info(
@@ -1932,12 +1947,12 @@ fn buffer_object_info<W: crate::transport::poll::SendStream>(
 	has_extensions: bool,
 	timestamp: Timestamp,
 	size: u64,
-	timescale: Timescale,
+	timescale: Option<Timescale>,
 	version: Version,
 ) -> Result<(), Error> {
 	writer.buffer(&delta)?;
 
-	if has_extensions {
+	if let Some(timescale) = timescale.filter(|_| has_extensions) {
 		// Per-object extension headers carry the frame's presentation timestamp.
 		let mut ext = bytes::BytesMut::new();
 		ietf::encode_object_time(&mut ext, timestamp, timescale, version)?;
@@ -1998,7 +2013,7 @@ mod group_priority_test {
 			msg,
 			200,
 			consumer,
-			Timescale::default(),
+			Some(Timescale::default()),
 			Version::Draft14,
 			GroupSlice::default(),
 		);
@@ -2035,6 +2050,7 @@ mod group_priority_test {
 			RequestId(0),
 			Version::Draft14,
 			ServeRange::default(),
+			Some(Timescale::default()),
 		);
 		kio::wait(|waiter| serve.poll(waiter)).await.unwrap();
 
@@ -2087,7 +2103,7 @@ mod group_priority_test {
 			},
 			0,
 			group,
-			Timescale::default(),
+			Some(Timescale::default()),
 			Version::Draft19,
 			GroupSlice::default(),
 		);
@@ -2135,7 +2151,7 @@ mod group_priority_test {
 			},
 			0,
 			group,
-			Timescale::default(),
+			Some(Timescale::default()),
 			Version::Draft19,
 			GroupSlice::default(),
 		);
@@ -2197,6 +2213,7 @@ mod subscribe_cursor_test {
 			RequestId(1),
 			Version::Draft14,
 			ServeRange::default(),
+			Some(Timescale::default()),
 		);
 		kio::wait(|waiter| serve.poll(waiter)).await.unwrap();
 
@@ -2470,7 +2487,7 @@ mod serve_tests {
 				header(),
 				0,
 				consumer,
-				Timescale::default(),
+				Some(Timescale::default()),
 				Version::Draft20,
 				slice,
 			);

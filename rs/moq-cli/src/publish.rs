@@ -56,12 +56,13 @@ pub struct CaptureArgs {
 	pub camera: Option<Option<String>>,
 
 	/// Capture a whole display, by the id `moq devices` reports. Bare
-	/// `--display` captures the main display. On Linux the desktop portal opens a
-	/// picker dialog and the id is ignored.
+	/// `--display` captures the main display. On Wayland the desktop portal opens
+	/// a picker dialog; X11 accepts the listed monitor id.
 	#[usage(long, group = "video-source", alias = "screen")]
 	pub display: Option<Option<String>>,
 
-	/// Capture a single window, by the id `moq devices` reports. macOS only.
+	/// Capture a single window, by the id `moq devices` reports. Supported on
+	/// macOS, Windows, and X11.
 	#[usage(long, group = "video-source")]
 	pub window: Option<String>,
 
