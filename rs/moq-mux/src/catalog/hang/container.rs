@@ -1,6 +1,13 @@
 use std::task::Poll;
 
-use crate::container::{Container as ContainerTrait, Frame, fmp4, legacy, loc};
+use crate::container::{
+	Container as ContainerTrait,
+	Frame,
+	fmp4,
+	legacy,
+	loc,
+};
+use crate::container::FrameWriter;
 
 /// Runtime-dispatched wire format for a track described by a hang catalog.
 ///
@@ -11,10 +18,12 @@ use crate::container::{Container as ContainerTrait, Frame, fmp4, legacy, loc};
 pub enum Container {
 	/// VarInt timestamp + raw codec bitstream. The original hang wire format.
 	Legacy,
+
 	/// ISO-BMFF moof+mdat fragments. The wrapped [`fmp4::Wire`] holds
 	/// the track's `trak` box so per-frame writes and reads have the
 	/// timescale and track id available.
 	Cmaf(fmp4::Wire),
+
 	/// Low Overhead Container. One LOC frame per moq frame.
 	Loc,
 }
@@ -25,9 +34,13 @@ impl TryFrom<&hang::catalog::Container> for Container {
 	fn try_from(container: &hang::catalog::Container) -> Result<Self, Self::Error> {
 		match container {
 			hang::catalog::Container::Legacy => Ok(Self::Legacy),
-			hang::catalog::Container::Cmaf { init, .. } => Ok(Self::Cmaf(fmp4::Wire::from_init(init)?)),
+			hang::catalog::Container::Cmaf { init, .. } => {
+				Ok(Self::Cmaf(fmp4::Wire::from_init(init)?))
+			}
 			hang::catalog::Container::Loc => Ok(Self::Loc),
-			hang::catalog::Container::Unknown(unknown) => Err(crate::Error::unsupported_container(unknown)),
+			hang::catalog::Container::Unknown(unknown) => {
+				Err(crate::Error::unsupported_container(unknown))
+			}
 		}
 	}
 }
@@ -36,10 +49,17 @@ impl TryFrom<&hang::catalog::Container> for Container {
 ///
 /// The hang spec requires a consumer to ignore a rendition whose container `kind` it does not
 /// recognize, so filter on this instead of failing the entire broadcast.
-pub(crate) fn supported(rendition: &str, container: &hang::catalog::Container) -> bool {
+pub(crate) fn supported(
+	rendition: &str,
+	container: &hang::catalog::Container,
+) -> bool {
 	match container {
 		hang::catalog::Container::Unknown(unknown) => {
-			tracing::warn!(rendition, kind = unknown.kind(), "ignoring unknown container");
+			tracing::warn!(
+				rendition,
+				kind = unknown.kind(),
+				"ignoring unknown container"
+			);
 			false
 		}
 		_ => true,
@@ -57,11 +77,18 @@ impl ContainerTrait for Container {
 		}
 	}
 
-	fn write(&self, group: &mut moq_net::group::Producer, frames: &[Frame]) -> Result<(), Self::Error> {
+	fn write<W>(
+		&self,
+		output: &mut W,
+		frames: &[Frame],
+	) -> Result<(), Self::Error>
+	where
+		W: FrameWriter<Error = Self::Error>,
+	{
 		match self {
-			Self::Legacy => legacy::Wire.write(group, frames),
-			Self::Cmaf(cmaf) => cmaf.write(group, frames).map_err(Into::into),
-			Self::Loc => loc::Wire.write(group, frames),
+			Self::Legacy => legacy::Wire.write(output, frames),
+			Self::Cmaf(cmaf) => cmaf.write(output, frames).map_err(Into::into),
+			Self::Loc => loc::Wire.write(output, frames),
 		}
 	}
 
@@ -72,7 +99,9 @@ impl ContainerTrait for Container {
 	) -> Poll<Result<Option<Vec<Frame>>, Self::Error>> {
 		match self {
 			Self::Legacy => legacy::Wire.poll_read(group, waiter),
-			Self::Cmaf(cmaf) => cmaf.poll_read(group, waiter).map(|r| r.map_err(Into::into)),
+			Self::Cmaf(cmaf) => {
+				cmaf.poll_read(group, waiter).map(|result| result.map_err(Into::into))
+			}
 			Self::Loc => loc::Wire.poll_read(group, waiter),
 		}
 	}
