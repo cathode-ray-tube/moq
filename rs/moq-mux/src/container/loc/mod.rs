@@ -10,6 +10,7 @@ use std::task::Poll;
 use moq_net::{Timescale, Timestamp};
 
 use crate::container::{Container, Frame};
+use crate::container::writer::{FrameWriter, MoqFrameWriter};
 
 /// LOC's catalog convention: timestamps are in microseconds when no per-frame
 /// 0x08 timescale property is present.
@@ -22,24 +23,33 @@ pub struct Wire;
 impl Container for Wire {
 	type Error = crate::Error;
 
-	fn write(&self, group: &mut moq_net::group::Producer, frames: &[Frame]) -> Result<(), Self::Error> {
-		for frame in frames {
-			// LOC's wire format omits per-frame timescale by convention; the catalog
-			// default is microseconds, so convert at the boundary.
-			let timestamp = frame.timestamp.convert(DEFAULT_TIMESCALE).map_err(hang::Error::from)?;
-			let data = moq_loc::encode(timestamp.value(), &frame.payload)?;
+	fn write(
+    &self,
+    group: &mut moq_net::group::Producer,
+    frames: &[Frame],
+) -> Result<(), Self::Error> {
+    let mut writer = MoqFrameWriter { group };
 
-			// Carry the timestamp on the net frame too (converted to the track's
-			// timescale), so a relay sees it without parsing the LOC payload.
-			let mut chunked = group.create_frame(moq_net::frame::Info {
-				size: data.len() as u64,
-				timestamp: frame.timestamp,
-			})?;
-			chunked.write(data)?;
-			chunked.finish()?;
-		}
-		Ok(())
-	}
+    for frame in frames {
+        // LOC's wire format omits the per-frame timescale by convention.
+        // Convert the timestamp to the catalog's default microsecond scale.
+        let timestamp = frame
+            .timestamp
+            .convert(DEFAULT_TIMESCALE)
+            .map_err(hang::Error::from)?;
+
+        let data = moq_loc::encode(timestamp.value(), &frame.payload)?;
+
+        // MoqFrameWriter handles create_frame, write, and finish.
+        //
+        // Use the original timestamp here because the MoQ frame timestamp
+        // should remain in the track's timescale.
+        writer.write_frame(frame.timestamp, data)?;
+    }
+
+    Ok(())
+}
+
 
 	fn poll_read(
 		&self,
