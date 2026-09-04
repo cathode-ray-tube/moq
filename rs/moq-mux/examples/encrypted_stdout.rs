@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use ed25519_dalek::SigningKey;
 use moq_mux::container::{FrameWriter, Sframe};
-use moq_mux::encryption::moq_secure::MoqSecureEncrypter;
+use moq_mux::encryption::moq_secure_adapter::MoqSecureEncrypter;
 use moq_secure::key_store::InMemoryKeyStore;
 use std::io::{self, Write};
 
