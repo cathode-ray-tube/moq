@@ -36,6 +36,7 @@ mod pace;
 pub mod select;
 mod source;
 pub mod timeline;
+pub mod encryption;
 
 pub use clock::Clock;
 pub use error::*;
