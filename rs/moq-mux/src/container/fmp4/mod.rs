@@ -248,7 +248,7 @@ impl Container for Wire {
         frames: &[Frame],
     ) -> std::result::Result<(), Self::Error>
     where
-        W: FrameWriter<Error = Self::Error>,
+       W: FrameWriter<Error = crate::error::Error>
     {
         let timescale =
             moq_net::Timescale::new(self.trak.mdia.mdhd.timescale as u64)?;
@@ -373,34 +373,33 @@ pub(crate) fn decode(data: Bytes, timescale: moq_net::Timescale) -> Result<Vec<F
 }
 
 pub(crate) fn encode<W>(
-	output: &mut W,
-	frames: &[Frame],
-	timescale: moq_net::Timescale,
-	track_id: u32,
-	sequence_number: u32,
-) -> Result<()>
+    output: &mut W,
+    frames: &[Frame],
+    timescale: moq_net::Timescale,
+    track_id: u32,
+    sequence_number: u32,
+) -> crate::error::Result<()>
 where
-	W: FrameWriter<Error = Error>,
+    W: FrameWriter<Error = crate::error::Error>,
 {
-	if frames.is_empty() {
-		return Ok(());
-	}
+    if frames.is_empty() {
+        return Ok(());
+    }
 
-	let info = FragmentInfo {
-		track_id,
-		timescale,
-		sequence_number,
-	};
+    let info = FragmentInfo {
+        track_id,
+        timescale,
+        sequence_number,
+    };
 
-	let bytes = encode_fragment(info, frames)?;
+    let bytes = encode_fragment(info, frames)?;
 
-	// The fragment may carry several samples; the net frame's timestamp is the
-	// fragment's earliest presentation time so a relay can order it.
-	output.write_frame(frames[0].timestamp, bytes)?;
+    // The fragment may carry several samples; the net frame's timestamp is the
+    // fragment's earliest presentation time so a relay can order it.
+    output.write_frame(frames[0].timestamp, bytes)?;
 
-	Ok(())
+    Ok(())
 }
-
 
 /// Which track a fragment belongs to, and where it sits in that track.
 ///

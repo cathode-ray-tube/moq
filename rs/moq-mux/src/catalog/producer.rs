@@ -422,14 +422,19 @@ impl<E: CatalogExt> Producer<E> {
 	///
 	/// The broadcast's one timeline track is created (and advertised in the catalog's root
 	/// `timeline` section) on first use; see [`timeline`](crate::timeline) for the whole model.
-	pub fn media_producer<C: crate::container::Container>(
-		&mut self,
-		track: moq_net::track::Producer,
-		container: C,
-	) -> crate::Result<crate::container::Producer<C>> {
-		let recorder = self.enroll(track.name())?;
-		Ok(crate::container::Producer::new(track, container).with_recorder(recorder))
-	}
+	pub fn media_producer<
+    C: crate::container::Container<Error = crate::error::Error>,
+    >(
+    &mut self,
+    track: moq_net::track::Producer,
+    container: C,
+     ) -> crate::Result<crate::container::Producer<C>> {
+    let recorder = self.enroll(track.name())?;
+
+    Ok(crate::container::Producer::new(track, container)
+        .with_recorder(recorder))
+    }
+
 
 	/// Enroll `track` in the broadcast's timeline, advertising the timeline in the catalog's
 	/// root section the first time.

@@ -1,276 +1,242 @@
+use crate::encryption::EncryptionError;
+
 /// Renders an error and its `source()` chain into a single message.
 ///
-/// Dependency errors are stored as messages so their crates stay out of this crate's public
-/// API. Several of them keep the actionable half in `source()` and nothing but a category in
-/// `Display`, so a plain `to_string()` would drop the only detail worth reporting.
+/// Dependency errors are stored as messages so their crates stay out of this
+/// crate's public API. Several of them keep the actionable half in
+/// `source()` and nothing but a category in `Display`, so a plain
+/// `to_string()` would drop the only detail worth reporting.
 pub(crate) fn message(err: impl std::error::Error) -> String {
-	use std::fmt::Write;
+    use std::fmt::Write;
 
-	let mut out = err.to_string();
-	let mut source = err.source();
-	while let Some(err) = source {
-		let _ = write!(out, ": {err}");
-		source = err.source();
-	}
-	out
-}
+    let mut out = err.to_string();
+    let mut source = err.source();
 
-/// Placeholder errors for the future encryption layer.
-///
-/// Keeping this type in `moq-mux` means the public error contract can include
-/// encryption failures before the actual encryption implementation exists.
-///
-/// To support different encryption libs, an adapter to map to this error behind a 
-/// Cargo feature could be used.
-#[derive(Debug, Clone, thiserror::Error)]
-#[non_exhaustive]
-pub enum EncryptionError {
-    #[error("encryption is not implemented")]
-    NotImplemented,
+    while let Some(err) = source {
+        let _ = write!(out, ": {err}");
+        source = err.source();
+    }
 
-    #[error("{0}")]
-    Message(String),
+    out
 }
 
 /// Errors from moq-mux operations.
 ///
-/// Most variants are delegations to underlying layers: [`moq_net::Error`] for
-/// transport / pub-sub failures, [`hang::Error`] for catalog/codec parsing, the
-/// per-format Errors for container shape problems, and the per-codec Errors for
-/// bitstream parsing problems.
+/// Most variants are delegations to underlying layers: [`moq_net::Error`]
+/// for transport / pub-sub failures, [`hang::Error`] for catalog/codec
+/// parsing, the per-format errors for container shape problems, and the
+/// per-codec errors for bitstream parsing problems.
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-	/// Error from the underlying moq-net transport.
-	#[error("moq: {0}")]
-	Moq(#[from] moq_net::Error),
+    /// Error from the underlying moq-net transport.
+    #[error("moq: {0}")]
+    Moq(#[from] moq_net::Error),
 
-	/// Error from the hang catalog/codec layer.
-	#[error("hang: {0}")]
-	Hang(#[from] hang::Error),
+    /// Error from the hang catalog/codec layer.
+    #[error("hang: {0}")]
+    Hang(#[from] hang::Error),
 
-	/// Error publishing or consuming JSON over a track.
-	#[error("json: {0}")]
-	Json(#[from] moq_json::Error),
+    /// Error publishing or consuming JSON over a track.
+    #[error("json: {0}")]
+    Json(#[from] moq_json::Error),
 
-	/// Error publishing or consuming binary payloads over a track.
-	#[error("binary: {0}")]
-	Binary(#[from] moq_binary::Error),
+    /// Error publishing or consuming binary payloads over a track.
+    #[error("binary: {0}")]
+    Binary(#[from] moq_binary::Error),
 
-	/// A catalog entry declares a track mode this build does not implement.
-	#[error("unsupported track mode: {0}")]
-	UnsupportedMode(String),
+    /// A catalog entry declares a track mode this build does not implement.
+    #[error("unsupported track mode: {0}")]
+    UnsupportedMode(String),
 
-	/// A catalog entry declares a compression this build does not implement.
-	#[error("unsupported track compression: {0}")]
-	UnsupportedCompression(String),
+    /// A catalog entry declares a compression this build does not implement.
+    #[error("unsupported track compression: {0}")]
+    UnsupportedCompression(String),
 
-	/// Error parsing or building CMAF moof+mdat fragments.
-	#[error("cmaf: {0}")]
-	Cmaf(#[from] crate::container::fmp4::Error),
+    /// Error parsing or building CMAF moof+mdat fragments.
+    #[error("cmaf: {0}")]
+    Cmaf(#[from] crate::container::fmp4::Error),
 
-	/// Error parsing or building MKV / WebM streams.
-	#[error("mkv: {0}")]
-	Mkv(#[from] crate::container::mkv::Error),
+    /// Error parsing or building MKV / WebM streams.
+    #[error("mkv: {0}")]
+    Mkv(#[from] crate::container::mkv::Error),
 
-	/// Error decoding the MSF catalog.
-	#[error("msf: {0}")]
-	Msf(#[from] crate::catalog::msf::Error),
+    /// Error decoding the MSF catalog.
+    #[error("msf: {0}")]
+    Msf(#[from] crate::catalog::msf::Error),
 
-	/// Error parsing or building LOC frames.
-	#[error("loc: {0}")]
-	Loc(#[from] moq_loc::Error),
+    /// Error parsing or building LOC frames.
+    #[error("loc: {0}")]
+    Loc(#[from] moq_loc::Error),
 
-	/// Error parsing an Annex B NAL stream.
-	#[error("annexb: {0}")]
-	Annexb(#[from] crate::codec::annexb::Error),
+    /// Error parsing an Annex B NAL stream.
+    #[error("annexb: {0}")]
+    Annexb(#[from] crate::codec::annexb::Error),
 
-	/// Error parsing AAC.
-	#[error("aac: {0}")]
-	Aac(#[from] crate::codec::aac::Error),
+    /// Error parsing AAC.
+    #[error("aac: {0}")]
+    Aac(#[from] crate::codec::aac::Error),
 
-	/// Error parsing Opus.
-	#[error("opus: {0}")]
-	Opus(#[from] crate::codec::opus::Error),
+    /// Error parsing Opus.
+    #[error("opus: {0}")]
+    Opus(#[from] crate::codec::opus::Error),
 
-	/// Error parsing FLAC.
-	#[error("flac: {0}")]
-	Flac(#[from] crate::codec::flac::Error),
+    /// Error parsing FLAC.
+    #[error("flac: {0}")]
+    Flac(#[from] crate::codec::flac::Error),
 
-	/// Error parsing MP3.
-	#[error("mp3: {0}")]
-	Mp3(#[from] crate::codec::mp3::Error),
+    /// Error parsing MP3.
+    #[error("mp3: {0}")]
+    Mp3(#[from] crate::codec::mp3::Error),
 
-	/// Error parsing H.264.
-	#[error("h264: {0}")]
-	H264(#[from] crate::codec::h264::Error),
+    /// Error parsing H.264.
+    #[error("h264: {0}")]
+    H264(#[from] crate::codec::h264::Error),
 
-	/// Error parsing H.265.
-	#[error("h265: {0}")]
-	H265(#[from] crate::codec::h265::Error),
+    /// Error parsing H.265.
+    #[error("h265: {0}")]
+    H265(#[from] crate::codec::h265::Error),
 
-	/// Error parsing AV1.
-	#[error("av1: {0}")]
-	Av1(#[from] crate::codec::av1::Error),
+    /// Error parsing AV1.
+    #[error("av1: {0}")]
+    Av1(#[from] crate::codec::av1::Error),
 
-	/// Error parsing VP8.
-	#[error("vp8: {0}")]
-	Vp8(#[from] crate::codec::vp8::Error),
+    /// Error parsing VP8.
+    #[error("vp8: {0}")]
+    Vp8(#[from] crate::codec::vp8::Error),
 
-	/// Error parsing VP9.
-	#[error("vp9: {0}")]
-	Vp9(#[from] crate::codec::vp9::Error),
+    /// Error parsing VP9.
+    #[error("vp9: {0}")]
+    Vp9(#[from] crate::codec::vp9::Error),
 
-	/// Error parsing legacy audio (MP2 / AC-3 / E-AC-3).
-	#[error("legacy: {0}")]
-	Legacy(#[from] crate::codec::legacy::Error),
+    /// Error parsing legacy audio (MP2 / AC-3 / E-AC-3).
+    #[error("legacy: {0}")]
+    Legacy(#[from] crate::codec::legacy::Error),
 
-	/// Timestamp overflow when converting between timescales.
-	#[error("timestamp overflow")]
-	TimestampOverflow(#[from] moq_net::TimeOverflow),
+    /// Timestamp overflow when converting between timescales.
+    #[error("timestamp overflow")]
+    TimestampOverflow(#[from] moq_net::TimeOverflow),
 
-	/// Error decoding or encoding an mp4 atom.
-	#[error("mp4: {0}")]
-	Mp4(std::sync::Arc<mp4_atom::Error>),
+    /// Error decoding or encoding an mp4 atom.
+    #[error("mp4: {0}")]
+    Mp4(std::sync::Arc<mp4_atom::Error>),
 
-	/// I/O error.
-	#[error("io: {0}")]
-	Io(std::sync::Arc<std::io::Error>),
+    /// I/O error.
+    #[error("io: {0}")]
+    Io(std::sync::Arc<std::io::Error>),
 
-	/// URL parse error.
-	#[error("url: {0}")]
-	Url(String),
+    /// URL parse error.
+    #[error("url: {0}")]
+    Url(String),
 
-	/// Unknown media format.
-	#[error("unknown format: {0}")]
-	UnknownFormat(String),
+    /// Unknown media format.
+    #[error("unknown format: {0}")]
+    UnknownFormat(String),
 
-	/// A video format that a raw byte stream cannot be split into.
-	///
-	/// Only the self-delimiting codecs (Annex-B H.264/H.265, AV1 OBUs) carry their own frame
-	/// boundaries. The rest need length prefixes or an out-of-band config record, so they can only
-	/// be imported as whole frames via [`Track::video`](crate::import::Track::video).
-	#[error("{0} is not self-describing, so its frame boundaries can't be inferred from a stream")]
-	NotSelfDescribing(String),
+    /// A video format that a raw byte stream cannot be split into.
+    #[error("{0} is not self-describing, so its frame boundaries can't be inferred from a stream")]
+    NotSelfDescribing(String),
 
-	/// A format was handed to a constructor for a different kind of import.
-	///
-	/// Each entry point takes only the fields its kind can honor, so the format has to match: an
-	/// audio format carries no video hint, and a container has no single rendition to label.
-	#[error("{format} is a {actual} format, not {wanted}")]
-	WrongKind {
-		/// The format string the caller passed.
-		format: String,
-		/// The kind that actually handles it.
-		actual: &'static str,
-		/// The kind the constructor expected.
-		wanted: &'static str,
-	},
+    /// A format was handed to a constructor for a different kind of import.
+    #[error("{format} is a {actual} format, not {wanted}")]
+    WrongKind {
+        format: String,
+        actual: &'static str,
+        wanted: &'static str,
+    },
 
-     /// Error from the future encryption layer.
+    /// Error from the encryption layer.
     #[error("encryption: {0}")]
     Encryption(#[from] EncryptionError),
 
-	/// A non-keyframe frame was received before any keyframe opened a group.
-	/// A track joining mid-stream should skip frames until the first keyframe.
-	#[error("{0}")]
-	MissingKeyframe(#[from] crate::container::MissingKeyframe),
+    /// A non-keyframe frame was received before any keyframe opened a group.
+    #[error("{0}")]
+    MissingKeyframe(#[from] crate::container::MissingKeyframe),
 
-	/// A FLV video frame resolved to a negative presentation timestamp.
-	#[error("negative FLV video presentation timestamp: dts={dts_ms}ms composition_time={composition_time_ms}ms")]
-	NegativeFlvPts {
-		/// The FLV tag decode timestamp in milliseconds.
-		dts_ms: u64,
-		/// The signed FLV composition-time offset in milliseconds.
-		composition_time_ms: i32,
-	},
+    /// A FLV video frame resolved to a negative presentation timestamp.
+    #[error(
+        "negative FLV video presentation timestamp: \
+         dts={dts_ms}ms composition_time={composition_time_ms}ms"
+    )]
+    NegativeFlvPts {
+        dts_ms: u64,
+        composition_time_ms: i32,
+    },
 
-	/// A segment ran past the [`duration_max`](crate::timeline::Config::duration_max) the
-	/// catalog advertised, so the timeline stopped publishing rather than contradict it. The
-	/// publisher declared a bound its media can't honor.
-	#[error("timeline segment {segment} lasted {duration:?}, over the declared maximum {duration_max:?}")]
-	TimelineOverrun {
-		/// The segment that broke the bound.
-		segment: u64,
-		/// How long it actually ran.
-		duration: std::time::Duration,
-		/// The bound the catalog advertised.
-		duration_max: std::time::Duration,
-	},
+    /// A segment ran past the advertised maximum duration.
+    #[error(
+        "timeline segment {segment} lasted {duration:?}, \
+         over the declared maximum {duration_max:?}"
+    )]
+    TimelineOverrun {
+        segment: u64,
+        duration: std::time::Duration,
+        duration_max: std::time::Duration,
+    },
 
-	/// [`timeline::Producer::finish`](crate::timeline::Producer::finish) was called before its
-	/// deferred [`timeline::Segmenter`](crate::timeline::Segmenter) completed and every record
-	/// was committed.
-	#[error("finish and commit every deferred timeline record before closing the Producer")]
-	TimelineDeferredPending,
+    /// `Producer::finish` was called while deferred records remained pending.
+    #[error("finish and commit every deferred timeline record before closing the Producer")]
+    TimelineDeferredPending,
 
-	/// [`timeline::Producer::push`](crate::timeline::Producer::push) received a pending record that
-	/// its [`timeline::Deferred`](crate::timeline::Deferred) did not yield.
-	#[error("timeline segment {0} was not yielded for deferred publication")]
-	TimelineDeferredRecord(u64),
+    /// A pending record was not yielded by its deferred publisher.
+    #[error("timeline segment {0} was not yielded for deferred publication")]
+    TimelineDeferredRecord(u64),
 
-	/// Error from a muxer/demuxer that reports via `anyhow` (currently MPEG-TS).
-	/// Boxed in an `Arc` so the enum stays `Clone` (`anyhow::Error` is not).
-	#[error("{0}")]
-	Other(std::sync::Arc<anyhow::Error>),
+    /// Error from a muxer/demuxer that reports via `anyhow`.
+    #[error("{0}")]
+    Other(std::sync::Arc<anyhow::Error>),
 
-	/// A timeline catalog section declared a timescale that isn't a valid
-	/// [`moq_net::Timescale`] (zero, or too large).
-	#[error("invalid timeline timescale: {0}")]
-	InvalidTimescale(u32),
+    /// A timeline catalog section declared an invalid timescale.
+    #[error("invalid timeline timescale: {0}")]
+    InvalidTimescale(u32),
 
-	/// Tried to set an application catalog section whose name collides with a
-	/// reserved media section (`video`/`audio`).
-	#[error("reserved catalog section: {0}")]
-	ReservedSection(String),
+    /// An application catalog section used a reserved name.
+    #[error("reserved catalog section: {0}")]
+    ReservedSection(String),
 
-	/// A rendition declared a container `kind` this build does not recognize, so its
-	/// frames cannot be parsed. Such a rendition must be ignored, not guessed at.
-	#[error("unsupported container: {0}")]
-	UnsupportedContainer(String),
+    /// A rendition declared an unsupported container.
+    #[error("unsupported container: {0}")]
+    UnsupportedContainer(String),
 
-	/// A rendition's `broadcast` reference walks above the root, so it names no broadcast.
-	///
-	/// The root is the consumer's authorized subtree, so such a reference is an attempt to
-	/// name content the consumer cannot reach. It rejects the whole catalog
-	/// ([`catalog::hang::Consumer`](crate::catalog::hang::Consumer)) rather than the one
-	/// rendition, and is also what a direct [`Source::resolve`](crate::Source::resolve) /
-	/// [`Source::subscribe_track`](crate::Source::subscribe_track) reports.
-	#[error("broadcast reference escapes the root: {0}")]
-	EscapingBroadcast(String),
+    /// A broadcast reference escapes the consumer's authorized root.
+    #[error("broadcast reference escapes the root: {0}")]
+    EscapingBroadcast(String),
 }
 
 impl Error {
-	/// The error for a rendition whose container this build does not recognize.
-	pub(crate) fn unsupported_container(container: &hang::catalog::UnknownContainer) -> Self {
-		Self::UnsupportedContainer(container.kind().unwrap_or("<missing>").to_string())
-	}
+    pub(crate) fn unsupported_container(
+        container: &hang::catalog::UnknownContainer,
+    ) -> Self {
+        Self::UnsupportedContainer(
+            container.kind().unwrap_or("<missing>").to_string(),
+        )
+    }
 }
 
 impl From<anyhow::Error> for Error {
-	fn from(err: anyhow::Error) -> Self {
-		Error::Other(std::sync::Arc::new(err))
-	}
+    fn from(err: anyhow::Error) -> Self {
+        Self::Other(std::sync::Arc::new(err))
+    }
 }
 
 impl From<mp4_atom::Error> for Error {
-	fn from(err: mp4_atom::Error) -> Self {
-		Error::Mp4(std::sync::Arc::new(err))
-	}
+    fn from(err: mp4_atom::Error) -> Self {
+        Self::Mp4(std::sync::Arc::new(err))
+    }
 }
 
 // Flattened to its message so `url` stays out of this crate's public API.
 impl From<url::ParseError> for Error {
-	fn from(err: url::ParseError) -> Self {
-		Error::Url(message(err))
-	}
+    fn from(err: url::ParseError) -> Self {
+        Self::Url(message(err))
+    }
 }
 
 impl From<std::io::Error> for Error {
-	fn from(err: std::io::Error) -> Self {
-		Error::Io(std::sync::Arc::new(err))
-	}
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(std::sync::Arc::new(err))
+    }
 }
 
-/// A Result type alias for moq-mux operations.
+/// A result type alias for moq-mux operations.
 pub type Result<T> = std::result::Result<T, Error>;

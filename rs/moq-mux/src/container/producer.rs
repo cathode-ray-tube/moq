@@ -88,7 +88,7 @@ pub struct Producer<C: Container> {
 	estimator: crate::catalog::Estimator,
 }
 
-impl<C: Container> Producer<C> {
+impl<C: Container<Error = crate::error::Error>> Producer<C> {
 	/// Create a Producer wrapping the given moq-lite producer, muxing into `container`.
 	///
 	/// A plain media track by default: no buffering, no timeline. Add buffering with
