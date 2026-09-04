@@ -24,7 +24,7 @@ moq-binary = { workspace = true }
 moq-json = { workspace = true }
 moq-loc = { workspace = true }
 moq-msf = { workspace = true }
-moq-secure = { path = "../../../moq-secure" }
+moq-secure = { path = "../../../moq-secure/rs/moq-secure" }
 moq-net = { workspace = true }
 mp4-atom = { version = "0.15", features = ["tokio", "bytes", "serde"] }
 mpeg2ts = "0.6.0"
