@@ -1,8 +1,8 @@
 mod error;
 
-pub mod moq_secure;
+pub mod moq_secure_adapter;
 
 pub use error::EncryptionError;
 
-pub use moq_secure::MoqSecureEncrypter;
+pub use moq_secure_adapter::MoqSecureEncrypter;
 
