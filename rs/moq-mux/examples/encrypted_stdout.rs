@@ -2,15 +2,16 @@ use bytes::Bytes;
 use ed25519_dalek::SigningKey;
 use moq_mux::container::{FrameWriter, Sframe};
 use moq_mux::encryption::moq_secure_adapter::MoqSecureEncrypter;
+use moq_mux::Error;
 use moq_secure::key_store::InMemoryKeyStore;
 use std::io::{self, Write};
+use std::sync::Arc;
 
 struct StdoutWriter {
     sequence_number: u32,
 }
-
 impl FrameWriter for StdoutWriter {
-    type Error = moq_mux::error::Error;
+    type Error = Error;
 
     fn write_frame(
         &mut self,
@@ -26,10 +27,10 @@ impl FrameWriter for StdoutWriter {
             timestamp,
             payload.len()
         )
-        .map_err(moq_mux::error::Error::Io)?;
+        .map_err(|error| Error::Io(Arc::new(error)))?;
 
         writeln!(stdout, "{}", hex::encode(&payload))
-            .map_err(moq_mux::error::Error::Io)?;
+            .map_err(|error| Error::Io(Arc::new(error)))?;
 
         self.sequence_number += 1;
         Ok(())
@@ -39,6 +40,7 @@ impl FrameWriter for StdoutWriter {
         self.sequence_number
     }
 }
+
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut key_store = InMemoryKeyStore::empty();
