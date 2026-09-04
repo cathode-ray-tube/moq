@@ -35,7 +35,7 @@ pub use group::GroupConsumer;
 pub use producer::Producer;
 pub(crate) use source::ExportSource;
 
-pub use crate::error::ContainerError;
+pub use crate::error::Error;
 
 pub use writer::{
     FrameEncrypter,
