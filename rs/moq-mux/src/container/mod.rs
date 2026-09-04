@@ -21,7 +21,6 @@ mod source;
 #[cfg(test)]
 pub(crate) mod test_util;
 
-pub mod error;
 pub mod writer;
 
 pub mod flv;
