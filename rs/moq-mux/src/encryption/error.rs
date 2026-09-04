@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum EncryptionError {
     #[error("encryption is not implemented")]
     NotImplemented,
