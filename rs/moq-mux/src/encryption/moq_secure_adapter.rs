@@ -1,4 +1,4 @@
-// src/encryption/moq_secure.rs
+// src/encryption/moq_secure_adapter.rs
 
 use bytes::Bytes;
 use ed25519_dalek::SigningKey;
