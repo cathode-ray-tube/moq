@@ -615,9 +615,7 @@ async fn broadcast_moq_lite_05_default_timescale() {
 async fn broadcast_moq_transport_20_current_group_join() {
 	let pub_origin = moq_tokio::origin::spawn(Hop::random());
 	let mut broadcast = pub_origin.create_broadcast("test").expect("create broadcast");
-	let _announce_broadcast = pub_origin
-		.announce("test", Default::default())
-		.expect("create broadcast");
+	let announce_broadcast = pub_origin.announce("test", Default::default()).expect("announce");
 	let mut track = broadcast.create_track("video", None).expect("create track");
 
 	// The group is left open, so the subscriber joins part way through it: the two head
@@ -652,6 +650,7 @@ async fn broadcast_moq_transport_20_current_group_join() {
 		let session = request.with_publisher(&pub_origin).ok().await?;
 		let _broadcast = broadcast;
 		let _track = track;
+		let _announce = announce_broadcast;
 		let _ = session.closed().await;
 		Ok::<_, anyhow::Error>(())
 	});
@@ -663,6 +662,7 @@ async fn broadcast_moq_transport_20_current_group_join() {
 		.expect("connect failed");
 
 	let announced = next_announce(&mut announcements).await;
+	assert_eq!(announced.prefix.as_path().as_str(), "test");
 	assert!(announced.active, "expected an announce");
 	let remote = tokio::time::timeout(TIMEOUT, sub_consumer.request_broadcast(announced.prefix.as_path()))
 		.await
