@@ -1954,18 +1954,16 @@ fn poll_recv_next(
 ) -> Poll<Result<Recv, Error>> {
 	{
 		let mut groups_finished = false;
-		match track.poll_recv_group(waiter) {
-			Poll::Ready(Ok(Some(group))) => return Poll::Ready(Ok(Recv::Group(group))),
-			Poll::Ready(Ok(None)) => groups_finished = true,
-			Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+		match track.poll_recv_group(waiter)? {
+			Poll::Ready(Some(group)) => return Poll::Ready(Ok(Recv::Group(group))),
+			Poll::Ready(None) => groups_finished = true,
 			Poll::Pending => {}
 		}
 		if datagrams {
-			match track.poll_recv_datagram(waiter) {
-				Poll::Ready(Ok(Some(datagram))) => return Poll::Ready(Ok(Recv::Datagram(datagram))),
+			match track.poll_recv_datagram(waiter)? {
+				Poll::Ready(Some(datagram)) => return Poll::Ready(Ok(Recv::Datagram(datagram))),
 				// Datagram side finished but groups are still paused/pending: keep waiting on groups.
-				Poll::Ready(Ok(None)) => {}
-				Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+				Poll::Ready(None) => {}
 				Poll::Pending => {}
 			}
 		}
@@ -2443,8 +2441,8 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 					// Queue and SUBSCRIBE_UPDATE priority changes apply on every pass,
 					// whatever the write pipeline is blocked on. The rank is re-read as
 					// a send order when handled, since the two conventions are inverted.
-					while self.priority.poll_next(waiter).is_ready() {
-						writer.set_priority(self.priority.send_order());
+					while let Poll::Ready(rank) = self.priority.poll_next(waiter) {
+						writer.set_priority(PriorityHandle::send_order_of(rank));
 					}
 					let seen = self.ctx.track_priority_seen;
 					// A dropped producer just disables this arm, like the queue arm above.
@@ -2456,8 +2454,8 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 						}
 					}) {
 						self.ctx.track_priority_seen = value;
-						self.priority.set_track(value);
-						writer.set_priority(self.priority.send_order());
+						let rank = self.priority.set_track(value);
+						writer.set_priority(PriorityHandle::send_order_of(rank));
 					}
 
 					let outcome = 'serve: {

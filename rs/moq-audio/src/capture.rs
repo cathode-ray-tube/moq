@@ -208,6 +208,15 @@ pub(crate) enum Stream {
 }
 
 impl Stream {
+	/// The concrete microphone currently in use, if this is a microphone stream.
+	pub(crate) fn device(&self) -> Option<&Device> {
+		match self {
+			Self::Microphone(mic) => Some(&mic.device),
+			#[cfg(target_os = "macos")]
+			Self::System(_) => None,
+		}
+	}
+
 	/// The PCM layout this opened stream actually delivers.
 	pub(crate) fn layout(&self) -> Layout {
 		match self {
@@ -238,7 +247,7 @@ pub(crate) async fn format(config: &Config) -> Result<Layout, Failure> {
 			// cpal enumerates devices with blocking host I/O, so keep it off the
 			// runtime's worker threads.
 			tokio::task::spawn_blocking(move || {
-				let (_, _, stream_config) = resolve(device.as_deref(), &config)?;
+				let (_, _, _, stream_config) = resolve(device.as_deref(), &config)?;
 				Ok(Layout {
 					sample_rate: stream_config.sample_rate,
 					channels: stream_config.channels as u32,
@@ -286,6 +295,8 @@ pub(crate) struct Microphone {
 	pending: Option<Samples>,
 	/// The format cpal negotiated for this stream generation.
 	layout: Layout,
+	/// The concrete device selected for this stream generation.
+	device: Device,
 }
 
 /// The async half of a microphone stream, separate from the cpal handle so its
@@ -344,7 +355,7 @@ impl Microphone {
 		// stream that silently delivers nothing. A no-op on other platforms.
 		permission::ensure_microphone_access().await.map_err(Failure::fatal)?;
 
-		let (device, sample_format, stream_config) = resolve(selector, config)?;
+		let (device, current, sample_format, stream_config) = resolve(selector, config)?;
 		let sample_rate = stream_config.sample_rate;
 		let channels = stream_config.channels as u32;
 
@@ -428,6 +439,7 @@ impl Microphone {
 			reader,
 			pending: Some(pending),
 			layout: Layout { sample_rate, channels },
+			device: current,
 		})
 	}
 
@@ -443,19 +455,25 @@ impl Microphone {
 }
 
 /// An audio input reported by [`devices`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Device {
 	/// Opaque identifier: pass to [`Source::Microphone`].
 	///
-	/// cpal exposes no identifier other than the device name, so this currently
-	/// equals [`name`](Self::name). Match on `id` anyway: it is what
-	/// [`source`](Self::source) uses, so a host that grows a stable id later
-	/// won't change this API.
+	/// This is cpal's `host:device` id, so it is stable across restarts and
+	/// unique even when two inputs share a [`name`](Self::name).
 	pub id: String,
 	/// Human-readable name, e.g. "MacBook Pro Microphone".
 	pub name: String,
 	/// Whether this is the system default input.
+	///
+	/// True for at most one device: the preferred host's default. Another host's
+	/// default is that host's, not the system's.
 	pub default: bool,
+	/// The host API this device is reached through, e.g. "PipeWire" or "ALSA".
+	///
+	/// The same hardware is usually reachable through several, so a caller that
+	/// offers a choice groups by this.
+	pub host: String,
 }
 
 impl Device {
@@ -472,20 +490,59 @@ pub async fn devices() -> Result<Vec<Device>, Error> {
 
 /// The blocking half of [`devices`].
 fn list() -> Result<Vec<Device>, Error> {
-	let host = cpal::default_host();
-	let default = host.default_input_device().map(|d| d.to_string());
-	Ok(host
-		.input_devices()
-		.map_err(capture_err)?
-		.map(|device| {
-			let name = device.to_string();
-			Device {
-				default: Some(&name) == default.as_ref(),
-				id: name.clone(),
-				name,
+	// Every host, not just the preferred one, matching the output side. The same
+	// hardware appears under each, and which one a caller wants is its decision:
+	// PipeWire and PulseAudio carry the server's own names and routing, ALSA
+	// reaches a device directly. `Device::host` is what lets a caller group them.
+	let preferred = cpal::default_host().id();
+	let mut devices = Vec::new();
+	// A sound server reports one id per stream, not per device, so a client with
+	// several open would otherwise appear once per stream.
+	let mut seen = std::collections::HashSet::new();
+
+	for id in cpal::available_hosts() {
+		// A host that will not open takes every device on it with it, so say so:
+		// the symptom is a device missing from the listing with no other trace.
+		let host = match cpal::host_from_id(id) {
+			Ok(host) => host,
+			Err(err) => {
+				tracing::debug!(host = id.name(), error = %err, "skipping an audio host that would not open");
+				continue;
 			}
-		})
-		.collect())
+		};
+		let default = host.default_input_device().and_then(|device| device.id().ok());
+
+		let inputs = match host.input_devices() {
+			Ok(inputs) => inputs,
+			Err(err) => {
+				tracing::debug!(host = id.name(), error = %err, "skipping a host that would not list its inputs");
+				continue;
+			}
+		};
+		for device in inputs {
+			let device_id = match device.id() {
+				Ok(device_id) => device_id,
+				Err(err) => {
+					tracing::debug!(host = id.name(), error = %err, "skipping an input device with no id");
+					continue;
+				}
+			};
+			if !seen.insert(device_id.to_string()) {
+				continue;
+			}
+			// Only the preferred host's default is the system default; the others
+			// are that host's idea of one.
+			let is_default = id == preferred && Some(&device_id) == default.as_ref();
+			match describe(&device, &device_id, is_default) {
+				Ok(device) => devices.push(device),
+				Err(err) => {
+					tracing::debug!(error = %err, "skipping an input device that could not be described");
+				}
+			}
+		}
+	}
+
+	Ok(devices)
 }
 
 /// Run blocking cpal host I/O off the runtime's worker threads.
@@ -503,18 +560,39 @@ where
 fn resolve(
 	selector: Option<&str>,
 	config: &Config,
-) -> Result<(cpal::Device, cpal::SampleFormat, cpal::StreamConfig), Failure> {
+) -> Result<(cpal::Device, Device, cpal::SampleFormat, cpal::StreamConfig), Failure> {
 	let host = cpal::default_host();
-	let device = match selector {
-		Some(name) => host
-			.input_devices()
-			.map_err(Failure::cpal)?
-			.find(|d| d.to_string() == name)
-			.ok_or_else(|| Failure::retry(Error::Device(format!("input device {name:?} not found"))))?,
-		None => host
-			.default_input_device()
-			.ok_or_else(|| Failure::retry(Error::Device("no default input device".into())))?,
+	let default = host.default_input_device().and_then(|device| device.id().ok());
+	let (device, id) = match selector {
+		// `Host::device_by_id` searches outputs too, so match against the inputs
+		// ourselves: an output id must not resolve as a microphone.
+		Some(selector) => {
+			let wanted: cpal::DeviceId = selector.parse().map_err(|err| {
+				Failure::fatal(Error::Device(format!(
+					"{selector:?} is not an input device id; run `devices` to list them: {err}"
+				)))
+			})?;
+			// Ids are host-qualified, so route to the host that issued this one
+			// rather than searching the preferred host alone: `devices` lists
+			// every host, and a device it named has to be openable.
+			let host = cpal::host_from_id(wanted.host())
+				.map_err(|err| Failure::fatal(Error::Device(format!("{selector:?}: {err}"))))?;
+			let device = host
+				.input_devices()
+				.map_err(Failure::cpal)?
+				.find(|device| device.id().ok().as_ref() == Some(&wanted))
+				.ok_or_else(|| Failure::retry(Error::Device(format!("input device {selector:?} not found"))))?;
+			(device, wanted)
+		}
+		None => {
+			let device = host
+				.default_input_device()
+				.ok_or_else(|| Failure::retry(Error::Device("no default input device".into())))?;
+			let id = device.id().map_err(Failure::cpal)?;
+			(device, id)
+		}
 	};
+	let current = describe(&device, &id, Some(&id) == default.as_ref()).map_err(Failure::cpal)?;
 
 	let supported = device.default_input_config().map_err(Failure::cpal)?;
 	let sample_format = supported.sample_format();
@@ -525,7 +603,17 @@ fn resolve(
 	if let Some(channels) = config.channels {
 		stream_config.channels = channels as u16;
 	}
-	Ok((device, sample_format, stream_config))
+	Ok((device, current, sample_format, stream_config))
+}
+
+/// Build the listing entry for `device`, whose id the caller has already read.
+fn describe(device: &cpal::Device, id: &cpal::DeviceId, default: bool) -> Result<Device, cpal::Error> {
+	Ok(Device {
+		default,
+		name: device.description()?.name().into(),
+		host: id.host().name().to_string(),
+		id: id.to_string(),
+	})
 }
 
 fn stream_err(errors: &kio::Producer<Option<cpal::Error>>, err: cpal::Error) {

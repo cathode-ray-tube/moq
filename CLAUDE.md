@@ -73,7 +73,7 @@ Top-level layout only. Per-crate and per-package detail lives in the nested guid
 - `/rs/` - Rust crates: core networking (`moq-net`), native helpers, the relay, CLIs, media muxing/codecs, and the FFI/C bindings. See `rs/CLAUDE.md`.
 - `/bench/` - Repository-level benchmark orchestration, workload fixtures, and methodology. Rust benchmark binaries and microbenchmarks stay under `/rs/`.
 - `/js/` - TypeScript/JavaScript packages for the browser, published as `@moq/*`. See `js/CLAUDE.md`.
-- `/py/`, `/swift/`, `/kt/`, `/go/` - language wrappers over `rs/moq-ffi` (see [Language Bindings](#language-bindings)). `/py/` has `py/CLAUDE.md`; the others defer to their `README.md`.
+- `/py/`, `/swift/`, `/kt/`, `/go/`, `/dart/` - language wrappers over `rs/moq-ffi` (see [Language Bindings](#language-bindings)). `/py/` has `py/CLAUDE.md`; the others defer to their `README.md`.
 - `/cpp/` - C/C++ consumers of `libmoq`. `cpp/obs/` is the OBS Studio plugin (CMake; links `libmoq` via `MOQ_LOCAL`), licensed GPL-2.0-or-later because it links `libobs`. `just check` type-checks it via `just obs compile`, which needs headers rather than an obs-deps download, and obs.yml links it on Linux for `cpp/obs/` and `rs/libmoq/` PRs. Still manual, like `just rs macos`: `just obs build` (a loadable plugin, and the only path on macOS/Windows) and `just obs test` (`cpp/obs/test/` against stubbed libobs/libmoq under ThreadSanitizer). See `doc/bin/obs.md`.
 - `/demo/` - demos and test media: relay configs, the web demo, MoQ Boy, media hosting, and a network throttle script.
 - `/test/` - test harnesses that span more than one language or need a server. `test/smoke/` is the cross-language interop matrix (`just test smoke[-full]`); `test/wasm/` runs the `@moq/wasm` bindings in headless Chromium against a real relay (`just test wasm`), which is the only behavioral coverage `rs/moq-wasm` has.
@@ -82,7 +82,7 @@ Top-level layout only. Per-crate and per-package detail lives in the nested guid
 
 ## Language Bindings
 
-`rs/moq-ffi` is the single UniFFI core that every non-Rust binding is generated from. The wrappers under `/py`, `/swift`, `/kt`, and `/go` are thin layers over it, and `rs/libmoq` exposes the same core as a C staticlib. So one `moq-ffi` change ripples out to all of them (and their docs) per the [Cross-Package Sync](#cross-package-sync) table. CI mirrors the Swift and Go source packages to their external repos; Kotlin publishes `dev.moq:*` artifacts to Maven Central. For Python, most callers want the ergonomic `moq-rs` wrapper rather than the generated `moq-ffi` bindings directly.
+`rs/moq-ffi` is the single UniFFI core that every non-Rust binding is generated from. The wrappers under `/py`, `/swift`, `/kt`, `/go`, and `/dart` are thin layers over it, and `rs/libmoq` exposes the same core as a C staticlib. So one `moq-ffi` change ripples out to all of them (and their docs) per the [Cross-Package Sync](#cross-package-sync) table. CI mirrors the Swift and Go source packages to their external repos; Kotlin publishes `dev.moq:*` artifacts to Maven Central, and Dart publishes `moq` and `moq_ffi` to pub.dev. For Python, Dart, and other wrapped bindings, most callers want the ergonomic package rather than the generated bindings directly.
 
 ## Per-Directory Guides
 
@@ -206,7 +206,7 @@ Changes in one area usually need matching updates elsewhere, including docs. If 
 
 | Change in | Also update |
 |---|---|
-| `rs/moq-ffi` | `rs/libmoq`, `{py,swift,kt}/`, `go/wrapper/*.go` (the `go/ffi` bindings regenerate automatically, but a new method needs a hand-written wrapper too, like `py/moq-rs`), `doc/lib/{py,swift,kt,go,c}` |
+| `rs/moq-ffi` | `rs/libmoq`, `{py,swift,kt,dart}/`, `go/wrapper/moq/*.go` (the `go/ffi` and `dart/moq_ffi` bindings regenerate automatically, but a new method needs a hand-written wrapper too, like `py/moq-rs` or `dart/moq`), `doc/lib/{py,swift,kt,go,dart,c}` |
 | `rs/moq-net` wire/API | `js/net`, `doc/concept`, `drafts/draft-lcurley-moq-lite.md` (if the wire spec changes) |
 | `rs/hang` catalog/container | `js/hang`, `doc/concept`, `drafts/draft-lcurley-moq-hang.md` (if the format spec changes) |
 | `rs/moq-token` | `js/token` |

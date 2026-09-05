@@ -76,10 +76,9 @@ The peer first replies with the set of routes that are currently advertised, the
 This initial set is a discrete batch: the latest draft reports how many entries to expect up front, so a freshly connected session can wait until that snapshot has fully arrived before listing what's available, rather than racing the gossip.
 
 Each route also describes the path it took: the chain of relay identities it passed through (which is how forwarding loops are caught) and what pulling content via that route would cost.
-The cost comes in two magnitudes, compared in order.
-The *warm* cost is what one more subscription would cost the mesh right now, so it collapses to zero at any relay already carrying the content; that is what lets a cluster deduplicate onto a warm copy instead of opening a second ingest.
-The *cold* cost prices the same path as if nothing were cached, so when two warm relays tie at zero it still says which of them sits closer to the publisher.
-Subscribers route to the lowest warm cost and break ties on cold; [moq-relay clustering](/bin/relay/cluster) covers how relays use this to pick an aggregation point.
+The cost comes in two magnitudes, compared in order: routing minimizes the *warm* cost and breaks a tie on the *cold* cost.
+Today both carry the same accumulated price; the split reserves room for a warm-copy discount, so an extension can let a relay already carrying the content advertise it cheaper while the cold price still says who sits closer to the publisher.
+Subscribers route to the lowest warm cost and break ties on cold; [moq-relay clustering](/bin/relay/cluster) covers how link prices are configured.
 
 ### Subscriptions
 
@@ -221,7 +220,7 @@ But if a publisher needs a feature, then the subscriber needs it too, so you can
 - **No Request IDs**: A bidirectional stream for each request to avoid HoLB. (NOTE: likely to be upstreamed into moq-transport)
 - **No Push**: A subscriber must explicitly subscribe to each track.
 - **Single-group FETCH only (lite-05+)**: Fetch one group by sequence, optionally bounded to a range of frames within it. Fetching across groups is not supported.
-- **No Joining Fetch, and single-group fills only**: A subscription resumes by asking for the missing range directly rather than pairing a fetch with a subscribe. `moqt-20` replaced the joining fetch with a fill. As a publisher we serve a fill whose range resolves to a single group, straight from the group cache and capped at the largest published object, which covers `moqt-20`'s own current-group join (a Next Object subscription plus a `StartGroup=1` fill); a fill spanning several groups is refused by resetting its fetch stream. As a subscriber we request no fill: we ask for the current group directly with a relative Location Filter instead, and refuse an incoming fetch stream because it answers no request of ours. Against a strict publisher, which only delivers objects published after the subscription, that degrades the join to the next group boundary.
+- **No Joining Fetch, and single-group fills only**: Subscriptions start at the latest group, not the latest frame. `moqt-20` replaced the joining fetch with a fill. As a publisher we serve a fill whose range resolves to a single group, straight from the group cache and capped at the largest published object, which covers `moqt-20`'s own current-group join (a Next Object subscription plus a `StartGroup=1` fill); a fill spanning several groups is refused by resetting its fetch stream. The native subscriber joins the same way: a Next Object subscription plus a `StartGroup=1` fill, whose fetch stream carries the current group's head while the subscription carries the rest. The two are stitched back into one group, so a group still starts at a decodable point even against a strict publisher that delivers nothing published before the subscription. A fill covering anything else, or one whose head does not meet the subscription's first object, is dropped, which degrades that join to the next group boundary. The browser subscriber requests no fill yet, so it takes that degradation on every join.
 - **No sub-groups**: SVC layers should be separate tracks.
 - **No gaps**: Makes life much easier for the relay and every application.
 - **No object properties**: Encode your metadata into the frame payload.

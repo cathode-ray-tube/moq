@@ -215,12 +215,14 @@ it reads without being able to publish it, since that is what an RTMP or SRT
 ingest produces. A rendition whose config declares HE-AAC fails when it opens,
 either spelling of it; one that carries SBR without declaring it plays as its
 AAC-LC core.
-`--latency-max` controls how far a stalled media group may lag before it is
-skipped and defaults to `500ms`. These flags all follow the `play` verb:
+`--max-age` controls how stale a media group may get before it is skipped and
+defaults to `500ms`. It is a staleness budget, not a playout delay: raising it
+never holds the picture back, it only waits longer on a late group before giving
+up. These flags all follow the `play` verb:
 
 ```bash
 moq --connect https://relay.example.com/anon --broadcast conference.hang \
-    play --video-name hd --audio-name en --latency-max 250ms
+    play --video-name hd --audio-name en --max-age 250ms
 ```
 
 Video decoding prefers the platform hardware backend and falls back to the
@@ -380,14 +382,16 @@ identical routes, which relays deduplicate: the mesh sees one route while
 either publisher is alive, so killing one retracts nothing and the survivor
 keeps serving.
 
-A relay never splices a live subscription from one publisher to another.
-When the publisher serving a subscription goes away, that subscription ends
-and the viewer re-subscribes, landing on the best remaining route; players do
-this automatically when the path is (still) announced. So 1+1 buys a fast
-resubscribe instead of a dead stream, not a seamless mid-group handover, and
-the two encoders should still produce equivalent broadcasts (same track
-names, comparable timelines) so a viewer that fails over keeps decoding. Run
-the same command from two encoders, pinning the same id on both:
+A relay resumes a live subscription across routes that name the same first
+hop. When the publisher serving a subscription goes away, the relay
+re-splices it through the best remaining route with that first hop at a group
+boundary, and the viewer keeps watching. So 1+1 with a shared id buys a
+seamless handover, and the two encoders must produce equivalent broadcasts
+(same track names, aligned group sequences, comparable timelines) so the
+spliced stream keeps decoding. Publishers with different ids (or none) never
+splice: that subscription ends and the viewer re-subscribes, landing on the
+best remaining route. Run the same command from two encoders, pinning the
+same id on both:
 
 ```bash
 moq --hop 42 --connect https://relay-a.example.com/anon --broadcast event.hang import ts
@@ -425,7 +429,7 @@ moq --connect https://relay.example.com/anon --broadcast cam.hang import capture
 # Pick devices, resolution, and bitrates:
 moq --connect https://relay.example.com/anon --broadcast cam.hang \
     import capture --camera 0 --width 1280 --height 720 --fps 30 --bitrate 3000000 \
-                   --microphone "MacBook Pro Microphone" --audio-bitrate 64000
+                   --microphone coreaudio:BuiltInMicrophoneDevice --audio-bitrate 64000
 
 # One medium only:
 moq --connect https://relay.example.com/anon --broadcast cam.hang import capture --no-audio
@@ -470,7 +474,7 @@ Microphones:
 ```
 
 ```bash
-# A single window, followed as it moves and resizes (macOS only):
+# Capture a single window (macOS, Windows, or X11):
 moq --connect https://relay.example.com/anon --broadcast win.hang \
     import capture --window 39193 --no-audio
 
@@ -494,11 +498,9 @@ moq --connect https://relay.example.com/anon --broadcast screen.hang \
     import capture --display --system-audio
 ```
 
-On Linux the NVENC (NVIDIA) encoder and the PipeWire screen capture are compiled
-in by default. VAAPI (Intel/AMD) is behind the off-by-default `vaapi` feature,
-since that backend has never been validated on real hardware. To build `capture`
-without any of them (software openh264 + V4L2 camera capture only), drop the
-default features. `capture` itself still needs libclang and the V4L2 headers for
+On Linux the NVENC (NVIDIA) and VAAPI (Intel/AMD) encoders and the PipeWire
+screen capture are compiled in by default. To build `capture` without any of
+them (software openh264 + V4L2 camera capture only), drop the default features. `capture` itself still needs libclang and the V4L2 headers for
 the camera, and ALSA for the microphone:
 
 ```bash
@@ -618,7 +620,7 @@ Import formats:
 - `flv` - FLV / RTMP (H.264 video, AAC audio)
 - `capture` - capture local devices directly (camera H.264 + microphone Opus; requires the `capture` build feature; does not read stdin)
 
-`import --latency-max <duration>` (default `30s`) declares how long relays keep a
+`import --max-age <duration>` (default `30s`) declares how long relays keep a
 non-latest group of the published media tracks fetchable. It is a retention
 budget, so raising it never makes a subscriber play further behind live: it caps
 how far back a fetch can still reach. The default is sized for a segmented
@@ -626,7 +628,7 @@ egress (HLS/DASH), which may only advertise segments that are still fetchable;
 lower it when nothing reads history and the memory matters:
 
 ```bash
-moq --connect https://relay.example.com --broadcast my-stream.hang import --latency-max 5s ts
+moq --connect https://relay.example.com --broadcast my-stream.hang import --max-age 5s ts
 ```
 
 It sits on `import` itself rather than the endpoint, so it applies to every
@@ -672,13 +674,13 @@ for raw elementary streams instead of combining those sinks with a contradictory
 
 Every export sink caps how long a stalled group is waited on before the muxer
 skips to a newer one. Each owns the knob so its default fits the transport: the
-stdout containers and `rtmp` take `--latency-max` (default `500ms`), and `srt`
+stdout containers and `rtmp` take `--max-age` (default `500ms`), and `srt`
 reuses its `--latency` (the receive buffer doubles as the skip threshold).
 WebRTC (`rtc`) is real-time and doesn't buffer, so it has no such knob. HLS
 export doesn't subscribe to media at all (segments are fetched on demand), so
 it has no latency knob either. This is the subscriber half of the pair the
 protocol names: the export knob is how long *this* consumer waits, while
-[`import --latency-max`](#container-formats) is how long the publisher keeps a
+[`import --max-age`](#container-formats) is how long the publisher keeps a
 group around for anyone to fetch.
 
 ### MPEG-TS
@@ -695,7 +697,7 @@ moq --connect https://relay.example.com --broadcast my-stream.hang export ts | f
 ```
 
 TS export is paced: bytes leave stdout at the instant the stream's clock (PCR)
-asserts, smoothed within the `--latency-max` budget, so the pipe carries a
+asserts, smoothed within the `--max-age` budget, so the pipe carries a
 real-time transport stream rather than draining as fast as frames arrive.
 
 TS export carries H.264 / H.265 as Annex-B and AAC as ADTS. Both in-band

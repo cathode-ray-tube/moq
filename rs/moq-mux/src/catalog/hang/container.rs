@@ -1,4 +1,4 @@
-use std::task::Poll;
+use std::task::{Poll, ready};
 
 use crate::container::{
 	Container as ContainerTrait,
@@ -102,6 +102,7 @@ impl ContainerTrait for Container {
 			Self::Cmaf(cmaf) => {
 				cmaf.poll_read(group, waiter).map(|result| result.map_err(Into::into))
 			}
+			Self::Cmaf(cmaf) => Poll::Ready(Ok(ready!(cmaf.poll_read(group, waiter))?)),
 			Self::Loc => loc::Wire.poll_read(group, waiter),
 		}
 	}

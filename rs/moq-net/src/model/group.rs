@@ -141,7 +141,9 @@ pub(crate) struct GroupState {
 	// at finish so the count outlives an abort that clears the cache.
 	pub(crate) fin: Option<usize>,
 
-	// The error that caused the group to be aborted, if any.
+	// The error that caused the group to be aborted, if any. Mirrored into
+	// `Alive::aborted`, so [`Producer::abort`] stays the only writer: anything else
+	// setting this would leave track scans reading a group as live.
 	pub(crate) abort: Option<Error>,
 }
 
@@ -320,6 +322,18 @@ pub struct Producer {
 struct Alive {
 	info: Info,
 	state: kio::Producer<GroupState>,
+	// Monotone mirror of `GroupState::abort` for track scans that already hold the
+	// track lock. A stale false only hands out a group that is concurrently aborting;
+	// true is stored after the abort exists, so it can never hide a live group.
+	//
+	// Only ever read on its own. A decision that pairs the abort with something else
+	// out of `GroupState` has to read both under one guard, or the two halves can
+	// straddle the abort: see `Producer::live_first_frame`.
+	aborted: AtomicBool,
+	// The cache stamp `GroupState::charge` maintains, held here as well so the
+	// eviction and expiry walks can weigh a candidate without taking the group lock
+	// they already hold the track lock over.
+	access: Arc<cache::Access>,
 }
 
 impl Drop for Alive {
@@ -374,10 +388,14 @@ impl Producer {
 	/// track evicts toward under memory pressure.
 	pub(crate) fn new(info: Info, track: track::Info, cache: Arc<cache::Track>) -> Self {
 		let state = kio::Producer::<GroupState>::default();
-		state.write().ok().expect("a new group is open").charge = cache.charge();
+		let charge = cache.charge();
+		let access = charge.access();
+		state.write().ok().expect("a new group is open").charge = charge;
 		let alive = Arc::new(Alive {
 			info,
 			state: state.clone(),
+			aborted: AtomicBool::new(false),
+			access,
 		});
 		Self {
 			info,
@@ -468,7 +486,7 @@ impl Producer {
 		debug_assert!(state.partial.is_none(), "a frame is already open");
 		let size = payload.len() as u64;
 		state.cache += size;
-		state.charge.add(size);
+		let now = state.charge.add(size);
 		state.frames.push_back(Frame { timestamp, payload });
 		state.next_index = next_index;
 		state.committed = state.next_index;
@@ -478,7 +496,7 @@ impl Producer {
 
 		// With the group lock released (lock order is track then group), settle
 		// eviction debt if enough has been written since the track last paid.
-		self.cache.settle();
+		self.cache.settle(now);
 
 		// Ingress payload: one whole frame written.
 		self.stats.frames(1);
@@ -521,6 +539,8 @@ impl Producer {
 			.ok_or(Error::BoundsExceeded(crate::coding::BoundsExceeded))?;
 
 		let mut bytes = 0;
+		// The last frame's tick, reused below so settling does not re-read the clock.
+		let mut now = None;
 		for mut frame in frames.drain() {
 			frame.timestamp = frame
 				.timestamp
@@ -529,7 +549,7 @@ impl Producer {
 			let size = frame.payload.len() as u64;
 			bytes += size;
 			state.cache += size;
-			state.charge.add(size);
+			now = state.charge.add(size);
 			state.stamp(frame.timestamp);
 			state.frames.push_back(frame);
 		}
@@ -538,7 +558,7 @@ impl Producer {
 		state.evict();
 		drop(state);
 
-		self.cache.settle();
+		self.cache.settle(now);
 		self.stats.frames(count as u64);
 		self.stats.bytes(bytes);
 		Ok(())
@@ -574,7 +594,7 @@ impl Producer {
 			.checked_add(1)
 			.ok_or(Error::BoundsExceeded(crate::coding::BoundsExceeded))?;
 		state.cache += frame.size;
-		state.charge.add(frame.size);
+		let now = state.charge.add(frame.size);
 		state.partial = Some(Partial {
 			timestamp,
 			buf: buf.clone(),
@@ -588,7 +608,7 @@ impl Producer {
 
 		// With the group lock released (lock order is track then group), settle
 		// eviction debt if enough has been written since the track last paid.
-		self.cache.settle();
+		self.cache.settle(now);
 
 		// Ingress payload: one frame opened; its bytes are counted per chunk as the
 		// frame::Producer writes them.
@@ -628,7 +648,7 @@ impl Producer {
 			.checked_add(1)
 			.ok_or(Error::BoundsExceeded(crate::coding::BoundsExceeded))?;
 		state.cache += frame.size;
-		state.charge.add(frame.size);
+		let now = state.charge.add(frame.size);
 		state.partial = Some(Partial {
 			timestamp,
 			buf: buf.clone(),
@@ -642,7 +662,7 @@ impl Producer {
 
 		// With the group lock released (lock order is track then group), settle
 		// eviction debt if enough has been written since the track last paid.
-		self.cache.settle();
+		self.cache.settle(now);
 
 		// Ingress payload: one frame opened; its bytes are counted per chunk as the
 		// producer writes them.
@@ -664,12 +684,14 @@ impl Producer {
 		// `record_write` takes `&mut`, which marks the guard modified: kio only
 		// notifies on a mutably-accessed guard's release, and that notify is what
 		// delivers the chunk to parked readers.
-		if let Ok(mut state) = self.state.write() {
-			state.charge.record_write();
-		}
+		let now = self
+			.state
+			.write()
+			.ok()
+			.and_then(|mut state| state.charge.record_write());
 		// The payload was charged when the frame opened, but a long streamed frame
 		// still counts as track activity for the independent expiry time gate.
-		self.cache.settle();
+		self.cache.settle(now);
 	}
 
 	/// Commit the in-flight frame as a completed frame (called by [`frame::Producer::finish`]).
@@ -680,6 +702,17 @@ impl Producer {
 		state.partial = None;
 		state.frames.push_back(frame);
 		state.committed = state.next_index;
+		// Completing the frame is a write access like any chunk, and the only one the
+		// payload is guaranteed to get: the wire ingest defers its chunk notifications
+		// to the poll boundary, so a tail that arrives and completes in one turn never
+		// reaches [`Self::frame_notify`]. Without this, a group whose payload streamed
+		// in across an idle gap would expire the instant it finished.
+		let now = state.charge.record_write();
+		drop(state);
+
+		// With the group lock released (lock order is track then group), settle
+		// eviction debt and age idle content out, reusing the tick above.
+		self.cache.settle(now);
 		Ok(())
 	}
 
@@ -719,6 +752,7 @@ impl Producer {
 	pub fn abort(self, err: Error) -> Result<()> {
 		let mut guard = modify(&self.state)?;
 		guard.abort = Some(err);
+		self.alive.aborted.store(true, Ordering::Release);
 		guard.release();
 		guard.close();
 		Ok(())
@@ -726,30 +760,46 @@ impl Producer {
 
 	/// Whether the group has been aborted (including pool eviction). The track's
 	/// read paths treat an aborted cached group as absent.
-	pub(crate) fn is_aborted(&self) -> bool {
-		self.state.read().abort.is_some()
-	}
-
-	/// Whether the group was cleanly finished, so no further frame can be appended.
-	pub(crate) fn is_finished(&self) -> bool {
-		self.state.read().fin.is_some()
-	}
-
-	/// The index of the first frame this group still holds: what a reader positioned
-	/// below it would be [`Error::Lagged`] on. Non-zero when the group started later
-	/// (see [`Self::start_at`]) or its head was evicted.
-	pub(crate) fn first_frame(&self) -> usize {
-		self.state.read().offset
-	}
-
-	/// One past the last frame that was fully written.
 	///
-	/// Trails [`Self::frame_count`] while a chunked frame is open, and stops there if
-	/// that frame never completes. This is the boundary a replacement route resumes
-	/// from: an incomplete frame has to be redelivered whole, since a reader can only
-	/// use it whole.
-	pub(crate) fn committed_frames(&self) -> usize {
-		self.state.read().committed
+	/// Reads the mirror rather than the group's state, so a track scan holding the
+	/// track lock never takes the group's. Monotone, and only ever conservative: a
+	/// concurrent abort can still read as live for the length of [`Self::abort`],
+	/// which hands out a group whose consumer then surfaces the abort.
+	pub(crate) fn is_aborted(&self) -> bool {
+		self.alive.aborted.load(Ordering::Acquire)
+	}
+
+	/// The index of the first frame this group still holds, or `None` once it has been
+	/// aborted. Non-zero when the group started later (see [`Self::start_at`]) or its
+	/// head was evicted; a reader positioned below it is [`Error::Lagged`].
+	///
+	/// One guard for both halves, deliberately. The track asks this to decide whether a
+	/// cached slot can still answer a request, and reading the abort and the offset
+	/// separately lets the abort land between them: the slot reads live, then hands
+	/// back an offset it only has because it is dead. The mirror
+	/// ([`Self::is_aborted`]) is for scans that ask about the abort alone.
+	pub(crate) fn live_first_frame(&self) -> Option<usize> {
+		let state = self.state.read();
+		state.abort.is_none().then_some(state.offset)
+	}
+
+	/// One past the last frame committed to an unfinished group, when that is past its
+	/// first: where a replacement route resumes. `None` once the group is finished, or
+	/// while it holds nothing a replacement could splice onto.
+	///
+	/// The *committed* count, not the written one: a route dying midway through a
+	/// chunked frame leaves that frame unusable, so the replacement has to send it
+	/// again rather than start after it. Answered under one guard so the count can't be
+	/// weighed against an offset from a different moment.
+	///
+	/// An aborted group still answers: readers that already consumed its head want the
+	/// tail, and the count outlives the released cache.
+	pub(crate) fn resume_frame(&self) -> Option<usize> {
+		let state = self.state.read();
+		if state.fin.is_some() {
+			return None;
+		}
+		(state.committed > state.offset).then_some(state.committed)
 	}
 
 	/// Where the group starts in presentation time: its first frame's timestamp,
@@ -786,12 +836,12 @@ impl Producer {
 	/// Tick of the group's last cache access, driving eviction protection and age
 	/// expiry (see [`cache::Pool::average`]).
 	pub(crate) fn cache_accessed(&self) -> u64 {
-		self.state.read().charge.accessed()
+		self.alive.access.get()
 	}
 
 	/// Coarse clock tick of the group's last cache access, used by age expiry.
 	pub(crate) fn cache_accessed_tick(&self) -> u64 {
-		self.state.read().charge.accessed_tick()
+		self.alive.access.tick()
 	}
 
 	/// Enter the group into the evictable population: demoted from the live edge,
@@ -1284,6 +1334,18 @@ impl Consumer {
 		}
 	}
 
+	/// Advance the read cursor to `index`, skipping every frame below it.
+	///
+	/// Unlike [`Self::start_at`], this does not clamp past an evicted requested
+	/// frame. An eviction confined below `index` is ignored, while an eviction at
+	/// or above it still surfaces as [`Error::Lagged`].
+	pub fn skip_to(&mut self, index: u64) {
+		match &mut self.inner {
+			ConsumerKind::Plain(plain) => plain.skip_to(index),
+			ConsumerKind::Spliced(spliced) => spliced.start_at(index),
+		}
+	}
+
 	/// Stop after frame `index` (inclusive), or remove the cap.
 	///
 	/// Reads past the cap end cleanly (`None`), as if the group finished there. Unlike
@@ -1522,6 +1584,15 @@ impl Plain {
 		}
 		self.index = index;
 		// The batch was drained from below the new cursor, so it can't be reused.
+		self.prefetch = Prefetch::default();
+	}
+
+	fn skip_to(&mut self, index: u64) {
+		let index = usize::try_from(index).unwrap_or(usize::MAX);
+		if index <= self.index {
+			return;
+		}
+		self.index = index;
 		self.prefetch = Prefetch::default();
 	}
 

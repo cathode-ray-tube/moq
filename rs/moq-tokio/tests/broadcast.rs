@@ -602,6 +602,110 @@ async fn broadcast_moq_lite_05_default_timescale() {
 		.expect("server task failed");
 }
 
+/// Draft-20's current-group join (section 5.1.6), which splits one group across two
+/// streams: the subscriber asks for the next Object plus a fill of the current group, and
+/// the publisher serves the head on a fill fetch stream and the rest on the subscription's
+/// own subgroup stream.
+///
+/// Both halves have to land in one group, in order and exactly once. Without the fill the
+/// publisher delivers nothing before the live edge, so the join would start at the next
+/// group boundary instead.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn broadcast_moq_transport_20_current_group_join() {
+	let pub_origin = moq_tokio::origin::spawn(Hop::random());
+	let mut broadcast = pub_origin.create_broadcast("test").expect("create broadcast");
+	let announce_broadcast = pub_origin.announce("test", Default::default()).expect("announce");
+	let mut track = broadcast.create_track("video", None).expect("create track");
+
+	// The group is left open, so the subscriber joins part way through it: the two head
+	// frames are published before the SUBSCRIBE and the tail frame after.
+	let mut group = track.append_group().expect("append group");
+	for payload in [b"head-0".as_ref(), b"head-1".as_ref()] {
+		group
+			.write_frame(moq_net::Timestamp::ZERO, payload)
+			.expect("write head");
+	}
+
+	let mut server_config = moq_tokio::listen::Config::default();
+	server_config.bind = Some("[::]:0".to_string());
+	server_config.tls.generate = vec!["localhost".into()];
+	server_config.version = vec!["moq-transport-20".parse().unwrap()];
+	let server = server_config.init(Default::default()).expect("init server");
+	let mut server = server.listen().await.expect("failed to listen");
+	let addr = server.local_addr().expect("local addr");
+
+	let sub_origin = moq_tokio::origin::spawn(Hop::random());
+	let sub_consumer = sub_origin.consume();
+	let mut announcements = sub_consumer.announced();
+
+	let mut client_config = moq_tokio::connect::Config::default();
+	client_config.tls.insecure = Some(true);
+	client_config.version = vec!["moq-transport-20".parse().unwrap()];
+	let client = client_config.init(Default::default()).expect("init client");
+	let url: url::Url = format!("moqt://localhost:{}", addr.port()).parse().unwrap();
+
+	let server_handle = tokio::spawn(async move {
+		let request = server.accept().await.expect("no incoming connection");
+		let session = request.with_publisher(&pub_origin).ok().await?;
+		let _broadcast = broadcast;
+		let _track = track;
+		let _announce = announce_broadcast;
+		let _ = session.closed().await;
+		Ok::<_, anyhow::Error>(())
+	});
+
+	let client = client.with_subscriber(sub_origin);
+	let (_client, connection) = tokio::time::timeout(TIMEOUT, connect_once(client, url))
+		.await
+		.expect("connect timed out")
+		.expect("connect failed");
+
+	let announced = next_announce(&mut announcements).await;
+	assert_eq!(announced.prefix.as_path().as_str(), "test");
+	assert!(announced.active, "expected an announce");
+	let remote = tokio::time::timeout(TIMEOUT, sub_consumer.request_broadcast("test"))
+		.await
+		.expect("request timed out")
+		.expect("announced broadcast resolves");
+
+	let mut subscriber = tokio::time::timeout(TIMEOUT, async { remote.track("video").unwrap().subscribe(None).await })
+		.await
+		.expect("subscribe timed out")
+		.expect("subscribe failed");
+
+	let mut joined = tokio::time::timeout(TIMEOUT, subscriber.recv_group())
+		.await
+		.expect("recv_group timed out")
+		.expect("recv_group failed")
+		.expect("track closed");
+	assert_eq!(joined.sequence, 0);
+
+	async fn read(group: &mut moq_net::group::Consumer) -> Option<Vec<u8>> {
+		tokio::time::timeout(TIMEOUT, group.read_frame())
+			.await
+			.expect("read_frame timed out")
+			.expect("read_frame failed")
+			.map(|frame| frame.payload.to_vec())
+	}
+
+	// The first head frame proves the publisher processed the SUBSCRIBE, so the tail frame
+	// really is published after the live edge the fill was sized against.
+	assert_eq!(read(&mut joined).await.as_deref(), Some(b"head-0".as_ref()));
+
+	group
+		.write_frame(moq_net::Timestamp::ZERO, b"tail-2".as_ref())
+		.expect("write tail");
+	group.finish().expect("finish group");
+
+	assert_eq!(read(&mut joined).await.as_deref(), Some(b"head-1".as_ref()));
+	assert_eq!(read(&mut joined).await.as_deref(), Some(b"tail-2".as_ref()));
+	assert_eq!(read(&mut joined).await, None, "the stitched group ends once");
+
+	drop(connection);
+	server_handle.await.expect("server panicked").expect("server failed");
+}
+
 /// Wait for the next announce event, failing the test on a timeout or a closed origin.
 async fn next_announce(announcements: &mut moq_net::announce::Consumer) -> moq_net::announce::Update {
 	tokio::time::timeout(TIMEOUT, announcements.next())
@@ -744,10 +848,10 @@ async fn read_payloads(sub: &mut moq_net::track::Subscriber, count: usize) -> Ve
 /// A path stays routed across two publisher sessions announcing it.
 ///
 /// The client connects to two servers announcing the same route. The preferred
-/// (cheaper) route serves the track; when that session dies, the materialized
-/// broadcast aborts and a fresh request resolves through the standby, without
-/// the path ever being retracted. Routes claim capability, not content
-/// identity, so the failover is an explicit re-request rather than a splice.
+/// (cheaper) route serves the track; when that session dies, the broadcast
+/// re-splices through the standby at a group boundary, without the path ever
+/// being retracted: both routes name the same first hop, so they are the same
+/// origin reached different ways and the subscription rides the failover.
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn broadcast_route_migration() {
@@ -872,28 +976,10 @@ async fn broadcast_route_migration() {
 		.expect("subscribe failed");
 	assert_eq!(read_payloads(&mut sub, 1).await, ["a1"]);
 
-	// Kill the serving session. The materialized broadcast aborts; the next
-	// request resolves through the standby route and serves its content.
+	// Kill the serving session. Both routes name the same first hop, so the
+	// broadcast re-splices through the standby at the group boundary and the
+	// SAME subscription carries B's continuation.
 	drop(session_a);
-	tokio::time::timeout(TIMEOUT, async { while sub.recv_group().await.is_ok() {} })
-		.await
-		.expect("the dead session's subscription should abort");
-
-	let mut sub = tokio::time::timeout(TIMEOUT, async {
-		loop {
-			// The dead session's entry may still be routable for an instant; keep
-			// re-requesting until the standby serves the subscription.
-			if let Ok(broadcast) = sub_consumer.request_broadcast("test").await
-				&& let Ok(track) = broadcast.track("video")
-				&& let Ok(sub) = track.subscribe(subscription.clone()).await
-			{
-				return sub;
-			}
-			tokio::time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await
-	.expect("the standby route should serve a fresh subscription");
 	assert_eq!(read_payloads(&mut sub, 2).await, ["b2", "b3"]);
 
 	// The new subscription is live: what B produces from here on flows through it.

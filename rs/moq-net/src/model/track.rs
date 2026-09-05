@@ -289,7 +289,9 @@ impl TrackState {
 	/// Find the next live group at or after `index` in arrival order.
 	///
 	/// Returns the group and its absolute index so the consumer can advance past it.
-	fn poll_recv_group(&self, index: usize, min_sequence: u64) -> Poll<Result<Option<(group::Consumer, usize)>>> {
+	/// The cached producer rather than a consumer: `consume` reads the clock and can
+	/// take the group's own lock, which the caller does once the track guard is gone.
+	fn poll_recv_group(&self, index: usize, min_sequence: u64) -> Poll<Result<Option<(group::Producer, usize)>>> {
 		let start = index.saturating_sub(self.offset);
 		for (i, (sequence, stamp)) in self.arrival.iter().enumerate().skip(start) {
 			if *sequence >= min_sequence
@@ -297,10 +299,7 @@ impl TrackState {
 				&& slot.stamp == *stamp
 				&& !slot.group.is_aborted()
 			{
-				// Delivery is a cache access: stamp it so expiry and the eviction
-				// walk don't kill a group a subscriber is about to read.
-				slot.group.cache_refresh();
-				return Poll::Ready(Ok(Some((slot.group.consume(), self.offset + i))));
+				return Poll::Ready(Ok(Some((slot.group.clone(), self.offset + i))));
 			}
 		}
 
@@ -361,7 +360,7 @@ impl TrackState {
 		&self,
 		next_sequence: u64,
 		end_sequence: Option<u64>,
-	) -> Poll<Result<Option<group::Consumer>>> {
+	) -> Poll<Result<Option<group::Producer>>> {
 		// If the end cap is already below where we'd resume, no group can
 		// ever satisfy this call until the cap rises. Pending (not None) so
 		// the consumer is parked rather than told the stream is over.
@@ -385,7 +384,8 @@ impl TrackState {
 			// Deliberately no cache refresh here: this is a pure seek, and the spliced
 			// merge consults candidates it may not deliver. The deliverer stamps the
 			// winner; a loser re-seeked every poll must not be shielded from eviction.
-			return Poll::Ready(Ok(Some(group.consume())));
+			// The caller consumes it with the track guard released, like `poll_recv_group`.
+			return Poll::Ready(Ok(Some(group.clone())));
 		}
 
 		// No in-range group is cached. Decide whether more could ever arrive.
@@ -410,10 +410,8 @@ impl TrackState {
 	/// is a miss instead, so the fetch goes upstream for the frames that are missing.
 	fn covering_group(&self, sequence: u64, frame_start: u64) -> Option<&group::Producer> {
 		let slot = self.lookup.get(&sequence)?;
-		if slot.group.is_aborted() || slot.group.first_frame() as u64 > frame_start {
-			return None;
-		}
-		Some(&slot.group)
+		let first = slot.group.live_first_frame()?;
+		(first as u64 <= frame_start).then_some(&slot.group)
 	}
 
 	/// The publisher's max age window, or `None` while the info is unknown (an
@@ -720,7 +718,14 @@ impl TrackState {
 	/// draining the old one keep their own handle.
 	fn claim_sequence(&mut self, sequence: u64, frame_start: u64) -> Result<()> {
 		if let Some(slot) = self.lookup.get(&sequence) {
-			if !slot.group.is_aborted() && slot.group.first_frame() as u64 <= frame_start {
+			// The same question `covering_group` asks: can this slot still answer from
+			// `frame_start`? If it can, the sequence is taken; if it can't, it is dead
+			// and the caller gets to replace it.
+			if slot
+				.group
+				.live_first_frame()
+				.is_some_and(|first| first as u64 <= frame_start)
+			{
 				return Err(Error::Duplicate);
 			}
 			self.lookup.remove(&sequence);
@@ -941,25 +946,18 @@ impl TrackState {
 		}
 
 		let max = self.latest_group?;
-		match self.lookup.get(&max) {
+		match self.lookup.get(&max).and_then(|slot| slot.group.resume_frame()) {
 			// Still open *and* carrying frames, so the replacement continues it
-			// frame-by-frame. This holds even for an aborted group: readers that already
-			// consumed its head want the tail, and the count outlives the released cache.
-			//
-			// The *committed* count, not the written one: a route dying midway through a
-			// chunked frame leaves that frame unusable, so the replacement has to send it
-			// again rather than start after it.
-			Some(slot) if !slot.group.is_finished() && slot.group.committed_frames() > slot.group.first_frame() => {
-				Some(Position {
-					group: max,
-					frame: slot.group.committed_frames() as u64,
-				})
-			}
+			// frame-by-frame.
+			Some(frame) => Some(Position {
+				group: max,
+				frame: frame as u64,
+			}),
 			// A copy that wrote nothing has no frames to splice onto, and the reader
 			// already holds its (empty) handle. Pointing a replacement at frame 0 would
 			// hand the same sequence out twice, so roll to the next group exactly as a
 			// finished one does.
-			_ => Some(Position::group(max.saturating_add(1))),
+			None => Some(Position::group(max.saturating_add(1))),
 		}
 	}
 
@@ -1163,7 +1161,7 @@ impl Producer {
 		});
 		let cache = state.cache.clone();
 		drop(state);
-		cache.settle();
+		cache.settle(None);
 		Ok(sequence)
 	}
 
@@ -1195,7 +1193,7 @@ impl Producer {
 		state.push_datagram(datagram);
 		let cache = state.cache.clone();
 		drop(state);
-		cache.settle();
+		cache.settle(None);
 		Ok(())
 	}
 
@@ -1456,7 +1454,7 @@ impl Producer {
 
 		let prev = &self.prev_subscription;
 		let mut combined = None;
-		let mut guard = match subs.poll(waiter, |subs| {
+		let mut guard = ready!(subs.poll(waiter, |subs| {
 			let next = combined_subscription(subs, bound, waiter);
 			if &next == prev {
 				Poll::Pending
@@ -1464,10 +1462,7 @@ impl Producer {
 				combined = next;
 				Poll::Ready(())
 			}
-		}) {
-			Poll::Ready(guard) => guard,
-			Poll::Pending => return Poll::Pending,
-		};
+		}));
 		// The aggregate changed: prune any closed subscribers now that we hold the lock.
 		guard.retain(|sub| !sub.is_closed());
 		drop(guard);
@@ -2971,7 +2966,7 @@ impl PlainSubscriber {
 					group
 				}
 				_ => {
-					let Some((consumer, found_index)) =
+					let Some((producer, found_index)) =
 						ready!(self.poll(waiter, |state| state.poll_recv_group(self.index, self.min_sequence))?)
 					else {
 						// Parked groups survive a finished track: they become deliverable
@@ -2981,6 +2976,10 @@ impl PlainSubscriber {
 						}
 						return Poll::Pending;
 					};
+					let consumer = producer.consume();
+					// Stamp with the track guard released, so delivery never nests the
+					// group's state lock under the track's.
+					consumer.cache_refresh();
 					self.index = found_index + 1;
 
 					// Park a group beyond the cap instead of dropping it, and keep scanning
@@ -3056,7 +3055,7 @@ impl PlainSubscriber {
 		let drift = ready!(self.poll_drift(servable_cap(end, self.stale_cap), waiter))?;
 
 		loop {
-			let Some(group) = ready!(self.poll(waiter, |state| state.poll_next_in_range(floor, end))?) else {
+			let Some(producer) = ready!(self.poll(waiter, |state| state.poll_next_in_range(floor, end))?) else {
 				// Deliberately no flush of `seek_pending` here: only a delivery commit
 				// may count a conviction. This `None` can be an artifact of a floor
 				// that will lower again, and a mid-group boundary can serve a
@@ -3065,6 +3064,7 @@ impl PlainSubscriber {
 				// cursor, the same tail bound a retired segment already has.
 				return Poll::Ready(Ok(None));
 			};
+			let group = producer.consume();
 
 			// Skip a group the budget has given up on and keep scanning, so one poll
 			// walks a whole backlog off rather than handing it out group by group.
@@ -4342,6 +4342,42 @@ mod test {
 		assert!(
 			state.lookup.contains_key(&0),
 			"a group streaming a frame survives expiry"
+		);
+	}
+
+	/// The wire ingest coalesces its chunk wakes to the poll boundary, so a payload
+	/// whose tail arrives all at once completes without a single `frame_notify`.
+	/// Committing is itself a write access: a group that just finished a frame must
+	/// not be expired by the next track write on its stale frame-open stamp.
+	#[tokio::test]
+	async fn coalesced_frame_completion_keeps_the_group_alive() {
+		let mut producer = track_producer("test", None);
+		let mut straggler = producer.create_group(0u64.into()).unwrap();
+		// The live edge moves on, so the straggler is demoted and expirable.
+		producer.create_group(1u64.into()).unwrap().finish().unwrap();
+
+		let mut frame = straggler
+			.create_frame_owned(frame::Info {
+				size: 3,
+				timestamp: Timestamp::ZERO,
+			})
+			.unwrap();
+
+		// The sender stalls past the retention window, then the whole payload lands in
+		// one poll turn: the loop never returns `Pending`, so `notify` is never reached
+		// and `finish` is the only write the charge sees.
+		crate::model::clock::advance(cache::DEFAULT_EXPIRY + Duration::from_secs(1));
+		frame.write(bytes::Bytes::from_static(b"abc")).unwrap();
+		frame.finish().unwrap();
+		straggler.finish().unwrap();
+
+		// A new group runs the expiry scan.
+		producer.create_group(2u64.into()).unwrap().finish().unwrap();
+
+		let state = producer.state.read();
+		assert!(
+			state.lookup.contains_key(&0),
+			"a group whose frame just completed must not expire"
 		);
 	}
 
@@ -7419,6 +7455,42 @@ mod test {
 
 		let mut group = pending.await.unwrap();
 		assert_eq!(&group.read_frame().await.unwrap().unwrap().payload[..], b"refetched");
+	}
+
+	/// An aborted group is dead whatever frame it starts at: the sequence is claimable
+	/// again, and a cache lookup misses rather than handing back a slot that can no
+	/// longer serve it.
+	///
+	/// The abort and the group's first frame decide this together, so they are read
+	/// under one guard. Read separately, the abort can land between them and the slot
+	/// answers as a live duplicate on the strength of an offset it only still has
+	/// because it died. That interleaving is what the single guard rules out; this
+	/// pins the committed semantics it has to preserve.
+	#[test]
+	fn an_aborted_group_releases_its_sequence() {
+		let mut producer = track_producer("test", None);
+		let consumer = producer.consume();
+
+		let mut group = producer.create_group(group::Info { sequence: 3 }).unwrap();
+		group
+			.write_frame(Timestamp::ZERO, bytes::Bytes::from_static(b"head"))
+			.unwrap();
+
+		// While it lives the slot answers, so the sequence is taken.
+		assert!(matches!(
+			producer.create_group(group::Info { sequence: 3 }),
+			Err(Error::Duplicate)
+		));
+		assert!(consumer.peek_group(3).is_some());
+
+		group.abort(Error::Cancel).unwrap();
+
+		assert!(consumer.peek_group(3).is_none(), "an aborted slot is a cache miss");
+		producer
+			.create_group(group::Info { sequence: 3 })
+			.expect("an aborted slot releases its sequence")
+			.finish()
+			.unwrap();
 	}
 
 	/// A fetched (backfill) group is served by sequence but never replayed to

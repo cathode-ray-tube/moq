@@ -12,6 +12,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `encode::Producer` carries a rendition's `label` into the catalog. It copied the config into hints
   field by field and had no case for the new field.
 
+## [0.0.22](https://github.com/moq-dev/moq/compare/moq-video-v0.0.21...moq-video-v0.0.22) - 2026-09-02
+
+### Fixed
+
+- *(video)* compile the PipeWire render test ([#3341](https://github.com/moq-dev/moq/pull/3341))
+
+## [0.0.21](https://github.com/moq-dev/moq/compare/moq-video-v0.0.20...moq-video-v0.0.21) - 2026-09-01
+
+### Added
+
+- *(video)* complete native screen capture ([#3244](https://github.com/moq-dev/moq/pull/3244))
+- *(video)* add packed RGBA surface exit ([#3236](https://github.com/moq-dev/moq/pull/3236))
+
+### Fixed
+
+- *(moq-video)* mark capture idle gaps ([#3214](https://github.com/moq-dev/moq/pull/3214))
+
+### Other
+
+- *(video)* exercise PipeWire DMA-BUF rendering ([#3228](https://github.com/moq-dev/moq/pull/3228))
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
 ## [0.0.20](https://github.com/moq-dev/moq/compare/moq-video-v0.0.19...moq-video-v0.0.20) - 2026-08-26
 
 ### Added

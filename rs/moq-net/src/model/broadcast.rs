@@ -774,6 +774,21 @@ impl Consumer {
 		Ok(consumer)
 	}
 
+	/// A watch-only handle to the broadcast's demand. See [`Demand`].
+	///
+	/// The consumer-side sibling of [`Producer::demand`], for a holder that has
+	/// only a read handle. Holding this handle, or the [`Consumer`] it came from,
+	/// is not itself demand.
+	///
+	/// Demand going away is [`Demand::unused`] resolving. The broadcast going
+	/// away is [`Error::Dropped`], which here means the upstream producer ended.
+	pub fn demand(&self) -> Demand {
+		Demand {
+			alive: self.alive.weak(),
+			state: self.state.clone(),
+		}
+	}
+
 	/// Block until the broadcast is closed, by [`Producer::finish`],
 	/// [`Producer::abort`], or every producer dropping, and return the cause.
 	///
@@ -868,7 +883,7 @@ impl super::WeakEntry for WeakConsumer {
 
 /// A cloneable, watch-only handle to a broadcast's subscriber demand.
 ///
-/// Obtained from [`Producer::demand`]; the broadcast-level sibling of
+/// Obtained from [`Producer::demand`] or [`Consumer::demand`]; the broadcast-level sibling of
 /// [`track::Demand`](crate::track::Demand). Demand means live interest in the
 /// broadcast's content: a subscribed spliced track on a route-fed broadcast, or
 /// a pending track request / a consumed track on an ordinary one. A publisher
@@ -1007,20 +1022,42 @@ mod test {
 		let producer = Producer::new_spliced(Info::new());
 		let consumer = producer.consume();
 		let demand = producer.demand();
+		let watched = consumer.demand();
 
 		assert!(!demand.is_used());
+		assert!(!watched.is_used());
 		let track = consumer.track("video").unwrap();
 		assert!(demand.is_used());
+		assert!(watched.is_used());
 
 		// Dropping the only consumer wakes a parked `unused`, even though the
 		// logical track itself stays cached in the broadcast.
-		let (unused, ()) = tokio::join!(expect(demand.unused()), async { drop(track) });
+		let (unused, ()) = tokio::join!(expect(watched.unused()), async { drop(track) });
 		unused.unwrap();
 		assert!(!demand.is_used());
+		assert!(!watched.is_used());
 
 		// A repeat consumer for the cached track counts again.
 		let _track = consumer.track("video").unwrap();
 		assert!(demand.is_used());
+	}
+
+	/// A consumer demand handle distinguishes lost demand from a dropped producer.
+	#[tokio::test]
+	async fn consumer_demand_reports_dropped_producer() {
+		let producer = Producer::new_spliced(Info::new());
+		let consumer = producer.consume();
+		let watched = consumer.demand();
+
+		let track = consumer.track("video").unwrap();
+		assert!(watched.is_used());
+
+		let (unused, ()) = tokio::join!(expect(watched.unused()), async { drop(track) });
+		unused.unwrap();
+
+		drop(producer);
+		assert!(matches!(watched.used().await, Err(Error::Dropped)));
+		assert!(matches!(watched.unused().await, Err(Error::Dropped)));
 	}
 
 	/// Subscribe and assert the result hasn't resolved yet (it stays pending until

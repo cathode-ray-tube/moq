@@ -358,11 +358,10 @@ impl Track {
 	pub(crate) fn charge(self: &Arc<Self>) -> Charge {
 		self.pool.add(ENTRY_OVERHEAD);
 		self.written.fetch_add(ENTRY_OVERHEAD, Ordering::Relaxed);
-		let last = self.pool.stamp(0);
 		Charge {
 			track: Some(self.clone()),
 			bytes: ENTRY_OVERHEAD,
-			last: AtomicU64::new(last),
+			access: Arc::new(Access::new(self.pool.stamp(0))),
 			counted: false,
 		}
 	}
@@ -379,9 +378,13 @@ impl Track {
 	/// when expiry is enabled. This is what makes a track that only appends frames to
 	/// open groups, never inserting another group, still pay its debt and age its
 	/// idle content out.
-	pub(crate) fn settle(&self) {
+	///
+	/// `now` is the coarse tick a cache access on this path just sampled (see
+	/// [`Charge::add`]), reused so a frame write reads the clock once instead of
+	/// twice. `None` leaves the gate to sample it, and only if it needs it.
+	pub(crate) fn settle(&self, now: Option<u64>) {
 		let settle_debt = self.written.load(Ordering::Relaxed) >= WRITE_CHARGE_THRESHOLD;
-		let scan_expiry = self.expiry_due();
+		let scan_expiry = self.expiry_due(now);
 		if !settle_debt && !scan_expiry {
 			return;
 		}
@@ -414,13 +417,15 @@ impl Track {
 	}
 
 	/// Claim the next write-driven expiry scan when its time gate is due.
-	fn expiry_due(&self) -> bool {
+	fn expiry_due(&self, now: Option<u64>) -> bool {
 		let expiry = self.pool.expiry_ticks();
 		if expiry == u64::MAX {
 			return false;
 		}
 
-		let now = self.pool.now();
+		// Sampled here, below the gate: a pool with no expiry window returns above
+		// without ever reading the clock, whether or not a caller had a tick.
+		let now = now.unwrap_or_else(|| self.pool.now());
 		let interval = expiry.clamp(1, EXPIRY_SCAN_TICKS);
 		let deadline = now.saturating_add(interval);
 		let next = self.next_expiry.load(Ordering::Relaxed);
@@ -448,16 +453,51 @@ pub(crate) struct Charge {
 	track: Option<Arc<Track>>,
 	// Bytes currently charged, including ENTRY_OVERHEAD, released on drop.
 	bytes: u64,
-	// Tick of the last cache access: creation, every write, and every read (group
-	// delivery, frame reads, FETCH hits, a fetched backfill's birth). Eviction
-	// protection and age expiry key off this. Atomic so the read paths can stamp
-	// it through a shared guard: a kio write guard's release notifies every parked
-	// consumer, which a mere access must not do. Accesses are still serialized by
-	// the owning state's lock, so `counted` can pair with it as a plain bool.
-	last: AtomicU64,
-	// Whether `last` is currently a sample in the pool's access mean, i.e. the
-	// group is in the evictable population.
+	// The group's last-access stamp, shared with the handles that read it during a
+	// track scan. Only ever written here, under the group's state lock.
+	access: Arc<Access>,
+	// Whether `access` is currently a sample in the pool's access mean, i.e. the
+	// group is in the evictable population. A plain bool: it is only read while
+	// updating the mean, which the owning state's lock already serializes.
 	counted: bool,
+}
+
+/// The tick of one cached group's last cache access: its creation, every write, and
+/// every read (group delivery, frame reads, FETCH hits, a fetched backfill's birth).
+/// Eviction protection and age expiry both key off it.
+///
+/// Shared, so a track scan can read it without entering the group's state. The
+/// eviction and expiry walks run under the track lock and weigh every candidate
+/// against [`Pool::average`], so reaching this through the group lock would nest one
+/// lock inside the other once per candidate.
+///
+/// Atomic for a second reason on the write side: a kio write guard's release notifies
+/// every parked consumer, and a mere cache access must not wake anyone, so [`Charge`]
+/// stamps this through a shared guard.
+#[derive(Default)]
+pub(crate) struct Access(AtomicU64);
+
+impl Access {
+	fn new(stamp: u64) -> Self {
+		Self(AtomicU64::new(stamp))
+	}
+
+	/// The stamp, tie-breaking bits included.
+	pub(crate) fn get(&self) -> u64 {
+		self.0.load(Ordering::Relaxed)
+	}
+
+	/// The coarse clock tick alone, without the priority bits.
+	pub(crate) fn tick(&self) -> u64 {
+		self.get() >> ACCESS_SHIFT
+	}
+
+	/// Advance to `target` if it is newer, returning the previous stamp.
+	fn bump(&self, target: u64) -> u64 {
+		// `fetch_max` keeps the stamp monotone, and its prior value makes the
+		// paired mean update exact even for back-to-back accesses.
+		self.0.fetch_max(target, Ordering::Relaxed)
+	}
 }
 
 impl Charge {
@@ -467,13 +507,17 @@ impl Charge {
 	/// actively-growing group (a straggler or backfill still being filled) from
 	/// being evicted or expired mid-write, even within the same coarse tick as
 	/// content that was merely inserted.
-	pub(crate) fn add(&mut self, n: u64) {
+	///
+	/// Returns the coarse tick it stamped, which the caller hands to
+	/// [`Track::settle`] so the write path reads the clock once rather than twice.
+	/// `None` when the charge is detached and stamped nothing.
+	pub(crate) fn add(&mut self, n: u64) -> Option<u64> {
 		if let Some(track) = &self.track {
 			track.pool.add(n);
 			track.written.fetch_add(n, Ordering::Relaxed);
 			self.bytes += n;
 		}
-		self.touch(WRITE_BOOST);
+		self.touch(WRITE_BOOST)
 	}
 
 	/// Release `n` payload bytes (a frame evicted by the group's own cap).
@@ -489,14 +533,15 @@ impl Charge {
 		self.bytes
 	}
 
-	/// Tick of the group's last cache access.
-	pub(crate) fn accessed(&self) -> u64 {
-		self.last.load(Ordering::Relaxed)
+	/// The shared handle to this group's last-access stamp, so the group can read it
+	/// without taking the state lock this charge lives behind.
+	pub(crate) fn access(&self) -> Arc<Access> {
+		self.access.clone()
 	}
 
-	/// Coarse clock tick of the group's last cache access, without its priority bits.
-	pub(crate) fn accessed_tick(&self) -> u64 {
-		self.accessed() >> ACCESS_SHIFT
+	/// Tick of the group's last cache access.
+	pub(crate) fn accessed(&self) -> u64 {
+		self.access.get()
 	}
 
 	/// Enter the group into the evictable population (demoted from the live edge,
@@ -521,9 +566,10 @@ impl Charge {
 	/// Record a write that charges no new bytes (a chunk written into an
 	/// already-charged in-flight frame): restarts the retention clock like any
 	/// other write. `&mut self` deliberately: reaching it through a kio write
-	/// guard marks the guard modified, so its release wakes parked readers.
-	pub(crate) fn record_write(&mut self) {
-		self.touch(WRITE_BOOST);
+	/// guard marks the guard modified, so its release wakes parked readers. Returns
+	/// the stamped tick like [`Self::add`].
+	pub(crate) fn record_write(&mut self) -> Option<u64> {
+		self.touch(WRITE_BOOST)
 	}
 
 	/// Advance the last-access stamp to the current clock tick with `boost` priority.
@@ -533,18 +579,15 @@ impl Charge {
 	/// same-tick access still reads as strictly newer than the population mean of
 	/// weaker accesses. Idempotent within a tick (monotone, never regressing), so
 	/// repeated accesses remain idempotent without advancing the expiry clock.
-	fn touch(&self, boost: u64) {
-		let Some(track) = &self.track else { return };
+	/// Returns the tick it read, or `None` when the charge is detached.
+	fn touch(&self, boost: u64) -> Option<u64> {
+		let track = self.track.as_ref()?;
 		let target = track.pool.stamp(boost);
-		// `fetch_max` keeps the stamp monotone, and its prior value makes the
-		// paired mean update exact even for back-to-back accesses.
-		let prev = self.last.fetch_max(target, Ordering::Relaxed);
-		if target <= prev {
-			return;
-		}
-		if self.counted {
+		let prev = self.access.bump(target);
+		if target > prev && self.counted {
 			track.pool.access_refresh(prev, target);
 		}
+		Some(target >> ACCESS_SHIFT)
 	}
 
 	/// Release everything this charge holds: bytes, overhead, and the access
@@ -723,7 +766,7 @@ mod test {
 		// A refresh in the same coarse tick still lifts the group above the mean.
 		c.refresh();
 		assert!(c.accessed() > average);
-		assert_eq!(c.accessed_tick(), pool.now(), "priority does not advance expiry time");
+		assert_eq!(c.access().tick(), pool.now(), "priority does not advance expiry time");
 		// Repeated same-tick refreshes are idempotent, not runaway.
 		let stamped = c.accessed();
 		c.refresh();
@@ -752,6 +795,28 @@ mod test {
 		assert_eq!(pool.expiry(), None);
 		assert_eq!(pool.expiry_ticks(), u64::MAX);
 		assert_eq!(pool.refresh_interval(), DEFAULT_EXPIRY / 2);
+	}
+
+	#[test]
+	fn expiry_gate_reuses_a_supplied_tick() {
+		let pool = Pool::new(Config::default().with_expiry(Duration::from_secs(1)));
+		let track = Track::new(pool, kio::Weak::new());
+		// A supplied tick drives the gate on its own: claimed immediately, closed
+		// until the interval elapses, claimable again on the tick it reopens.
+		assert!(track.expiry_due(Some(0)));
+		assert!(!track.expiry_due(Some(9)));
+		assert!(track.expiry_due(Some(10)));
+		// Without one the gate samples the pool clock, frozen here at tick 0, so it
+		// stays closed rather than inheriting the caller's tick 10.
+		assert!(!track.expiry_due(None));
+	}
+
+	#[test]
+	fn expiry_gate_stays_closed_without_a_window() {
+		// No window means no time gate, and no clock read to reach it.
+		let track = Track::new(Pool::unbounded(), kio::Weak::new());
+		assert!(!track.expiry_due(None));
+		assert!(!track.expiry_due(Some(u64::MAX)));
 	}
 
 	#[test]
