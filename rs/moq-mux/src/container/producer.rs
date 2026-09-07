@@ -80,8 +80,73 @@ impl<C: Container<Error = crate::error::Error>> Producer<C> {
 			recorder: None,
 			end: None,
 			estimator: crate::catalog::Estimator::new(),
+			encrypter: None,
 		}
 	}
+
+	/// Enable encryption for all encoded container payloads.
+	///
+	/// The encrypter is retained for the lifetime of the producer. This is
+	/// important because its encryption counter must advance across immediate
+	/// writes and buffered flushes.
+	///
+	/// Usage:
+	/// let encrypter = MoqSecureEncrypter::new(
+	/// &key_store,
+    /// &signing_key,
+    /// key_id...
+	/// 
+	/// TODO: tear-down behavior will zero-ize credentials.
+	/// Key management will generally be left to the application,
+	/// however, safeguards may be applied here to prevent nonce reuse
+	/// in the event of restart (mandate new key, for instance)
+	pub fn with_encrypter<E>(mut self, encrypter: E) -> Self
+	where
+    E: crate::container::FrameEncrypter + 'static,
+	{
+    self.encrypter = Some(Box::new(encrypter));
+    self
+	}
+
+	/// Writes encoded container payloads through the configured writer chain.
+	///
+	/// Every call uses the current group. If an encrypter is configured, the
+	/// encoded payload is passed through ProtectedFrame before reaching MoQ.
+	fn write_container(
+	    &mut self,
+	    frames: &[Frame],
+	) -> Result<(), C::Error> {
+	    let group = match self.group.as_mut() {
+	        Some(group) => group,
+	        None => return Ok(()),
+	    };
+	
+	    let container = &mut self.container;
+	    let encrypter = &mut self.encrypter;
+	
+	    let output = crate::container::MoqFrameWriter { group };
+	
+	    match encrypter.as_mut() {
+	        Some(encrypter) => {
+	            let mut protected =
+	                crate::container::ProtectedFrame::new(
+	                    output,
+	                    encrypter.as_mut(),
+	                );
+	
+	            container.write(&mut protected, frames)?;
+	        }
+	
+	        None => {
+	            let mut plain = output;
+	
+	            container.write(&mut plain, frames)?;
+	        }
+	    }
+	
+	    Ok(())
+	}
+
 
 	/// The jitter and bitrate measured from the frames written so far.
 	///
@@ -182,17 +247,13 @@ pub fn write(&mut self, frame: Frame) -> Result<(), C::Error> {
 
 	// Buffer or write the frame.
 	if self.buffer_duration.is_zero() {
-		let group = self.group.as_mut().unwrap();
-
 		let (timestamp, duration, bytes) = (
-			frame.timestamp,
-			frame.duration,
-			frame.payload.len(),
+		    frame.timestamp,
+		    frame.duration,
+		    frame.payload.len(),
 		);
 
-		let mut output = crate::container::MoqFrameWriter { group };
-
-		self.container.write(&mut output, &[frame])?;
+		self.write_container(std::slice::from_ref(&frame))?;
 
 		// Only what the container accepted is measured. A rejected frame
 		// leaves the producer usable, and the estimate's extrema never fall,
@@ -364,15 +425,13 @@ fn flush(&mut self, next: Option<moq_net::Timestamp>) -> Result<(), C::Error> {
 		}
 	}
 
-	let group = match &mut self.group {
-		Some(group) => group,
-		None => return Ok(()),
-	};
+	if self.group.is_none() {
+    return Ok(());
+	}
 
-	let mut output = crate::container::MoqFrameWriter { group };
+	let buffered = std::mem::take(&mut self.buffer);
 
-	self.container.write(&mut output, &self.buffer)?;
-	self.buffer.clear();
+	self.write_container(&buffered)?;
 
 	Ok(())
 }
