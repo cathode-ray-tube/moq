@@ -133,16 +133,16 @@ impl FrameEncrypter for MoqSecureEncrypter<'_> {
         let ctr = self.take_counter()?;
 
         let frame = moq_secure::wire::encrypt_frame(
-            self.key_store,
-            self.signing_key,
-            self.key_id,
-            ctr,
-            self.n_signed,
-            self.maybe_sign,
-            1, // encrypted
-            self.pad_len,
-            plaintext,
-        )?;
+    		self.key_store.as_ref(),
+    		&self.signing_key,
+    		self.key_id,
+    		ctr,
+    		self.n_signed,
+    		self.maybe_sign,
+    		1,
+    		self.pad_len,
+    		plaintext,
+		)?;
 
         Ok(Bytes::from(frame.serialize()))
     }
