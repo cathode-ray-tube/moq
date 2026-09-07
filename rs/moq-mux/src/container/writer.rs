@@ -78,7 +78,7 @@ impl<W, E> ProtectedFrame<W, E> {
 impl<W, E> FrameWriter for ProtectedFrame<W, E>
 where
     W: FrameWriter<Error = Error>,
-    E: FrameEncrypter + ?Sized,
+    E: FrameEncrypter,
 {
     type Error = Error;
 
