@@ -15,6 +15,13 @@ regression test per Root Cause First.
 
 ## Quests
 
+- [#3478](/quest/m0/3478-js-net-fractional-max-age.md) - js/net: a fractional maxAge is rounded up before it reaches the wire, so auto mode on dev subscribes at all
+- [#3491](/quest/m0/3491-moq-net-a-group-consumer-is-one-cursor.md) - moq-net: a group consumer is one cursor, so an evicted group is skipped instead of ending `moq export ts`
+- [Auto latency](/quest/m0/3477-watch-auto-latency.md) - js/watch: auto latency follows measured arrivals, and the audio ring holds slack and re-buffers
+- [#3492](/quest/m0/3492-ietf-track-status.md) - moq-net: TRACK_STATUS gets a truthful answer on every draft instead of a dropped stream
+- [Jitter estimator](/quest/m0/3479-mux-jitter-flush-span.md) - moq-mux: catalog jitter is the publisher's maximum flush span, never a running minimum
+- [Audio identity](/quest/m0/3479-watch-audio-identity.md) - js/watch: a catalog republish rebuilds the audio graph only when the decoder identity changes
+- [Encoder lag](/quest/m0/publish-audio-encoder-lag.md) - js/publish: AudioEncoder output falls behind its input after a subscriber churn
 - [OBS callback lifetime](/quest/m0/obs-session-callback-lifetime.md) - keep output state alive through delayed terminal callbacks
 - [IETF error codes](/quest/m0/ietf-error-codes.md) - every code on a moq-transport wire is a registered value for the negotiated draft, requests and stream resets alike
 - [Resume info](/quest/m0/resume-info-newest.md) - moq-net: resume reports segment zero's track info, so a replaced broadcast rescales timestamps on the predecessor's timescale
