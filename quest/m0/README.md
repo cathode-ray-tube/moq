@@ -2,43 +2,43 @@
 
 ## Goal
 
-Defects in what main ships today: crashes, races, protocol violations,
-wrong output, security gaps, and the missing tests that let them through.
+Defects in what main or dev ships today: crashes, races, protocol violations,
+wrong output, security gaps, regressions an unreleased change introduced, and
+the missing tests that let them through.
 
 ## Plan
 
-Fix on main. Security and credential exposure lead; user-visible breakage
+Fix where the defect is, which is usually main; a quest says so when it is dev.
+Security and credential exposure lead; user-visible breakage
 next; hardening, tooling, and test debt close the list. Each fix lands with a
 regression test per Root Cause First.
 
 ## Quests
 
-- [#3087](/quest/m0/3087-relay-mtls-peers-bypass-auth-api-mode-so-proxy-grants.md) - relay: mTLS peers bypass --auth-api-mode, so proxy grants can't refuse or scope them
-- [#2405](/quest/m0/2405-js-net-connect-logs-on-every-connection-at-the-wrong.md) - js/net: connect() logs on every connection at the wrong level and prints the JWT in the URL
-- [Dart leaks](/quest/m0/dart-leak.md) - the generated Dart bindings leak native memory on every call
-- [#3207](/quest/m0/3207-send-valid-publish-done-statuses-for-every-supported-ietf.md) - Send valid PUBLISH_DONE statuses for every supported IETF draft
-- [#3076](/quest/m0/3076-moq-relay-publish-is-unimplemented-by-design-make-the.md) - moq-relay: PUBLISH is unimplemented by design - make the rejection fail fast for clients that wait
-- [#2388](/quest/m0/2388-safari-stops-delivering-new-incoming-unidirectional.md) - Safari stops delivering new incoming unidirectional streams after roughly 7000 on a session; one stream per group exhausts that in about two minutes of playback
-- [#2527](/quest/m0/2527-publish-video-breaks-when-the-publishers-window-is.md) - Publish video breaks when the publisher's window is minimized, on every browser using the MediaStreamTrackProcessor polyfill
-- [#2849](/quest/m0/2849-moq-import-ts-a-truncated-or-spliced-opus-pes-ends-the.md) - moq import ts: a truncated or spliced Opus PES ends the session
-- [#2788](/quest/m0/2788-moq-transcode-run-cant-bootstrap-from-a-demand-gated.md) - moq-transcode: run() can't bootstrap from a demand-gated source that doesn't advertise its geometry
-- [#3139](/quest/m0/3139-moqsrc-a-rendition-nobody-answers-keeps-the-session-alive.md) - moqsrc: a rendition nobody answers keeps the session alive after the catalog closes
-- [#2812](/quest/m0/2812-watch-has-audio-stutter-on-ios-on-https-moq-dev-watch.md) - Watch has Audio stutter on iOS on https://moq.dev/watch/
-- [#2981](/quest/m0/2981-moq-audio-nothing-in-the-decode-or-playback-path-models-a.md) - moq-audio: nothing in the decode or playback path models a media gap
-- [#3080](/quest/m0/3080-fix-watch-audio-ring-truncate-can-race-the-worklet-reader.md) - fix(watch): audio ring truncate can race the worklet reader for one quantum
-- [#2833](/quest/m0/2833-moq-export-ts-a-rewound-timeline-stalls-the-si-table.md) - moq export ts: a rewound timeline stalls the SI table cadence until the media clock catches up
-- [#2806](/quest/m0/2806-js-net-the-draft-14-15-adapter-keeps-one-request-per.md) - js/net: the draft-14/15 adapter keeps one request per namespace, so a duplicate strands the first
-- [#2799](/quest/m0/2799-moq-video-capture-negotiates-twice-so-a-window-resize.md) - moq-video: capture negotiates twice, so a window resize between the probe and the first subscriber strands consumers that fixed on the first snapshot
-- [#2813](/quest/m0/2813-capture-on-ios-is-software-only-not-hardware.md) - Capture on iOS is software only , not hardware
-- [#2847](/quest/m0/2847-the-quinn-backends-send-bandwidth-estimate-is-cwnd-rtt.md) - The quinn backend's send-bandwidth estimate is cwnd/rtt, not a rate
+- [#3360](/quest/m0/3360-js-watch-broadcast-is-undefined-at-initialization.md) - js/watch: a framework binding the element reads `broadcast` before the custom element is upgraded
+- [Adapter namespace map](/quest/m0/rs-adapter-namespace-map.md) - moq-net: a duplicate PUBLISH_NAMESPACE on draft-14/15 strands the first request, and the map never shrinks
+- [Playout clock](/quest/m0/playout-clock.md) - moq play presents on a clock it controls, with a `--delay` offset and forward re-anchoring
+- [IETF error codes](/quest/m0/ietf-error-codes.md) - every request error a moq-transport wire carries is a registered value for the negotiated draft, in Rust and js/net
+- [Resume info](/quest/m0/resume-info-newest.md) - moq-net: resume reports segment zero's track info, so a replaced broadcast rescales timestamps on the predecessor's timescale
+- [#3363](/quest/m0/3363-js-watch-a-broadcast-republished-on-one-session-keeps-resuming.md) - js/watch: a broadcast republished under its name on one session keeps resuming
+- [#3361](/quest/m0/3361-js-every-moq-package-a-package-imports-is-declared.md) - js: every @moq package a package imports is a declared dependency
+- [JavaScript rewind cursor](/quest/m0/js-rewind-cursor.md) - detect a rewind in the unread active group
+- [SRT rewind pacing](/quest/m0/srt-rewind-pacing.md) - re-anchor SRT egress timestamps when the media timeline restarts
+- [TS timebase discontinuity](/quest/m0/ts-forward-discontinuity.md) - preserve source-signalled clock changes through import and export
+- [#3326](/quest/m0/3326-moq-audio-held-resampler-frames-keep-their-source-timestamp.md) - moq-audio: held resampler frames keep their source timestamp
 - [Group charge](/quest/m0/group-charge.md) - charge real per-group cost so MOQ_CACHE_CAPACITY bounds real memory
-- [H.265 suffix SEI ownership](/quest/m0/h265-suffix.md) - suffix SEI stays with the access unit it follows, including at EOF
-- [#2676](/quest/m0/2676-libmoq-process-exit-can-abort-in-glibcs-pthread-tpp.md) - libmoq: process exit can abort in glibc's __pthread_tpp_change_priority
-- [#2850](/quest/m0/2850-js-net-give-reader-a-synchronous-decode-so-the-publisher.md) - js/net: give Reader a synchronous decode so the publisher need not read controls ahead
-- [#3123](/quest/m0/3123-moq-bench-a-lagged-group-permanently-ends-the.md) - moq-bench: a lagged group permanently ends the subscription, so offered load silently decays mid-run
-- [#2838](/quest/m0/2838-js-flate-codec-rejects-frames-that-inflate-past-the.md) - js/flate: "codec rejects frames that inflate past the default cap" times out under parallel test load
-- [#3115](/quest/m0/3115-moqsink-the-publication-has-no-generation-so-a-flush.md) - moqsink: the publication has no generation, so a flush after EOS cannot restart it
-- [#2798](/quest/m0/2798-moq-import-ts-an-audio-resync-is-silent-no-log-no-counter.md) - moq import ts: an audio resync is silent - no log, no counter, no downstream signal
-- [#2860](/quest/m0/2860-cpp-obs-moq-source-cpp-has-no-test-coverage.md) - cpp/obs: moq-source.cpp has no test coverage
-- [#2868](/quest/m0/2868-obs-the-plugin-targets-obs-31-1-1-while-linux-ci-links.md) - obs: the plugin targets OBS 31.1.1 while Linux CI links against nixpkgs' 32.1.2
-- [#2067](/quest/m0/2067-test-open-gop-h-264-tune-in-end-to-end-leading-picture.md) - Test open-GOP H.264 tune-in end to end (leading-picture handling)
+- [Cache governor lifetime](/quest/m0/cache-governor-lifetime.md) - stop the headroom task after setup failure or the last owner drops
+- [uring all-features](/quest/m0/uring-all-features-build.md) - moq-uring does not compile with `--all-features`, so the nightly features gate fails on it
+- [Echo-delay test runtime](/quest/m0/aec-test-runtime.md) - keep the audio regression within the normal workspace test budget
+- [Go smoke client](/quest/m0/smoke-go-client.md) - the interop matrix has no Go client, so nothing in CI exercises the Go wrapper
+- [Auth expiry test](/quest/m0/auth-expiry-test-clock.md) - remove mixed-clock scheduling from the credential expiry regression
+- [Retirement race](/quest/m0/transcode-retirement-race.md) - moq-transcode: retirement has no coverage for a fetch that is still opening its decoder
+- [Quest ready gate](/quest/m0/quest-ready-gate.md) - quest: nothing reports whether a quest is blocked, so the start flow reconstructs it by grepping
+- [PR behavioral gates](/quest/m0/pr-behavioral-gates.md) - run the applicable interop and platform gates on source PRs before merge
+- [Merge evidence](/quest/m0/merge-verification-evidence.md) - bind local, CI, and device results to the current source and merge candidate
+- [Verification preflight](/quest/m0/verification-preflight.md) - diagnose missing tools, denied access, and unusable runtimes before building
+- [Worktree QA isolation](/quest/m0/worktree-qa-isolation.md) - give concurrent worktrees explicit bases, endpoints, and process ownership
+- [Failure artifacts](/quest/m0/qa-failure-artifacts.md) - retain inspectable traces, logs, and rerun commands when QA fails
+- [Browser media QA](/quest/m0/browser-media-qa.md) - measure actual playback output and lifecycle recovery beyond successful delivery
+- [Transport failure drills](/quest/m0/transport-failure-drills.md) - exercise disruption, cancellation, and races with non-vacuous regressions
+- [Packaged consumer QA](/quest/m0/packaged-consumer-qa.md) - install Rust and JS candidate archives outside the workspace before publication

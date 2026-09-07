@@ -62,8 +62,6 @@ encoders on every target change.
 
 ## Quests
 
-- [Rung order](/quest/m1/ladder/order.md) - resolve a ladder into strictly
-  ascending configured maximums and reject the ambiguous ones
 - [Controller](/quest/m1/ladder/controller.md) - one controller owns every
   rung's share, target, and stalled state
 - [Fetch and catalog](/quest/m1/ladder/fetch.md) - uncached FETCH encodes at
@@ -79,4 +77,4 @@ encoders on every target change.
 
 - [#2848](/quest/m1/2848-follow-the-bandwidth-grant-in-moq-audio-instead-of.md) - the other sender that reserves but never follows its grant
 - [#2859](/quest/m1/2859-passthrough-imports-reserve-no-bandwidth-so-a-co-resident.md) - passthrough tracks that reserve nothing at all
-- [#2857](/quest/m1/2857-bindings-cant-reach-encoder-rate-control-so-every-non.md) - non-Rust publishers cannot reach rate control regardless of what the ladder does
+- [#2857](/quest/m1/plan-binding-rate-control.md) - non-Rust publishers cannot reach rate control regardless of what the ladder does

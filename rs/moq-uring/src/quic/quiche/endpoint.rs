@@ -23,8 +23,10 @@ use crate::{Handle, udp};
 /// nobody has claimed yet.
 struct Accepting {
 	config: quiche::Config,
-	/// The keep-alive every accepted connection's driver runs.
-	keep_alive: Option<std::time::Duration>,
+	/// The per-connection settings the server was configured with, for the
+	/// ones quiche takes on the connection rather than on its config: the
+	/// driver's keep-alive, and the qlog trace.
+	transport: crate::quic::Transport,
 	queue: VecDeque<Connection>,
 }
 
@@ -153,7 +155,7 @@ impl Endpoint {
 		let accepting = match config.server {
 			Some(server) => Some(Accepting {
 				config: super::server_config(&server)?,
-				keep_alive: server.transport.keep_alive,
+				transport: server.transport.clone(),
 				queue: VecDeque::new(),
 			}),
 			None => None,
@@ -216,13 +218,22 @@ impl Endpoint {
 		}
 		let mut quiche_config = super::client_config(config)?;
 		let scid = self.inner.cid();
-		let conn = quiche::connect(
+		let conn = quiche::connect_with_buffer_factory::<super::BytesFactory>(
 			Some(&config.server_name),
 			&quiche::ConnectionId::from_ref(&scid),
 			self.inner.local,
 			config.peer,
 			&mut quiche_config,
 		)?;
+		#[cfg(feature = "qlog")]
+		let conn = super::with_qlog(
+			conn,
+			super::Qlog {
+				sink: config.transport.qlog.as_ref(),
+				cid: &scid,
+				side: crate::quic::qlog::Side::Client,
+			},
+		);
 		let (shared, _key) = self
 			.inner
 			.launch(conn, ConnectionIds::issued(scid), config.transport.keep_alive);
@@ -364,11 +375,17 @@ impl Inner {
 		}
 
 		let scid = self.cid();
-		let keep_alive = self.accepting.borrow().as_ref().expect("checked above").keep_alive;
+		let keep_alive = self
+			.accepting
+			.borrow()
+			.as_ref()
+			.expect("checked above")
+			.transport
+			.keep_alive;
 		let mut conn = {
 			let mut accepting = self.accepting.borrow_mut();
 			let accepting = accepting.as_mut().expect("checked above");
-			match quiche::accept(
+			match quiche::accept_with_buf_factory::<super::BytesFactory>(
 				&quiche::ConnectionId::from_ref(&scid),
 				None,
 				self.local,
@@ -382,6 +399,27 @@ impl Inner {
 				}
 			}
 		};
+		// Named from the client's Initial destination id, like the noq backend,
+		// so a trace is findable from a packet capture. Before `recv`, since
+		// quiche records nothing that happened before the writer was attached.
+		#[cfg(feature = "qlog")]
+		{
+			conn = super::with_qlog(
+				conn,
+				super::Qlog {
+					sink: self
+						.accepting
+						.borrow()
+						.as_ref()
+						.expect("checked above")
+						.transport
+						.qlog
+						.as_ref(),
+					cid: &hdr.dcid,
+					side: crate::quic::qlog::Side::Server,
+				},
+			);
+		}
 		if let Err(err) = conn.recv(segment, info) {
 			// Without a valid first flight there is no handshake to continue.
 			tracing::debug!(%err, "dropping a connection whose Initial was rejected");
@@ -446,7 +484,7 @@ impl Inner {
 	/// Register `conn`, spawn its driver, and arrange its teardown.
 	fn launch(
 		self: &Rc<Self>,
-		conn: quiche::Connection,
+		conn: super::RawConnection,
 		ids: ConnectionIds,
 		keep_alive: Option<std::time::Duration>,
 	) -> (connection::Shared, usize) {

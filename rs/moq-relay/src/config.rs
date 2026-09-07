@@ -461,13 +461,13 @@ io_uring = false
 [web]
 ws = false
 
-[connect.websocket]
-enabled = false
 "#;
+		#[cfg(feature = "websocket")]
+		let toml = format!("{toml}\n[connect.websocket]\nenabled = false\n");
 		let dir = std::env::temp_dir().join("moq-relay-config-test");
 		std::fs::create_dir_all(&dir).unwrap();
 		let path = dir.join("runtime-toml-wins.toml");
-		std::fs::write(&path, toml).unwrap();
+		std::fs::write(&path, &toml).unwrap();
 
 		let args = vec![std::ffi::OsString::from("moq-relay"), std::ffi::OsString::from(&path)];
 		let config = Config::parse_and_merge(args).expect("config load");
@@ -490,6 +490,7 @@ enabled = false
 			Some(false),
 			"TOML's web.ws=false must survive the CLI re-parse"
 		);
+		#[cfg(feature = "websocket")]
 		assert_eq!(
 			config.connect.websocket.enabled,
 			Some(false),
@@ -501,11 +502,13 @@ enabled = false
 			std::ffi::OsString::from(&path),
 			std::ffi::OsString::from("--runtime-pin=true"),
 			std::ffi::OsString::from("--web-ws=true"),
+			#[cfg(feature = "websocket")]
 			std::ffi::OsString::from("--connect-websocket-enabled=true"),
 		];
 		let config = Config::parse_and_merge(args).expect("config load");
 		assert_eq!(config.runtime.pin, Some(true));
 		assert_eq!(config.web.ws, Some(true));
+		#[cfg(feature = "websocket")]
 		assert_eq!(config.connect.websocket.enabled, Some(true));
 	}
 
@@ -669,6 +672,38 @@ congestion_control = "delay"
 		);
 	}
 
+	/// Flow-control windows loaded from TOML survive the CLI re-parse.
+	#[test]
+	fn cli_does_not_clobber_toml_windows() {
+		let _env = EnvGuard::clear(&[
+			"MOQ_QUIC_RECEIVE_WINDOW",
+			"MOQ_QUIC_STREAM_RECEIVE_WINDOW",
+			"MOQ_QUIC_SEND_WINDOW",
+		]);
+
+		let toml = r#"
+[quic]
+receive_window = 67108864
+stream_receive_window = 8388608
+send_window = 33554432
+"#;
+		let dir = std::env::temp_dir().join("moq-relay-config-test");
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("windows-toml-wins.toml");
+		std::fs::write(&path, toml).unwrap();
+
+		let args = vec![std::ffi::OsString::from("moq-relay"), std::ffi::OsString::from(&path)];
+		let config = Config::parse_and_merge(args).expect("config load");
+
+		assert_eq!(config.quic.receive_window, Some(67108864));
+		assert_eq!(config.quic.stream_receive_window, Some(8388608));
+		assert_eq!(
+			config.quic.send_window,
+			Some(33554432),
+			"TOML's quic window sizes must not be clobbered by the CLI re-parse"
+		);
+	}
+
 	/// The client connect timeout loaded from TOML replaces the built-in default.
 	#[test]
 	fn cli_does_not_clobber_toml_client_connect_timeout() {
@@ -764,6 +799,33 @@ auth_api = "https://api.moq.dev/cluster/auth"
 			config.auth.auth_api.as_deref(),
 			Some("https://api.moq.dev/cluster/auth"),
 			"TOML's auth.auth_api must not be clobbered by the CLI re-parse",
+		);
+	}
+
+	/// Same clap+TOML clobber guard for `auth.api_mode`. It's an `Option` so an
+	/// absent `--auth-api-mode` must not wipe a TOML-configured value during the
+	/// `update_from` re-parse.
+	#[test]
+	fn cli_does_not_clobber_toml_auth_api_mode() {
+		let _env = EnvGuard::clear(&["MOQ_AUTH_API", "MOQ_AUTH_API_MODE"]);
+
+		let toml = r#"
+[auth]
+auth_api = "https://api.moq.dev/cluster/auth"
+api_mode = "proxy"
+"#;
+		let dir = std::env::temp_dir().join("moq-relay-config-test");
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("auth-api-mode-toml-wins.toml");
+		std::fs::write(&path, toml).unwrap();
+
+		let args = vec![std::ffi::OsString::from("moq-relay"), std::ffi::OsString::from(&path)];
+		let config = Config::parse_and_merge(args).expect("config load");
+
+		assert_eq!(
+			config.auth.api_mode,
+			Some(crate::AuthApiMode::Proxy),
+			"TOML's auth.api_mode must not be clobbered by the CLI re-parse"
 		);
 	}
 

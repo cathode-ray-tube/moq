@@ -1,7 +1,7 @@
 //! One rendition: playlists from its view of the broadcast timeline, segments fetched on
 //! demand.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -17,6 +17,14 @@ use crate::Result;
 /// Fallback advertised bitrates when the catalog doesn't carry one.
 const DEFAULT_VIDEO_BITRATE: u64 = 2_000_000;
 const DEFAULT_AUDIO_BITRATE: u64 = 128_000;
+
+/// The fallback advertised bitrate for a rendition of this kind.
+fn default_bandwidth(kind: Kind) -> u64 {
+	match kind {
+		Kind::Video => DEFAULT_VIDEO_BITRATE,
+		Kind::Audio => DEFAULT_AUDIO_BITRATE,
+	}
+}
 
 /// Upper bound on the groups fetched for one segment, so a corrupt timeline can't turn one
 /// HTTP request into an endless fetch loop.
@@ -57,10 +65,36 @@ impl std::str::FromStr for Kind {
 }
 
 /// The rendition's catalog config, kept whole so a [`Muxer`] can be built per request.
-#[derive(PartialEq)]
 enum Config {
 	Video(VideoConfig),
 	Audio(AudioConfig),
+}
+
+/// Clear the video fields that don't change how the rendition decodes or is muxed, so a config
+/// the publisher only re-measured or re-labelled compares equal to the one already being served.
+///
+/// A denylist rather than an allowlist on purpose: a field the catalog gains later counts as
+/// decode-relevant until someone decides otherwise, so the failure mode is a needless rebuild
+/// rather than serving an init segment that no longer describes the media.
+fn normalize_video(config: &VideoConfig) -> VideoConfig {
+	let mut config = config.clone();
+	config.bitrate = None;
+	config.jitter = None;
+	config.label = None;
+	config.stalled = None;
+	// The muxer ignores a non-finite framerate, and NaN never equals itself, so a catalog
+	// carrying one would otherwise look different from itself on every republish.
+	config.framerate = config.framerate.filter(|fps| fps.is_finite());
+	config
+}
+
+/// The audio counterpart of [`normalize_video`].
+fn normalize_audio(config: &AudioConfig) -> AudioConfig {
+	let mut config = config.clone();
+	config.bitrate = None;
+	config.jitter = None;
+	config.label = None;
+	config
 }
 
 /// A single HLS rendition: master-playlist metadata, its view of the broadcast timeline (which
@@ -70,8 +104,9 @@ pub struct Rendition {
 	pub name: String,
 	/// Whether this rendition is video or audio.
 	pub kind: Kind,
-	/// Advertised bitrate for the master playlist `BANDWIDTH` attribute.
-	pub bandwidth: u64,
+	/// Advertised bitrate for the master playlist `BANDWIDTH` attribute; read through
+	/// [`bandwidth`](Self::bandwidth), refreshed in place by [`refresh`](Self::refresh).
+	bitrate: RwLock<Option<u64>>,
 	/// Coded width, for the master playlist `RESOLUTION` (video only).
 	pub width: Option<u32>,
 	/// Coded height, for the master playlist `RESOLUTION` (video only).
@@ -85,57 +120,100 @@ pub struct Rendition {
 	/// This rendition's window over the broadcast timeline, fed by the catalog watcher's
 	/// fan-out.
 	live: Arc<segments::Producer>,
-	/// The source and sibling broadcast reference, for the cross-broadcast case: a rendition
-	/// served by the catalog's own broadcast already holds it (see [`Upstream::local`]).
-	source: moq_mux::Source,
-	sibling: Option<moq_net::PathRelativeOwned>,
+	/// The broadcast serving this rendition's media, bound when the rendition was created (see
+	/// [`Upstream::bind`]).
+	media: moq_mux::Binding,
 	/// The init segment, built on first request.
 	init: tokio::sync::Mutex<Option<Bytes>>,
 }
 
 impl Rendition {
+	/// Whether `config` describes the same media this rendition is already serving, i.e. whether
+	/// it decodes and muxes identically. Fields the publisher revises without touching the media
+	/// (its bitrate and jitter estimates, a label) are ignored here and picked up by
+	/// [`refresh`](Self::refresh) instead.
 	pub(crate) fn matches_video(&self, config: &VideoConfig) -> bool {
-		self.config == Config::Video(config.clone())
+		let Config::Video(current) = &self.config else {
+			return false;
+		};
+		normalize_video(current) == normalize_video(config)
 	}
 
+	/// The audio counterpart of [`matches_video`](Self::matches_video).
 	pub(crate) fn matches_audio(&self, config: &AudioConfig) -> bool {
-		self.config == Config::Audio(config.clone())
+		let Config::Audio(current) = &self.config else {
+			return false;
+		};
+		normalize_audio(current) == normalize_audio(config)
+	}
+
+	/// The advertised bitrate in bits per second, for the master playlist `BANDWIDTH` attribute
+	/// and the DASH `bandwidth`. Falls back to a per-kind default when the catalog carries none.
+	pub fn bandwidth(&self) -> u64 {
+		self.bitrate().unwrap_or(default_bandwidth(self.kind))
+	}
+
+	/// Take the advertised bitrate from a catalog update that
+	/// [`matches`](Self::matches_video) this rendition.
+	///
+	/// The publisher's estimator republishes the catalog whenever its measured bitrate moves, so
+	/// this is the common update by far: rebuilding the rendition for it would reset the playlist
+	/// window, the cached init segment, and `EXT-X-MEDIA-SEQUENCE` several times a minute.
+	pub(crate) fn refresh(&self, bitrate: Option<u64>) {
+		*self.bitrate.write().expect("bitrate lock poisoned") = bitrate;
+	}
+
+	/// The latest catalog bitrate, preserving `None` for muxer-specific fallback behavior.
+	fn bitrate(&self) -> Option<u64> {
+		*self.bitrate.read().expect("bitrate lock poisoned")
 	}
 
 	/// Build a video rendition over the broadcast's timeline `section`.
-	pub(crate) fn video(name: String, config: &VideoConfig, upstream: &Upstream, section: Timeline) -> Self {
-		Self {
+	///
+	/// Fails when the config's `broadcast` reference escapes above the origin root: it names no
+	/// broadcast, so there would be no media to serve.
+	pub(crate) fn video(
+		name: String,
+		config: &VideoConfig,
+		upstream: &Upstream,
+		section: Timeline,
+	) -> moq_mux::Result<Self> {
+		Ok(Self {
 			name,
 			kind: Kind::Video,
-			bandwidth: config.bitrate.unwrap_or(DEFAULT_VIDEO_BITRATE),
+			bitrate: RwLock::new(config.bitrate),
 			width: config.coded_width,
 			height: config.coded_height,
 			codec: config.codec.to_string(),
 			config: Config::Video(config.clone()),
 			section,
-			live: Arc::new(segments::Producer::new(upstream.local(config.broadcast.as_ref()))),
-			source: upstream.source.clone(),
-			sibling: config.broadcast.clone(),
+			live: Arc::new(segments::Producer::new()),
+			media: upstream.bind(config.broadcast.as_ref())?,
 			init: tokio::sync::Mutex::new(None),
-		}
+		})
 	}
 
-	/// Build an audio rendition over the broadcast's timeline `section`.
-	pub(crate) fn audio(name: String, config: &AudioConfig, upstream: &Upstream, section: Timeline) -> Self {
-		Self {
+	/// Build an audio rendition over the broadcast's timeline `section`, failing like
+	/// [`video`](Self::video).
+	pub(crate) fn audio(
+		name: String,
+		config: &AudioConfig,
+		upstream: &Upstream,
+		section: Timeline,
+	) -> moq_mux::Result<Self> {
+		Ok(Self {
 			name,
 			kind: Kind::Audio,
-			bandwidth: config.bitrate.unwrap_or(DEFAULT_AUDIO_BITRATE),
+			bitrate: RwLock::new(config.bitrate),
 			width: None,
 			height: None,
 			codec: config.codec.to_string(),
 			config: Config::Audio(config.clone()),
 			section,
-			live: Arc::new(segments::Producer::new(upstream.local(config.broadcast.as_ref()))),
-			source: upstream.source.clone(),
-			sibling: config.broadcast.clone(),
+			live: Arc::new(segments::Producer::new()),
+			media: upstream.bind(config.broadcast.as_ref())?,
 			init: tokio::sync::Mutex::new(None),
-		}
+		})
 	}
 
 	/// Feed one timeline record into this rendition's window: its own ranges (empty when the
@@ -296,7 +374,7 @@ impl Rendition {
 		mpd::Representation {
 			name: self.name.clone(),
 			kind: self.kind,
-			bandwidth: self.bandwidth,
+			bandwidth: self.bandwidth(),
 			codec: self.codec.clone(),
 			width: self.width,
 			height: self.height,
@@ -335,24 +413,29 @@ impl Rendition {
 	}
 
 	fn muxer(&self) -> Result<Muxer> {
+		let bitrate = self.bitrate();
 		Ok(match &self.config {
-			Config::Video(config) => Muxer::video(config)?,
-			Config::Audio(config) => Muxer::audio(config)?,
+			Config::Video(config) => {
+				let mut config = config.clone();
+				config.bitrate = bitrate;
+				Muxer::video(&config)?
+			}
+			Config::Audio(config) => {
+				let mut config = config.clone();
+				config.bitrate = bitrate;
+				Muxer::audio(&config)?
+			}
 		})
 	}
 
 	/// The media track handle on the broadcast serving this rendition.
 	///
-	/// Seeded at construction unless the catalog names a sibling, so the media comes from the
-	/// same broadcast the catalog did. Resolving the path again would not be idempotent: a
-	/// same-path republish installs a new broadcast at the leaf, whose group numbering restarts,
-	/// and its bytes would be served under the replaced broadcast's segment numbers.
+	/// The broadcast was bound when the rendition was created, so this only collects an answer
+	/// rather than asking again. Asking again by path would not be idempotent: a same-path
+	/// republish installs a new broadcast at the leaf, whose group numbering restarts, and its
+	/// bytes would be served under the replaced broadcast's segment numbers.
 	async fn track(&self) -> Option<moq_net::track::Consumer> {
-		if self.live.broadcast.get().is_none() {
-			let broadcast = self.source.resolve(self.sibling.as_ref()).await.ok()?;
-			let _ = self.live.broadcast.set(broadcast);
-		}
-		let broadcast = self.live.broadcast.get()?;
+		let broadcast = self.media.broadcast().await.ok()?;
 		broadcast.track(&self.name).ok()
 	}
 

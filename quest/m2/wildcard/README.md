@@ -17,13 +17,13 @@ subtree pattern `<pid>/chat/**` expresses them. An archive serving recordings
 over FETCH wants to say "if nobody is publishing this live, I have it", which
 is the catch-all `**`, a claim about every path at once.
 
-The cost of enumerating is measured, not assumed.
-[relay-memory](/quest/m2/relay-memory/README.md) puts one announcement at
-8.8 KB per relay with one route, plus 4.3 KB per additional route, and every
-relay that hears it materializes that whether or not anything there subscribes.
-So "workers times broadcasts" is not just a large number of messages; it is that
-number multiplied across the fleet in resident memory, which is the same growth
-that questline exists to stop.
+The cost of enumerating is real even though its last measurement is stale.
+[relay-memory](/quest/m2/relay-memory.md) measured one announcement at 8.8 KB
+per relay plus 4.3 KB per additional route before prefix routes made a
+standby route a table entry, and owns remeasuring it. Whatever the current
+number, every relay that hears an announcement pays it whether or not anything
+there subscribes, so "workers times broadcasts" is that number multiplied
+across the fleet in resident memory.
 
 ## Plan
 
@@ -38,40 +38,49 @@ would have to start working (a cold transcoder)"
 same exact containment check. [#2925](https://github.com/moq-dev/moq/pull/2925)
 has since replaced `RouteCost` with `Cost { warm, cold }`.
 
-Matching, by contrast, is prefix-only everywhere today. The pattern matcher is
-not this questline's to build: path authorization adopts the same dialect first,
-and its [Matcher](/quest/m2/path-patterns/matcher.md) quest delivers the shared
-matching, containment, and rebasing that [Advertise](/quest/m2/wildcard/advertise.md) now requires.
+[moq#3225](https://github.com/moq-dev/moq/pull/3225) moved a long way toward
+this. An announcement is now a route over a path *prefix*, `origin::Prefix` is
+an opaque newtype built explicitly as the extension point a pattern type slots
+into, and matching is segment-wise intersection in one place. So the wire, the
+model, and every binding already speak in covering claims rather than in
+per-broadcast announcements.
 
-Two things look built and are not:
+The routing table exists too, which it did not when this questline was written.
+`Consumer::request_broadcast` resolves a local broadcast first, then
+`best_server`: the longest covering prefix, filtered by the requester's excluded
+hop, ordered by `route_order`, served on demand by the session that announced it
+and cached per prefix in `ServeState.served`. That is the split-horizon-safe
+lookup the old `origin::Dynamic` could not provide, and it is what
+[Resolve](/quest/m2/wildcard/resolve.md) now extends rather than replaces.
 
-1. **A routing table.** `origin::Dynamic` (`rs/moq-net/src/model/origin.rs`)
-   serves an unannounced path on demand and `lite::publisher::recv_subscribe`
-   already falls back to it. It is not usable here. Its queue is keyed by path
-   alone, so requests from peers with different `exclude` origins coalesce onto
-   one entry; a `Request` carries no requester identity, hop list, or cost; and
-   every live handler drains one shared FIFO, so N wildcards cannot be ranked.
-   `request_broadcast` says so itself: "a handler resolves paths with no route
-   chain to check, so falling through would let it route around the split
-   horizon and rebuild the loop."
-2. **Announcement `Epoch`.** [#2611](https://github.com/moq-dev/moq/pull/2611)
-   specced it into lite-06 and [#1920](https://github.com/moq-dev/moq/pull/1920)
-   had earlier removed the one that used to exist in code, so it is specified and
-   unimplemented. It is absent from `dev` too, whose `AnnounceBroadcast::Active`
-   carries `{ suffix, hops, cost }` and no epoch. `broadcast.rs`'s `route_epoch`
-   is an unrelated route-change counter. [Epoch](/quest/m2/wildcard/epoch.md) owns closing that gap.
+Route matching, by contrast, is prefix-only. The pattern matcher itself
+exists: `moq_net::path` and `@moq/net`'s `Path` module own the shared
+matching, containment, specificity, and rebasing that
+[Advertise](/quest/m2/wildcard/advertise.md) builds on.
+
+What is genuinely missing, beyond patterns themselves, is content identity.
+Announcement `Epoch` was specified into lite-06 by
+[#2611](https://github.com/moq-dev/moq/pull/2611), never implemented, and
+removed from the draft by #3225, which retired `draft-lcurley-moq-broadcast`
+with it. [moq#3312](https://github.com/moq-dev/moq/pull/3312) restored per-path identity
+from the route's first hop, reversing #3225's no-splice rule, and this
+questline builds its collision handling on that rather than on a generation
+field.
 
 ### Decisions
 
 - **One pattern: the [path-patterns](/quest/m2/path-patterns/README.md)
   dialect.** An advertisement carries the same path pattern token rules use
-  (literal, `*`, or `lit*lit` segments, at most one `**`), matched by the same
-  shared matcher, so nothing resembles a second grammar. Exact set-valued
+  (literal, `*`, or `lit*lit` segments, at most one `**`),
+  matched by the same shared matcher, so nothing resembles a second grammar. Exact set-valued
   rebasing preserves every match inside a rooted view, including both the root
   and deeper residuals when `**` consumes zero or more segments.
-- **Most specific pattern wins, and its refusal is final.** When several
-  patterns match one path, only the tier selected by the matcher's shared
-  structural specificity is consulted; equal-specificity patterns
+- **Most specific pattern wins, and its refusal is final.** This is the rule
+  routing already follows: `best_server` filters to the longest covering prefix
+  before it compares cost, and the lite draft says the same, matching
+  longest-prefix-match wherever it appears. When several patterns match one
+  path, only the tier selected by the matcher's shared structural specificity is
+  consulted; equal-specificity patterns
   form one pool that cost and the request hash order. A terminal refusal from
   the winning tier IS the answer and never falls through to a less specific
   pattern, so a transcoder refusing a path does not leak the request to the
@@ -91,16 +100,23 @@ Two things look built and are not:
   same way. Cost orders the pool first, which keeps work local and makes a
   distant advertiser the overflow rather than an equal peer.
 - **A wildcard is priced, not special-cased.** Within a tier, route selection
-  stays one comparison on one metric; there is no "concrete beats wildcard"
-  rule beside it. What makes a running transcode win is that its announcement
-  is seeded live while a standby wildcard is seeded high (`with_cost(1000)` is
-  the existing convention for a production-cost seed). The seed has a floor: it
-  MUST exceed the maximum accumulated topology cost a bounded hop list can
-  reach (`MAX_HOPS` is 32 and the planned link costs are 1/3/5, so the ceiling is 160), or a nearby
-  standby outranks a distant running transcode and the mesh starts a second
-  encode of a stream it is already serving. That floor replaces the ad-hoc
-  standby bias the moq.pro (downstream) transcode worker carries today, and it
-  is the same stride discipline
+  stays one comparison on one metric. Concrete-versus-wildcard is not decided
+  by price at all: a concrete claim is maximally specific, so "most specific
+  wins" above already shadows every pattern behind it at any cost. The
+  accepted consequence follows from that rule's finality: a live session's
+  concrete claim shadows a healthy wildcard pool even when its service is
+  broken, its terminal refusal does not fall through, and the shadow lasts
+  exactly as long as the claiming session that carries it.
+  The seed still has a floor, because standby and running claims of equal
+  specificity do meet: a standby concrete claim (`with_cost(1000)` is the
+  existing per-broadcast convention) shares a tier with a running publisher's
+  concrete announcement and with warm-advertise's exact-path warm routes. The
+  floor MUST exceed the deployment's enforced maximum charged-link count
+  times its enforced maximum link cost (32 links at cost at most 5 gives
+  a bound of 160, with producing origins seeded at 0), or a nearby standby outranks a distant running copy and the
+  mesh starts a second encode of a stream it is already serving. That floor
+  replaces the ad-hoc standby bias the moq.pro (downstream) transcode worker
+  carries today, and it is the same stride discipline
   [pop-skipping](/quest/m2/pop-skipping/README.md) states for provider
   economics.
 - **One cost varint, not the pair.** `Cost` is `{ warm, cold }` because a relay
@@ -129,7 +145,8 @@ Two things look built and are not:
   availability there.
 - **Refusal is a typed stream reset, with no negative cache.** An advertiser
   resets a subscribe it will not serve, and the reset carries which KIND of
-  refusal it is (`Error::to_code` already puts a typed code on the wire).
+  refusal it is (`Error::to_code` already puts a typed code on the wire; the
+  capacity code is NO_CAPACITY, 0x30, in moq-lite's own 48-63 range).
 
   A capacity refusal is unavoidable: an advertiser's capacity and a relay's view
   of it are separated by at least half a round trip, so a retraction and a
@@ -148,23 +165,30 @@ Two things look built and are not:
   permanent, so a new refusal mode surfaces instead of quietly joining a retry
   loop. No negative cache either way; rate limiting stays with the advertiser
   and the per-project auth gate.
-- **A double claim is settled by the service's `Epoch` contract.** Two relays can
-  hash one path to different workers before either concrete announcement
-  propagates, and both concrete announcements land at the SAME literal path.
-  Deterministic services such as transcode, and external processors whose
-  configured workers are interchangeable, derive one epoch from the source
-  generation so a relay may splice between them. Session-local services such as
-  transcription allocate distinct globally ordered epochs, so the higher
-  generation wins and consumers reset rather than splice. Wildcard routing does
-  not invent a lease or choose between those media contracts. This is why
-  [Epoch](/quest/m2/wildcard/epoch.md) is required by any service that can
-  produce colliding concrete claims, including transcode, transcription, and
-  external processors. A service that derives output identity from the source
-  requires a resolved nonzero source epoch; zero is unspecified and must refuse
-  derived work rather than splice across an ambiguous restart.
-- **The spec home is moq-lite core, mirrored in moq-cluster**, following how
-  route cost landed. moq-lite-06 is still WIP, so this goes into it rather than
-  opening an 07.
+- **A double claim is settled by route identity, not by a lease.** Two relays
+  can hash one path to different workers before either concrete announcement
+  propagates, and both land at the SAME literal path. Whichever route wins
+  selection serves it, and a consumer moves between them only when the winner's
+  identity is preserved, per the first-hop resume rule ([moq#3312](https://github.com/moq-dev/moq/pull/3312)); two distinct workers are two identities,
+  so the loser's subscribers end and resubscribe rather than being spliced onto
+  another worker's frames mid-group. Wildcard routing invents neither a lease
+  nor a generation. This is weaker than the retired `Epoch` design, which could
+  declare two workers' output interchangeable and splice between them; a service
+  that needs that guarantee has to carry it in its own media contract, not in
+  routing.
+- **Patterns are independent of clustering.** `draft-lcurley-moq-pattern`
+  owns shared semantics and the moq-transport NAMESPACE_PATTERNS capability,
+  NAMESPACE_PATTERN parameter, and pattern withdrawal framing. moq-lite-06
+  carries ANNOUNCE_PATTERN (0x3) natively and references those semantics.
+  moq-cluster adds hop lists, costs, and pool selection when both extensions
+  are negotiated. Neither extension implies support for the other.
+- **A pattern travels as typed segments, not text.** Each wire segment is a
+  kind (0 literal, 1 wildcard, 2 globstar, 3 partial = prefix + suffix) plus a
+  length-prefixed value, so no glob syntax reaches the wire, an unknown kind
+  is skipped by its length and the advertisement ignored rather than the
+  stream killed, and a later revision can add kinds (multi-star segments,
+  regexes) without a new message. The `*` and `**` spellings exist only in
+  `moq_net::path` and `@moq/net`.
 
 ### Where derived output lives
 
@@ -191,7 +215,7 @@ overlay, because prefix-only matching needs the variable part of a path
 trailing. That overlay was not a view transform: `pid/foo` and
 `.transcode/pid/foo` are separate tree leaves with separate broadcast fronts,
 so it had to build a logical front across roots that re-owned route selection,
-epoch identity, the split-horizon guard, and splicing. The suffix pattern
+content identity, the split-horizon guard, and splicing. The suffix pattern
 deletes all of it while keeping what the mirror bought:
 
 - **The grant needs no transform.** The customer addresses
@@ -208,8 +232,8 @@ deletes all of it while keeping what the mirror bought:
   removes project discovery entirely.
 - **Takeover is single-front.** A worker's concrete announcement lands at the
   literal path the wildcard served, so wildcard-versus-concrete and
-  worker-versus-worker collisions are ordinary route selection plus `Epoch`
-  splicing at one tree node, not a cross-root front.
+  worker-versus-worker collisions are ordinary route selection at one tree node,
+  not a cross-root front.
 
 What the mirror bought and this deliberately gives up: a customer holding
 `publish: ["pid/"]` CAN publish `foo.hang/transcode.pro` themselves, competing
@@ -228,8 +252,6 @@ than announce state.
 
 ## Quests
 
-- [Draft](/quest/m2/wildcard/draft.md) - specify the wildcard advertisement in
-  moq-lite and mirror it in the moq-cluster extension
 - [Advertise](/quest/m2/wildcard/advertise.md) - moq-net encodes, forwards, and
   authorizes wildcard advertisements, without yet resolving one into a
   subscription
@@ -238,9 +260,6 @@ than announce state.
 - [Demand](/quest/m2/wildcard/demand.md) - the browser player subscribes to a
   catalog-referenced broadcast a wildcard covers, breaking the lazy-rendition
   deadlock
-- [Epoch](/quest/m2/wildcard/epoch.md) - implement moq-lite-06's announcement
-  `Epoch`, so two publishers colliding on one path resolve instead of both
-  serving
 
 ## Related
 

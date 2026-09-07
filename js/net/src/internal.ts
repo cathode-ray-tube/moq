@@ -52,6 +52,8 @@ export interface TrackRequestOptions {
 	producer: Producer;
 	/** Sequence namespaces shared by the broadcast generation. */
 	sequences: TrackSequences;
+	/** Requests not yet accepted or rejected by the publisher. */
+	pending: Set<Request>;
 }
 
 /** Hooks assigned in static blocks by the owning class. */
@@ -84,7 +86,7 @@ export const hooks: {
 	/** Stop an in-flight group operation if the handed-out group expires. */
 	guardGroup: <T>(group: GroupConsumer, operation: Promise<T>) => Promise<T>;
 	/** Read a frame the wire publisher completes (or skips) once written. */
-	readGroupFrame: (group: GroupConsumer) => Promise<ReadGroupFrame | undefined>;
+	readGroupFrame: (group: GroupConsumer, from?: number) => Promise<ReadGroupFrame | undefined>;
 	/** Make an evicted mirror terminal while its track timeline still contains it. */
 	evictGroup: (group: GroupConsumer) => void;
 } = {

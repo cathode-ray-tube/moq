@@ -63,7 +63,7 @@ pub struct Frame {
 ///
 /// A fill stamps the group's cache access once for the whole batch, which bounds
 /// frames rather than elapsed time. A reader that may take longer than the track's
-/// `latency_max` to work through one batch calls
+/// `max_age` to work through one batch calls
 /// [`group::Consumer::keep_alive`] between frames, or the rest of the group is
 /// expired out from under it.
 #[derive(Debug, Default)]
@@ -331,7 +331,6 @@ impl<G: std::borrow::BorrowMut<group::Producer>> Raw<G> {
 		} else {
 			self.buf.append(chunk.as_ref());
 		}
-		self.group.borrow_mut().frame_notify();
 		Ok(())
 	}
 
@@ -420,7 +419,9 @@ impl<'a> Producer<'a> {
 	///
 	/// Returns [`Error::WrongSize`] if the chunk would exceed the remaining bytes.
 	pub fn write<B: IntoBytes>(&mut self, chunk: B) -> Result<()> {
-		self.0.write(chunk)
+		self.0.write(chunk)?;
+		self.0.group.frame_notify();
+		Ok(())
 	}
 
 	/// Commit the frame, verifying that all bytes were written.
@@ -474,9 +475,21 @@ impl ProducerOwned {
 		self.0.remaining()
 	}
 
-	/// Write a chunk of data to the frame.
-	pub fn write<B: IntoBytes>(&mut self, chunk: B) -> Result<()> {
+	/// Write a chunk of payload *without* waking consumers; pair it with [`Self::notify`].
+	///
+	/// The wake is split out because the wire ingest drains every chunk the transport
+	/// has already buffered in one poll turn, and a consumer parked on the group cannot
+	/// run until that turn yields. Waking per chunk pays a group lock and a clock read
+	/// to publish bytes nobody can observe yet.
+	///
+	/// `coding::Reader::poll_read_frame` owns the pairing and is the only caller.
+	pub(crate) fn write<B: IntoBytes>(&mut self, chunk: B) -> Result<()> {
 		self.0.write(chunk)
+	}
+
+	/// Publish what has been written so far, waking consumers parked on the group.
+	pub(crate) fn notify(&self) {
+		self.0.group.frame_notify();
 	}
 
 	/// Commit the frame, verifying that all bytes were written.

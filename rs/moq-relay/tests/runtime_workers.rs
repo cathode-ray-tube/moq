@@ -2,8 +2,9 @@
 //!
 //! Linux-only, because the mode is: every worker binds the listen address with
 //! `SO_REUSEPORT`, and no other platform load-balances a unicast UDP port
-//! across the group.
-#![cfg(target_os = "linux")]
+//! across the group. There is also nothing to serve without a QUIC backend, so
+//! `Relay::workers` is absent from such a build.
+#![cfg(all(target_os = "linux", feature = "_quic"))]
 
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
@@ -99,12 +100,10 @@ async fn workers_serve_quic_and_share_one_origin() {
 	let mut workers = relay.workers.expect("workers configured");
 	let mut tasks = Vec::new();
 	for (server, spawner) in workers.split() {
-		tasks.push(spawner.run(moq_relay::serve(
-			server,
-			cluster.clone(),
-			auth.clone(),
-			shutdown.clone(),
-		)));
+		let cluster = cluster.clone();
+		let auth = auth.clone();
+		let shutdown = shutdown.clone();
+		tasks.push(spawner.run(move || moq_relay::serve(server, cluster, auth, shutdown)));
 	}
 
 	let url: url::Url = format!("https://127.0.0.1:{port}/workers").parse().expect("parse url");
@@ -112,7 +111,7 @@ async fn workers_serve_quic_and_share_one_origin() {
 	// ── publisher ───────────────────────────────────────────────────
 	let origin = moq_tokio::origin::spawn(Hop::random());
 	let mut broadcast = origin.create_broadcast("test").expect("create broadcast");
-	let _announce_broadcast = origin.announce("test", Default::default()).expect("create broadcast");
+	broadcast.announce(Default::default()).expect("create broadcast");
 	let mut track = broadcast.create_track("video", None).expect("create track");
 	let mut group = track.append_group().expect("append group");
 	group

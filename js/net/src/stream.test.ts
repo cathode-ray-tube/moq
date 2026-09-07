@@ -1,6 +1,17 @@
 import { expect, test } from "bun:test";
-import { SessionCode, SessionError, StreamCode, StreamError } from "./error.ts";
+import {
+	FrameTooLarge,
+	Lagged,
+	NotFound,
+	ProtocolViolation,
+	SessionCode,
+	SessionError,
+	StreamCode,
+	StreamError,
+} from "./error.ts";
+import { Version } from "./ietf/version.ts";
 import { Reader, Stream, Writer } from "./stream.ts";
+import { TimeoutError } from "./util/timeout.ts";
 
 // Helper to create a writable stream that captures written data
 function createTestWritableStream(): { stream: WritableStream<Uint8Array>; written: Uint8Array[] } {
@@ -306,6 +317,29 @@ test("Reader stream with partial reads", async () => {
 	expect(await reader.done()).toBe(true);
 });
 
+test("Reader owns streamed chunks and preserves returned views across fills", async () => {
+	const first = new Uint8Array([99, 1, 2, 99]);
+	const second = new Uint8Array([99, 3, 4, 5, 99]);
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(first.subarray(1, 3));
+			controller.enqueue(second.subarray(1, 4));
+			controller.close();
+		},
+	});
+	const reader = new Reader(stream);
+	const head = await reader.read(1);
+	first.fill(0);
+	expect(head).toEqual(new Uint8Array([1]));
+	const joined = await reader.read(3);
+	second.fill(0);
+	expect(joined).toEqual(new Uint8Array([2, 3, 4]));
+	joined.fill(0);
+	expect(head).toEqual(new Uint8Array([1]));
+	expect(await reader.read(1)).toEqual(new Uint8Array([5]));
+	expect(await reader.done()).toBe(true);
+});
+
 test("Reader u53 decodes two-byte stream type prefixes", async () => {
 	const { stream, written } = createTestWritableStream();
 	const writer = new Writer(stream);
@@ -538,3 +572,45 @@ test("open waits for a stream slot instead of rejecting once the peer's limit is
 		{ sendOrder: undefined, waitUntilAvailable: false },
 	]);
 });
+
+for (const version of [undefined, Version.DRAFT_14, Version.DRAFT_19, Version.DRAFT_20]) {
+	test(`stream resets select the negotiated registry (${version})`, async () => {
+		for (const [reason, liteCode] of [
+			[new Lagged(), StreamCode.TooFarBehind],
+			[new Reset(5), StreamCode.TooFarBehind],
+			[new FrameTooLarge(), StreamCode.FrameTooLarge],
+			[new NotFound("broadcast"), StreamCode.NotFound],
+			[new TimeoutError("open"), StreamCode.DeliveryTimeout],
+			[new ProtocolViolation("bad message"), StreamCode.SessionClosed],
+			[new StreamError(StreamCode.Cancel), StreamCode.Cancel],
+		] as const) {
+			const expected = version === undefined || liteCode === StreamCode.Cancel ? liteCode : StreamCode.Internal;
+			const aborted = Promise.withResolvers<unknown>();
+			const writer = new Writer(new WritableStream<Uint8Array>({ abort: aborted.resolve }), version);
+			writer.reset(reason);
+			const sent = await aborted.promise;
+			expect((sent as { streamErrorCode?: number }).streamErrorCode ?? 0).toBe(expected);
+			const cancelled = Promise.withResolvers<unknown>();
+			const reader = new Reader(
+				new ReadableStream<Uint8Array>({ cancel: cancelled.resolve }),
+				undefined,
+				version,
+			);
+			reader.stop(reason);
+			const stopped = await cancelled.promise;
+			expect((stopped as { streamErrorCode?: number }).streamErrorCode ?? 0).toBe(expected);
+		}
+	});
+	test(`received reset uses the negotiated registry (${version})`, async () => {
+		const reader = new Reader(
+			new ReadableStream<Uint8Array>({
+				start: (controller) => controller.error(new Reset(5)),
+			}),
+			undefined,
+			version,
+		);
+		const err = await reader.closed.catch((err: unknown) => err);
+		expect(err).toBeInstanceOf(StreamError);
+		expect(err instanceof Lagged).toBe(version === undefined);
+	});
+}

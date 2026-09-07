@@ -14,7 +14,72 @@ pub use stream::{RecvStream, SendStream};
 
 pub(crate) use connection::Shared;
 
+#[cfg(feature = "qlog")]
+use super::qlog;
 use super::{Congestion, Error, Identity, SEGMENT, Transport, client, server};
+
+/// Keeps caller-owned chunks refcounted all the way through quiche's
+/// retransmission and datagram queues.
+///
+/// Both buffer types are [`bytes::Bytes`] so a stream write hands quiche the
+/// caller's own allocation, and a received datagram comes back out of the
+/// queue as one instead of being copied through a scratch buffer.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BytesFactory;
+
+impl quiche::BufFactory for BytesFactory {
+	type Buf = bytes::Bytes;
+	type DgramBuf = bytes::Bytes;
+
+	fn buf_from_slice(buf: &[u8]) -> Self::Buf {
+		#[cfg(test)]
+		STREAM_COPIES.with(|copies| copies.set(copies.get() + 1));
+		bytes::Bytes::copy_from_slice(buf)
+	}
+
+	fn dgram_buf_from_slice(buf: &[u8]) -> Self::DgramBuf {
+		bytes::Bytes::copy_from_slice(buf)
+	}
+}
+
+pub(crate) type RawConnection = quiche::Connection<BytesFactory>;
+
+/// The context needed to attach one connection's qlog trace.
+#[cfg(feature = "qlog")]
+struct Qlog<'a> {
+	sink: Option<&'a qlog::Sink>,
+	cid: &'a [u8],
+	side: qlog::Side,
+}
+
+/// Stream this connection's qlog trace into the configured sink, if any.
+///
+/// quiche takes the writer on the connection rather than the config, so the
+/// trace is per connection and has to be attached before the first packet is
+/// fed in: earlier events are simply not recorded.
+#[cfg(feature = "qlog")]
+fn with_qlog(mut conn: RawConnection, qlog: Qlog<'_>) -> RawConnection {
+	if let Some(sink) = qlog.sink {
+		conn.set_qlog(sink.trace(qlog.cid, qlog.side), "moq-uring".to_string(), String::new());
+	}
+	conn
+}
+
+#[cfg(test)]
+thread_local! {
+	static STREAM_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+impl BytesFactory {
+	fn reset_stream_copies() {
+		STREAM_COPIES.with(|copies| copies.set(0));
+	}
+
+	fn stream_copies() -> usize {
+		STREAM_COPIES.with(std::cell::Cell::get)
+	}
+}
 
 /// The platform trust store, loaded when a role config asks for it.
 const SYSTEM_ROOTS: &str = "/etc/ssl/certs";

@@ -361,6 +361,20 @@ impl<E: CatalogExt> Producer<E> {
 		super::Reserved::new(self.clone())
 	}
 
+	/// Take a rendition name without withholding the catalog's initial snapshot.
+	///
+	/// Use this for a long-lived incremental producer whose config may arrive
+	/// later or never arrive. The returned handle owns the name immediately,
+	/// publishes the config on [`set`](super::Rendition::set), and retires it on
+	/// drop. Use [`reserve`](Self::reserve) when the initial catalog must wait for
+	/// the complete track set instead.
+	pub fn rendition<C: super::RenditionConfig<E>>(
+		&self,
+		name: impl Into<String>,
+	) -> crate::Result<super::Rendition<E, C>> {
+		super::Rendition::live(self.clone(), name.into())
+	}
+
 	/// Take `name` in `C`'s section for a new [`Rendition`](super::Rendition), which owns it until
 	/// the handle drops.
 	///
@@ -978,6 +992,29 @@ mod test {
 			matches!(consumer.poll_next(&waiter), Poll::Pending),
 			"only the one complete snapshot should be published"
 		);
+	}
+
+	#[test]
+	fn live_rendition_owns_its_name_without_gating_the_catalog() {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = Producer::new(&mut broadcast).unwrap();
+		let mut consumer: Consumer = Consumer::new(catalog.outputs.hang.consume());
+		let waiter = kio::Waiter::noop();
+
+		let _unresolved = catalog.rendition::<VideoConfig>("video0").unwrap();
+		assert!(
+			catalog.rendition::<VideoConfig>("video0").is_err(),
+			"the unresolved live rendition owns its name"
+		);
+		let mut audio = catalog.rendition::<AudioConfig>("audio0").unwrap();
+		audio.set(AudioConfig::new(AudioCodec::Opus, 48_000, 2));
+
+		let snapshot = match consumer.poll_next(&waiter) {
+			Poll::Ready(Ok(Some(c))) => c,
+			other => panic!("expected the incremental audio catalog, got {other:?}"),
+		};
+		assert!(snapshot.audio.renditions.contains_key("audio0"));
+		assert!(!snapshot.video.renditions.contains_key("video0"));
 	}
 
 	// Dropping a reservation without fulfilling it (a stream that never produced a config) still opens

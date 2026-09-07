@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use rustc_hash::FxHashMap;
 
-use super::{Error, SEGMENT};
+use super::{Error, RawConnection, SEGMENT};
 use crate::{Handle, udp};
 
 /// The state shared by every handle and the driver, single-threaded behind
@@ -31,7 +31,7 @@ const DEFAULT_URGENCY: u8 = 127;
 /// operation can mutate the connection, drop that borrow, and then register a
 /// waiter without ever holding both.
 pub(crate) struct Inner {
-	pub(crate) conn: RefCell<quiche::Connection>,
+	pub(crate) conn: RefCell<RawConnection>,
 	pub(crate) state: RefCell<State>,
 }
 
@@ -328,7 +328,7 @@ impl Clone for Connection {
 pub(crate) fn launch(
 	handle: &Handle,
 	socket: Rc<udp::Socket>,
-	conn: quiche::Connection,
+	conn: RawConnection,
 	keep_alive: Option<std::time::Duration>,
 ) -> (Shared, impl Future<Output = ()> + use<>) {
 	let is_server = conn.is_server();
@@ -346,7 +346,6 @@ pub(crate) fn launch(
 			None => moq_net::runtime::Deadline::new(handle),
 		},
 		keep_alive_every: keep_alive,
-		scratch: vec![0u8; 65535],
 		carry: None,
 	};
 	let future = async move { kio::wait(|waiter| driver.poll(waiter)).await };
@@ -619,8 +618,6 @@ struct Driver {
 	/// caller asked for no keep-alive.
 	keep_alive: moq_net::runtime::Deadline<Handle>,
 	keep_alive_every: Option<std::time::Duration>,
-	/// Datagram receive scratch.
-	scratch: Vec<u8>,
 	/// A packet quiche handed us for a different path than the train being
 	/// packed; it opens the next one.
 	carry: Option<(SocketAddr, Vec<u8>)>,
@@ -763,11 +760,14 @@ impl Driver {
 		});
 
 		let mut received = false;
-		while let Ok(len) = conn.dgram_recv(&mut self.scratch) {
+		// The buffer factory already hands these out as `Bytes`, so moving one
+		// from quiche's queue to ours copies nothing, and no scratch buffer can
+		// be too small for a datagram and silently drop it.
+		while let Ok(dgram) = conn.dgram_recv_buf() {
 			if state.datagrams.len() >= DGRAM_QUEUE {
 				state.datagrams.pop_front();
 			}
-			state.datagrams.push_back(Bytes::copy_from_slice(&self.scratch[..len]));
+			state.datagrams.push_back(dgram);
 			received = true;
 		}
 		if received {
@@ -892,7 +892,7 @@ fn queue_accept(state: &mut State, id: u64) {
 }
 
 /// The terminal error of a closed connection.
-fn terminal(conn: &quiche::Connection) -> Error {
+fn terminal(conn: &RawConnection) -> Error {
 	let err = conn.peer_error().or_else(|| conn.local_error());
 	match err {
 		Some(err) if err.is_app => Error::App {
@@ -909,6 +909,7 @@ fn terminal(conn: &quiche::Connection) -> Error {
 
 #[cfg(test)]
 mod tests {
+	use super::super::BytesFactory;
 	use super::*;
 	use std::net::UdpSocket;
 	use web_transport_trait::poll::{SendStream as _, Session as _};
@@ -963,10 +964,33 @@ mod tests {
 				let client = crate::quic::client::connect(&handle, client_socket, &client_config)
 					.await
 					.expect("connect");
-				let mut server = endpoint.accept().await.expect("accept");
-				let mut send = std::future::poll_fn(|cx| server.poll_open_uni(cx))
+				let server = endpoint.accept().await.expect("accept");
+				let mut session = crate::quic::web::Session::raw(server.clone());
+				let mut send = std::future::poll_fn(|cx| session.poll_open_uni(cx))
 					.await
 					.expect("open stream");
+
+				BytesFactory::reset_stream_copies();
+				std::future::poll_fn(|cx| send.poll_write(cx, b"copied"))
+					.await
+					.expect("queue copied stream data");
+				assert_eq!(
+					BytesFactory::stream_copies(),
+					1,
+					"slice write allocates a quiche buffer"
+				);
+
+				BytesFactory::reset_stream_copies();
+				let mut owned = Bytes::from_static(b"owned");
+				std::future::poll_fn(|cx| send.poll_write_buf(cx, &mut owned))
+					.await
+					.expect("queue owned stream data");
+				assert!(owned.is_empty(), "owned write consumes the buffer");
+				assert_eq!(
+					BytesFactory::stream_copies(),
+					0,
+					"owned write reuses the caller's buffer"
+				);
 
 				let payload = vec![0x5a; TRAIN_SEGMENTS * SEGMENT * 2];
 				let mut offset = 0;

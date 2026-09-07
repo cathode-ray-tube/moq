@@ -1,6 +1,6 @@
 use crate::origin;
 use crate::{
-	Error, Hop, SessionError,
+	Error, Hop, SessionError, StreamError,
 	coding::{Decode, DecodeError, Encode, Reader, Stream, Writer},
 	ietf::{self, FetchHeader, RequestId},
 	setup,
@@ -694,11 +694,12 @@ where
 			let mut reader = reader.with_version(version);
 			if let Err(err) = run_uni_group(&mut sub, &mut reader).await {
 				tracing::debug!(%err, "uni stream error");
-				// A moq-transport code, not `Error::to_code`'s moq-lite one. A group arriving
-				// for an alias we retired is the expected tail of our own cancellation, and
-				// moq-lite's cancel encodes to 0, which on this wire means the stream died of
-				// an internal failure on our side.
-				reader.stop(super::error::to_stream_code(&err));
+				// This handler stops only the stream, so it cannot claim the session closed.
+				let reset = match StreamError::from(&err) {
+					StreamError::Session(_) => StreamError::Internal,
+					reset => reset,
+				};
+				reader.abort(reset);
 			}
 		});
 	}
@@ -725,10 +726,9 @@ where
 	}
 
 	match kind {
-		// We never request a fill, so a fetch stream answers a request we did not make. Its
-		// objects would duplicate a group the live subscription is already delivering, and
-		// two producers for one sequence is a `Duplicate` error, so refuse the stream.
-		FetchHeader::TYPE => Err(Error::Unsupported),
+		// A fill fetch stream carries the head of the group a draft-20 subscription joined
+		// part way through. One answering no fill of ours is refused inside.
+		FetchHeader::TYPE => subscriber.recv_fill(stream).await,
 		_ => Err(Error::UnexpectedStream),
 	}
 }
@@ -1179,5 +1179,94 @@ mod tests {
 	#[tokio::test]
 	async fn a_bidi_stream_dead_before_its_header_does_not_end_the_session() {
 		a_dead_incoming_stream_is_not_fatal(crate::lite::test_transport::DeadStreamSession::bis(1)).await;
+	}
+
+	/// The bytes a publisher writes at the head of a group's unidirectional stream. Built
+	/// with the crate's own encoder so the framing can't drift from the decoder the
+	/// dispatch loop runs.
+	async fn subgroup_header(version: Version, track_alias: u64) -> Vec<u8> {
+		let log = crate::lite::test_transport::Log::default();
+		let mut writer = crate::coding::Writer::new(crate::lite::test_transport::SinkSend::new(log.clone()), version);
+
+		writer
+			.encode(&ietf::GroupHeader {
+				track_alias,
+				group_id: 0,
+				sub_group_id: 0,
+				publisher_priority: 128,
+				flags: ietf::GroupFlags::default(),
+			})
+			.await
+			.unwrap();
+
+		let writes = log.writes.lock().unwrap();
+		writes.clone()
+	}
+
+	async fn dispatch_uni(payload: Vec<u8>, retired_alias: Option<u64>) -> crate::lite::test_transport::Log {
+		const VERSION: Version = Version::Draft19;
+
+		let origin = crate::origin::Info::new(crate::Hop::new(1).unwrap()).produce();
+		// The peer opens one uni stream and then goes quiet, so
+		// the loop is still running when the assertion is taken.
+		let session = crate::lite::test_transport::ScriptedSession::new(Vec::new()).with_incoming_unis(vec![payload]);
+		let log = session.log.clone();
+
+		let (tasks, _task_set) = TaskSet::new();
+		let peer_setup = peer::PeerSetup::default();
+		let subscriber = Subscriber::new(
+			TestRuntime::new(),
+			session.clone(),
+			origin,
+			Control::new(None, true),
+			None,
+			peer_setup.clone(),
+			crate::Hop::new(1).unwrap(),
+			None,
+			VERSION,
+			tasks,
+			Default::default(),
+		);
+		if let Some(alias) = retired_alias {
+			subscriber.retire_alias(alias);
+		}
+
+		// Held so the trigger side stays alive for as long as the loop runs.
+		let (_goaway, goaway) = crate::goaway::Handle::new(false);
+		// The peer's SETUP has not arrived yet, which is the state a group stream racing
+		// ahead of it lands in.
+		let mut unis = std::pin::pin!(run_unis(session, subscriber, Some(peer_setup), false, VERSION, goaway));
+
+		for _ in 0..100 {
+			if let std::task::Poll::Ready(result) = futures::poll!(unis.as_mut()) {
+				panic!("the dispatch loop ended over one rejected stream: {result:?}");
+			}
+			if !log.stops().is_empty() {
+				break;
+			}
+			tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+		}
+
+		log
+	}
+
+	/// A late group must reach the dispatch loop and stop with CANCELLED.
+	#[tokio::test(start_paused = true)]
+	async fn a_group_for_a_retired_alias_is_stopped_with_cancelled() {
+		let log = dispatch_uni(subgroup_header(Version::Draft19, 7).await, Some(7)).await;
+
+		assert_eq!(
+			log.stops(),
+			vec![crate::ietf::error::CANCELLED],
+			"the group stream must be stopped with the cancelled code",
+		);
+		assert_eq!(log.closes(), vec![], "one dropped group may not close the session");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn unknown_uni_type_does_not_claim_the_session_closed() {
+		let log = dispatch_uni(vec![0], None).await;
+		assert_eq!(log.stops(), vec![crate::ietf::error::INTERNAL_ERROR]);
+		assert!(log.closes().is_empty());
 	}
 }

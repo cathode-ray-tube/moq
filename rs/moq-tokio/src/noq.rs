@@ -1,5 +1,6 @@
 //! The noq QUIC backend, used for both WebTransport (`https://`) and raw QUIC (`moqt://`, `moql://`).
 
+use crate::RedactedUrl;
 use crate::connect;
 use crate::listen;
 use crate::quic::CongestionControl;
@@ -56,15 +57,27 @@ fn apply_transport(transport: &mut noq::TransportConfig, quic: &Resolved) {
 		transport.enable_segmentation_offload(gso);
 	}
 
+	apply_windows(transport, quic);
+
 	transport.congestion_controller_factory(congestion_factory(congestion_control(quic)));
 }
 
+/// Apply the flow-control windows, leaving each at the backend default when unset.
+fn apply_windows(transport: &mut noq::TransportConfig, quic: &Resolved) {
+	// Saturating rather than erroring: `Config::validate` already rejects a window
+	// past the varint, so this only bites a `Resolved` built without it.
+	if let Some(window) = quic.receive_window {
+		transport.receive_window(noq::VarInt::from_u64(window).unwrap_or(noq::VarInt::MAX));
+	}
+	if let Some(window) = quic.stream_receive_window {
+		transport.stream_receive_window(noq::VarInt::from_u64(window).unwrap_or(noq::VarInt::MAX));
+	}
+	if let Some(window) = quic.send_window {
+		transport.send_window(window);
+	}
+}
+
 /// The congestion control family to install, defaulting to loss-based.
-///
-/// Unlike the other backends we don't default to BBR here: noq's BBRv3 subtracts
-/// without a floor when computing the inflight bytes at the loss event, so a single
-/// packet loss can underflow and panic, taking the whole process with it. Delay-based
-/// stays reachable, but only when an operator asks for it by name.
 fn congestion_control(quic: &Resolved) -> CongestionControl {
 	quic.congestion_control.unwrap_or(CongestionControl::Loss)
 }
@@ -349,7 +362,7 @@ impl NoqClient {
 				fingerprint.set_query(None);
 				fingerprint.set_fragment(None);
 
-				tracing::warn!(url = %fingerprint, "performing insecure HTTP request for certificate");
+				tracing::warn!(url = %RedactedUrl::new(&fingerprint), "performing insecure HTTP request for certificate");
 
 				let resp = reqwest::get(fingerprint.as_str())
 					.await
@@ -502,10 +515,11 @@ fn proto_status(err: &web_transport_noq::proto::ConnectError) -> Option<u16> {
 pub(crate) struct NoqServer {
 	pub quic: noq::Endpoint,
 	pub certs: Arc<ServeCerts>,
+	_reload: crate::tls::Reload,
 }
 
 impl NoqServer {
-	pub fn new(config: listen::Config, quic: &crate::quic::Config, shard: Option<listen::Shard>) -> Result<Self> {
+	pub fn new(config: listen::Config, quic: &crate::quic::Config, member: Option<listen::Member>) -> Result<Self> {
 		let mut transport = noq::TransportConfig::default();
 		let quic = quic.resolve();
 		apply_transport(&mut transport, &quic);
@@ -563,7 +577,7 @@ impl NoqServer {
 
 		// Configure connection ID generator with server ID if provided
 		let mut endpoint_config = noq::EndpointConfig::default();
-		if let Some(shard) = shard {
+		if let Some(shard) = member.as_ref().map(listen::Member::shard) {
 			if config.lb_id.is_some() {
 				return Err(Error::ShardWithQuicLb);
 			}
@@ -594,16 +608,23 @@ impl NoqServer {
 			}));
 		}
 
-		let socket = moq_sock::shard::bind(listen, shard).map_err(Error::BindSocket)?;
+		// A group member binds the address its group holds, not the one this
+		// config resolved: the group is what guarantees every member shares one
+		// port, in the order the kernel steers by.
+		let socket = match member {
+			Some(member) => member.bind(),
+			None => crate::bind::udp(crate::bind::Udp::new(listen)),
+		}
+		.map_err(Error::BindSocket)?;
 
 		// Create the generic QUIC endpoint.
 		let quic = noq::Endpoint::new(endpoint_config, Some(tls), socket, runtime).map_err(Error::CreateEndpoint)?;
 
 		// Spawn the cert reload watcher only after endpoint creation succeeds,
 		// so we don't leave a dangling watcher on failure.
-		tokio::spawn(crate::tls::reload_certs(certs.clone(), config.tls.clone()));
+		let _reload = crate::tls::Reload::spawn(certs.clone(), config.tls.clone());
 
-		Ok(Self { quic, certs })
+		Ok(Self { quic, certs, _reload })
 	}
 
 	pub fn accept(&self) -> impl std::future::Future<Output = Option<noq::Incoming>> + '_ {
@@ -769,6 +790,37 @@ impl noq::ConnectionIdGenerator for ServerIdGenerator {
 mod tests {
 	use super::*;
 
+	/// noq exposes no getters for the flow-control windows, but its `Debug` prints
+	/// them, which is enough to prove each one reached the transport config and that
+	/// an unset knob leaves noq's own default in place.
+	#[test]
+	fn apply_windows_writes_each_field() {
+		let defaults = format!("{:?}", noq::TransportConfig::default());
+
+		let quic = crate::quic::Config {
+			receive_window: Some(64 << 20),
+			stream_receive_window: Some(8 << 20),
+			send_window: Some(32 << 20),
+			..Default::default()
+		};
+
+		let mut transport = noq::TransportConfig::default();
+		apply_windows(&mut transport, &quic.resolve());
+		let applied = format!("{:?}", transport);
+
+		for field in [
+			format!("receive_window: {}", 64 << 20),
+			format!("stream_receive_window: {}", 8 << 20),
+			format!("send_window: {}", 32 << 20),
+		] {
+			assert!(applied.contains(&field), "{field} missing from {applied}");
+		}
+
+		let mut untouched = noq::TransportConfig::default();
+		apply_windows(&mut untouched, &crate::quic::Config::default().resolve());
+		assert_eq!(format!("{:?}", untouched), defaults);
+	}
+
 	/// Build a controller from each family's factory and downcast it to the
 	/// concrete noq implementation it must map to.
 	#[test]
@@ -783,8 +835,7 @@ mod tests {
 		assert!(delay.into_any().downcast::<noq::congestion::Bbr3>().is_ok());
 	}
 
-	/// noq's BBRv3 panics on loss, so an unset knob must land on CUBIC here even
-	/// though every other backend defaults to BBR.
+	/// An unset knob lands on CUBIC, while an explicit delay request gets BBRv3.
 	#[test]
 	fn congestion_control_defaults_to_loss() {
 		let mut quic = crate::quic::Config::default();

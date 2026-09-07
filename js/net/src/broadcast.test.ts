@@ -105,25 +105,19 @@ test("concurrent dynamic producers share a sequence namespace", async () => {
 	broadcast.close();
 });
 
-test("closing a broadcast preserves dequeued request sequences", async () => {
+test("closing a broadcast rejects a dequeued request", async () => {
 	const broadcast = new BroadcastProducer();
-	const firstSubscriber = broadcast.subscribe("media");
-	const firstRequest = await broadcast.requested();
-	if (!firstRequest) throw new Error("expected first request");
-	const firstProducer = firstRequest.accept();
-	expect(firstProducer.appendGroup().sequence).toBe(0);
-
-	const secondSubscriber = broadcast.subscribe("media");
-	const secondRequest = await broadcast.requested();
-	if (!secondRequest) throw new Error("expected second request");
+	const subscriber = broadcast.subscribe("media");
+	const request = await broadcast.requested();
+	if (!request) throw new Error("expected request");
 	broadcast.close();
-	const secondProducer = secondRequest.accept();
-	expect(secondProducer.appendGroup().sequence).toBe(1);
+	await expect(subscriber.info()).rejects.toThrow("track closed before info was known");
 
-	firstSubscriber.close();
-	secondSubscriber.close();
-	firstProducer.close();
-	secondProducer.close();
+	const producer = request.accept();
+	expect(() => producer.appendGroup()).toThrow("track is closed");
+	await expect(subscriber.info()).rejects.toThrow("track closed before info was known");
+	subscriber.close();
+	producer.close();
 });
 
 test("a request exposes the aggregate subscription options", async () => {
@@ -374,4 +368,28 @@ test("close rejects a still-pending track request so its subscriber unblocks", a
 	broadcast.close();
 
 	await expect(info).rejects.toThrow();
+});
+
+// A fetch parks for a group that has yet to be published, which is what the consuming wire
+// layer's coalescing relies on. The publisher's fill deliberately does not use this path: it
+// wants a group that already exists, and waiting for one that is gone would never return.
+test("a fetch waits for a group still to come", async () => {
+	const broadcast = new BroadcastProducer();
+	const track = broadcast.createTrack("video");
+
+	const pending = broadcast.fetchGroup("video", 1);
+
+	const first = track.appendGroup();
+	first.writeFrame({ payload: new TextEncoder().encode("0"), timestamp: Timestamp.now() });
+	first.close();
+
+	const second = track.appendGroup();
+	second.writeFrame({ payload: new TextEncoder().encode("1"), timestamp: Timestamp.now() });
+	second.close();
+
+	const group = await pending;
+	expect(group.sequence).toBe(1);
+	expect(await group.readString()).toBe("1");
+
+	broadcast.close();
 });

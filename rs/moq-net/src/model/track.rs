@@ -48,10 +48,15 @@ const EVICT_SLACK: usize = 64;
 /// groups, small enough that a write never scans a long queue.
 const EVICT_SCAN: usize = 4;
 
-/// One bounded pass over the eviction order at a fixed cache time.
+/// One pass over the eviction order at a fixed cache time.
 #[derive(Clone, Copy)]
 pub(super) struct ExpiryScan {
 	start: usize,
+	// Ceiling on how many entries this pass examines. `EVICT_SCAN` from the write
+	// path, the whole queue from the pool's sweep. Either way the pass stops once it
+	// has retained `EVICT_SCAN` entries, so its cost tracks what it reclaims rather
+	// than how much the track has cached.
+	width: usize,
 	now: u64,
 	max_ticks: u64,
 }
@@ -135,6 +140,9 @@ pub(crate) struct TrackState {
 	// The publisher's properties, once known; always Some for Subscriber/Producer.
 	// Copied by value into each group it creates.
 	info: Option<Info>,
+	// Whether a live Producer was minted. A reverse fetch may install `info`
+	// before acceptance, so the two states are deliberately separate.
+	published: bool,
 
 	// The broadcast this track belongs to. Supplies the cache pool its groups charge
 	// into and the `cache_duration` ceiling clamping `Info::max_age`.
@@ -278,9 +286,23 @@ struct FetchOutcome {
 }
 
 impl TrackState {
+	fn normalize_info(broadcast: &broadcast::Info, mut info: Info) -> Info {
+		info.max_age = info.max_age.min(broadcast.origin.cache_duration);
+		info
+	}
+
+	fn accept(&mut self, info: Info) {
+		self.published = true;
+		self.install(info);
+	}
+
 	fn poll_info(&self) -> Poll<Result<Info>> {
 		if let Some(info) = &self.info {
 			Poll::Ready(Ok(info.clone()))
+		} else if let Some(err) = &self.abort {
+			// Aborted before anyone served it, so the info can never arrive: fail the
+			// waiting subscribes instead of parking them on a track nobody will fill.
+			Poll::Ready(Err(err.clone()))
 		} else {
 			Poll::Pending
 		}
@@ -289,7 +311,9 @@ impl TrackState {
 	/// Find the next live group at or after `index` in arrival order.
 	///
 	/// Returns the group and its absolute index so the consumer can advance past it.
-	fn poll_recv_group(&self, index: usize, min_sequence: u64) -> Poll<Result<Option<(group::Consumer, usize)>>> {
+	/// The cached producer rather than a consumer: `consume` reads the clock and can
+	/// take the group's own lock, which the caller does once the track guard is gone.
+	fn poll_recv_group(&self, index: usize, min_sequence: u64) -> Poll<Result<Option<(group::Producer, usize)>>> {
 		let start = index.saturating_sub(self.offset);
 		for (i, (sequence, stamp)) in self.arrival.iter().enumerate().skip(start) {
 			if *sequence >= min_sequence
@@ -297,10 +321,7 @@ impl TrackState {
 				&& slot.stamp == *stamp
 				&& !slot.group.is_aborted()
 			{
-				// Delivery is a cache access: stamp it so expiry and the eviction
-				// walk don't kill a group a subscriber is about to read.
-				slot.group.cache_refresh();
-				return Poll::Ready(Ok(Some((slot.group.consume(), self.offset + i))));
+				return Poll::Ready(Ok(Some((slot.group.clone(), self.offset + i))));
 			}
 		}
 
@@ -361,7 +382,7 @@ impl TrackState {
 		&self,
 		next_sequence: u64,
 		end_sequence: Option<u64>,
-	) -> Poll<Result<Option<group::Consumer>>> {
+	) -> Poll<Result<Option<group::Producer>>> {
 		// If the end cap is already below where we'd resume, no group can
 		// ever satisfy this call until the cap rises. Pending (not None) so
 		// the consumer is parked rather than told the stream is over.
@@ -385,7 +406,8 @@ impl TrackState {
 			// Deliberately no cache refresh here: this is a pure seek, and the spliced
 			// merge consults candidates it may not deliver. The deliverer stamps the
 			// winner; a loser re-seeked every poll must not be shielded from eviction.
-			return Poll::Ready(Ok(Some(group.consume())));
+			// The caller consumes it with the track guard released, like `poll_recv_group`.
+			return Poll::Ready(Ok(Some(group.clone())));
 		}
 
 		// No in-range group is cached. Decide whether more could ever arrive.
@@ -410,10 +432,8 @@ impl TrackState {
 	/// is a miss instead, so the fetch goes upstream for the frames that are missing.
 	fn covering_group(&self, sequence: u64, frame_start: u64) -> Option<&group::Producer> {
 		let slot = self.lookup.get(&sequence)?;
-		if slot.group.is_aborted() || slot.group.first_frame() as u64 > frame_start {
-			return None;
-		}
-		Some(&slot.group)
+		let first = slot.group.live_first_frame()?;
+		(first as u64 <= frame_start).then_some(&slot.group)
 	}
 
 	/// The publisher's max age window, or `None` while the info is unknown (an
@@ -562,7 +582,8 @@ impl TrackState {
 	/// entries beyond one scan window can't be starved by fresh (recently read,
 	/// fetched, or written) entries in front of them: every position is revisited
 	/// within a few writes. Expiry throughput is therefore EVICT_SCAN groups per write; the
-	/// byte budget reclaims the remainder under memory pressure.
+	/// byte budget reclaims the remainder under memory pressure, and the pool's sweep
+	/// ([`Self::expiry_scan_full`]) covers a track that stopped writing entirely.
 	pub(super) fn evict_expired(&mut self) {
 		let scan = self.expiry_scan();
 		self.evict_expired_scan(scan);
@@ -572,17 +593,41 @@ impl TrackState {
 	pub(super) fn expiry_scan(&self) -> ExpiryScan {
 		ExpiryScan {
 			start: self.cache.next_expiry_scan(EVICT_SCAN),
+			width: EVICT_SCAN,
+			now: self.cache.pool().now(),
+			max_ticks: self.cache.pool().expiry_ticks(),
+		}
+	}
+
+	/// Describe a scan that drains the stale front of the eviction order, for the
+	/// pool's sweep.
+	///
+	/// A write's rotating window is fine while writes keep coming, because the next
+	/// one revisits the rest. The sweep is the only thing running on a track nobody
+	/// writes, so that window would take a backlog's length in sweeps to reach the
+	/// oldest entry. This starts at the front, where the oldest entries are, and the
+	/// shared stop rule ends it once the front stops yielding victims. A track that
+	/// went quiet has its whole backlog stale and contiguous there, so one sweep takes
+	/// all of it; a track with nothing due costs `EVICT_SCAN` entries, not its depth.
+	pub(super) fn expiry_scan_drain(&self) -> ExpiryScan {
+		ExpiryScan {
+			start: 0,
+			width: self.evict.len(),
 			now: self.cache.pool().now(),
 			max_ticks: self.cache.pool().expiry_ticks(),
 		}
 	}
 
 	/// Whether an expiry scan would change observable track state.
+	///
+	/// Mirrors [`Self::evict_expired_scan`]'s walk exactly, stop rule included: a memo
+	/// that scanned further would report work the scan itself will not do.
 	pub(super) fn expiry_mutation_due(&self, scan: ExpiryScan) -> bool {
 		let len = self.evict.len();
 		if len > 0 {
 			let start = scan.start % len;
-			for step in 0..len.min(EVICT_SCAN) {
+			let mut retained = 0;
+			for step in 0..len.min(scan.width) {
 				let (sequence, stamp) = self.evict[(start + step) % len];
 				let Some(slot) = self.lookup.get(&sequence) else {
 					continue;
@@ -595,6 +640,10 @@ impl TrackState {
 						&& scan.now.saturating_sub(slot.group.cache_accessed_tick()) > scan.max_ticks)
 				{
 					return true;
+				}
+				retained += 1;
+				if retained >= EVICT_SCAN {
+					break;
 				}
 			}
 		}
@@ -609,12 +658,14 @@ impl TrackState {
 			|| self.evict.len() > 2 * self.lookup.len() + EVICT_SLACK
 	}
 
-	/// Apply a scan previously selected by [`Self::expiry_scan`].
+	/// Apply a scan previously selected by [`Self::expiry_scan`] or
+	/// [`Self::expiry_scan_drain`].
 	pub(super) fn evict_expired_scan(&mut self, scan: ExpiryScan) {
 		let len = self.evict.len();
 		if len > 0 {
 			let start = scan.start % len;
-			for step in 0..len.min(EVICT_SCAN) {
+			let mut retained = 0;
+			for step in 0..len.min(scan.width) {
 				let (sequence, stamp) = self.evict[(start + step) % len];
 				let Some(slot) = self.lookup.get(&sequence) else {
 					continue;
@@ -632,6 +683,13 @@ impl TrackState {
 				if Some(sequence) == self.latest_group
 					|| scan.now.saturating_sub(slot.group.cache_accessed_tick()) <= scan.max_ticks
 				{
+					// Nothing to reclaim here. The front of the queue is the oldest
+					// content, so a run of these means the rest is fresher still: stop
+					// rather than walk a whole cache to find nothing.
+					retained += 1;
+					if retained >= EVICT_SCAN {
+						break;
+					}
 					continue;
 				}
 				// Take the group out of the cache and abort it, so any consumer
@@ -689,8 +747,8 @@ impl TrackState {
 	/// group is never retained longer than the origin allows. Every path that binds an
 	/// info to a track funnels through here, covering local publishers and relayed
 	/// (lite / IETF) tracks alike.
-	fn install(&mut self, mut info: Info) {
-		info.max_age = info.max_age.min(self.broadcast.origin.cache_duration);
+	fn install(&mut self, info: Info) {
+		let info = Self::normalize_info(&self.broadcast, info);
 		self.info = Some(info);
 	}
 
@@ -720,7 +778,14 @@ impl TrackState {
 	/// draining the old one keep their own handle.
 	fn claim_sequence(&mut self, sequence: u64, frame_start: u64) -> Result<()> {
 		if let Some(slot) = self.lookup.get(&sequence) {
-			if !slot.group.is_aborted() && slot.group.first_frame() as u64 <= frame_start {
+			// The same question `covering_group` asks: can this slot still answer from
+			// `frame_start`? If it can, the sequence is taken; if it can't, it is dead
+			// and the caller gets to replace it.
+			if slot
+				.group
+				.live_first_frame()
+				.is_some_and(|first| first as u64 <= frame_start)
+			{
 				return Err(Error::Duplicate);
 			}
 			self.lookup.remove(&sequence);
@@ -941,25 +1006,18 @@ impl TrackState {
 		}
 
 		let max = self.latest_group?;
-		match self.lookup.get(&max) {
+		match self.lookup.get(&max).and_then(|slot| slot.group.resume_frame()) {
 			// Still open *and* carrying frames, so the replacement continues it
-			// frame-by-frame. This holds even for an aborted group: readers that already
-			// consumed its head want the tail, and the count outlives the released cache.
-			//
-			// The *committed* count, not the written one: a route dying midway through a
-			// chunked frame leaves that frame unusable, so the replacement has to send it
-			// again rather than start after it.
-			Some(slot) if !slot.group.is_finished() && slot.group.committed_frames() > slot.group.first_frame() => {
-				Some(Position {
-					group: max,
-					frame: slot.group.committed_frames() as u64,
-				})
-			}
+			// frame-by-frame.
+			Some(frame) => Some(Position {
+				group: max,
+				frame: frame as u64,
+			}),
 			// A copy that wrote nothing has no frames to splice onto, and the reader
 			// already holds its (empty) handle. Pointing a replacement at frame 0 would
 			// hand the same sequence out twice, so roll to the next group exactly as a
 			// finished one does.
-			_ => Some(Position::group(max.saturating_add(1))),
+			None => Some(Position::group(max.saturating_add(1))),
 		}
 	}
 
@@ -1014,10 +1072,23 @@ impl TrackState {
 	}
 }
 
+/// Record `err` and close the track: the shared tail of [`Producer::abort`] and
+/// [`Producer::abort_unused`].
+fn commit_abort(mut state: kio::Mut<'_, TrackState>, err: Error) {
+	// Snapshot the frame boundary before the cache it's derived from goes away: an
+	// abort is exactly when a replacement route asks where to resume.
+	state.resume = state.resume_position();
+	state.abort = Some(err);
+	state.clear_cache();
+	state.datagrams.clear();
+	state.close();
+}
+
 /// A producer for a track, used to create new groups.
 #[derive(Clone)]
 pub struct Producer {
 	name: Arc<str>,
+	info: Info,
 	// The parent broadcast's info, inherited from [`broadcast::Producer::create_track`].
 	// Top link of the ownership chain; carried for identity and future inheritance.
 	broadcast: Arc<broadcast::Info>,
@@ -1045,16 +1116,14 @@ impl Producer {
 		info: impl Into<Option<Info>>,
 	) -> Self {
 		let name = name.into();
+		let info = TrackState::normalize_info(&broadcast, info.into().unwrap_or_default());
 		let state = TrackState::spawn(broadcast.clone());
-		state
-			.write()
-			.ok()
-			.expect("a new track is open")
-			.install(info.into().unwrap_or_default());
+		state.write().ok().expect("a new track is open").accept(info.clone());
 		let alive = Alive::new(name.clone(), state.clone());
 		alive.publish(None);
 		Self {
 			name,
+			info,
 			state,
 			broadcast,
 			prev_subscription: None,
@@ -1163,7 +1232,7 @@ impl Producer {
 		});
 		let cache = state.cache.clone();
 		drop(state);
-		cache.settle();
+		cache.settle(None);
 		Ok(sequence)
 	}
 
@@ -1195,7 +1264,7 @@ impl Producer {
 		state.push_datagram(datagram);
 		let cache = state.cache.clone();
 		drop(state);
-		cache.settle();
+		cache.settle(None);
 		Ok(())
 	}
 
@@ -1284,15 +1353,41 @@ impl Producer {
 	/// [`finish`](Self::finish) is deliberately not terminal: it declares the final
 	/// sequence, and lower-numbered groups may still be written afterwards.
 	pub fn abort(self, err: Error) -> Result<()> {
-		let mut guard = self.modify()?;
-		// Snapshot the frame boundary before the cache it's derived from goes away: an
-		// abort is exactly when a replacement route asks where to resume.
-		guard.resume = guard.resume_position();
-		guard.abort = Some(err);
-		guard.clear_cache();
-		guard.datagrams.clear();
-		guard.close();
+		commit_abort(self.modify()?, err);
 		Ok(())
+	}
+
+	/// Abort an unused track, returning the producer unchanged if consumers remain.
+	///
+	/// Consumer creation and the unused check share a lock, so demand returning
+	/// after [`poll_unused`](Self::poll_unused) prevents the abort. `Ok(())` means
+	/// the track is closed, including when it was already closed; existing handles
+	/// may still observe its final state. `Err(producer)` leaves the track unchanged
+	/// so the caller can continue serving and wait for the next unused wake.
+	#[expect(
+		clippy::result_large_err,
+		reason = "return the owned producer without allocating on an idle check"
+	)]
+	pub fn abort_unused(self, err: Error) -> std::result::Result<(), Self> {
+		match self.state.write_unused() {
+			kio::Unused::Idle(guard) => {
+				commit_abort(guard, err);
+				return Ok(());
+			}
+			kio::Unused::Closed => return Ok(()),
+			kio::Unused::Used => {}
+		}
+		Err(self)
+	}
+
+	/// Whether the track is open and anyone is consuming it right now.
+	///
+	/// A point-in-time snapshot for gating work on demand (on-demand capture,
+	/// dropping cached state nobody is watching). Acting on it to *end* the track
+	/// is the race [`abort_unused`](Self::abort_unused) exists for; use
+	/// [`unused`](Self::unused) to wait for the edge.
+	pub fn is_used(&self) -> bool {
+		!self.is_closed() && self.state.is_used()
 	}
 
 	/// Block until there are no active consumers.
@@ -1381,8 +1476,7 @@ impl Producer {
 		// requiring a live producer state. If the track already ended, the returned
 		// subscriber surfaces the close/abort on its first read; the preferences are
 		// simply never registered (nothing aggregates them anymore).
-		let info = self.state.read().info.clone().expect("producer always has info");
-
+		let info = self.info.clone();
 		let min_sequence = floor_of(&preferences);
 		let subscription = kio::Producer::new(preferences);
 		register_subscription(self.state.read(), &subscription);
@@ -1456,7 +1550,7 @@ impl Producer {
 
 		let prev = &self.prev_subscription;
 		let mut combined = None;
-		let mut guard = match subs.poll(waiter, |subs| {
+		let mut guard = ready!(subs.poll(waiter, |subs| {
 			let next = combined_subscription(subs, bound, waiter);
 			if &next == prev {
 				Poll::Pending
@@ -1464,10 +1558,7 @@ impl Producer {
 				combined = next;
 				Poll::Ready(())
 			}
-		}) {
-			Poll::Ready(guard) => guard,
-			Poll::Pending => return Poll::Pending,
-		};
+		}));
 		// The aggregate changed: prune any closed subscribers now that we hold the lock.
 		guard.retain(|sub| !sub.is_closed());
 		drop(guard);
@@ -1821,14 +1912,43 @@ pub(crate) struct TrackWeak {
 }
 
 impl TrackWeak {
-	pub fn consume(&self) -> Consumer {
-		Consumer::plain(self.name.clone(), self.state.consume())
+	/// A [`Consumer`] for the cached track, or `None` once it has closed.
+	///
+	/// The count moves under the same lock the close takes, which is the other half
+	/// of [`Producer::abort_unused`]: a lookup either gets a consumer in time to
+	/// decline the teardown, or gets nothing and re-requests the track. It is never
+	/// handed a track that is already on its way out.
+	pub fn try_consume(&self) -> Option<Consumer> {
+		Some(Consumer::plain(self.name.clone(), self.state.try_consume()?))
 	}
 
 	/// The shared name handle, for use as a broadcast lookup key (clone is a
 	/// refcount bump, and the same `Arc` is shared with the track's handles).
 	pub(crate) fn name(&self) -> &Arc<str> {
 		&self.name
+	}
+
+	/// Reject a track nothing ever served, resolving its pending subscribes with `err`.
+	///
+	/// A track whose [`Producer`] was minted is left alone and this returns false;
+	/// so is one that already carries an abort reason. Fetched backfill can install
+	/// [`Info`] before acceptance, so metadata alone does not prove a publisher exists.
+	///
+	/// Closes the state like [`Producer::abort`], so a [`Request`] still held by the
+	/// publisher can't `accept` its way back to life afterwards.
+	pub(crate) fn reject(&self, err: Error) -> bool {
+		let Some(producer) = self.state.produce() else {
+			return false;
+		};
+		let Ok(mut state) = producer.write() else {
+			return false;
+		};
+		if state.published || state.abort.is_some() {
+			return false;
+		}
+		state.abort = Some(err);
+		state.close();
+		true
 	}
 
 	/// Whether anyone is consuming the track right now. A closed track doesn't
@@ -2971,7 +3091,7 @@ impl PlainSubscriber {
 					group
 				}
 				_ => {
-					let Some((consumer, found_index)) =
+					let Some((producer, found_index)) =
 						ready!(self.poll(waiter, |state| state.poll_recv_group(self.index, self.min_sequence))?)
 					else {
 						// Parked groups survive a finished track: they become deliverable
@@ -2981,6 +3101,10 @@ impl PlainSubscriber {
 						}
 						return Poll::Pending;
 					};
+					let consumer = producer.consume();
+					// Stamp with the track guard released, so delivery never nests the
+					// group's state lock under the track's.
+					consumer.cache_refresh();
 					self.index = found_index + 1;
 
 					// Park a group beyond the cap instead of dropping it, and keep scanning
@@ -3056,7 +3180,7 @@ impl PlainSubscriber {
 		let drift = ready!(self.poll_drift(servable_cap(end, self.stale_cap), waiter))?;
 
 		loop {
-			let Some(group) = ready!(self.poll(waiter, |state| state.poll_next_in_range(floor, end))?) else {
+			let Some(producer) = ready!(self.poll(waiter, |state| state.poll_next_in_range(floor, end))?) else {
 				// Deliberately no flush of `seek_pending` here: only a delivery commit
 				// may count a conviction. This `None` can be an artifact of a floor
 				// that will lower again, and a mid-group boundary can serve a
@@ -3065,6 +3189,7 @@ impl PlainSubscriber {
 				// cursor, the same tail bound a retired segment already has.
 				return Poll::Ready(Ok(None));
 			};
+			let group = producer.consume();
 
 			// Skip a group the budget has given up on and keep scanning, so one poll
 			// walks a whole backlog off rather than handing it out group by group.
@@ -3719,16 +3844,18 @@ impl Request {
 	/// [`Producer`] is inert: writes fail with the abort error, as if it had been
 	/// aborted immediately after accepting.
 	pub fn accept(self, info: impl Into<Option<Info>>) -> Producer {
+		let info = TrackState::normalize_info(&self.broadcast, info.into().unwrap_or_default());
 		// A closed state means the track was aborted under us. Mirror `reject` and
 		// tolerate it: the Producer we hand back simply can't write.
 		if let Ok(mut state) = self.state.write() {
-			state.install(info.into().unwrap_or_default());
+			state.accept(info.clone());
 		}
 		// Accepting the request creates the track producer: count it as one ingress
 		// subscription (closed when the last handle drops). No-op when untagged.
 		self.alive.publish(Some(&self.stats));
 		Producer {
 			name: self.name,
+			info,
 			broadcast: self.broadcast,
 			state: self.state,
 			prev_subscription: None,
@@ -4345,6 +4472,42 @@ mod test {
 		);
 	}
 
+	/// The wire ingest coalesces its chunk wakes to the poll boundary, so a payload
+	/// whose tail arrives all at once completes without a single `frame_notify`.
+	/// Committing is itself a write access: a group that just finished a frame must
+	/// not be expired by the next track write on its stale frame-open stamp.
+	#[tokio::test]
+	async fn coalesced_frame_completion_keeps_the_group_alive() {
+		let mut producer = track_producer("test", None);
+		let mut straggler = producer.create_group(0u64.into()).unwrap();
+		// The live edge moves on, so the straggler is demoted and expirable.
+		producer.create_group(1u64.into()).unwrap().finish().unwrap();
+
+		let mut frame = straggler
+			.create_frame_owned(frame::Info {
+				size: 3,
+				timestamp: Timestamp::ZERO,
+			})
+			.unwrap();
+
+		// The sender stalls past the retention window, then the whole payload lands in
+		// one poll turn: the loop never returns `Pending`, so `notify` is never reached
+		// and `finish` is the only write the charge sees.
+		crate::model::clock::advance(cache::DEFAULT_EXPIRY + Duration::from_secs(1));
+		frame.write(bytes::Bytes::from_static(b"abc")).unwrap();
+		frame.finish().unwrap();
+		straggler.finish().unwrap();
+
+		// A new group runs the expiry scan.
+		producer.create_group(2u64.into()).unwrap().finish().unwrap();
+
+		let state = producer.state.read();
+		assert!(
+			state.lookup.contains_key(&0),
+			"a group whose frame just completed must not expire"
+		);
+	}
+
 	/// Re-offering a parked group (once the cap rises) is a delivery: it restarts
 	/// the expiry clock so the subscriber gets to read what it was just handed.
 	#[tokio::test]
@@ -4428,7 +4591,11 @@ mod test {
 
 	/// Mint a track under an origin whose pool has the given wall-clock LRU window.
 	fn track_producer_expiring(name: impl Into<Arc<str>>, expiry: impl Into<Option<Duration>>) -> Producer {
-		let pool = cache::Pool::new(cache::Config::default().with_expiry(expiry));
+		track_producer_pooled(name, cache::Pool::new(cache::Config::default().with_expiry(expiry)))
+	}
+
+	/// Mint a track under an origin caching into `pool`.
+	fn track_producer_pooled(name: impl Into<Arc<str>>, pool: cache::Pool) -> Producer {
 		let origin = crate::origin::Info::default().with_pool(pool);
 		Producer::new(
 			Arc::new(broadcast::Info {
@@ -4438,6 +4605,50 @@ mod test {
 			name,
 			None,
 		)
+	}
+
+	/// The write path is not the only thing that runs expiry: a pool sweep reclaims a
+	/// track's idle groups even when the track never writes again, which is the only
+	/// bound on a publisher that stalls with a group still open.
+	#[tokio::test]
+	async fn pool_sweep_expires_without_a_write() {
+		let pool = cache::Pool::new(cache::Config::default().with_expiry(Duration::from_secs(1)));
+		let mut producer = track_producer_pooled("test", pool.clone());
+		let mut stalled = producer.append_group().unwrap(); // seq 0, left open
+		stalled.write_frame(Timestamp::ZERO, b"x".as_slice()).unwrap();
+		producer.append_group().unwrap(); // seq 1, the live edge
+
+		crate::model::clock::advance(Duration::from_secs(2));
+		pool.sweep();
+
+		assert!(
+			!producer.state.read().lookup.contains_key(&0),
+			"the sweep reclaimed an idle open group with no write behind it"
+		);
+	}
+
+	/// One sweep drains a whole idle backlog, not a rotating window of it: a quiet
+	/// track has no writes left to revisit the rest of the queue with, so a bounded
+	/// pass would leave the oldest groups parked for a backlog's length in windows.
+	#[tokio::test]
+	async fn pool_sweep_drains_a_deep_backlog() {
+		let pool = cache::Pool::new(cache::Config::default().with_expiry(Duration::from_secs(1)));
+		let mut producer = track_producer_pooled("test", pool.clone());
+
+		// Comfortably more than one write-driven scan window (EVICT_SCAN).
+		let backlog = 4 * EVICT_SCAN;
+		for _ in 0..backlog {
+			let mut group = producer.append_group().unwrap();
+			group.write_frame(Timestamp::ZERO, b"x".as_slice()).unwrap();
+		}
+		producer.append_group().unwrap(); // the live edge, always protected
+
+		crate::model::clock::advance(Duration::from_secs(2));
+		pool.sweep();
+
+		let state = producer.state.read();
+		let stale = (0..backlog as u64).filter(|seq| state.lookup.contains_key(seq)).count();
+		assert_eq!(stale, 0, "one sweep reclaimed the whole idle backlog");
 	}
 
 	#[tokio::test]
@@ -4618,6 +4829,7 @@ mod test {
 			Duration::from_secs(1),
 		);
 		assert_eq!(capped.state.read().max_age_bound(), Some(Duration::from_secs(1)));
+		assert_eq!(capped.subscribe(None).info().max_age, Duration::from_secs(1));
 
 		let under = track_producer_capped(
 			"test",
@@ -7419,6 +7631,42 @@ mod test {
 
 		let mut group = pending.await.unwrap();
 		assert_eq!(&group.read_frame().await.unwrap().unwrap().payload[..], b"refetched");
+	}
+
+	/// An aborted group is dead whatever frame it starts at: the sequence is claimable
+	/// again, and a cache lookup misses rather than handing back a slot that can no
+	/// longer serve it.
+	///
+	/// The abort and the group's first frame decide this together, so they are read
+	/// under one guard. Read separately, the abort can land between them and the slot
+	/// answers as a live duplicate on the strength of an offset it only still has
+	/// because it died. That interleaving is what the single guard rules out; this
+	/// pins the committed semantics it has to preserve.
+	#[test]
+	fn an_aborted_group_releases_its_sequence() {
+		let mut producer = track_producer("test", None);
+		let consumer = producer.consume();
+
+		let mut group = producer.create_group(group::Info { sequence: 3 }).unwrap();
+		group
+			.write_frame(Timestamp::ZERO, bytes::Bytes::from_static(b"head"))
+			.unwrap();
+
+		// While it lives the slot answers, so the sequence is taken.
+		assert!(matches!(
+			producer.create_group(group::Info { sequence: 3 }),
+			Err(Error::Duplicate)
+		));
+		assert!(consumer.peek_group(3).is_some());
+
+		group.abort(Error::Cancel).unwrap();
+
+		assert!(consumer.peek_group(3).is_none(), "an aborted slot is a cache miss");
+		producer
+			.create_group(group::Info { sequence: 3 })
+			.expect("an aborted slot releases its sequence")
+			.finish()
+			.unwrap();
 	}
 
 	/// A fetched (backfill) group is served by sequence but never replayed to

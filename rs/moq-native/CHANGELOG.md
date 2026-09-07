@@ -6,6 +6,28 @@ All notable changes to this project will be documented in this file.
 
 - Rename the crate to `moq-tokio`. This release intentionally produces a compile error with migration instructions.
 
+## [0.19.16](https://github.com/moq-dev/moq/compare/moq-native-v0.19.15...moq-native-v0.19.16) - 2026-09-02
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.19.15](https://github.com/moq-dev/moq/compare/moq-native-v0.19.14...moq-native-v0.19.15) - 2026-09-01
+
+### Added
+
+- *(moq-net)* add moq-transport draft-20 (moqt-20) ([#3255](https://github.com/moq-dev/moq/pull/3255))
+
+### Fixed
+
+- *(native)* make heap profiling signals safe ([#3216](https://github.com/moq-dev/moq/pull/3216))
+- *(native)* remove deadlock detection ([#3166](https://github.com/moq-dev/moq/pull/3166))
+- *(cli)* serve TCP and Unix listeners without QUIC ([#3149](https://github.com/moq-dev/moq/pull/3149))
+
+### Other
+
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
 ## [0.19.14](https://github.com/moq-dev/moq/compare/moq-native-v0.19.13...moq-native-v0.19.14) - 2026-08-26
 
 ### Fixed

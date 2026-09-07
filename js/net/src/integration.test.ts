@@ -4,6 +4,7 @@ import * as Announce from "./announced.ts";
 import type { Consumer as BroadcastConsumer, Producer as BroadcastProducer } from "./broadcast.ts";
 import { accept, connect, Reload } from "./connection/index.ts";
 import { StreamCode, StreamError } from "./error.ts";
+import * as Group from "./group.ts";
 import * as Ietf from "./ietf/index.ts";
 import * as Lite from "./lite/index.ts";
 import { createMockTransportPair } from "./mock.ts";
@@ -512,6 +513,74 @@ test("integration: a group reset carries the peer's code to the subscriber", asy
 	server.close();
 });
 
+test("integration: a locally raised group error reaches the peer as its own code", async () => {
+	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+	const origin = new OriginProducer();
+
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	const broadcast = origin.publish(Path.from("test"));
+	const producer = broadcast.createTrack("video", { timescale: Timescale.MILLI });
+
+	const remote = client.consume(Path.from("test"));
+	const track = remote.track("video").subscribe().ordered();
+
+	const group = producer.appendGroup();
+	group.writeString("frame");
+
+	const consumer = await track.nextGroup();
+	if (!consumer) throw new Error("expected a group");
+	expect(await consumer.readString()).toBe("frame");
+
+	// The publisher's own cache dropped the rest of the group. Nothing hand-builds a transport
+	// error here, which is the point: the condition is raised the way the library raises it.
+	group.close(new Group.Lagged());
+
+	const err = await consumer.readFrame().then(
+		() => undefined,
+		(e: unknown) => e,
+	);
+	// Without the mapping this arrives as StreamCode.Internal (0), which reads as a crash on the
+	// publisher's side rather than a reader that fell behind.
+	expect(err).toBeInstanceOf(StreamError);
+	expect((err as StreamError).code).toBe(StreamCode.TooFarBehind);
+	// And the reverse direction agrees, so a gap is one class whichever side it happened on.
+	expect(err).toBeInstanceOf(Group.Lagged);
+
+	broadcast.close();
+	remote.close();
+	client.close();
+	server.close();
+});
+
+test("integration: subscribing to an unserved broadcast is refused as NotFound", async () => {
+	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+	const origin = new OriginProducer();
+
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	// Announced, so the subscribe is attempted, but the publisher drops it before the subscribe
+	// arrives and answers with a reset instead of a track.
+	const broadcast = origin.publish(Path.from("test"));
+	const remote = client.consume(Path.from("test"));
+	broadcast.close();
+
+	const track = remote.track("video").subscribe();
+	const err = await withTimeout(Promise.resolve(track.closed), 1000, "track never closed");
+	expect(err).toBeInstanceOf(StreamError);
+	expect((err as StreamError).code).toBe(StreamCode.NotFound);
+
+	remote.close();
+	client.close();
+	server.close();
+});
+
 test("integration: lite draft-05 fetches a cached group", async () => {
 	const enc = new TextEncoder();
 	const dec = new TextDecoder();
@@ -633,6 +702,86 @@ test("integration: lite draft-05 fetches an in-progress group", async () => {
 	expect(await fetched.readFrame()).toBeUndefined();
 
 	broadcast.close();
+	remote.close();
+	client.close();
+	server.close();
+});
+
+// The publisher caches TRACK_INFO so it only asks the application once per track. The cache
+// has to expire with the broadcast that answered it: a republish puts a different producer
+// on the path, and its immutable properties are its own.
+test("integration: lite draft-05 track info follows a republished broadcast", async () => {
+	const pair = createMockTransportPair(Lite.ALPN_05);
+	const origin = new OriginProducer();
+
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	const path = Path.from("test");
+	const first = origin.publish(path);
+	first.createTrack("video", { priority: 1, timescale: Timescale.MILLI, maxAge: 1000 });
+
+	const remote = client.consume(path);
+	const before = await remote.track("video").info();
+	expect(before.priority).toBe(1);
+	expect(before.timescale).toBe(Timescale.MILLI);
+	expect(before.maxAge).toBe(1000);
+
+	// Replace the broadcast on the same path with one whose track declares different
+	// immutable properties.
+	const second = origin.publish(path);
+	second.createTrack("video", { priority: 7, timescale: Timescale.MICRO, maxAge: 5000 });
+
+	const after = await remote.track("video").info();
+	expect(after.priority).toBe(7);
+	expect(after.timescale).toBe(Timescale.MICRO);
+	expect(after.maxAge).toBe(5000);
+
+	first.close();
+	second.close();
+	remote.close();
+	client.close();
+	server.close();
+});
+
+// FETCH reads the same cache to decide the timescale it serves frames in, so a stale entry
+// quantizes the successor's timestamps to the predecessor's resolution.
+test("integration: lite draft-05 fetch uses the republished track's timescale", async () => {
+	const enc = new TextEncoder();
+	const pair = createMockTransportPair(Lite.ALPN_05);
+	const origin = new OriginProducer();
+
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	const path = Path.from("test");
+	const first = origin.publish(path);
+	const firstTrack = first.createTrack("video", { timescale: Timescale.MILLI });
+	const firstGroup = firstTrack.appendGroup();
+	firstGroup.writeFrame({ payload: enc.encode("alpha"), timestamp: Timestamp.fromMillis(10) });
+	firstGroup.close();
+
+	// Prime the publisher's TRACK_INFO cache against the predecessor.
+	const remote = client.consume(path);
+	expect((await remote.track("video").info()).timescale).toBe(Timescale.MILLI);
+
+	const second = origin.publish(path);
+	const secondTrack = second.createTrack("video", { timescale: Timescale.MICRO });
+	const secondGroup = secondTrack.appendGroup();
+	secondGroup.writeFrame({ payload: enc.encode("beta"), timestamp: Timestamp.fromMicros(1234) });
+	secondGroup.close();
+
+	// A millisecond timescale would round this to 1000us.
+	const fetched = await remote.track("video").fetchGroup(0);
+	const frame = await fetched.readFrame();
+	expect(frame?.timestamp.asMicros()).toBe(1234);
+
+	first.close();
+	second.close();
 	remote.close();
 	client.close();
 	server.close();

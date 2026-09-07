@@ -159,14 +159,14 @@ impl Broadcaster {
 			match rendition.kind {
 				Kind::Video => video.push(master::VideoVariant {
 					name: rendition.name.clone(),
-					bandwidth: rendition.bandwidth,
+					bandwidth: rendition.bandwidth(),
 					width: rendition.width,
 					height: rendition.height,
 					codec: rendition.codec.clone(),
 				}),
 				Kind::Audio => audio.push(master::AudioVariant {
 					name: rendition.name.clone(),
-					bandwidth: rendition.bandwidth,
+					bandwidth: rendition.bandwidth(),
 					codec: rendition.codec.clone(),
 				}),
 			}
@@ -417,7 +417,7 @@ mod tests {
 	async fn escaping_broadcast_reference_is_not_advertised() {
 		let origin = produce_origin();
 		let _broadcast = origin.create_broadcast("a/pub").expect("publish allowed");
-		let _announce_broadcast = origin.announce("a/pub", Default::default()).expect("publish allowed");
+		_broadcast.announce(Default::default()).expect("publish allowed");
 		settle().await;
 		let source = moq_mux::Source::new(origin.consume(), "a/pub");
 		let upstream = Upstream {
@@ -435,6 +435,201 @@ mod tests {
 		assert!(renditions.get(Kind::Video, "video").is_none());
 	}
 
+	/// An upstream over an empty published broadcast, for the `sync` reconciliation tests.
+	async fn empty_upstream(origin: &moq_net::origin::Producer, path: &str) -> Upstream {
+		let source = moq_mux::Source::new(origin.consume(), path);
+		Upstream {
+			broadcast: source.broadcast().await.unwrap(),
+			source,
+		}
+	}
+
+	/// A catalog with one video and one audio rendition, both servable.
+	fn catalog_with_both() -> moq_mux::catalog::hang::Catalog {
+		let mut audio = hang::catalog::AudioConfig::new(
+			hang::catalog::AudioCodec::AAC(hang::catalog::AAC { profile: 2 }),
+			44_100,
+			2,
+		);
+		audio.description = Some(bytes::Bytes::from_static(&[0x12, 0x10]));
+		audio.bitrate = Some(96_000);
+
+		let mut catalog = moq_mux::catalog::hang::Catalog::default();
+		catalog.timeline = Some(hang::catalog::Timeline::new(hang::timeline::DEFAULT_NAME));
+		catalog.video.renditions.insert("video0".to_string(), video_config());
+		catalog.audio.renditions.insert("audio0".to_string(), audio);
+		catalog
+	}
+
+	/// The next rendition event, or `None` if the set is quiet.
+	async fn next_event(cursor: &mut renditions::Consumer) -> Option<renditions::Event> {
+		tokio::time::timeout(Duration::from_millis(50), cursor.next())
+			.await
+			.ok()
+			.flatten()
+	}
+
+	/// The average bitrate encoded in a synthesized AAC init segment.
+	fn aac_avg_bitrate(init: &bytes::Bytes) -> u32 {
+		let wire = moq_mux::container::fmp4::Wire::from_init(init).unwrap();
+		let codec = &wire.trak().mdia.minf.stbl.stsd.codecs[0];
+		let moq_mux::container::fmp4::mp4_atom::Codec::Mp4a(mp4a) = codec else {
+			panic!("expected mp4a, got {codec:?}");
+		};
+		mp4a.esds.es_desc.dec_config.avg_bitrate
+	}
+
+	// A publisher's estimator republishes the catalog every time its measured bitrate or jitter
+	// moves, writing those two fields and nothing else. That must not churn the rendition:
+	// rebuilding resets the playlist window, the cached init segment and EXT-X-MEDIA-SEQUENCE,
+	// and makes every recording cursor see a Removed followed by an Added.
+	#[tokio::test]
+	async fn estimate_only_catalog_update_keeps_the_rendition() {
+		let origin = produce_origin();
+		let _broadcast = origin.create_broadcast("live").expect("publish allowed");
+		_broadcast.announce(Default::default()).expect("publish allowed");
+		settle().await;
+		let upstream = empty_upstream(&origin, "live").await;
+
+		let mut catalog = catalog_with_both();
+		let renditions = renditions::Producer::new(Config::default().window);
+		let mut cursor = renditions.subscribe();
+		renditions.sync(&upstream, &catalog);
+
+		let video = renditions.get(Kind::Video, "video0").expect("video rendition");
+		let audio = renditions.get(Kind::Audio, "audio0").expect("audio rendition");
+		let audio_init = audio.init().await.unwrap().expect("AAC init segment");
+		assert_eq!(
+			aac_avg_bitrate(&audio_init),
+			96_000,
+			"the muxer keeps the declared catalog bitrate"
+		);
+		assert_eq!(video.bandwidth(), 2_000_000, "the catalog carries no video bitrate yet");
+		assert_eq!(audio.bandwidth(), 96_000);
+		assert!(matches!(
+			next_event(&mut cursor).await,
+			Some(renditions::Event::Added(_))
+		));
+		assert!(matches!(
+			next_event(&mut cursor).await,
+			Some(renditions::Event::Added(_))
+		));
+
+		// Exactly what `catalog::Rendition::estimate` writes back.
+		let video_config = catalog.video.renditions.get_mut("video0").unwrap();
+		video_config.bitrate = Some(1_800_000);
+		video_config.jitter = Some(Duration::from_millis(33));
+		catalog.audio.renditions.get_mut("audio0").unwrap().bitrate = Some(110_000);
+		renditions.sync(&upstream, &catalog);
+
+		assert!(
+			Arc::ptr_eq(&video, &renditions.get(Kind::Video, "video0").unwrap()),
+			"the video rendition survives an estimate-only update"
+		);
+		assert!(
+			Arc::ptr_eq(&audio, &renditions.get(Kind::Audio, "audio0").unwrap()),
+			"the audio rendition survives an estimate-only update"
+		);
+		assert_eq!(
+			video.bandwidth(),
+			1_800_000,
+			"the master playlist advertises the estimate"
+		);
+		assert_eq!(audio.bandwidth(), 110_000);
+		assert_eq!(
+			audio.init().await.unwrap().expect("cached AAC init segment"),
+			audio_init,
+			"an estimate update preserves the cached init segment"
+		);
+		assert!(next_event(&mut cursor).await.is_none(), "no rendition churn");
+
+		// A bitrate the publisher retracts falls back to the advertised default.
+		catalog.video.renditions.get_mut("video0").unwrap().bitrate = None;
+		renditions.sync(&upstream, &catalog);
+		assert_eq!(video.bandwidth(), 2_000_000);
+	}
+
+	#[tokio::test]
+	async fn estimate_before_first_init_reaches_aac_descriptor() {
+		let origin = produce_origin();
+		let _broadcast = origin.create_broadcast("live").expect("publish allowed");
+		_broadcast.announce(Default::default()).expect("publish allowed");
+		settle().await;
+		let upstream = empty_upstream(&origin, "live").await;
+
+		let mut catalog = catalog_with_both();
+		catalog.audio.renditions.get_mut("audio0").unwrap().bitrate = None;
+		let renditions = renditions::Producer::new(Config::default().window);
+		renditions.sync(&upstream, &catalog);
+		let audio = renditions.get(Kind::Audio, "audio0").expect("audio rendition");
+
+		catalog.audio.renditions.get_mut("audio0").unwrap().bitrate = Some(110_000);
+		renditions.sync(&upstream, &catalog);
+		assert!(
+			Arc::ptr_eq(&audio, &renditions.get(Kind::Audio, "audio0").unwrap()),
+			"the estimate updates the existing rendition"
+		);
+		let init = audio.init().await.unwrap().expect("AAC init segment");
+
+		assert_eq!(audio.bandwidth(), 110_000);
+		assert_eq!(
+			aac_avg_bitrate(&init),
+			110_000,
+			"the latest estimate reaches an init that was not cached yet"
+		);
+	}
+
+	// The other half: a change that alters how the rendition decodes still rebuilds it, so the
+	// cached init segment can never describe media it no longer matches.
+	#[tokio::test]
+	async fn decoder_config_change_rebuilds_the_rendition() {
+		let origin = produce_origin();
+		let _broadcast = origin.create_broadcast("live").expect("publish allowed");
+		_broadcast.announce(Default::default()).expect("publish allowed");
+		settle().await;
+		let upstream = empty_upstream(&origin, "live").await;
+
+		let mut catalog = catalog_with_both();
+		let renditions = renditions::Producer::new(Config::default().window);
+		let mut cursor = renditions.subscribe();
+		renditions.sync(&upstream, &catalog);
+
+		let video = renditions.get(Kind::Video, "video0").expect("video rendition");
+		let audio = renditions.get(Kind::Audio, "audio0").expect("audio rendition");
+		assert!(matches!(
+			next_event(&mut cursor).await,
+			Some(renditions::Event::Added(_))
+		));
+		assert!(matches!(
+			next_event(&mut cursor).await,
+			Some(renditions::Event::Added(_))
+		));
+
+		// A resolution change and a sample-rate change both invalidate the init segment.
+		catalog.video.renditions.get_mut("video0").unwrap().coded_width = Some(640);
+		catalog.audio.renditions.get_mut("audio0").unwrap().sample_rate = 48_000;
+		renditions.sync(&upstream, &catalog);
+
+		let rebuilt = renditions.get(Kind::Video, "video0").expect("video rendition");
+		assert!(!Arc::ptr_eq(&video, &rebuilt), "the video rendition is rebuilt");
+		assert_eq!(rebuilt.width, Some(640));
+		assert!(
+			!Arc::ptr_eq(&audio, &renditions.get(Kind::Audio, "audio0").unwrap()),
+			"the audio rendition is rebuilt"
+		);
+
+		// Both cursors see the replacement as a removal followed by an addition.
+		let mut removed = 0;
+		let mut added = 0;
+		while let Some(event) = next_event(&mut cursor).await {
+			match event {
+				renditions::Event::Removed { .. } => removed += 1,
+				renditions::Event::Added(_) => added += 1,
+			}
+		}
+		assert_eq!((removed, added), (2, 2));
+	}
+
 	// The whole fetch-on-demand path in process: a broadcast publishes media through the
 	// catalog (which records the timeline), the Broadcaster renders playlists from the
 	// timeline alone, and a segment request fetches and transmuxes exactly its groups.
@@ -442,7 +637,7 @@ mod tests {
 	async fn serves_playlist_and_segments_from_the_timeline() {
 		let origin = produce_origin();
 		let mut broadcast = origin.create_broadcast("live").expect("publish allowed");
-		let _announce_broadcast = origin.announce("live", Default::default()).expect("publish allowed");
+		broadcast.announce(Default::default()).expect("publish allowed");
 		settle().await;
 		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 
@@ -518,7 +713,7 @@ mod tests {
 	async fn serves_dash_manifest_and_time_addressed_segments() {
 		let origin = produce_origin();
 		let mut broadcast = origin.create_broadcast("live").expect("publish allowed");
-		let _announce_broadcast = origin.announce("live", Default::default()).expect("publish allowed");
+		broadcast.announce(Default::default()).expect("publish allowed");
 		settle().await;
 		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 
@@ -598,7 +793,7 @@ mod tests {
 	async fn dash_manifest_turns_static_when_finished() {
 		let origin = produce_origin();
 		let mut broadcast = origin.create_broadcast("live").expect("publish allowed");
-		let _announce_broadcast = origin.announce("live", Default::default()).expect("publish allowed");
+		broadcast.announce(Default::default()).expect("publish allowed");
 		settle().await;
 		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 
@@ -658,7 +853,7 @@ mod tests {
 	async fn target_duration_covers_the_window_without_a_declared_bound() {
 		let origin = produce_origin();
 		let mut broadcast = origin.create_broadcast("live").expect("publish allowed");
-		let _announce_broadcast = origin.announce("live", Default::default()).expect("publish allowed");
+		broadcast.announce(Default::default()).expect("publish allowed");
 		settle().await;
 		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 
@@ -694,7 +889,7 @@ mod tests {
 	async fn audio_and_video_segments_are_aligned() {
 		let origin = produce_origin();
 		let mut broadcast = origin.create_broadcast("live").expect("publish allowed");
-		let _announce_broadcast = origin.announce("live", Default::default()).expect("publish allowed");
+		broadcast.announce(Default::default()).expect("publish allowed");
 		settle().await;
 		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 
@@ -778,7 +973,7 @@ mod tests {
 	async fn dropping_the_broadcaster_keeps_a_cursor_drainable() {
 		let origin = produce_origin();
 		let mut broadcast = origin.create_broadcast("live").expect("publish allowed");
-		let _announce_broadcast = origin.announce("live", Default::default()).expect("publish allowed");
+		broadcast.announce(Default::default()).expect("publish allowed");
 		settle().await;
 		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 
@@ -829,6 +1024,30 @@ mod tests {
 		drop((catalog, media, registration, broadcast, rendition));
 	}
 
+	/// Whether `haystack` carries `needle` verbatim, i.e. whether a transmuxed segment carries a
+	/// particular publisher's frame payloads.
+	fn contains(haystack: &bytes::Bytes, needle: &[u8]) -> bool {
+		haystack.windows(needle.len()).any(|window| window == needle)
+	}
+
+	/// Reconcile a one-video-rendition catalog snapshot by hand and drive the timeline, which is
+	/// what `watch_catalog` does with each snapshot.
+	fn export(
+		upstream: &Upstream,
+		config: &hang::catalog::VideoConfig,
+	) -> (Arc<Rendition>, tokio::task::JoinHandle<()>) {
+		let mut catalog = moq_mux::catalog::hang::Catalog::default();
+		catalog.video.renditions.insert("video0".to_string(), config.clone());
+		let section = hang::catalog::Timeline::new(hang::timeline::DEFAULT_NAME);
+		catalog.timeline = Some(section.clone());
+
+		let renditions = renditions::Producer::new(Config::default().window);
+		renditions.sync(upstream, &catalog);
+		let watcher = tokio::spawn(watch_timeline(upstream.broadcast.clone(), section, renditions.fanout()));
+		let rendition = renditions.get(Kind::Video, "video0").expect("rendition synced");
+		(rendition, watcher)
+	}
+
 	// A same-path republish takes the origin leaf over with a brand new broadcast (an ordinary
 	// publisher is `Hop::UNKNOWN`, which never counts as the same publisher, so even a plain
 	// reconnect qualifies). Renditions derived from the old broadcast's catalog must not serve the
@@ -847,7 +1066,7 @@ mod tests {
 			payload: &'static [u8],
 		) -> (Box<dyn std::any::Any>, hang::catalog::VideoConfig) {
 			let mut broadcast = origin.create_broadcast("live").expect("publish allowed");
-			let _announce_broadcast = origin.announce("live", Default::default()).expect("publish allowed");
+			broadcast.announce(Default::default()).expect("publish allowed");
 			let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 
 			let reserved = catalog.reserve();
@@ -865,28 +1084,6 @@ mod tests {
 			media.write(payload_frame(4_000_000, true, payload)).unwrap();
 
 			(Box::new((broadcast, catalog, registration, media)), config)
-		}
-
-		fn contains(haystack: &bytes::Bytes, needle: &[u8]) -> bool {
-			haystack.windows(needle.len()).any(|window| window == needle)
-		}
-
-		// Reconcile a catalog snapshot by hand and drive the timeline, which is what
-		// `watch_catalog` does with each snapshot.
-		fn export(
-			upstream: &Upstream,
-			config: &hang::catalog::VideoConfig,
-		) -> (Arc<Rendition>, tokio::task::JoinHandle<()>) {
-			let mut catalog = moq_mux::catalog::hang::Catalog::default();
-			catalog.video.renditions.insert("video0".to_string(), config.clone());
-			let section = hang::catalog::Timeline::new(hang::timeline::DEFAULT_NAME);
-			catalog.timeline = Some(section.clone());
-
-			let renditions = renditions::Producer::new(Config::default().window);
-			renditions.sync(upstream, &catalog);
-			let watcher = tokio::spawn(watch_timeline(upstream.broadcast.clone(), section, renditions.fanout()));
-			let rendition = renditions.get(Kind::Video, "video0").expect("rendition synced");
-			(rendition, watcher)
 		}
 
 		let origin = produce_origin();
@@ -948,6 +1145,115 @@ mod tests {
 		drop(new);
 	}
 
+	// The sibling half of the case above. A rendition whose catalog names another broadcast is
+	// bound to whatever serves that path when the rendition is created, not when its first
+	// segment is requested: the timeline on the catalog broadcast keeps describing the epoch it
+	// was written for, so a media publisher that reconnects (restarting its group numbering)
+	// must not answer for segments the old catalog already described.
+	#[tokio::test]
+	async fn a_replacement_sibling_is_not_served_under_the_replaced_catalog() {
+		const OLD: &[u8] = b"OLDOLDOLDOLDOLDO";
+		const NEW: &[u8] = b"NEWNEWNEWNEWNEWN";
+
+		// Publish broadcast "media": a `video0` track of three keyframe groups whose frames carry
+		// `payload`, so the two epochs' media differs byte for byte. `recorder` enrolls the track
+		// in the *catalog* broadcast's timeline; the replacement publishes without one, exactly
+		// as a reconnecting media publisher does before the catalog broadcast catches up.
+		fn publish_media(
+			origin: &moq_net::origin::Producer,
+			payload: &'static [u8],
+			recorder: Option<moq_mux::timeline::Recorder>,
+		) -> Box<dyn std::any::Any> {
+			let mut broadcast = origin.create_broadcast("media").expect("publish allowed");
+			broadcast.announce(Default::default()).expect("publish allowed");
+			let track = broadcast.create_track("video0", None).unwrap();
+
+			let mut media = moq_mux::container::Producer::new(track, moq_mux::catalog::hang::Container::Legacy);
+			if let Some(recorder) = recorder {
+				media = media.with_recorder(recorder);
+			}
+			media.write(payload_frame(0, true, payload)).unwrap();
+			media.write(payload_frame(2_000_000, true, payload)).unwrap();
+			media.write(payload_frame(4_000_000, true, payload)).unwrap();
+
+			Box::new((broadcast, media))
+		}
+
+		let origin = produce_origin();
+
+		// The catalog broadcast carries the catalog and the timeline; the media lives next door.
+		let mut live = origin.create_broadcast("live").expect("publish allowed");
+		live.announce(Default::default()).expect("publish allowed");
+		let mut catalog = moq_mux::catalog::Producer::new(&mut live).unwrap();
+		let recorder = catalog.enroll("video0").unwrap();
+
+		let old_media = publish_media(&origin, OLD, Some(recorder));
+		settle().await;
+
+		let source = moq_mux::Source::new(origin.consume(), "live");
+		let upstream = Upstream {
+			broadcast: source.broadcast().await.unwrap(),
+			source,
+		};
+
+		// A relative reference replaces the base's last segment, so "media" is a sibling of the
+		// catalog broadcast "live".
+		let mut config = video_config();
+		config.broadcast = Some(moq_net::PathRelative::new("media").to_owned());
+
+		let (rendition, watcher) = export(&upstream, &config);
+		tokio::time::timeout(Duration::from_secs(5), rendition.playable())
+			.await
+			.expect("the timeline reaches the rendition");
+
+		// The media publisher reconnects before any segment is requested, taking the origin leaf
+		// over with a brand new broadcast whose group numbering restarts from zero.
+		drop(old_media);
+		let new_media = publish_media(&origin, NEW, None);
+		settle().await;
+
+		let served = rendition
+			.segment(0)
+			.await
+			.expect("a replaced sibling is an unavailable group, not a server error");
+		if let Some(served) = &served {
+			assert!(
+				!contains(served, NEW),
+				"the replacement publisher's media was served under the replaced sibling's segment numbers"
+			);
+		}
+		assert!(
+			served.is_none(),
+			"the replaced sibling broadcast is closed, so it serves nothing"
+		);
+		watcher.abort();
+
+		// Control: an export started after the takeover does serve the new publisher's media, so
+		// the assertion above is about which epoch the rendition is bound to, not about a
+		// broadcast that happens to be unreadable.
+		let source = moq_mux::Source::new(origin.consume(), "live");
+		let fresh = Upstream {
+			broadcast: source.broadcast().await.unwrap(),
+			source,
+		};
+		let (rendition, watcher) = export(&fresh, &config);
+		tokio::time::timeout(Duration::from_secs(5), rendition.playable())
+			.await
+			.expect("the timeline reaches the fresh rendition");
+		let served = rendition
+			.segment(0)
+			.await
+			.unwrap()
+			.expect("the new publisher is servable on a freshly bound rendition");
+		assert!(
+			contains(&served, NEW),
+			"the new export serves the new publisher's media"
+		);
+		watcher.abort();
+
+		drop((new_media, catalog, live));
+	}
+
 	// A rendition the catalog drops must end its segment cursors. The cursor holds an
 	// `Arc<Rendition>`, so without an explicit close the rendition (and its timeline
 	// subscription) would stay alive and the cursor would park at the live edge forever.
@@ -955,7 +1261,7 @@ mod tests {
 	async fn removing_a_rendition_ends_its_segment_cursor() {
 		let origin = produce_origin();
 		let broadcast = origin.create_broadcast("live").expect("publish allowed");
-		let _announce_broadcast = origin.announce("live", Default::default()).expect("publish allowed");
+		broadcast.announce(Default::default()).expect("publish allowed");
 		let source = moq_mux::Source::new(origin.consume(), "live");
 		settle().await;
 		let upstream = Upstream {
@@ -995,7 +1301,7 @@ mod tests {
 	async fn dropping_the_broadcaster_releases_its_renditions() {
 		let origin = produce_origin();
 		let mut broadcast = origin.create_broadcast("live").expect("publish allowed");
-		let _announce_broadcast = origin.announce("live", Default::default()).expect("publish allowed");
+		broadcast.announce(Default::default()).expect("publish allowed");
 		settle().await;
 		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 
@@ -1051,7 +1357,7 @@ mod tests {
 	async fn record_cursors_yield_renditions_and_segments() {
 		let origin = produce_origin();
 		let mut broadcast = origin.create_broadcast("live").expect("publish allowed");
-		let _announce_broadcast = origin.announce("live", Default::default()).expect("publish allowed");
+		broadcast.announce(Default::default()).expect("publish allowed");
 		settle().await;
 		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 

@@ -9,11 +9,11 @@
 
 use criterion::{criterion_group, criterion_main};
 
-#[cfg(all(target_os = "linux", any(feature = "quiche", feature = "quinn")))]
+#[cfg(all(target_os = "linux", any(feature = "noq", feature = "quiche", feature = "quinn")))]
 #[path = "../tests/support/quiche.rs"]
 mod support;
 
-#[cfg(all(target_os = "linux", any(feature = "quiche", feature = "quinn")))]
+#[cfg(all(target_os = "linux", any(feature = "noq", feature = "quiche", feature = "quinn")))]
 mod linux {
 	use std::net::UdpSocket;
 	use std::pin::Pin;
@@ -148,9 +148,7 @@ mod linux {
 			});
 
 			let mut broadcast = pub_origin.create_broadcast("bench").expect("create broadcast");
-			let _announce_broadcast = pub_origin
-				.announce("bench", Default::default())
-				.expect("create broadcast");
+			broadcast.announce(Default::default()).expect("create broadcast");
 			let mut track = broadcast.create_track("data", None).expect("create track");
 
 			let certs = support::certs().expect("certificates");
@@ -255,10 +253,10 @@ mod linux {
 	}
 }
 
-#[cfg(all(target_os = "linux", any(feature = "quiche", feature = "quinn")))]
+#[cfg(all(target_os = "linux", any(feature = "noq", feature = "quiche", feature = "quinn")))]
 use linux::benchmark;
 
-#[cfg(not(all(target_os = "linux", any(feature = "quiche", feature = "quinn"))))]
+#[cfg(not(all(target_os = "linux", any(feature = "noq", feature = "quiche", feature = "quinn"))))]
 fn benchmark(_: &mut criterion::Criterion) {}
 
 criterion_group!(benches, benchmark);

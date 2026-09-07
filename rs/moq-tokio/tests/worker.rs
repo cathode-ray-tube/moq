@@ -13,8 +13,8 @@ const WORKERS: u16 = 4;
 
 /// A UDP port nothing is bound to.
 ///
-/// Every worker binds the same port, so this cannot be `:0`: each would pick an
-/// ephemeral port of its own and they would not form a group.
+/// Named rather than ephemeral because these tests rebind the port, or probe it
+/// while the group holds it, which needs a port known before the group starts.
 fn free_udp_port() -> u16 {
 	let probe = UdpSocket::bind("127.0.0.1:0").expect("bind probe");
 	let port = probe.local_addr().expect("local addr").port();
@@ -67,7 +67,7 @@ async fn dropping_the_workers_releases_the_port() {
 
 	// Serving first is the case that used to strand the threads.
 	for (server, spawner) in workers.split() {
-		spawner.run(async move {
+		spawner.run(|| async move {
 			let _ = server.listen().await;
 		});
 	}
@@ -77,6 +77,126 @@ async fn dropping_the_workers_releases_the_port() {
 	// succeeds only if every worker's socket is really gone.
 	let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 	moq_tokio::bind::udp(moq_tokio::bind::Udp::new(addr)).expect("workers left the port bound");
+}
+
+/// The future factory runs on the worker, so the future may hold local state
+/// across an await without making that state thread-safe, and spawn more of it
+/// onto the same task set.
+#[tokio::test]
+async fn spawner_runs_a_send_less_future() {
+	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+	let dir = tempfile::tempdir().expect("tempdir");
+	let (cert, key) = certificate(dir.path());
+	let mut workers = Workers::bind(listen_config(&cert, &key, 0), Default::default(), config(1)).expect("bind worker");
+
+	let task = {
+		let mut split = workers.split();
+		let (_server, spawner) = split.pop().expect("one worker");
+		spawner.run(|| async move {
+			let value = std::rc::Rc::new(std::cell::Cell::new(1));
+			tokio::task::yield_now().await;
+			value.set(value.get() + 1);
+
+			// A nested `!Send` task, which panics outside a local task set.
+			let shared = value.clone();
+			tokio::task::spawn_local(async move { shared.set(shared.get() + 1) })
+				.await
+				.expect("local spawn");
+
+			value.get()
+		})
+	};
+
+	assert_eq!(task.await.expect("local task"), 3);
+	workers.shutdown().await;
+}
+
+/// A factory that panics while building its future takes the task down, not the
+/// worker thread: the group keeps running and the next future still starts.
+#[tokio::test]
+async fn spawner_contains_a_factory_panic() {
+	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+	let dir = tempfile::tempdir().expect("tempdir");
+	let (cert, key) = certificate(dir.path());
+	let mut workers = Workers::bind(listen_config(&cert, &key, 0), Default::default(), config(1)).expect("bind worker");
+
+	let (panicked, survived) = {
+		let mut split = workers.split();
+		let (_server, spawner) = split.pop().expect("one worker");
+		let panicked = spawner.run(|| -> std::future::Pending<()> { panic!("factory") });
+		let survived = spawner.run(|| async { "still here" });
+		(panicked, survived)
+	};
+
+	assert!(panicked.await.expect_err("factory panic").is_panic());
+	assert_eq!(survived.await.expect("worker survived"), "still here");
+	workers.shutdown().await;
+}
+
+/// Aborting the returned handle stops the worker-local future, rather than
+/// detaching it to run unreachable until the group stops.
+#[tokio::test]
+async fn spawner_abort_reaches_the_worker() {
+	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+	let dir = tempfile::tempdir().expect("tempdir");
+	let (cert, key) = certificate(dir.path());
+	let mut workers = Workers::bind(listen_config(&cert, &key, 0), Default::default(), config(1)).expect("bind worker");
+
+	// Dropped when the future is, so it reports the cancellation from the worker.
+	let (dropped, was_dropped) = tokio::sync::oneshot::channel::<()>();
+	let (started, has_started) = tokio::sync::oneshot::channel::<()>();
+
+	let task = {
+		let mut split = workers.split();
+		let (_server, spawner) = split.pop().expect("one worker");
+		spawner.run(move || async move {
+			let _dropped = dropped;
+			let _ = started.send(());
+			std::future::pending::<()>().await;
+		})
+	};
+
+	has_started.await.expect("future started");
+	task.abort();
+
+	let waited = tokio::time::timeout(std::time::Duration::from_secs(5), was_dropped).await;
+	assert!(waited.expect("abort reached the worker").is_err());
+	workers.shutdown().await;
+}
+
+/// The same, but aborting before the factory has even reached its worker. The
+/// task is owned from the moment it is spawned, so no handoff window detaches
+/// it: a caller that aborts while the handle is still in flight cancels it.
+#[tokio::test]
+async fn spawner_abort_races_the_handoff() {
+	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+	let dir = tempfile::tempdir().expect("tempdir");
+	let (cert, key) = certificate(dir.path());
+	let mut workers = Workers::bind(listen_config(&cert, &key, 0), Default::default(), config(1)).expect("bind worker");
+
+	// Dropped with the future, whether or not it was ever polled.
+	let (dropped, was_dropped) = tokio::sync::oneshot::channel::<()>();
+
+	let task = {
+		let mut split = workers.split();
+		let (_server, spawner) = split.pop().expect("one worker");
+		spawner.run(move || async move {
+			let _dropped = dropped;
+			std::future::pending::<()>().await;
+		})
+	};
+
+	// No wait: the closure may still be in the channel, or its handle buffered in
+	// the oneshot the forwarding task has yet to read.
+	task.abort();
+
+	let waited = tokio::time::timeout(std::time::Duration::from_secs(5), was_dropped).await;
+	assert!(waited.expect("abort reached the worker").is_err());
+	workers.shutdown().await;
 }
 
 /// Never splitting them has to release the port too, or a failure between bind
@@ -98,22 +218,28 @@ async fn dropping_unserved_workers_releases_the_port() {
 	moq_tokio::bind::udp(moq_tokio::bind::Udp::new(addr)).expect("workers left the port bound");
 }
 
-/// An ephemeral bind gives every worker a port of its own instead of a shared
-/// one, leaving all but the first unreachable behind an address that reads as
-/// bound. That has to fail at startup rather than come up looking healthy.
+/// The group holds one port, so an ephemeral bind is the port its first member
+/// drew and the rest join it. A member picking a port of its own would sit
+/// unreachable behind an address that reads as bound.
 #[tokio::test]
-async fn an_ephemeral_port_is_refused() {
+async fn an_ephemeral_port_is_shared_by_the_group() {
 	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
 	let dir = tempfile::tempdir().expect("tempdir");
 	let (cert, key) = certificate(dir.path());
 
-	let err = Workers::bind(listen_config(&cert, &key, 0), Default::default(), config(WORKERS))
-		.expect_err("an ephemeral port cannot be shared");
-	assert!(
-		matches!(err, moq_tokio::Error::WorkerPortMismatch { .. }),
-		"unexpected error: {err}"
-	);
+	let workers = Workers::bind(listen_config(&cert, &key, 0), Default::default(), config(WORKERS))
+		.expect("a group may take an ephemeral port");
+	assert_eq!(workers.len(), usize::from(WORKERS));
+
+	let addr = workers.local_addr();
+	assert_ne!(addr.port(), 0, "the group reports the port it bound");
+
+	// A plain bind refuses a port any socket holds, so this fails while the
+	// group is alive and succeeds once every member has let go.
+	moq_tokio::bind::udp(moq_tokio::bind::Udp::new(addr)).expect_err("the group must hold its port");
+	workers.shutdown().await;
+	moq_tokio::bind::udp(moq_tokio::bind::Udp::new(addr)).expect("the group must release its port");
 }
 
 /// `SO_REUSEPORT` groups by address and UID, so a second group on a served
@@ -225,43 +351,6 @@ async fn a_foreign_reuseport_group_is_refused() {
 
 	Workers::bind(listen_config(&cert, &key, port), Default::default(), config(WORKERS))
 		.expect_err("a group must not join a foreign reuseport member");
-}
-
-/// A bind that fails midway drops the members it already spawned, and the error
-/// must not return before their sockets are closed: an owner that immediately
-/// rebinds the address would otherwise join the half-dead reuseport group and be
-/// renumbered when it finished dying.
-#[tokio::test]
-async fn a_failed_bind_releases_its_port_first() {
-	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-	let dir = tempfile::tempdir().expect("tempdir");
-	let (cert, key) = certificate(dir.path());
-
-	// Ephemeral, so the first member binds a port of its own and the second
-	// fails the group: a real partial construction, deterministically.
-	let err = Workers::bind(listen_config(&cert, &key, 0), Default::default(), config(2))
-		.expect_err("an ephemeral port cannot be shared");
-	let moq_tokio::Error::WorkerPortMismatch { first, .. } = err else {
-		panic!("unexpected error: {err}");
-	};
-
-	// A plain bind refuses a port any socket still holds, so this succeeds only
-	// if the first member was joined before `bind` returned its error.
-	moq_tokio::bind::udp(moq_tokio::bind::Udp::new(first)).expect("a failed bind left its port held");
-}
-
-/// One worker has no group to disagree with, so an ephemeral port is fine there.
-#[tokio::test]
-async fn a_single_worker_may_use_an_ephemeral_port() {
-	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-	let dir = tempfile::tempdir().expect("tempdir");
-	let (cert, key) = certificate(dir.path());
-
-	let workers = Workers::bind(listen_config(&cert, &key, 0), Default::default(), config(1))
-		.expect("a lone worker may take any port");
-	assert_ne!(workers.local_addr().port(), 0);
 }
 
 /// The steering filter picks a member with one byte of the connection ID, so a

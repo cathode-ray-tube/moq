@@ -33,6 +33,21 @@ the UDP sockets bound through it.
   `connect_lite`/`accept_lite` run moq-lite sessions on the worker either
   way, with stream and close codes mapped through the HTTP/3 error space in
   web mode.
+- **qlog**: `quic::qlog::Sink` points a group of workers at a directory and
+  `quic::Transport::qlog` turns capture on. The pinned worker never writes to
+  the file: the QUIC stacks want a `Send + Sync` writer, which cannot hold the
+  worker's `!Send` ring handle, so a trace is staged in memory and handed to
+  one background thread for every worker sharing the sink. Behind the `qlog`
+  feature, so a production build compiles none of it.
+- **Metrics**: a set of relaxed atomic counters per worker, read from any
+  thread through `metrics::Metrics::snapshot`. Buffer-pool health (`ENOBUFS`,
+  provided-buffer exhaustion, TX-pool stalls), batch effectiveness (datagrams
+  per receive and per send), ring traffic (submissions, completions,
+  `io_uring_enter` calls), and scheduling (parks, remote futex wakes, timer
+  churn). Pass a `metrics::Metrics` to `Config::metrics` to hold a copy on the
+  thread that spawned the worker, or read the worker's own with
+  `Handle::metrics`. `moq-relay` publishes them at `/metrics` on its internal
+  listener.
 - **Steering**: an endpoint whose socket sits in a `moq-sock` steered
   `SO_REUSEPORT` group sets `endpoint::Config::shard`, and every issued
   connection id leads with the group's steering byte, so the kernel keeps a
@@ -50,12 +65,13 @@ them is compiled:
 
 | Feature | Stack | TLS |
 |---|---|---|
-| `quiche` (default) | [quiche](https://github.com/cloudflare/quiche) | BoringSSL, which needs cmake and a C++ toolchain to build |
+| `noq` (default) | [noq-proto](https://github.com/kixelated/noq) | rustls |
 | `quinn` | [quinn-proto](https://github.com/quinn-rs/quinn) | rustls, the stack the rest of this workspace already links |
+| `quiche` | [quiche](https://github.com/cloudflare/quiche) | BoringSSL, which needs cmake and a C++ toolchain to build |
 
 Nothing above the module changes: the same `quic::{Endpoint, Connection,
 SendStream, RecvStream}`, the same WebTransport layer, the same tests. A build
-asking for both (`--all-features`) gets `quinn`, and a build asking for
+asking for several (`--all-features`) gets `noq`, and a build asking for
 neither leaves the `quic` module out entirely, keeping the worker, its timers,
 and `udp::Socket`.
 
@@ -63,14 +79,19 @@ and `udp::Socket`.
 cargo test -p moq-uring --no-default-features --features quinn
 ```
 
-`moq-relay` picks with its own pair: `--features io-uring` takes quiche and
-`--features io-uring-quinn` takes quinn, since cargo features are additive and
-a backend selected on top of a default one would compile both.
+`moq-relay` uses noq with `--features io-uring`. The
+`io-uring-quinn` and `io-uring-quiche` features select the alternatives.
+
+The `qlog` feature is orthogonal to the three, turning on whichever backend's
+own qlog support is compiled. Its per-backend shape follows the tokio stack:
+noq and quiche write one file per connection, while quinn-proto takes one sink
+per transport config and so writes one file per endpoint, tagging each event
+with the connection's qlog `group_id`.
 
 ## Validation
 
 Every test runs against whichever backend is compiled, so the suite is the
-parity check between the two.
+parity check between the three.
 
 `tests/echo.rs` runs a raw [quiche](https://github.com/cloudflare/quiche) echo
 over the worker: handshake, half a megabyte each way, timers driven by

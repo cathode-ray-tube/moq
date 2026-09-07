@@ -1,5 +1,5 @@
 import { expect, setSystemTime, test } from "bun:test";
-import { Producer as GroupProducer, Lagged } from "./group.ts";
+import { Producer as GroupProducer, Lagged, MAX_GROUP_FRAMES } from "./group.ts";
 import { hooks } from "./internal.ts";
 import { Timestamp } from "./time.ts";
 import { Producer as TrackProducer } from "./track.ts";
@@ -804,6 +804,78 @@ test("retention pruning aborts a held mirror without a new live edge", async () 
 	}
 });
 
+test("retention reclaims a group the publisher abandoned open", async () => {
+	const clock = mockMonotonicTime(10_000);
+	try {
+		const producer = new TrackProducer("test").accept({ maxAge: 100 });
+		const track = producer.subscribe({ maxAge: 100 });
+		const stalled = producer.appendGroup();
+		stalled.writeString("first");
+		// A successor, so the stalled group is not the live edge the publisher is
+		// still filling. It is never closed: the publisher simply walked away.
+		producer.appendGroup();
+
+		const group = await track.recvGroup();
+		if (!group) throw new Error("missing group");
+		expect(await group.readString()).toBe("first");
+
+		clock.set(10_200);
+		producer.subscribe({ maxAge: 100 });
+
+		// A gap, not a clean finish: the publisher never ended this group.
+		await expect(group.readFrame()).rejects.toBeInstanceOf(Lagged);
+	} finally {
+		clock.restore();
+	}
+});
+
+test("an abandoned open group ages out with no further write", async () => {
+	// Real time, since this is about the wakeup: nothing writes to the track again, so
+	// without a timer the read below parks forever.
+	const producer = new TrackProducer("test").accept({ maxAge: 30 });
+	const track = producer.subscribe({ maxAge: 30 });
+	const stalled = producer.appendGroup();
+	stalled.writeString("first");
+	producer.appendGroup();
+
+	const group = await track.recvGroup();
+	if (!group) throw new Error("missing group");
+	expect(await group.readString()).toBe("first");
+
+	const read = group.readFrame().then(
+		() => "clean end",
+		(err: unknown) => err,
+	);
+	const timeout = new Promise((resolve) => setTimeout(() => resolve("still parked"), 1000));
+	expect(await Promise.race([read, timeout])).toBeInstanceOf(Lagged);
+});
+
+test("the prune wakeup never exceeds the setTimeout limit", () => {
+	// A window past 2^31 ms truncates the delay to a signed 32-bit int, so the wakeup
+	// fires immediately and re-arms the same oversized delay: a millisecond timer loop
+	// instead of a wakeup. Capped, it just wakes early and finds nothing due.
+	const real = globalThis.setTimeout;
+	const delays: number[] = [];
+	// @ts-expect-error a stub, not a full setTimeout
+	globalThis.setTimeout = (_fn: () => void, delay: number) => {
+		delays.push(delay);
+		return { unref: () => {} };
+	};
+
+	try {
+		const producer = new TrackProducer("test").accept({ maxAge: 2 ** 31 + 10_000 });
+		const stalled = producer.appendGroup();
+		stalled.writeString("first");
+		producer.appendGroup(); // the live edge, so the stalled group is prunable
+		producer.close();
+	} finally {
+		globalThis.setTimeout = real;
+	}
+
+	expect(delays.length).toBeGreaterThan(0);
+	for (const delay of delays) expect(delay).toBeLessThanOrEqual(2 ** 31 - 1);
+});
+
 test("retention pruning preserves clean EOF for a drained mirror", async () => {
 	const clock = mockMonotonicTime(10_000);
 	try {
@@ -1252,3 +1324,56 @@ test("readFrame does not livelock when a sole group finishes before the next arr
 
 	expect(await track.readString()).toBe("hello");
 }, 2000);
+
+// The IETF publisher resolves Largest Object from this, so it has to name a frame, not just
+// a group: a filter is applied down to the object.
+test("largest names the newest frame written", async () => {
+	const producer = new TrackProducer("test").accept();
+	const subscriber = producer.subscribe({ maxAge: 1_000 });
+
+	// Nothing published yet.
+	expect(subscriber.largest()).toBeUndefined();
+
+	const first = producer.appendGroup();
+	first.writeFrame({ payload: enc.encode("a"), timestamp: Timestamp.now() });
+	first.writeFrame({ payload: enc.encode("b"), timestamp: Timestamp.now() });
+	expect(subscriber.largest()).toEqual({ group: 0, frame: 1 });
+	first.close();
+
+	// A group with no frames yet has no object of its own, so the edge stays in the group
+	// before it rather than reading as an empty track.
+	const second = producer.appendGroup();
+	expect(subscriber.largest()).toEqual({ group: 0, frame: 1 });
+
+	second.writeFrame({ payload: enc.encode("c"), timestamp: Timestamp.now() });
+	expect(subscriber.largest()).toEqual({ group: 1, frame: 0 });
+	second.close();
+
+	// Reading a group does not move the edge: it is what the track produced, not what is left.
+	await subscriber.recvGroup();
+	expect(subscriber.largest()).toEqual({ group: 1, frame: 0 });
+
+	producer.close();
+});
+
+// A subscriber that arrives after the frames were written reads mirrors, and a mirror only
+// replays what is still buffered. Once a group has evicted from its front, a replay-local
+// count would put the edge below the frames actually written.
+test("largest survives a mirror replay of an evicted group", async () => {
+	const producer = new TrackProducer("test").accept();
+
+	// Overflow the group's frame cap so the front is evicted, which is the only case where
+	// the replayed frames and the frames ever written disagree.
+	const written = MAX_GROUP_FRAMES + 5;
+	const group = producer.appendGroup();
+	for (let i = 0; i < written; i++) {
+		group.writeFrame({ payload: enc.encode(`${i}`), timestamp: Timestamp.now() });
+	}
+	group.close();
+
+	// Subscribing now replays the retained window into a fresh sink.
+	const late = producer.subscribe();
+	expect(late.largest()).toEqual({ group: 0, frame: written - 1 });
+
+	producer.close();
+});

@@ -400,13 +400,21 @@ pub type TextTrack<E = ()> = Rendition<E, hang::catalog::TextConfig>;
 
 impl<E: CatalogExt, C: RenditionConfig<E>> Rendition<E, C> {
 	fn new(reserved: Reserved<E>, name: String) -> crate::Result<Self> {
+		Self::owned(reserved.catalog.clone(), Some(reserved), name)
+	}
+
+	pub(super) fn live(catalog: Producer<E>, name: String) -> crate::Result<Self> {
+		Self::owned(catalog, None, name)
+	}
+
+	fn owned(catalog: Producer<E>, gate: Option<Reserved<E>>, name: String) -> crate::Result<Self> {
 		// Take the name now, not at `set`: a lazily-configured importer (H.264 before its first SPS)
 		// has no catalog entry until much later, and the name has to be ours for that whole window.
-		reserved.catalog.acquire::<C>(&name)?;
+		catalog.acquire::<C>(&name)?;
 
 		Ok(Self {
-			catalog: reserved.catalog.clone(),
-			gate: Some(reserved),
+			catalog,
+			gate,
 			name,
 			present: false,
 			supplied: Estimate::default(),

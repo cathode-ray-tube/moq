@@ -13,10 +13,16 @@ keywords = ["quic", "http3", "webtransport", "media", "live"]
 categories = ["multimedia", "network-programming", "web-programming"]
 
 [features]
-default = ["quinn", "aws-lc-rs", "websocket", "tcp", "uds"]
-quinn = ["dep:quinn", "dep:web-transport-quinn", "dep:rcgen", "dep:reqwest", "dep:rustls-webpki", "watch", "dep:dns-lookup"]
-noq = ["dep:web-transport-noq", "dep:rcgen", "dep:reqwest", "dep:rustls-webpki", "watch", "dep:dns-lookup"]
-quiche = ["dep:web-transport-quiche", "dep:rcgen", "dep:reqwest", "dep:rustls-webpki", "dep:rustls-native-certs", "dep:dns-lookup", "watch"]
+default = ["noq", "aws-lc-rs", "websocket", "tcp", "uds"]
+quinn = ["_certs", "dep:quinn", "dep:web-transport-quinn", "dep:reqwest", "watch", "dep:dns-lookup"]
+noq = ["_certs", "dep:web-transport-noq", "dep:reqwest", "watch", "dep:dns-lookup"]
+quiche = ["_certs", "dep:web-transport-quiche", "dep:reqwest", "dep:rustls-native-certs", "dep:dns-lookup", "watch"]
+# Server-side certificate handling: chains loaded from disk, self-signed generation,
+# in-memory identities, and per-SNI selection. Not one to enable on its own, since
+# nothing turns it into a listener: every QUIC backend needs it for its own TLS, and
+# so does the plain-TLS `tls::Listen::server_config` an RTMPS or HTTPS listener builds,
+# which is why the crypto-provider features below turn it on too.
+_certs = ["dep:rcgen", "dep:rustls-webpki"]
 # Filesystem watcher for hot-reloading on-disk TLS certs, keys, and root CAs.
 watch = ["dep:notify"]
 # Capture qlog traces (`--*-quic-qlog <DIR>`). Off by default: quinn and noq pull in
@@ -27,7 +33,16 @@ watch = ["dep:notify"]
 qlog = ["quinn?/qlog", "web-transport-noq?/qlog"]
 # The QUIC backends pull in their crypto provider from these features (default-features
 # are off on each backend dep), so a backend without aws-lc-rs/ring has no initial cipher.
-aws-lc-rs = ["rustls/aws-lc-rs", "rcgen?/aws_lc_rs", "quinn?/rustls-aws-lc-rs", "web-transport-noq?/aws-lc-rs", "web-transport-quinn?/aws-lc-rs"]
+# A provider is also all it takes to sign and serve certificates, so each turns on
+# `_certs` even where there is no QUIC backend to serve them for.
+aws-lc-rs = [
+    "_certs",
+    "rustls/aws-lc-rs",
+    "rcgen/aws_lc_rs",
+    "quinn?/rustls-aws-lc-rs",
+    "web-transport-noq?/aws-lc-rs",
+    "web-transport-quinn?/aws-lc-rs",
+]
 iroh = ["dep:web-transport-iroh", "dep:web-transport-proto", "dep:noq-proto"]
 # LAN peer discovery over mDNS (the `mdns` module).
 mdns = ["dep:mdns-sd", "dep:hmac", "dep:sha2", "dep:subtle"]
@@ -38,16 +53,16 @@ tcp = ["dep:qmux", "dep:dns-lookup"]
 # Unix-domain-socket qmux transport (`unix://`), unix-only. Adds peer-credential
 # inspection on accept. Pulls in `tcp` (shares qmux's stream transport).
 uds = ["tcp", "qmux/uds"]
-ring = ["rustls/ring", "rcgen?/ring", "quinn?/rustls-ring", "web-transport-noq?/ring", "web-transport-quinn?/ring"]
+ring = ["_certs", "rustls/ring", "rcgen/ring", "quinn?/rustls-ring", "web-transport-noq?/ring", "web-transport-quinn?/ring"]
 android-logcat = ["dep:tracing-android"]
 
 [dependencies]
 bytes = "1"
 # Family-restricted `getaddrinfo`, so the AAAA and A queries can be issued separately
 # (RFC 8305 section 3) while still going through the system resolver.
-dns-lookup = { version = "3", optional = true }
+dns-lookup = { version = "4", optional = true }
 futures = "0.3"
-hex = "0.4"
+hex = { workspace = true }
 hmac = { workspace = true, optional = true }
 humantime = "2.3"
 mdns-sd = { workspace = true, optional = true }
@@ -56,7 +71,7 @@ moq-net = { workspace = true }
 moq-sock = { workspace = true }
 # iroh runs on noq but re-exports only the ControllerFactory trait, not the concrete
 # congestion configs. Version matched to the copy iroh pulls in.
-noq-proto = { version = "1", default-features = false, optional = true }
+noq-proto = { workspace = true, optional = true }
 notify = { version = "8", optional = true }
 qmux = { workspace = true, features = ["wss", "tls", "tcp"], optional = true }
 quinn = { version = "0.11", default-features = false, features = ["platform-verifier", "runtime-tokio", "bloom"], optional = true }

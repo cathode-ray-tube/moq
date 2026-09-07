@@ -12,7 +12,11 @@
 //! connections. The `mdns` feature finds peers to connect to on the local network.
 //!
 //! With `default-features = false`, the `quinn` and `noq` backends must be paired
-//! with the `aws-lc-rs` or `ring` crypto-provider feature.
+//! with the `aws-lc-rs` or `ring` crypto-provider feature. Every other subset
+//! compiles, including no transport at all: such a build cannot connect to
+//! anything, though a crypto provider on its own is still enough to configure TLS
+//! and to build a plain-TLS listener's `rustls::ServerConfig` from
+//! [`tls::Listen::server_config`].
 
 #![warn(missing_docs)]
 
@@ -24,6 +28,7 @@
 ))]
 compile_error!("a rustls QUIC backend requires a crypto provider: enable either the `aws-lc-rs` or `ring` feature");
 
+mod abort;
 pub mod accept;
 pub use moq_sock::bind;
 pub mod cli;
@@ -64,7 +69,6 @@ pub mod tls;
 pub mod transport;
 #[cfg(all(feature = "uds", unix))]
 pub mod unix;
-#[cfg(any(feature = "noq", feature = "quinn", feature = "quiche"))]
 pub mod worker;
 // Resolving a `host:port` bind string is a QUIC-listener concern; the stream
 // listeners take a `SocketAddr`/path straight from their config.
@@ -83,7 +87,7 @@ pub use connection::{Backoff, Connection, ConnectionStatsReader, GoawayConfig, R
 pub use deprecated::Deprecated;
 pub use duration::Duration;
 pub use error::{Error, Result};
-pub use log::Log;
+pub use log::{Log, RedactedUrl};
 #[cfg(any(
 	feature = "noq",
 	feature = "quinn",
@@ -208,15 +212,15 @@ pub fn qlog_supported() -> bool {
 /// reaches for a default, since `QuicBackend` has no variants there.
 #[cfg(any(feature = "noq", feature = "quinn", feature = "quiche"))]
 fn default_quic_backend() -> QuicBackend {
-	#[cfg(feature = "quinn")]
-	{
-		QuicBackend::Quinn
-	}
-	#[cfg(all(feature = "noq", not(feature = "quinn")))]
+	#[cfg(feature = "noq")]
 	{
 		QuicBackend::Noq
 	}
-	#[cfg(all(feature = "quiche", not(feature = "quinn"), not(feature = "noq")))]
+	#[cfg(all(feature = "quinn", not(feature = "noq")))]
+	{
+		QuicBackend::Quinn
+	}
+	#[cfg(all(feature = "quiche", not(feature = "noq"), not(feature = "quinn")))]
 	{
 		QuicBackend::Quiche
 	}
@@ -224,9 +228,9 @@ fn default_quic_backend() -> QuicBackend {
 
 #[cfg(test)]
 mod tests {
-	#[cfg(feature = "quinn")]
+	#[cfg(feature = "noq")]
 	#[test]
-	fn quinn_is_the_default_backend() {
-		assert!(matches!(super::default_quic_backend(), super::QuicBackend::Quinn));
+	fn noq_is_the_default_backend() {
+		assert!(matches!(super::default_quic_backend(), super::QuicBackend::Noq));
 	}
 }

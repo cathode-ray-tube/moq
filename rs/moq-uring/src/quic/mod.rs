@@ -21,26 +21,32 @@
 //! The sans-IO stack underneath is a build-time choice, and only one of them
 //! is ever compiled:
 //!
-//! - `quiche` (default): Cloudflare's stack, TLS through BoringSSL.
+//! - `noq` (default): noq-proto, TLS through rustls.
 //! - `quinn`: quinn-proto, TLS through rustls, which is the same stack the
 //!   rest of this workspace uses.
+//! - `quiche`: Cloudflare's stack, TLS through BoringSSL.
 //!
 //! Everything above this module is the same either way: the types in here,
-//! the [`web`] layer, and the sessions they carry. Enabling both features at
-//! once selects `quinn`, so a `--all-features` build has one backend like
+//! the [`web`] layer, and the sessions they carry. Enabling several features at
+//! once selects `noq`, so a `--all-features` build has one backend like
 //! every other build.
 
 pub mod client;
 pub mod endpoint;
+#[cfg(feature = "qlog")]
+pub mod qlog;
 pub mod server;
 pub mod web;
 
-// `quinn` wins a build that asks for both, so `--all-features` compiles one
+// `noq` wins a build that asks for several, so `--all-features` compiles one
 // backend rather than failing.
-#[cfg(all(feature = "quiche", not(feature = "quinn")))]
+#[cfg(all(feature = "quiche", not(feature = "noq"), not(feature = "quinn")))]
 #[path = "quiche/mod.rs"]
 mod backend;
-#[cfg(feature = "quinn")]
+#[cfg(all(feature = "quinn", not(feature = "noq")))]
+#[path = "quinn/mod.rs"]
+mod backend;
+#[cfg(feature = "noq")]
 #[path = "quinn/mod.rs"]
 mod backend;
 
@@ -124,6 +130,17 @@ pub struct Transport {
 	/// connection, or `None` (the default) to send none and let the idle
 	/// timeout decide.
 	pub keep_alive: Option<std::time::Duration>,
+	/// Where to write qlog traces, or `None` (the default) to write none.
+	///
+	/// The layout follows the backend, as it does on the tokio stack: noq and
+	/// quiche write one file per connection, while quinn-proto takes one sink
+	/// per configuration and so writes one file per endpoint, tagging each
+	/// event with the qlog `group_id` of the connection it belongs to.
+	///
+	/// Only compiled with the `qlog` feature, so a build without it cannot ask
+	/// for traces the backends would not produce.
+	#[cfg(feature = "qlog")]
+	pub qlog: Option<qlog::Sink>,
 }
 
 impl Default for Transport {
@@ -133,6 +150,8 @@ impl Default for Transport {
 			max_streams: 1024,
 			congestion: Congestion::default(),
 			keep_alive: None,
+			#[cfg(feature = "qlog")]
+			qlog: None,
 		}
 	}
 }
@@ -219,6 +238,10 @@ pub enum Error {
 		/// The UTF-8 lossy close reason, empty for a stream-level code.
 		reason: String,
 	},
+	/// qlog traces were asked for and cannot be captured: the directory is
+	/// missing or unwritable, or the writer thread could not be started.
+	#[error("qlog error: {0}")]
+	Qlog(String),
 }
 
 impl web_transport_trait::Error for Error {

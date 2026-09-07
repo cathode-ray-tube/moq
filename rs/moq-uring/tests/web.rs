@@ -6,7 +6,7 @@
 //! Kernel-gated: skips loudly below the Linux 6.12 floor (GitHub-hosted CI),
 //! and runs everywhere else.
 
-#![cfg(all(target_os = "linux", any(feature = "quiche", feature = "quinn")))]
+#![cfg(all(target_os = "linux", any(feature = "noq", feature = "quiche", feature = "quinn")))]
 
 #[path = "support/quiche.rs"]
 mod support;
@@ -220,9 +220,7 @@ fn lite_session_over_webtransport() {
 	});
 
 	let mut broadcast = pub_origin.create_broadcast("test").expect("create broadcast");
-	let _announce_broadcast = pub_origin
-		.announce("test", Default::default())
-		.expect("create broadcast");
+	broadcast.announce(Default::default()).expect("create broadcast");
 	let mut track = broadcast.create_track("data", None).expect("create track");
 	let mut group = track.append_group().expect("append group");
 	group

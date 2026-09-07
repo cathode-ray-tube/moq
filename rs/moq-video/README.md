@@ -12,27 +12,49 @@ swapping or bumping a backend crate is not a breaking change.
 
 ## Capture
 
-The default-on `capture` feature exposes the device APIs and their per-platform
-backends. Disable it for a codec-only build that accepts frames supplied by the
-caller without pulling Linux V4L2 and libclang build dependencies.
+The opt-in `capture` feature exposes the device APIs and their per-platform
+backends. Enable it with `cargo add moq-video --features capture`; the default
+codec-only build accepts frames supplied by the caller without pulling Linux
+V4L2 and libclang build dependencies.
 
 Per-platform, picked at compile time:
 
-- **macOS**: AVFoundation (camera) and ScreenCaptureKit (display), yielding
-  zero-copy `CVPixelBuffer` surfaces straight to VideoToolbox.
+- **macOS**: AVFoundation (camera) and ScreenCaptureKit (display, window, or
+  application), yielding zero-copy `CVPixelBuffer` surfaces straight to
+  VideoToolbox.
 - **Linux**: native V4L2 (camera; YUYV resampled, MJPEG via `zune-jpeg`) and
-  xdg-desktop-portal + PipeWire (display; RGB -> CPU I420, behind the `pipewire`
-  feature since it links libpipewire). Works on Wayland and X11; the desktop's
-  picker dialog chooses the screen, and the portal's restore token is reused so
-  demand-driven reopens don't re-prompt.
+  xdg-desktop-portal + PipeWire on Wayland (display; behind the `pipewire`
+  feature), with native X11 monitor/window selection and capture as the X11
+  fallback. The Wayland picker dialog chooses the screen, and the portal's
+  restore token is reused so demand-driven reopens don't re-prompt.
 - **Windows**: native Media Foundation (camera; `IMFSourceReader`) and DXGI
-  Desktop Duplication (display; BGRA -> CPU I420). Display capture is
-  whole-monitor; select one with a bare index or `display:{index}`.
+  Desktop Duplication (display), plus GDI single-window capture. Both convert
+  BGRA to CPU I420 and use the ids returned by the enumerators.
 
 `capture::cameras()` lists AVFoundation, V4L2, or Media Foundation cameras with
 identifiers accepted by `capture::Source::Camera`. `capture::displays()` does
-the same for macOS and Windows displays. Linux display selection stays in the
-desktop portal picker, which does not expose a stable display identifier.
+the same for macOS, Windows, and X11 displays. `capture::windows()` lists macOS,
+Windows, and X11 windows. Wayland display selection stays in the desktop portal
+picker, which does not expose a stable display identifier.
+
+Embedded applications can consume raw capture without creating a MoQ
+broadcast:
+
+```rust
+let mut config = moq_video::capture::Config::default();
+config.source = moq_video::capture::Source::Display(None);
+
+let mut capture = moq_video::capture::open(&config).await?;
+while let Some(surface) = capture.read().await? {
+    // Encode, render, or inspect the newest captured surface.
+}
+```
+
+The stream retains only the newest unconsumed frame, so a slow encoder adds
+drops rather than latency. `read` ends with `None` when the source stopped for
+a benign reason, such as a window resize, so reopen to follow it. Permission
+denial and a source disappearing are terminal, reported as
+`Error::PermissionDenied` and `Error::SourceUnavailable`.
 
 ## Encode
 
@@ -40,10 +62,10 @@ The codec is chosen via `encode::Codec`. Backends are tried in order (hardware
 first, then software) and the first that opens wins; `encode::Kind` narrows the
 choice (`Auto` / `Hardware` / `Software` / a named backend).
 
-| Codec | Software | macOS | Windows | Linux |
-|---|---|---|---|---|
-| H.264 | openh264 (vendored, static) | VideoToolbox | Media Foundation | NVENC (feature `nvidia`), VAAPI (feature `vaapi`) |
-| H.265 | none | VideoToolbox | Media Foundation | NVENC (feature `nvidia`) |
+| Codec | Software | macOS | Windows | Linux | Android |
+|---|---|---|---|---|---|
+| H.264 | openh264 (vendored, static) | VideoToolbox | Media Foundation | NVENC (feature `nvidia`), VAAPI (feature `vaapi`) | MediaCodec (feature `mediacodec`, API 26+) |
+| H.265 | none | VideoToolbox | Media Foundation | NVENC (feature `nvidia`) | MediaCodec (feature `mediacodec`, API 26+) |
 
 Every backend emits Annex-B with in-band parameter sets (SPS/PPS, plus VPS for
 H.265), so the matching `moq_mux::codec` importer handles framing and catalog
@@ -70,10 +92,12 @@ Two public entry points:
 - `encode::Producer` publishes frames you encoded yourself (`publish(&[Encoded])`),
   handling the catalog and framing. Each is published at its own timestamp.
 
-The NVENC and VAAPI backends are Linux-only and gated behind their respective
-features. Both `dlopen` the vendor driver at runtime (and fall back to software
-where the driver is absent), so a feature-enabled binary still links on a
-GPU-less builder and still starts on a GPU-less machine.
+The NVENC, VAAPI, and V4L2 M2M backends are Linux-only. `nvidia` is on by
+default: it `dlopen`s the driver at runtime and needs nothing at build time.
+`vaapi` and `v4l2` are opt-in because their bindgen needs libclang on the build
+host (plus the kernel headers for `v4l2`). None of them link a vendor library,
+so a binary carrying them still links on a GPU-less builder and still starts on
+a machine without the hardware, falling back to software.
 
 ## Decode
 
@@ -84,8 +108,8 @@ same device keeps it there (the transcode path), while `into_i420()` downloads
 it. An encoder that can't take that surface (openh264, or a different device)
 downloads it through I420 for you. Every frame carries a `Surface`, a
 `#[non_exhaustive]` enum naming where the pixels live (`PixelBuffer` on macOS,
-`Texture` on Windows, `Cuda` on Linux, or CPU `I420`). Match it to take a
-zero-copy path for a representation you recognize, and fall back to
+`Texture` on Windows, `Cuda` on Linux, `HardwareBuffer` on Android, or CPU
+`I420`). Match it to take a zero-copy path for a representation you recognize, and fall back to
 `Surface::into_i420()`, which always works. On macOS `Surface::into_pixel_buffer()`
 is the mirror: free for a hardware-decoded frame, an upload for a CPU one.
 `Surface::into_rgba()` is the portable exit for CPU image and UI toolkits,
@@ -93,11 +117,11 @@ returning owned, tightly packed RGBA8 pixels with the surface's color metadata
 applied.
 Backends are tried hardware-first, like encode:
 
-| Codec | Software | macOS | Windows | Linux |
-|---|---|---|---|---|
-| H.264 | openh264 (vendored, static) | VideoToolbox | Media Foundation (DXVA) | NVDEC (feature `nvidia`) |
-| H.265 | none | VideoToolbox | Media Foundation (DXVA) | NVDEC (feature `nvidia`) |
-| AV1 | none | none | none | NVDEC (feature `nvidia`) |
+| Codec | Software | macOS | Windows | Linux | Android |
+|---|---|---|---|---|---|
+| H.264 | openh264 (vendored, static) | VideoToolbox | Media Foundation (DXVA) | NVDEC (feature `nvidia`), VAAPI (feature `vaapi`) | MediaCodec (feature `mediacodec`, API 26+) |
+| H.265 | none | VideoToolbox | Media Foundation (DXVA) | NVDEC (feature `nvidia`) | MediaCodec (feature `mediacodec`, API 26+) |
+| AV1 | none | none | none | NVDEC (feature `nvidia`) | MediaCodec (feature `mediacodec`, when the device provides it) |
 
 On macOS VideoToolbox decodes H.264 and H.265 on hardware, pulling the parameter
 sets (SPS/PPS, plus VPS for H.265) out of each keyframe to build the format
@@ -107,5 +131,7 @@ Direct3D11 device bound to it, so the decode happens on the GPU through DXVA
 no software decoder, so it needs the GPU path (on Windows, an HEVC decoder MFT:
 the inbox HEVC Video Extensions or a vendor one). On Linux, NVDEC decodes H.264,
 H.265, and 8-bit 4:2:0 AV1 to CUDA NV12 frames; AV1 is decode-only and is useful
-for AV1 source to H.264/H.265 transcode rungs. A non-H.264/H.265/AV1 rendition
-yields `Error::UnsupportedCodec`.
+for AV1 source to H.264/H.265 transcode rungs. VAAPI decodes H.264 to CPU I420 by
+default; set `decode::Config::gpu_frames` to receive DMA-BUF surfaces that the
+renderer can import without a download. A non-H.264/H.265/AV1 rendition yields
+`Error::UnsupportedCodec`.

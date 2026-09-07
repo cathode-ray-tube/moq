@@ -5,7 +5,7 @@ authors = ["Luke Curley"]
 repository = "https://github.com/moq-dev/moq"
 license = "MIT OR Apache-2.0"
 
-version = "0.14.13"
+version = "0.14.15"
 edition = "2024"
 # sysinfo 0.39 (cache governor cgroup limits) needs 1.95, above the 1.91
 # workspace floor. moq-relay is lib+bin, so this applies to its library target
@@ -23,35 +23,39 @@ path = "src/main.rs"
 doc = false
 
 [features]
-default = ["iroh", "cluster-lan", "quinn", "websocket", "uds"]
+default = ["iroh", "cluster-lan", "noq", "websocket", "uds"]
 iroh = ["moq-tokio/iroh"]
 # Discover cluster peers on the LAN with mDNS (`--cluster-lan`).
 cluster-lan = ["moq-tokio/mdns"]
 jemalloc = ["moq-tokio/jemalloc"]
-noq = ["moq-tokio/noq"]
-quinn = ["moq-tokio/quinn"]
-quiche = ["moq-tokio/quiche"]
-# qlog trace capture (`--server-quic-qlog <DIR>`). Off by default: it compiles the
+noq = ["_quic", "moq-tokio/noq"]
+quinn = ["_quic", "moq-tokio/quinn"]
+quiche = ["_quic", "moq-tokio/quiche"]
+# The tokio QUIC listener, and the thread-per-core worker group behind
+# `runtime.workers`. Not one to enable on its own: it names no backend, so
+# moq-tokio would have nothing to bind a socket with.
+_quic = []
+# qlog trace capture (`--quic-qlog <DIR>`). Off by default: it compiles the
 # qlog machinery into the enabled backends and is only wanted for debugging or
-# congestion-control testing.
-qlog = ["moq-tokio/qlog"]
+# congestion-control testing. Covers the io_uring workers too, so one feature
+# means one thing whichever runtime is serving.
+qlog = ["moq-tokio/qlog", "moq-uring?/qlog"]
 websocket = ["moq-tokio/websocket", "dep:qmux", "axum/ws"]
 # Unix-domain-socket stream listener (`--server-unix-bind`), unix-only. In the
 # default set; drop via --no-default-features on platforms without Unix sockets.
 uds = ["moq-tokio/uds"]
 # Serve QUIC from io_uring workers (`--runtime-io-uring`), Linux-only, in one of
-# two flavors. Both are off by default: the relay is useful without io_uring,
-# and `io-uring` links a second TLS stack (quiche brings BoringSSL, which needs
-# cmake and a C++ toolchain a default relay build does not). `io-uring-quinn`
-# serves the same path from quinn-proto over the rustls this relay already
-# links, so it builds no second stack.
+# three flavors. All are off by default: the relay is useful without io_uring.
+# `io-uring` uses noq-proto over rustls, matching the default tokio backend;
+# the suffixed features retain quinn-proto and quiche as explicit alternatives.
 #
-# Cargo features are additive, so asking for both compiles both and runs quinn,
-# which is what the nightly `--all-features` pass (`just rs features`) does.
-# `just rs uring` builds each on its own.
-io-uring = ["_uring", "moq-uring/quiche"]
+# Cargo features are additive, so asking for several compiles them and runs noq,
+# which is what the nightly `--all-features` pass does. `just rs uring` builds
+# each on its own.
+io-uring = ["_uring", "moq-uring/noq"]
 io-uring-quinn = ["_uring", "moq-uring/quinn"]
-# The listener both flavors share. Not one to enable on its own: moq-uring has
+io-uring-quiche = ["_uring", "moq-uring/quiche"]
+# The listener all flavors share. Not one to enable on its own: moq-uring has
 # no `quic` module without a backend, so this alone does not build.
 _uring = ["dep:moq-sock", "dep:moq-uring"]
 
@@ -62,6 +66,7 @@ axum-server = { workspace = true }
 bytes = { workspace = true }
 bytesize = "2.4.2"
 futures = { workspace = true }
+hex = { workspace = true }
 http-body = "1"
 http-cache-reqwest = { version = "1.0.0-alpha.6", features = ["manager-moka", "reqwest-middleware", "url-standard"], default-features = false }
 jsonwebtoken = { workspace = true }
@@ -77,6 +82,7 @@ rustls = { version = "0.23", features = ["aws-lc-rs"], default-features = false 
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true, features = ["json", "base64"] }
+sha2 = { workspace = true }
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
@@ -99,6 +105,7 @@ sd-notify = { workspace = true }
 [dev-dependencies]
 rcgen = "0.14"
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 wiremock = "0.6"
 
 # `raise(SIGINT)` at ourselves, so the shutdown test exercises the real signal

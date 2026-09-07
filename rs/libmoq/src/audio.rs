@@ -84,10 +84,10 @@ pub struct moq_audio_encoder_output {
 	pub channels: u32,
 	/// 0 = libopus default.
 	pub bitrate: u32,
-	/// Encoded frame duration in milliseconds. Opus accepts
-	/// 2.5/5/10/20/40/60 ms; pass 20 to match the JS publish path.
-	/// (For 2.5 ms, the caller must pre-round; integer ms only.)
-	pub frame_duration_ms: u32,
+	/// Encoded frame duration in microseconds. Opus accepts exactly
+	/// 2500/5000/10000/20000/40000/60000 us. 0 = the 20 ms default, which
+	/// matches the JS publish path.
+	pub frame_duration_us: u32,
 }
 
 /// PCM layout the caller wants out of [`moq_decode_audio`].
@@ -318,7 +318,9 @@ pub unsafe extern "C" fn moq_encode_audio(
 		options.sample_rate = zeroable(raw_output.sample_rate);
 		options.channels = zeroable(raw_output.channels);
 		options.bitrate = zeroable(raw_output.bitrate).map(|bps| moq_net::bandwidth::Rate::from_bps(bps.into()));
-		options.frame_duration = Duration::from_millis(raw_output.frame_duration_ms.into());
+		if let Some(micros) = zeroable(raw_output.frame_duration_us) {
+			options.frame_duration = Duration::from_micros(micros.into());
+		}
 
 		let mut state = State::lock();
 		let State { publish, audio, .. } = &mut *state;
@@ -349,11 +351,9 @@ pub unsafe extern "C" fn moq_encode_audio_frame(producer: u32, frame: *const moq
 		let frame = unsafe { frame.as_ref() }.ok_or(Error::InvalidPointer)?;
 		let data = unsafe { ffi::parse_slice(frame.data, frame.data_size)? };
 
-		let owned = moq_audio::Frame {
-			// The C ABI carries plain microseconds; scale them at the boundary.
-			timestamp: moq_net::Timestamp::from_micros(frame.timestamp_us).map_err(moq_audio::Error::from)?,
-			data: Bytes::copy_from_slice(data),
-		};
+		// The C ABI carries plain microseconds; scale them at the boundary.
+		let timestamp = moq_net::Timestamp::from_micros(frame.timestamp_us).map_err(moq_audio::Error::from)?;
+		let owned = moq_audio::Frame::new(Bytes::copy_from_slice(data), timestamp);
 
 		let producer = State::lock().audio.producer(producer)?;
 		producer.lock().as_mut().ok_or(Error::MediaNotFound)?.write(&owned)?;
