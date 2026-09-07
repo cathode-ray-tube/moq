@@ -1,3 +1,5 @@
+// src/container/writer.rs
+
 use bytes::Bytes;
 
 use crate::{
@@ -15,14 +17,15 @@ pub trait FrameWriter {
         payload: Bytes,
     ) -> Result<(), Self::Error>;
 
-    /// Returns the sequence number that will be assigned to the next frame.
+    /// Returns the frame number that will be assigned to the next frame
+    /// in the current group.
     fn next_sequence_number(&self) -> u32;
 }
 
 /// Transforms a plaintext media payload before it is written.
 ///
-/// Despite the historical `FrameEncrypter` name, an implementation may
-/// encrypt, authenticate, and sign the payload.
+/// The sequence number passed to the encrypter is the frame number within
+/// the current group. It is independent of the encryption counter.
 pub trait FrameEncrypter {
     fn encrypt(
         &mut self,
@@ -32,12 +35,16 @@ pub trait FrameEncrypter {
 }
 
 /// A FrameWriter decorator that protects each payload before forwarding it.
+///
+/// `sequence_number` is obtained from the underlying writer and identifies
+/// the frame within the current group. The encrypter owns and increments its
+/// own encryption counter independently.
 pub struct ProtectedFrame<W, E> {
     pub inner: W,
     pub encrypter: E,
 }
 
-impl<W, E> Sframe<W, E> {
+impl<W, E> ProtectedFrame<W, E> {
     pub fn new(inner: W, encrypter: E) -> Self {
         Self { inner, encrypter }
     }
@@ -63,17 +70,17 @@ where
         timestamp: moq_net::Timestamp,
         payload: Bytes,
     ) -> Result<(), Self::Error> {
-        // MoqFrameWriter uses the underlying group's frame_count() as
-        // the sequence number for the next frame.
-        let sequence_number = self.inner.next_sequence_number() as u64;
+        // This is the frame number within the current group.
+        // It is not the encryption counter.
+        let sequence_number =
+            u64::from(self.inner.next_sequence_number());
 
         let protected_payload = self
             .encrypter
             .encrypt(sequence_number, &payload)
             .map_err(Error::from)?;
 
-        self.inner
-            .write_frame(timestamp, protected_payload)
+        self.inner.write_frame(timestamp, protected_payload)
     }
 
     fn next_sequence_number(&self) -> u32 {
