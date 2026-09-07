@@ -41,7 +41,7 @@ pub use writer::{
     FrameEncrypter,
     FrameWriter,
     MoqFrameWriter,
-    Sframe,
+    ProtectedFrame,
 };
 
 /// A decoded media frame: timestamp, payload bytes, keyframe flag.
@@ -61,7 +61,7 @@ pub struct Frame {
     /// Encoded codec payload.
     pub payload: Bytes,
 
-    /// Whether this frame is a keyframe.
+    /// Whether the frame is a keyframe.
     pub keyframe: bool,
 }
 
