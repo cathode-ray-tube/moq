@@ -27,7 +27,7 @@ Add the AI marker `(Written by <model>)` to any posts on GitHub, excluding commi
 # Reviews
 
 Codex and CodeRabbit automatically review PRs.
-CodeRabbit may be rate-limited; don't require it to produce a review.
+CodeRabbit may be rate-limited, treat it as optional.
 
 Address review comments or leave a comment if you disagree with a suggestion.
 If a review comment is out of scope or not relevant to the PR, make or update a follow-up quest.
