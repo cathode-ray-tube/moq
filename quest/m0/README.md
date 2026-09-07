@@ -21,7 +21,6 @@ regression test per Root Cause First.
 - [Resume info](/quest/m0/resume-info-newest.md) - moq-net: resume reports segment zero's track info, so a replaced broadcast rescales timestamps on the predecessor's timescale
 - [#3361](/quest/m0/3361-js-every-moq-package-a-package-imports-is-declared.md) - js: every @moq package a package imports is a declared dependency
 - [TS timebase discontinuity](/quest/m0/ts-forward-discontinuity.md) - preserve source-signalled clock changes through import and export
-- [#3326](/quest/m0/3326-moq-audio-held-resampler-frames-keep-their-source-timestamp.md) - moq-audio: held resampler frames keep their source timestamp
 - [Group charge](/quest/m0/group-charge.md) - charge real per-group cost so MOQ_CACHE_CAPACITY bounds real memory
 - [uring all-features](/quest/m0/uring-all-features-build.md) - moq-uring does not compile with `--all-features`, so the nightly features gate fails on it
 - [Go smoke client](/quest/m0/smoke-go-client.md) - the interop matrix has no Go client, so nothing in CI exercises the Go wrapper
