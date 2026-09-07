@@ -1,5 +1,7 @@
 // src/encryption/moq_secure_adapter.rs
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use ed25519_dalek::SigningKey;
 use moq_secure::key_store::KeyStore;
@@ -71,19 +73,20 @@ impl From<moq_secure::error::MoqSecureError> for EncryptionError {
 /// the current group. The independent `ctr` field is incremented by this
 /// encrypter once for every frame.
 pub struct MoqSecureEncrypter {
-    pub key_store: std::sync::Arc<dyn KeyStore>,
+    pub key_store: Arc<dyn KeyStore>,
     pub signing_key: SigningKey,
     pub key_id: u8,
     pub n_signed: u8,
     pub maybe_sign: bool,
     pub pad_len: u32,
 
+    /// Independent encryption counter.
     ctr: u64,
 }
 
 impl MoqSecureEncrypter {
     pub fn new(
-        key_store: std::sync::Arc<dyn KeyStore>,
+        key_store: Arc<dyn KeyStore>,
         signing_key: SigningKey,
         key_id: u8,
         n_signed: u8,
@@ -101,7 +104,6 @@ impl MoqSecureEncrypter {
             ctr: initial_ctr,
         }
     }
-}
 
     /// Returns the counter that will be assigned to the next frame.
     pub fn next_counter(&self) -> u64 {
@@ -122,27 +124,27 @@ impl MoqSecureEncrypter {
     }
 }
 
-impl FrameEncrypter for MoqSecureEncrypter<'_> {
+impl FrameEncrypter for MoqSecureEncrypter {
     fn encrypt(
         &mut self,
         _sequence_number: u64,
         plaintext: &[u8],
     ) -> Result<Bytes, EncryptionError> {
         // This counter is intentionally independent of the group frame
-        // sequence number passed by Sframe.
+        // sequence number passed by ProtectedFrame.
         let ctr = self.take_counter()?;
 
         let frame = moq_secure::wire::encrypt_frame(
-    		self.key_store.as_ref(),
-    		&self.signing_key,
-    		self.key_id,
-    		ctr,
-    		self.n_signed,
-    		self.maybe_sign,
-    		1,
-    		self.pad_len,
-    		plaintext,
-		)?;
+            self.key_store.as_ref(),
+            &self.signing_key,
+            self.key_id,
+            ctr,
+            self.n_signed,
+            self.maybe_sign,
+            1, // encrypted
+            self.pad_len,
+            plaintext,
+        )?;
 
         Ok(Bytes::from(frame.serialize()))
     }
