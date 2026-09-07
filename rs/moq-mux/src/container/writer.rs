@@ -32,7 +32,7 @@ pub trait FrameEncrypter {
 }
 
 /// A FrameWriter decorator that protects each payload before forwarding it.
-pub struct Sframe<W, E> {
+pub struct ProtectedFrame<W, E> {
     pub inner: W,
     pub encrypter: E,
 }

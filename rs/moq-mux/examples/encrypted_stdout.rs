@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use ed25519_dalek::SigningKey;
-use moq_mux::container::{FrameWriter, Sframe};
+use moq_mux::container::{FrameWriter, ProtectedFrame};
 use moq_mux::encryption::moq_secure_adapter::MoqSecureEncrypter;
 use moq_mux::Error;
 use moq_secure::key_store::InMemoryKeyStore;
@@ -70,7 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sequence_number: 0,
     };
 
-    let mut writer = Sframe::new(inner, encrypter);
+    let mut writer = ProtectedFrame::new(inner, encrypter);
 
     writer.write_frame(
         moq_net::Timestamp::from_secs(1)?,
