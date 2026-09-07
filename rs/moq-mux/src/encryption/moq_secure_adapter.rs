@@ -70,22 +70,21 @@ impl From<moq_secure::error::MoqSecureError> for EncryptionError {
 /// `sequence_number` supplied to `encrypt()` is the frame number within
 /// the current group. The independent `ctr` field is incremented by this
 /// encrypter once for every frame.
-pub struct MoqSecureEncrypter<'a> {
-    pub key_store: &'a dyn KeyStore,
-    pub signing_key: &'a SigningKey,
+pub struct MoqSecureEncrypter {
+    pub key_store: std::sync::Arc<dyn KeyStore>,
+    pub signing_key: SigningKey,
     pub key_id: u8,
     pub n_signed: u8,
     pub maybe_sign: bool,
     pub pad_len: u32,
 
-    /// Independent encryption counter.
     ctr: u64,
 }
 
-impl<'a> MoqSecureEncrypter<'a> {
+impl MoqSecureEncrypter {
     pub fn new(
-        key_store: &'a dyn KeyStore,
-        signing_key: &'a SigningKey,
+        key_store: std::sync::Arc<dyn KeyStore>,
+        signing_key: SigningKey,
         key_id: u8,
         n_signed: u8,
         maybe_sign: bool,
@@ -102,6 +101,7 @@ impl<'a> MoqSecureEncrypter<'a> {
             ctr: initial_ctr,
         }
     }
+}
 
     /// Returns the counter that will be assigned to the next frame.
     pub fn next_counter(&self) -> u64 {
