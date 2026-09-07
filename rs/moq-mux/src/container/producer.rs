@@ -1,32 +1,3 @@
-// TODO(encryption):
-// Replace the plain MoqFrameWriter used by write() and flush() with the
-// encryption-aware writer once the encrypted frame format and configuration
-// are finalized.
-//
-// The intended writer chain is:
-//
-//     Sframe {
-//         inner: MoqFrameWriter { group },
-//     }
-//
-// For unencrypted tracks, continue using:
-//
-//     MoqFrameWriter { group }
-//
-// Before enabling Sframe, implement the following:
-//
-// 1. Define the encrypted payload format and versioning.
-// 2. Add the encryption key/configuration to the producer or its track context.
-// 3. Implement encrypt() in container/writer.rs.
-// 4. Decide whether encryption metadata belongs in the catalog/init segment.
-// 5. Ensure each encrypted frame has the required nonce/counter and
-//    authentication tag.
-// 6. Add tests covering successful encryption, decryption, tampered payloads,
-//    key rotation, and buffered flushes.
-//
-// Both the immediate write path and flush() must use the same writer chain so
-// buffered and unbuffered frames are encrypted consistently.
-
 use super::{Container, Frame};
 
 /// A producer for media tracks that manages group boundaries.
@@ -86,6 +57,10 @@ pub struct Producer<C: Container> {
 	/// Measures the jitter and bitrate of what gets written, for the catalog. Always on: it costs
 	/// two counters, and a caller who doesn't publish a rendition simply never reads it.
 	estimator: crate::catalog::Estimator,
+      
+	  /// Optional encrypter
+	  /// Persistent across immediate writes and flushes.
+    encrypter: Option<Box<dyn FrameEncrypter>>,
 }
 
 impl<C: Container<Error = crate::error::Error>> Producer<C> {
