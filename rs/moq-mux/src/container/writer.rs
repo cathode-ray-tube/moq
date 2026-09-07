@@ -34,7 +34,24 @@ pub trait FrameEncrypter {
     ) -> Result<Bytes, EncryptionError>;
 }
 
-/// A FrameWriter decorator that protects each payload before forwarding it.
+/// Forwards encryption through a mutable reference.
+///
+/// This allows `&mut dyn FrameEncrypter` to be used as the encrypter in
+/// `ProtectedFrame`.
+impl<T> FrameEncrypter for &mut T
+where
+    T: FrameEncrypter + ?Sized,
+{
+    fn encrypt(
+        &mut self,
+        sequence_number: u64,
+        plaintext: &[u8],
+    ) -> Result<Bytes, EncryptionError> {
+        (**self).encrypt(sequence_number, plaintext)
+    }
+}
+
+/// A [`FrameWriter`] decorator that protects each payload before forwarding it.
 ///
 /// `sequence_number` is obtained from the underlying writer and identifies
 /// the frame within the current group. The encrypter owns and increments its
@@ -61,7 +78,7 @@ impl<W, E> ProtectedFrame<W, E> {
 impl<W, E> FrameWriter for ProtectedFrame<W, E>
 where
     W: FrameWriter<Error = Error>,
-    E: FrameEncrypter,
+    E: FrameEncrypter + ?Sized,
 {
     type Error = Error;
 
@@ -88,7 +105,7 @@ where
     }
 }
 
-/// Writes payloads into a moq_net group.
+/// Writes payloads into a `moq_net` group.
 pub struct MoqFrameWriter<'a> {
     pub group: &'a mut moq_net::group::Producer,
 }
