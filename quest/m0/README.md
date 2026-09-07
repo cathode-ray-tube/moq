@@ -16,7 +16,6 @@ regression test per Root Cause First.
 ## Quests
 
 - [OBS callback lifetime](/quest/m0/obs-session-callback-lifetime.md) - keep output state alive through delayed terminal callbacks
-- [Adapter namespace map](/quest/m0/rs-adapter-namespace-map.md) - moq-net: a duplicate PUBLISH_NAMESPACE on draft-14/15 strands the first request, and the map never shrinks
 - [IETF error codes](/quest/m0/ietf-error-codes.md) - every code on a moq-transport wire is a registered value for the negotiated draft, requests and stream resets alike
 - [Resume info](/quest/m0/resume-info-newest.md) - moq-net: resume reports segment zero's track info, so a replaced broadcast rescales timestamps on the predecessor's timescale
 - [#3361](/quest/m0/3361-js-every-moq-package-a-package-imports-is-declared.md) - js: every @moq package a package imports is a declared dependency
