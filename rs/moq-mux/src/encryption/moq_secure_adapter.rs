@@ -65,6 +65,11 @@ impl From<moq_secure::error::MoqSecureError> for EncryptionError {
     }
 }
 
+/// Encrypts each frame using moq-secure.
+///
+/// `sequence_number` supplied to `encrypt()` is the frame number within
+/// the current group. The independent `ctr` field is incremented by this
+/// encrypter once for every frame.
 pub struct MoqSecureEncrypter<'a> {
     pub key_store: &'a dyn KeyStore,
     pub signing_key: &'a SigningKey,
@@ -72,6 +77,9 @@ pub struct MoqSecureEncrypter<'a> {
     pub n_signed: u8,
     pub maybe_sign: bool,
     pub pad_len: u32,
+
+    /// Independent encryption counter.
+    ctr: u64,
 }
 
 impl<'a> MoqSecureEncrypter<'a> {
@@ -82,6 +90,7 @@ impl<'a> MoqSecureEncrypter<'a> {
         n_signed: u8,
         maybe_sign: bool,
         pad_len: u32,
+        initial_ctr: u64,
     ) -> Self {
         Self {
             key_store,
@@ -90,28 +99,50 @@ impl<'a> MoqSecureEncrypter<'a> {
             n_signed,
             maybe_sign,
             pad_len,
+            ctr: initial_ctr,
         }
+    }
+
+    /// Returns the counter that will be assigned to the next frame.
+    pub fn next_counter(&self) -> u64 {
+        self.ctr
+    }
+
+    /// Returns the counter that will be assigned to the next frame and
+    /// advances it by one.
+    fn take_counter(&mut self) -> Result<u64, EncryptionError> {
+        let ctr = self.ctr;
+
+        self.ctr = self
+            .ctr
+            .checked_add(1)
+            .ok_or(EncryptionError::CounterExhausted)?;
+
+        Ok(ctr)
     }
 }
 
 impl FrameEncrypter for MoqSecureEncrypter<'_> {
     fn encrypt(
         &mut self,
-        sequence_number: u64,
+        _sequence_number: u64,
         plaintext: &[u8],
     ) -> Result<Bytes, EncryptionError> {
+        // This counter is intentionally independent of the group frame
+        // sequence number passed by Sframe.
+        let ctr = self.take_counter()?;
+
         let frame = moq_secure::wire::encrypt_frame(
             self.key_store,
             self.signing_key,
             self.key_id,
-            sequence_number,
+            ctr,
             self.n_signed,
             self.maybe_sign,
-            1,
+            1, // encrypted
             self.pad_len,
             plaintext,
-        )
-        .map_err(EncryptionError::from)?;
+        )?;
 
         Ok(Bytes::from(frame.serialize()))
     }
