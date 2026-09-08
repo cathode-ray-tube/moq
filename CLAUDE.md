@@ -81,6 +81,7 @@ The API is the most important thing to get right. A bad shape costs a breaking c
 - Match the existing conventions, patterns, and naming.
 - These `CLAUDE.md` files (the root `AGENTS.md` is a symlink) are stateless instructions: minimal, situational, no history, no file links. If a missing line here would have saved you cycles, suggest it.
 - Deleting code is better than adding code.
+- Suggest follow up sessions and quests.
 
 # Development
 
