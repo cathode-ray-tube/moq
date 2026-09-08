@@ -10,6 +10,7 @@ use std::sync::Arc;
 struct StdoutWriter {
     sequence_number: u32,
 }
+
 impl FrameWriter for StdoutWriter {
     type Error = Error;
 
@@ -41,7 +42,6 @@ impl FrameWriter for StdoutWriter {
     }
 }
 
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut key_store = InMemoryKeyStore::empty();
 
@@ -58,12 +58,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let signing_key = SigningKey::from_bytes(&[0x42; 32]);
 
     let encrypter = MoqSecureEncrypter::new(
-        &key_store,
-        &signing_key,
-        1,     // key_id
-        0,     // n_signed
-        false, // maybe_sign
-        0,     // pad_len
+        Arc::new(key_store),
+        signing_key,
+        1,      // key_id
+        0,      // n_signed
+        false,  // maybe_sign
+        0,      // pad_len
+        0,      // initial_ctr
     );
 
     let inner = StdoutWriter {
@@ -84,3 +85,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
