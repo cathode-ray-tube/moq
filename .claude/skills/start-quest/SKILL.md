@@ -19,7 +19,7 @@ After submitting the PR:
 - Monitor it for CI failures and reviews.
 - Address any automated review findings (Codex/CodeRabbit) you agree with. Turn down any you disagree with with a comment.
 - Push any changes you made to the PR, updating the summary if needed.
-- Repeat for at most a few cycles, backing out if substantial issues are raised.
+- Repeat at most once, avoiding a loop of back-and-forth review/feedback cycles.
 
 If you're confident in the PR, enable auto-merge.
 Otherwise, leave the PR open and the user will decide if it should be merged.
