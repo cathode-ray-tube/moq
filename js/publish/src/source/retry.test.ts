@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { Signal } from "@moq/signals";
 import type * as Audio from "../audio";
 import type * as Video from "../video";
@@ -435,3 +435,25 @@ test("screen capture prompts again after being switched off and on", async () =>
 
 	screen.close();
 });
+
+for (const screenPixelRatio of [undefined, 2]) {
+	test(`screen capture maps pixel ratio ${screenPixelRatio} into source scale`, async () => {
+		using media = install(new FakeScreenDevices());
+		const settings = spyOn(media.video, "getSettings").mockReturnValue({
+			deviceId: "default",
+			screenPixelRatio,
+		} as MediaTrackSettings);
+		const screen = new Screen({ enabled: true });
+		try {
+			await settle();
+			const source = screen.out.source.peek()?.video;
+			expect(source).toMatchObject({ track: media.video, scale: screenPixelRatio });
+			settings.mockReturnValue({ deviceId: "default", screenPixelRatio: 1 } as MediaTrackSettings);
+			expect(source).toMatchObject({ track: media.video, scale: 1 });
+			expect(screen.out.source.peek()?.video).toBe(source);
+		} finally {
+			screen.close();
+			settings.mockRestore();
+		}
+	});
+}

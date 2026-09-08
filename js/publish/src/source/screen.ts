@@ -120,7 +120,15 @@ export class Screen {
 			}
 
 			effect.set(this.#out.source, {
-				video: v,
+				video: v
+					? {
+							track: v,
+							get scale() {
+								return (v.getSettings() as MediaTrackSettings & { screenPixelRatio?: number })
+									.screenPixelRatio;
+							},
+						}
+					: undefined,
 				audio: a ? { track: a, kind: "music" } : undefined,
 			});
 		});
