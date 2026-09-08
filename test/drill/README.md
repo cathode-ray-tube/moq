@@ -58,6 +58,9 @@ bounded rather than fast.
 
 ## Sensitivity
 
+The Nightly workflow runs all mutations, so patches that stop applying and drills
+that stop detecting their recovery failures fail CI.
+
 `sensitivity.sh` removes one recovery behavior at a time and requires the drill
 covering it to fail. Each mutation is a patch under `mutations/`, applied to a
 disposable copy of the tree; the checkout it runs from is never modified.
