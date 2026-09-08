@@ -4,6 +4,7 @@
  * @module
  */
 
+import { sharedStreamCode } from "./ietf/error.ts";
 import type { IetfVersion } from "./ietf/version.ts";
 import { TimeoutError } from "./util/timeout.ts";
 
@@ -269,16 +270,20 @@ interface TransportErrorOptions {
  * rather than inventing one. A {@link SessionError} lands there too: the two registries are
  * disjoint, so forwarding its code onto a stream would mistranslate it.
  *
- * On IETF streams only cancellation is mapped; other failures use INTERNAL_ERROR.
+ * On an IETF stream the code has to be one the negotiated draft assigns the same meaning to,
+ * so a condition it does not register degrades to INTERNAL_ERROR as well. See
+ * {@link sharedStreamCode}.
  *
  * @internal
  */
 export function toStreamCode(err: unknown, options?: TransportErrorOptions): StreamCode {
-	if (options?.version !== undefined) {
-		// Match Rust's IETF mapping: a local timeout is not a negotiated delivery timeout,
-		// and losing one group does not establish that the subscription is terminating.
-		return err instanceof StreamError && err.code === StreamCode.Cancel ? StreamCode.Cancel : StreamCode.Internal;
-	}
+	const code = localStreamCode(err);
+	if (options?.version === undefined) return code;
+	return sharedStreamCode(code, options.version) ? code : StreamCode.Internal;
+}
+
+/** The moq-lite code for a local failure, before any draft has a say. */
+function localStreamCode(err: unknown): StreamCode {
 	if (err instanceof StreamError) return err.code;
 	if (err instanceof TimeoutError) return StreamCode.DeliveryTimeout;
 	// Session-scoped: the peer learns which rule it broke from the session close, not from here.
@@ -298,13 +303,36 @@ export function toStreamCode(err: unknown, options?: TransportErrorOptions): Str
  * the same `instanceof` as one raised here. Only the registered codes do: the reserved 32-63
  * placeholders carry no meaning the draft assigns, so they stay a plain {@link StreamError}.
  *
+ * On an IETF stream a code keeps its value unless moq-lite claims that number for something
+ * the draft does not: `0x4` is GOING_AWAY here but UNKNOWN_OBJECT_STATUS on draft-16 and 17,
+ * and reading one back as the other would retire a session that is not going anywhere. Those
+ * read as {@link StreamCode.Internal} with the wire value kept in the message, since
+ * {@link StreamCode} is one numeric space and cannot hold a foreign code without lying about
+ * it. A code moq-lite names nothing for survives intact: nothing can misread it.
+ *
  * @internal Called at the transport boundary so the raw error never reaches an application.
  */
 export function fromTransport(err: unknown, options?: TransportErrorOptions): Error {
 	const code = streamCode(err);
 	if (code === undefined) return error(err);
-	if (options?.version === undefined && code === StreamCode.TooFarBehind) return new Lagged({ cause: err });
+	if (options?.version !== undefined && !sharedStreamCode(code, options.version) && claimedLocally(code)) {
+		return new StreamError(StreamCode.Internal, { cause: err, message: `remote error: ${code}` });
+	}
+	if (code === StreamCode.TooFarBehind) return new Lagged({ cause: err });
 	return new StreamError(code, { cause: err });
+}
+
+/** The codes moq-lite names, which a foreign one must not borrow. */
+const NAMED_CODES: ReadonlySet<number> = new Set(Object.values(StreamCode));
+
+/**
+ * Whether moq-lite could give `code` a meaning of its own: one of its named codes, or
+ * anywhere in the 64+ range, where `StreamCode(code)` mints an application code and an
+ * application compares against its own. moq-transport registers nothing above 0x12 and has
+ * no application range at all, so a foreign code landing there is never what it looks like.
+ */
+function claimedLocally(code: number): boolean {
+	return code >= 64 || NAMED_CODES.has(code);
 }
 
 const legacyWebTransportErrors = new WeakSet<object>();

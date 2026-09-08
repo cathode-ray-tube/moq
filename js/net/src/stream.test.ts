@@ -573,18 +573,26 @@ test("open waits for a stream slot instead of rejecting once the peer's limit is
 	]);
 });
 
-for (const version of [undefined, Version.DRAFT_14, Version.DRAFT_19, Version.DRAFT_20]) {
+// A moq-transport code has to be one the negotiated draft assigns the same meaning to, so
+// each row says what it costs on a draft that predates the registration. TOO_FAR_BEHIND
+// arrived in draft-17, and moq-lite's reserved 32-63 placeholders are in no draft at all.
+for (const [version, tooFarBehind] of [
+	[undefined, StreamCode.TooFarBehind],
+	[Version.DRAFT_14, StreamCode.Internal],
+	[Version.DRAFT_19, StreamCode.TooFarBehind],
+	[Version.DRAFT_20, StreamCode.TooFarBehind],
+] as const) {
 	test(`stream resets select the negotiated registry (${version})`, async () => {
-		for (const [reason, liteCode] of [
-			[new Lagged(), StreamCode.TooFarBehind],
-			[new Reset(5), StreamCode.TooFarBehind],
-			[new FrameTooLarge(), StreamCode.FrameTooLarge],
-			[new NotFound("broadcast"), StreamCode.NotFound],
+		for (const [reason, expected] of [
+			[new Lagged(), tooFarBehind],
+			[new Reset(5), tooFarBehind],
+			[new FrameTooLarge(), version === undefined ? StreamCode.FrameTooLarge : StreamCode.Internal],
+			[new NotFound("broadcast"), version === undefined ? StreamCode.NotFound : StreamCode.Internal],
+			// Assigned by every draft, so these survive the translation intact.
 			[new TimeoutError("open"), StreamCode.DeliveryTimeout],
 			[new ProtocolViolation("bad message"), StreamCode.SessionClosed],
 			[new StreamError(StreamCode.Cancel), StreamCode.Cancel],
 		] as const) {
-			const expected = version === undefined || liteCode === StreamCode.Cancel ? liteCode : StreamCode.Internal;
 			const aborted = Promise.withResolvers<unknown>();
 			const writer = new Writer(new WritableStream<Uint8Array>({ abort: aborted.resolve }), version);
 			writer.reset(reason);
@@ -611,6 +619,43 @@ for (const version of [undefined, Version.DRAFT_14, Version.DRAFT_19, Version.DR
 		);
 		const err = await reader.closed.catch((err: unknown) => err);
 		expect(err).toBeInstanceOf(StreamError);
-		expect(err instanceof Lagged).toBe(version === undefined);
+		// 0x5 is TOO_FAR_BEHIND only where the draft registers it; on draft-14 it means
+		// nothing, so reading it as a lag would invent a gap the peer never reported.
+		expect(err instanceof Lagged).toBe(tooFarBehind === StreamCode.TooFarBehind);
+		// Flattened where the draft does not register it, but the wire value still reaches a
+		// log rather than being lost.
+		if (tooFarBehind === StreamCode.Internal) expect((err as StreamError).message).toContain("5");
+	});
+
+	// EXCESSIVE_LOAD, which moq-lite names nothing for, so nothing can misread the value
+	// and it survives intact. Only a code moq-lite claims for something else is flattened.
+	test(`a code moq-lite does not claim keeps its value (${version})`, async () => {
+		const reader = new Reader(
+			new ReadableStream<Uint8Array>({
+				start: (controller) => controller.error(new Reset(0x9)),
+			}),
+			undefined,
+			version,
+		);
+		const err = await reader.closed.catch((err: unknown) => err);
+		expect(err).toBeInstanceOf(StreamError);
+		expect((err as StreamError).code).toBe(0x9 as StreamCode);
+	});
+
+	// moq-lite mints an application code for anything 64 and up, so an application compares
+	// against its own. moq-transport has no such range, so a code landing there from an IETF
+	// peer is never the application code it would look like.
+	test(`a foreign code in the application range is flattened (${version})`, async () => {
+		const reader = new Reader(
+			new ReadableStream<Uint8Array>({
+				start: (controller) => controller.error(new Reset(70)),
+			}),
+			undefined,
+			version,
+		);
+		const err = await reader.closed.catch((err: unknown) => err);
+		expect(err).toBeInstanceOf(StreamError);
+		expect((err as StreamError).code).toBe(version === undefined ? StreamCode(70) : StreamCode.Internal);
+		if (version !== undefined) expect((err as StreamError).message).toContain("70");
 	});
 }
