@@ -5109,7 +5109,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
- "sha2",
+ "sha2 0.11.0",
  "sysinfo",
  "tempfile",
  "thiserror 2.0.20",
