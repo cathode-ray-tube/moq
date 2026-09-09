@@ -8,6 +8,16 @@ use super::Error;
 use crate::Result;
 use crate::catalog::Estimator;
 
+use crate::{
+    container::writer::{
+        FrameEncrypter,
+        FrameWriter,
+        MoqFrameWriter,
+        ProtectedFrame,
+    },
+
+};
+
 /// Converts fMP4/CMAF files into MoQ broadcast streams using CMAF passthrough.
 ///
 /// This struct processes fragmented MP4 (fMP4) files and transports complete
@@ -89,6 +99,8 @@ pub struct Import<E: crate::catalog::hang::CatalogExt = ()> {
 	// Only the timeline report is anchored. Each fragment still carries its own timestamp on the
 	// wire, and `Recorder::end` still reports real content time.
 	segment_start: Option<Timestamp>,
+
+	encrypter: Option<Box<dyn FrameEncrypter>>,
 }
 
 #[derive(PartialEq, Debug)]
@@ -169,8 +181,18 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			segment: 0,
 			pending_timeline_cut: false,
 			segment_start: None,
+			encrypter: None,
 		}
 	}
+
+	/// Enable encryption for imported fMP4 payloads.
+	pub fn with_encrypter<E2>(mut self, encrypter: E2) -> Self
+		where
+		    E2: crate::container::FrameEncrypter + 'static,
+		{
+		    self.encrypter = Some(Box::new(encrypter));
+		    self
+		}
 
 	/// Declare that the next fragment starts a new segment, for callers that know the source's
 	/// segmentation out of band (e.g. an HLS import following its playlist).
@@ -957,18 +979,25 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 				track.estimator.cut(Some(timestamp));
 				sync_bitrate(&mut self.catalog, track)?;
 			}
-			let fragment_len = fragment_bytes.len();
-
-			let mut frame = g.create_frame(moq_net::frame::Info {
-				size: fragment_bytes.len() as u64,
-				timestamp,
-			})?;
-			frame.write(fragment_bytes)?;
-			frame.finish()?;
-
+			{
+		     	let output = MoqFrameWriter { group: &mut g };
+		
+			    match self.encrypter.as_mut() {
+			        Some(encrypter) => {
+			            let mut protected =
+			                ProtectedFrame::new(output, encrypter.as_mut());
+			
+			            protected.write_frame(timestamp, fragment_bytes)?;
+			        }
+			        None => {
+			            let mut plain = output;
+			            plain.write_frame(timestamp, fragment_bytes)?;
+			        }
+			    }
+			}
+			
 			track.group = Some(g);
-
-			track.estimator.write(timestamp, fragment_len);
+			track.estimator.write(timestamp, fragment_bytes.len());
 
 			// Report how far this fragment presents. Every group but the last is bounded by the
 			// next one's open, so this is what keeps the final segment from being published a
