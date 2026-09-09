@@ -1,5 +1,5 @@
 name: Rust cache
-description: Restore the Cargo build cache cache.yml warms on the default branch.
+description: Install mbx and restore the Rust build cache cache.yml warms on the default branch.
 
 inputs:
   save-on-dispatch:
@@ -9,14 +9,35 @@ inputs:
 runs:
   using: composite
   steps:
-    # One shared key lets differently named jobs restore the cache warmed by
-    # cache.yml. Pull requests stay read-only, while a trusted manual run can
-    # explicitly seed a cold cache.
-    - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+    - uses: jdx/mr-boxington-action@7234d3dd1a6ca8f6c381eea8e4dfb03f18fcf777 # v1.3.0
       with:
-        # Build scripts link against Nix store paths from the dev shell. Roll
-        # the cache when that shell changes so Cargo never restores executables
-        # whose dynamic linker has disappeared.
-        shared-key: rust-${{ hashFiles('flake.nix', 'flake.lock') }}
-        cache-on-failure: true
-        save-if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.save-on-dispatch == 'true') }}
+        version: 1.10.0
+        # `github-cache-mode` is left at its `target` default. That transports
+        # Cargo's pruned target tree, the same payload Swatinem carried, with
+        # mbx's per-compilation store on top. The `objects` closure is portable
+        # across differing target directories, which nothing here needs, and
+        # measured slower.
+        #
+        # The key is spelled out because the generated one cannot name this
+        # repository's compiler. It keys on `rustc -vV` from PATH, which here is
+        # whatever the runner image ships: the compiler these jobs build with
+        # exists only inside `nix develop`. The `toolchain` input is no help
+        # either, since it names a rustup toolchain and probes
+        # `rustc +<name> -vV`, and nothing installs 1.95.0 through rustup.
+        #
+        # flake.lock pins that compiler, so hashing the flake identifies it more
+        # precisely than `rustc -vV` would, and rolls the cache when the dev
+        # shell changes. Build scripts link against Nix store paths, so a
+        # restored executable whose dynamic linker moved is worse than a cold
+        # cache. rust-toolchain.toml is in the hash because it picks the channel,
+        # even though it is kept in sync with the flake.
+        #
+        # Every segment the generated layout carries has to be carried here too:
+        # the runner pair, so the two architectures cache.yml warms cannot read
+        # each other, and `target`, so changing `github-cache-mode` cannot
+        # restore the other payload. The trailing run id rolls the key on every
+        # run, which is what lets a repeated `workflow_dispatch` seed a cold
+        # cache against GitHub's immutable entries.
+        cache-key: ${{ runner.os }}-${{ runner.arch }}-mbx-target-${{ hashFiles('flake.nix', 'flake.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: ${{ runner.os }}-${{ runner.arch }}-mbx-target-${{ hashFiles('flake.nix', 'flake.lock', 'rust-toolchain.toml') }}-
+        save-on-workflow-dispatch: ${{ inputs.save-on-dispatch }}
