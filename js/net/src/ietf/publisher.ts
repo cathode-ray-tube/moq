@@ -773,6 +773,7 @@ export class Publisher {
 			() => undefined,
 		);
 
+		let dispose: Dispose | undefined;
 		try {
 			// What the peer holds: keyed by path, valued by the routing front, so a republish
 			// diffs as withdraw-then-advertise rather than nothing.
@@ -790,14 +791,13 @@ export class Publisher {
 				// through it and leave the namespace unadvertised until something unrelated
 				// changed.
 				// TODO Make a better helper within Signals.
-				let dispose!: Dispose;
 				const changed = new Promise<ReadonlyMap<Path.Valid, broadcast.Consumer> | undefined>((resolve) => {
 					dispose = this.#broadcasts.changed(resolve);
 				});
 
 				const broadcasts = this.#broadcasts.peek();
 				if (!broadcasts) {
-					dispose();
+					dispose?.();
 					break;
 				}
 
@@ -849,7 +849,7 @@ export class Publisher {
 				const next = await (retry
 					? Promise.race([changed, closed, retryAfter(retry).then(() => broadcasts)])
 					: Promise.race([changed, closed]));
-				dispose();
+				dispose?.();
 				if (!next) break;
 			}
 		} catch (err: unknown) {
@@ -857,6 +857,7 @@ export class Publisher {
 			// discovery. Not a debug-level event.
 			console.warn(`publish_namespace loop failed: ${reason(error(err))}`);
 		} finally {
+			dispose?.();
 			// Close out every open PUBLISH_NAMESPACE request.
 			for (const path of [...requests.keys()]) {
 				await this.#withdraw(path, requests);
@@ -995,8 +996,14 @@ export class Publisher {
 			} catch {
 				// Stream might already be closed
 			}
+			request.stream.close();
+			return;
 		}
 		request.stream.close();
+		// Wait for transport acknowledgment before opening a replacement request.
+		// This assumes the peer processes the withdrawal by then; FIN acknowledgment
+		// does not itself acknowledge application processing across streams.
+		await request.stream.writer.closed;
 	}
 
 	/**

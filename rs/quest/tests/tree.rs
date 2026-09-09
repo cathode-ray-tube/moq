@@ -1,4 +1,5 @@
-//! Every rule, each proven to actually fail.
+//! Every rule, each proven to actually fail, and the readiness the same tree
+//! answers.
 //!
 //! A validator that silently stopped enforcing a rule is indistinguishable from
 //! a clean tree, so each case starts from the same valid fixture and breaks
@@ -108,6 +109,23 @@ impl Tree {
 			.collect()
 	}
 
+	/// The rendered blocker chain: one line per blocker, nesting indented.
+	fn blockers(&self, path: &str) -> Vec<String> {
+		quest::ready::blockers(self.path(), Path::new(path))
+			.expect("blockers")
+			.iter()
+			.flat_map(|blocker| blocker.to_string().lines().map(str::to_owned).collect::<Vec<_>>())
+			.collect()
+	}
+
+	fn ready(&self) -> Vec<String> {
+		quest::ready::quests(self.path())
+			.expect("ready")
+			.iter()
+			.map(|path| path.display().to_string())
+			.collect()
+	}
+
 	#[track_caller]
 	fn accepts(&self) {
 		let findings = self.findings();
@@ -149,7 +167,7 @@ fn dangling_absolute_link() {
 	tree.rejects("link does not resolve: /quest/m0/line/gone.md");
 }
 
-/// Relative links escape the tree (AGENTS.md points at ../CONTRIBUTING.md), so
+/// Relative links escape the tree (CLAUDE.md points at ../CONTRIBUTING.md), so
 /// they resolve against the LINKING FILE's directory. The pair of cases pins the
 /// direction: resolving against the wrong base would flip both verdicts.
 #[test]
@@ -185,7 +203,7 @@ fn relative_link_to_a_quest() {
 	tree.rejects("link to a quest must be root-absolute: two.md (write /quest/m0/line/two.md)");
 }
 
-/// Templates inside fenced blocks are illustrations. Flagging AGENTS.md's own
+/// Templates inside fenced blocks are illustrations. Flagging CLAUDE.md's own
 /// example would make this a check everyone learns to skip.
 #[test]
 fn fenced_templates_are_not_links() {
@@ -332,13 +350,13 @@ fn relative_index_entry() {
 }
 
 /// The index points readers at work to pick up, so a target that merely exists
-/// is not enough: quest/AGENTS.md is a file under quest/ that is not a quest.
+/// is not enough: quest/CLAUDE.md is a file under quest/ that is not a quest.
 #[test]
 fn index_entry_that_is_not_a_quest() {
 	let tree = Tree::new();
-	tree.write("quest/AGENTS.md", "# Contract\n");
-	tree.append("quest/README.md", "- [Contract](/quest/AGENTS.md)\n");
-	tree.rejects("lists /quest/AGENTS.md, which is not a quest document");
+	tree.write("quest/CLAUDE.md", "# Contract\n");
+	tree.append("quest/README.md", "- [Contract](/quest/CLAUDE.md)\n");
+	tree.rejects("lists /quest/CLAUDE.md, which is not a quest document");
 }
 
 /// The index is a list of entries, not prose that happens to link.
@@ -432,7 +450,7 @@ fn required_link_on_a_wrapped_bullet() {
 }
 
 /// The other half of that rule: an external condition with no link at all is the
-/// shape AGENTS.md prescribes, and must stay legal.
+/// shape CLAUDE.md prescribes, and must stay legal.
 #[test]
 fn required_external_condition() {
 	let tree = Tree::new();
@@ -618,4 +636,139 @@ fn cycle_through_an_unnormalized_link() {
 		"\n## Required\n\n- [Two](/quest/m0/line/../line/two.md) - must finish first\n",
 	);
 	tree.rejects("Required cycle:");
+}
+
+// Readiness: what `quest ready` reports about the same fixture. A blocker list
+// is the machine-readable result, so the cases that must come back EMPTY carry
+// as much weight as the ones that must not.
+
+/// The absence of `## Required` is the whole definition of ready.
+#[test]
+fn ready_quest_has_no_blockers() {
+	let tree = Tree::new();
+	assert!(tree.blockers("quest/m0/line/one.md").is_empty());
+}
+
+#[test]
+fn blocked_by_a_quest() {
+	let tree = Tree::new();
+	assert_eq!(tree.blockers("quest/m0/line/two.md"), ["quest/m0/line/one.md"]);
+}
+
+/// A plain-text bullet names a condition outside the repository, so nothing in
+/// the tree can ever clear it: it is a blocker, printed as written. Wrapped
+/// here because that is what the bullets in the tree actually look like.
+#[test]
+fn blocked_by_plain_text() {
+	let tree = Tree::new();
+	tree.append(
+		"quest/m0/line/one.md",
+		"\n## Required\n\n- A `moq-video` release that carries\n  the encoder\n",
+	);
+	assert_eq!(
+		tree.blockers("quest/m0/line/one.md"),
+		["A moq-video release that carries the encoder"]
+	);
+}
+
+/// A questline blocker clears only when the whole line is complete, so the
+/// useful answer is which of its quests are still open - all of them, since a
+/// completed quest is deleted.
+#[test]
+fn blocked_by_a_questline() {
+	let tree = Tree::new();
+	tree.append("quest/m0/README.md", "- [Outer](/quest/m0/outer.md)\n");
+	tree.write(
+		"quest/m0/outer.md",
+		"# [S] Outer\n\n## Goal\n\nBlocked on a whole questline.\n\n## Required\n\n- [Line](/quest/m0/line/README.md) - the whole questline must finish\n",
+	);
+	assert_eq!(
+		tree.blockers("quest/m0/outer.md"),
+		[
+			"quest/m0/line/README.md",
+			"  quest/m0/line/one.md",
+			"  quest/m0/line/two.md",
+		]
+	);
+}
+
+/// A required QUEST does not expand: its own blockers are its readiness, and
+/// running this on it is how you ask. Expanding buried the entries that were
+/// asked for under a subtree repeated once per path through it.
+#[test]
+fn a_required_quest_is_not_expanded() {
+	let tree = Tree::new();
+	tree.append("quest/m0/line/README.md", "- [Three](/quest/m0/line/three.md)\n");
+	tree.write(
+		"quest/m0/line/three.md",
+		"# [S] Three\n\n## Goal\n\nLast in the chain.\n\n## Required\n\n- [Two](/quest/m0/line/two.md) - must finish first\n",
+	);
+	assert_eq!(tree.blockers("quest/m0/line/three.md"), ["quest/m0/line/two.md"]);
+}
+
+/// `quest check` reports an empty `## Required` as a defect, and every reader
+/// that greps for the heading calls the quest blocked. Reading it as ready here
+/// would make this the one tool that disagrees.
+#[test]
+fn empty_required_section_still_blocks() {
+	let tree = Tree::new();
+	tree.append("quest/m0/line/one.md", "\n## Required\n");
+	assert_eq!(
+		tree.blockers("quest/m0/line/one.md"),
+		["an empty '## Required' section, which blocks the quest until the heading is removed"]
+	);
+}
+
+/// The listing is the query the start flow reproduces by grepping. Questlines
+/// are never executed, so they are not in it, and `two.md` is blocked.
+#[test]
+fn ready_listing() {
+	let tree = Tree::new();
+	assert_eq!(tree.ready(), ["quest/m0/line/one.md"]);
+
+	tree.append("quest/m0/README.md", "- [Outer](/quest/m0/outer.md)\n");
+	tree.write("quest/m0/outer.md", "# [S] Outer\n\n## Goal\n\nReady too.\n");
+	assert_eq!(tree.ready(), ["quest/m0/line/one.md", "quest/m0/outer.md"]);
+}
+
+/// `quest check` proves the graph acyclic, but readiness also runs on trees
+/// nobody has checked yet - the branch that just introduced the cycle - and a
+/// cycle there has to print rather than recurse forever.
+#[test]
+fn cycle_terminates() {
+	let tree = Tree::new();
+	tree.append("quest/m0/line/README.md", "- [Itself](/quest/m0/line/README.md)\n");
+	tree.append("quest/m0/README.md", "- [Outer](/quest/m0/outer.md)\n");
+	tree.write(
+		"quest/m0/outer.md",
+		"# [S] Outer\n\n## Goal\n\nBlocked on a questline that lists itself.\n\n## Required\n\n- [Line](/quest/m0/line/README.md) - the whole questline must finish\n",
+	);
+	assert_eq!(
+		tree.blockers("quest/m0/outer.md"),
+		[
+			"quest/m0/line/README.md",
+			"  quest/m0/line/one.md",
+			"  quest/m0/line/two.md",
+			"  quest/m0/line/README.md",
+		]
+	);
+}
+
+#[test]
+fn ready_listing_follows_nested_priority_and_terminates_cycles() {
+	let tree = Tree::new();
+	tree.write("quest/m0/line/two.md", "# [S] Two\n\n## Goal\n\nReady.\n");
+	tree.write("quest/m0/line/README.md", "# Line\n\n## Quests\n\n- [Two](/quest/m0/line/two.md)\n- [Self](/quest/m0/line/README.md)\n- [One](/quest/m0/line/one.md)\n");
+	assert_eq!(tree.ready(), ["quest/m0/line/two.md", "quest/m0/line/one.md"]);
+}
+
+#[test]
+fn ready_listing_appends_unindexed_quests() {
+	let tree = Tree::new();
+	tree.write("quest/m0/aaa.md", "# [S] Unindexed\n\n## Goal\n\nDiscover me.\n");
+	tree.write(
+		"quest/m0/blocked.md",
+		"# [S] Blocked\n\n## Goal\n\nWait.\n\n## Required\n\n- External condition\n",
+	);
+	assert_eq!(tree.ready(), ["quest/m0/line/one.md", "quest/m0/aaa.md"]);
 }

@@ -15,13 +15,6 @@ use web_transport_proto::{ConnectRequest, ConnectResponse};
 pub use iroh::Endpoint;
 pub use web_transport_iroh;
 
-/// The congestion control family to install, defaulting to loss-based.
-///
-/// iroh uses loss-based congestion control unless delay-based is requested.
-fn congestion_control(quic: &crate::quic::Resolved) -> CongestionControl {
-	quic.congestion_control.unwrap_or(CongestionControl::Loss)
-}
-
 /// The iroh controller factory for a congestion control family.
 ///
 /// iroh is built on noq, so its BBR is v3. It re-exports the `ControllerFactory`
@@ -251,7 +244,7 @@ impl EndpointConfig {
 		if let Some(window) = quic.send_window {
 			transport = transport.send_window(window);
 		}
-		transport = transport.congestion_controller_factory(congestion_factory(congestion_control(&quic)));
+		transport = transport.congestion_controller_factory(congestion_factory(quic.congestion()));
 
 		let mut builder = if self.disable_relay.unwrap_or(false) {
 			Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -480,16 +473,5 @@ mod tests {
 
 		let delay = congestion_factory(CongestionControl::Delay).build(now, mtu);
 		assert!(delay.into_any().downcast::<noq_proto::congestion::Bbr3>().is_ok());
-	}
-
-	/// An unset knob lands on CUBIC, while an explicit delay request gets BBRv3.
-	#[test]
-	fn congestion_control_defaults_to_loss() {
-		let mut quic = crate::quic::Config::default();
-		assert_eq!(congestion_control(&quic.resolve()), CongestionControl::Loss);
-
-		// An explicit request still gets through.
-		quic.congestion_control = Some(CongestionControl::Delay);
-		assert_eq!(congestion_control(&quic.resolve()), CongestionControl::Delay);
 	}
 }

@@ -36,7 +36,7 @@ Transport tuning, applied to accepted and dialed connections alike.
 
 ```toml
 [quic]
-congestion_control = "delay"         # "delay" (BBR) or "loss" (CUBIC, the default on noq and iroh).
+congestion_control = "delay"         # "delay" (BBR, the default) or "loss" (CUBIC).
 max_streams = 1024                   # Concurrent streams per connection, bidi and uni. Default.
 idle_timeout = "30s"                 # Drop a connection after this long with nothing on it.
 keep_alive = "5s"                    # Ping interval; "0s" disables it. Ignored by iroh.
@@ -186,6 +186,14 @@ publisher that stalls but stays connected still has its idle groups reclaimed
 (an open one included, and a subscriber parked inside it is told rather than
 waiting forever).
 
+`headroom` starts a background task that re-samples system memory every few
+seconds and resizes the pool. Embedders calling `CacheConfig::init` directly
+should know that the task is owned by the `cache::Pool` it resizes, not by the
+`Cache` struct or the `Relay`: it stops on its next tick once the last `Pool`
+clone drops. Handing the `Cache` to `Cluster::with_cache` therefore moves the
+task's lifetime onto the cluster, and keeping a `Pool` clone of your own keeps
+the task running for as long as you hold it.
+
 ## \[stats]
 
 ```toml
@@ -222,3 +230,20 @@ See [Transport](/concept/transport#iroh-peer-to-peer-experimental).
 [log]
 level = "info"                       # RUST_LOG overrides this.
 ```
+
+At `info` the relay logs one `listening` record for the `[server]` QUIC socket
+and each public `[web]` listener as it binds. Each record carries the bound
+address and a `kind` naming the listener:
+
+```
+INFO listening addr=[::]:4443 kind=quic
+INFO listening addr=[::]:4443 kind=http
+INFO listening addr=[::]:8443 kind=https
+```
+
+For these listeners, `addr` is the address the socket bound, not the one
+configured, so a `listen` port of `0` reports the port the OS picked. That is
+the only way to learn it from outside the process, and the QUIC and TCP ports
+are chosen independently.
+A relay with no `[server]` UDP socket logs `listening (stream transports only)`
+instead of the `quic` line.

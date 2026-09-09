@@ -11,7 +11,6 @@ use std::net;
 use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
-
 use web_transport_noq::noq;
 
 pub use web_transport_noq;
@@ -59,7 +58,7 @@ fn apply_transport(transport: &mut noq::TransportConfig, quic: &Resolved) {
 
 	apply_windows(transport, quic);
 
-	transport.congestion_controller_factory(congestion_factory(congestion_control(quic)));
+	transport.congestion_controller_factory(congestion_factory(quic.congestion()));
 }
 
 /// Apply the flow-control windows, leaving each at the backend default when unset.
@@ -75,11 +74,6 @@ fn apply_windows(transport: &mut noq::TransportConfig, quic: &Resolved) {
 	if let Some(window) = quic.send_window {
 		transport.send_window(window);
 	}
-}
-
-/// The congestion control family to install, defaulting to loss-based.
-fn congestion_control(quic: &Resolved) -> CongestionControl {
-	quic.congestion_control.unwrap_or(CongestionControl::Loss)
 }
 
 /// The noq controller factory for a congestion control family. noq's BBR is v3.
@@ -835,14 +829,74 @@ mod tests {
 		assert!(delay.into_any().downcast::<noq::congestion::Bbr3>().is_ok());
 	}
 
-	/// An unset knob lands on CUBIC, while an explicit delay request gets BBRv3.
-	#[test]
-	fn congestion_control_defaults_to_loss() {
-		let mut quic = crate::quic::Config::default();
-		assert_eq!(congestion_control(&quic.resolve()), CongestionControl::Loss);
+	/// Loopback regression test: with the knob unset, live noq connections must run
+	/// BBRv3 on both ends.
+	#[tokio::test]
+	async fn default_reaches_the_live_connection() {
+		let server_config = listen::Config {
+			bind: Some("127.0.0.1:0".to_string()),
+			tls: crate::tls::Listen {
+				generate: vec!["localhost".into()],
+				..Default::default()
+			},
+			..Default::default()
+		};
 
-		// An explicit request still gets through.
-		quic.congestion_control = Some(CongestionControl::Delay);
-		assert_eq!(congestion_control(&quic.resolve()), CongestionControl::Delay);
+		// The knob left unset, the way a binary that never mentions it runs.
+		let quic = crate::quic::Config::default();
+
+		let server = NoqServer::new(server_config, &quic, None).expect("server init");
+		let addr = server.local_addr().expect("local addr");
+
+		let accepted = tokio::spawn(async move {
+			let incoming = server.accept().await.expect("no incoming connection");
+			let conn = incoming.accept().expect("accept").await.expect("handshake");
+			is_bbr3(&conn)
+		});
+
+		// tls::Connect has a private field, so it can't be built with a struct literal.
+		let mut tls_config = crate::tls::Connect::default();
+		tls_config.insecure = Some(true);
+
+		let client_config = connect::Config {
+			bind: Some("127.0.0.1:0".parse().unwrap()),
+			tls: tls_config,
+			..Default::default()
+		};
+
+		let tls = client_config.tls.build().expect("tls config");
+		let client = NoqClient::new(&client_config, &quic).expect("client init");
+		// Dial the loopback IP directly so the system resolver is never involved.
+		let url: Url = format!("moqt://127.0.0.1:{}", addr.port()).parse().unwrap();
+
+		// Bound the whole connect + accept + assert flow so a handshake
+		// regression fails fast instead of stalling CI.
+		tokio::time::timeout(Duration::from_secs(5), async move {
+			let session = client
+				.connect(&tls, url, &moq_net::Versions::default())
+				.await
+				.expect("connect failed");
+
+			// web_transport_noq::Session derefs to the noq connection.
+			assert!(is_bbr3(&session), "client connection is not running BBRv3");
+			assert!(
+				accepted.await.expect("server task panicked"),
+				"server connection is not running BBRv3"
+			);
+		})
+		.await
+		.expect("test timed out");
+	}
+
+	/// Whether a live connection's initial path is running BBRv3.
+	///
+	/// noq is multipath, so the controller is per path rather than per connection;
+	/// `PathId::ZERO` is the path the handshake came up on.
+	fn is_bbr3(conn: &noq::Connection) -> bool {
+		conn.congestion_state(noq::PathId::ZERO)
+			.expect("no controller on the initial path")
+			.into_any()
+			.downcast::<noq::congestion::Bbr3>()
+			.is_ok()
 	}
 }

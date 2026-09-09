@@ -41,19 +41,23 @@ instead host sessions with `--listen`, or both at once. `moq import --help` list
 
 ```bash
 # Publish a file (remux to MPEG-TS without re-encoding)
-ffmpeg -re -i video.mp4 -c copy -f mpegts - | \
+ffmpeg -re -i video.mp4 -c copy -f mpegts -pes_payload_size 0 - | \
     moq --connect https://relay.example.com/anon --broadcast my-stream.hang import ts
 
 # Pull it back out
-moq --connect https://relay.example.com/anon --broadcast my-stream.hang export fmp4 | ffplay -
+moq --connect https://relay.example.com/anon --broadcast my-stream.hang export ts | ffplay -
 
 # With a token
 moq --connect "https://relay.example.com/rooms/1?jwt=$TOKEN" --broadcast alice.hang import ts
 ```
 
 MPEG-TS import carries H.264/H.265 and AAC/MP2/AC-3/E-AC-3, passes SCTE-35 and
-subtitle PIDs through as tracks, and round-trips the service tables. FLV
-covers H.264 + AAC.
+subtitle PIDs through as tracks, and round-trips the service tables. A
+`discontinuity_indicator` on the program's PCR PID is a system time-base reset,
+so it breaks every track's timeline and the exported clock declares the break in
+turn. The same flag on an elementary PID other than the program PCR PID, a
+continuity-counter gap, and the 33-bit timestamp rollover move no clock and
+declare nothing. FLV covers H.264 + AAC.
 
 MPEG-TS export restarts its clock and table cadence after a publisher rewind,
 discarding the old mux buffer. The first new clock packet signals the break and

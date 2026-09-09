@@ -20,6 +20,19 @@ enum ContainerImpl<E: crate::container::ts::Catalog = ()> {
 }
 
 impl<E: crate::container::ts::Catalog> ContainerImpl<E> {
+	fn new(
+		broadcast: moq_net::broadcast::Producer,
+		reserved: crate::catalog::Reserved<E>,
+		format: ContainerFormat,
+	) -> Self {
+		match format {
+			ContainerFormat::Fmp4 => Self::fmp4(broadcast, reserved),
+			ContainerFormat::Mkv => Self::mkv(broadcast, reserved),
+			ContainerFormat::Ts => Self::ts(broadcast, reserved),
+			ContainerFormat::Flv => Self::flv(broadcast, reserved),
+		}
+	}
+
 	fn fmp4(broadcast: moq_net::broadcast::Producer, reserved: crate::catalog::Reserved<E>) -> Self {
 		ContainerImpl::Fmp4(Box::new(crate::container::fmp4::Import::new(broadcast, reserved)))
 	}
@@ -97,12 +110,7 @@ impl<E: crate::container::ts::Catalog> Container<E> {
 		reserved: crate::catalog::Reserved<E>,
 		init: &ContainerInit,
 	) -> Result<Self> {
-		let mut inner = match init.format {
-			ContainerFormat::Fmp4 => ContainerImpl::fmp4(broadcast, reserved),
-			ContainerFormat::Mkv => ContainerImpl::mkv(broadcast, reserved),
-			ContainerFormat::Ts => ContainerImpl::ts(broadcast, reserved),
-			ContainerFormat::Flv => ContainerImpl::flv(broadcast, reserved),
-		};
+		let mut inner = ContainerImpl::new(broadcast, reserved, init.format);
 		inner.decode(&init.data)?;
 		Ok(Self { inner })
 	}
@@ -160,12 +168,7 @@ impl<E: crate::container::ts::Catalog> ContainerStream<E> {
 		// recovered from a raw byte stream belong here. Today that's all of them,
 		// but a non-streamable container (e.g. RTP) would be added to `Container`
 		// alone.
-		let inner = match format {
-			ContainerFormat::Fmp4 => ContainerImpl::fmp4(broadcast, reserved),
-			ContainerFormat::Mkv => ContainerImpl::mkv(broadcast, reserved),
-			ContainerFormat::Ts => ContainerImpl::ts(broadcast, reserved),
-			ContainerFormat::Flv => ContainerImpl::flv(broadcast, reserved),
-		};
+		let inner = ContainerImpl::new(broadcast, reserved, format);
 		Ok(Self { inner })
 	}
 

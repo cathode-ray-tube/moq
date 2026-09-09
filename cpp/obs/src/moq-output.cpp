@@ -3,24 +3,78 @@
 
 #include "moq-output.h"
 #include "moq-settings.h"
+#include "moq-url.h"
+#include "logger.h"
 #include "util/util_uint64.h"
+
+#include <cstring>
+#include <string>
 
 extern "C" {
 #include "moq.h"
 }
 
+namespace {
+
+bool LooksGenericOffline(const std::string &reason)
+{
+	if (reason.empty() || reason == "offline")
+		return true;
+	// Case-insensitive contains for "offline" only as a whole-ish token.
+	for (size_t i = 0; i + 6 < reason.size() + 1; i++) {
+		char buf[8] = {};
+		for (int j = 0; j < 7 && i + j < reason.size(); j++) {
+			char c = reason[i + j];
+			buf[j] = (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+		}
+		if (std::strncmp(buf, "offline", 7) == 0)
+			return true;
+	}
+	return false;
+}
+
+bool IsAuthFailure(int code, const std::string &reason)
+{
+	if (code == -34 || code == -35)
+		return true;
+	std::string lower = reason;
+	for (char &c : lower) {
+		if (c >= 'A' && c <= 'Z')
+			c = static_cast<char>(c - 'A' + 'a');
+	}
+	return lower.find("unauthorized") != std::string::npos || lower.find("forbidden") != std::string::npos;
+}
+
+// Dial URL scheme only. https races WebTransport vs WebSocket in moq-native;
+// libmoq does not yet expose which won, so do not invent a transport name here.
+std::string DialSchemeLabel(const std::string &url)
+{
+	const auto colon = url.find(':');
+	if (colon == std::string::npos || colon == 0)
+		return {};
+	std::string scheme = url.substr(0, colon);
+	for (char &c : scheme) {
+		if (c >= 'A' && c <= 'Z')
+			c = static_cast<char>(c - 'A' + 'a');
+	}
+	if (scheme == "moqt" || scheme == "moql" || scheme == "quic")
+		return "quic";
+	if (scheme == "tcp")
+		return "tcp";
+	if (scheme == "unix")
+		return "unix";
+	return scheme;
+}
+
+} // namespace
+
 MoQOutput::MoQOutput(obs_data_t *, obs_output_t *output)
 	: output(output),
-	  server_url(),
+	  state(std::make_shared<SessionState>(output)),
 	  path(),
 	  total_bytes_sent(0),
-	  connect_time_ms(0),
 	  origin(moq_origin_create()),
-	  broadcast(0),
-	  outstanding_sessions(0),
-	  session(0),
-	  session_attempt(0),
-	  session_connected(false)
+	  broadcast(0)
 {
 }
 
@@ -34,13 +88,25 @@ MoQOutput::~MoQOutput()
 	// the origin has no children left.
 	moq_origin_close(origin);
 
-	// Wait for any outstanding session terminal callback to fire before `this`
-	// is freed, so a late callback on the libmoq runtime thread can't touch freed
-	// memory. Bounded so a missing terminal degrades to a warning, not a hang.
-	std::unique_lock<std::mutex> lock(session_mutex);
-	if (!session_cv.wait_for(lock, std::chrono::seconds(2), [this] { return outstanding_sessions == 0; }))
-		LOG_WARNING("Output teardown timed out with %d MoQ session callback(s) outstanding",
-			    outstanding_sessions);
+	// Give up the frontend. A terminal callback still in flight holds its own
+	// reference to the shared state, so nothing here waits on the libmoq runtime:
+	// whenever it arrives it finds the state detached and reports nothing.
+	state->Detach();
+}
+
+void MoQOutput::SessionState::Detach()
+{
+	// A callback that has already decided to report parks here, so this returns
+	// only once nothing is inside an OBS call and the output can be freed.
+	std::lock_guard<std::recursive_mutex> signal_lock(signal_mutex);
+	output = nullptr;
+}
+
+void MoQOutput::SessionState::SignalStop(int code)
+{
+	std::lock_guard<std::recursive_mutex> signal_lock(signal_mutex);
+	if (output)
+		obs_output_signal_stop(output, code);
 }
 
 bool MoQOutput::Start()
@@ -52,7 +118,7 @@ bool MoQOutput::Start()
 	obs_service_t *service = obs_output_get_service(output);
 	if (!service) {
 		LOG_ERROR("Failed to get service from output");
-		SignalStop(OBS_OUTPUT_ERROR);
+		state->SignalStop(OBS_OUTPUT_ERROR);
 		return false;
 	}
 
@@ -67,10 +133,10 @@ bool MoQOutput::Start()
 	}
 
 	const char *server_value = obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_SERVER_URL);
-	server_url = server_value ? server_value : "";
-	if (server_url.empty()) {
+	const std::string url = server_value ? server_value : "";
+	if (url.empty()) {
 		LOG_ERROR("Server URL is empty");
-		SignalStop(OBS_OUTPUT_BAD_PATH);
+		state->SignalStop(OBS_OUTPUT_BAD_PATH);
 		return false;
 	}
 
@@ -100,34 +166,31 @@ bool MoQOutput::Start()
 		// BuildConfig logged why. Refusing to start beats connecting with a setting
 		// the user asked for quietly dropped.
 		obs_output_set_last_error(output, "Invalid advanced MoQ settings; see the log for details.");
-		SignalStop(OBS_OUTPUT_CONNECT_FAILED);
+		state->SignalStop(OBS_OUTPUT_CONNECT_FAILED);
 		return false;
 	}
 
-	LOG_INFO("Connecting to MoQ server: %s", server_url.c_str());
+	LOG_INFO("Connecting to MoQ server: %s", MoQRedactUrl(url).c_str());
 
 	// Held from the connect through obs_output_begin_data_capture. The status
 	// callback takes the same lock before reporting anything, so this attempt's
 	// terminal cannot signal a failure against an output that is only half
 	// started: it waits until the output is committed, and OBS then handles the
 	// stop through its normal active-output path.
-	std::lock_guard<std::recursive_mutex> signal_lock(signal_mutex);
+	std::lock_guard<std::recursive_mutex> signal_lock(state->signal_mutex);
 
 	uint64_t attempt;
 	{
-		std::lock_guard<std::mutex> lock(session_mutex);
-		attempt = session_attempt;
-
-		// Pre-account for the session subscription before handing the reference to
-		// libmoq: the connection can fail and fire its terminal callback before
-		// connect returns, and the destructor must wait for that callback.
-		outstanding_sessions++;
+		std::lock_guard<std::mutex> lock(state->mutex);
+		attempt = state->attempt;
+		state->url = url;
 	}
 
 	// Everything the callbacks need about this attempt, copied so they never read
-	// a member the next Start() may be rewriting. Freed by the terminal callback,
-	// so it outlives this scope.
-	auto ref = new SessionRef{this, attempt, server_url, std::chrono::steady_clock::now()};
+	// a member the next Start() may be rewriting, plus the reference that keeps
+	// the shared state alive. Freed by the terminal callback, so it outlives this
+	// scope.
+	auto ref = new SessionRef{state, attempt, url, std::chrono::steady_clock::now()};
 
 	// Start establishing a session with the MoQ server
 	// NOTE: You could publish the same broadcasts to multiple sessions if you want (redundant ingest).
@@ -137,31 +200,29 @@ bool MoQOutput::Start()
 	if (handle < 0) {
 		const char *reason = moq_error();
 		LOG_ERROR("Failed to initialize MoQ server: %d: %s", handle, reason ? reason : "unknown error");
+		obs_output_set_last_error(output, reason ? reason : "Failed to initialize MoQ connection");
+		// No subscription was created, so no terminal will fire; drop the reference.
 		delete ref;
-		// No subscription was created, so no terminal will fire; undo the ref.
-		std::lock_guard<std::mutex> lock(session_mutex);
-		if (--outstanding_sessions == 0)
-			session_cv.notify_all();
 		return false;
 	}
 
 	bool superseded;
 	{
-		std::lock_guard<std::mutex> lock(session_mutex);
+		std::lock_guard<std::mutex> lock(state->mutex);
 		// Holding signal_mutex keeps this attempt current: libmoq delivers the
-		// terminal on its runtime thread, which parks in SessionClosed until we
-		// commit. The check stands guard over that assumption rather than trusting
-		// libmoq's threading to stay as it is.
-		superseded = session_attempt != attempt;
+		// terminal on its runtime thread, which parks in SessionState::Closed until
+		// we commit. The check stands guard over that assumption rather than
+		// trusting libmoq's threading to stay as it is.
+		superseded = state->attempt != attempt;
 		if (!superseded)
-			session = handle;
+			state->session = handle;
 	}
 
 	if (superseded) {
 		// The session died during connect without going through the callback's
 		// signal path. Refuse the start rather than capturing into a dead session;
 		// OBS surfaces the last error we recorded when info.start returns false.
-		LOG_ERROR("MoQ session failed before the output started: %s", server_url.c_str());
+		LOG_ERROR("MoQ session failed before the output started: %s", MoQRedactUrl(url).c_str());
 		return false;
 	}
 
@@ -187,19 +248,13 @@ bool MoQOutput::Start()
 
 void MoQOutput::Stop(bool signal)
 {
-	std::lock_guard<std::recursive_mutex> signal_lock(signal_mutex);
+	std::lock_guard<std::recursive_mutex> signal_lock(state->signal_mutex);
 
 	Reset();
 
 	if (signal) {
-		obs_output_signal_stop(output, OBS_OUTPUT_SUCCESS);
+		state->SignalStop(OBS_OUTPUT_SUCCESS);
 	}
-}
-
-void MoQOutput::SignalStop(int code)
-{
-	std::lock_guard<std::recursive_mutex> signal_lock(signal_mutex);
-	obs_output_signal_stop(output, code);
 }
 
 void MoQOutput::Reset()
@@ -207,20 +262,24 @@ void MoQOutput::Reset()
 	// Excludes the status callback's report: retiring the attempt and signalling
 	// a failure must not interleave, or a stop that already happened gets followed
 	// by a failure OBS turns into a reconnect.
-	std::lock_guard<std::recursive_mutex> signal_lock(signal_mutex);
+	std::lock_guard<std::recursive_mutex> signal_lock(state->signal_mutex);
 
 	int stale;
 	{
-		std::lock_guard<std::mutex> lock(session_mutex);
+		std::lock_guard<std::mutex> lock(state->mutex);
 		// Retire the attempt so an in-flight terminal callback stays out of the way.
-		session_attempt++;
-		session_connected = false;
-		connect_time_ms = 0;
-		stale = session;
-		session = 0;
+		state->attempt++;
+		state->connected = false;
+		state->connect_time_ms = 0;
+		state->epoch = 0;
+		state->url.clear();
+		state->last_failure_code = 0;
+		state->last_failure_reason.clear();
+		stale = state->session;
+		state->session = 0;
 	}
 
-	// Outside the lock: the status callback takes session_mutex, and libmoq is
+	// Outside the lock: the status callback takes state->mutex, and libmoq is
 	// free to run it on its own thread while we're here.
 	if (stale > 0)
 		moq_session_close(stale);
@@ -245,6 +304,85 @@ void MoQOutput::Reset()
 	}
 }
 
+bool MoQOutput::TryGetConnectionStats(ConnectionStats *out)
+{
+	if (!out)
+		return false;
+
+	uint32_t handle;
+	uint64_t attempt;
+	std::string dialUrl;
+	{
+		std::lock_guard<std::mutex> lock(state->mutex);
+		if (state->session == 0)
+			return false;
+		handle = static_cast<uint32_t>(state->session);
+		attempt = state->attempt;
+		dialUrl = state->url;
+	}
+
+	moq_connection_snapshot connection{};
+	const int32_t rc = moq_session_snapshot(handle, &connection);
+	if (rc != 0) {
+		const char *message = moq_error();
+		const std::string next = message && *message ? message : "offline";
+		std::lock_guard<std::mutex> lock(state->mutex);
+		if (state->attempt != attempt)
+			return false;
+		// Keep a more specific prior failure (unauthorized) over a generic offline blip.
+		if (state->last_failure_reason.empty() || LooksGenericOffline(state->last_failure_reason) ||
+		    !LooksGenericOffline(next) || IsAuthFailure(rc, next)) {
+			state->last_failure_code = rc;
+			state->last_failure_reason = next;
+		}
+		return false;
+	}
+
+	const auto &raw = connection.stats;
+	ConnectionStats snapshot;
+	snapshot.reconnects = GetReconnectCount();
+	snapshot.rtt_valid = raw.rtt_valid;
+	snapshot.rtt_ms = raw.rtt_valid ? static_cast<double>(raw.rtt_us) / 1000.0 : 0;
+	snapshot.send_rate_valid = raw.send_rate_valid;
+	snapshot.send_rate_bps = raw.send_rate_valid ? static_cast<double>(raw.send_rate_bps) : 0;
+	snapshot.recv_rate_valid = raw.recv_rate_valid;
+	snapshot.recv_rate_bps = raw.recv_rate_valid ? static_cast<double>(raw.recv_rate_bps) : 0;
+	snapshot.bytes_sent_valid = raw.bytes_sent_valid;
+	snapshot.bytes_sent = raw.bytes_sent_valid ? raw.bytes_sent : 0;
+	if (raw.packets_sent_valid && raw.packets_lost_valid && raw.packets_sent > 0) {
+		snapshot.loss_valid = true;
+		snapshot.loss_pct =
+			100.0 * static_cast<double>(raw.packets_lost) / static_cast<double>(raw.packets_sent);
+	}
+	snapshot.dial = DialSchemeLabel(dialUrl);
+
+	snapshot.protocol.assign(connection.protocol.data, connection.protocol.len);
+
+	{
+		std::lock_guard<std::mutex> lock(state->mutex);
+		if (state->attempt != attempt || static_cast<uint32_t>(state->session) != handle)
+			return false;
+		*out = std::move(snapshot);
+	}
+
+	return true;
+}
+
+bool MoQOutput::IsLiveSession()
+{
+	std::lock_guard<std::mutex> lock(state->mutex);
+	return state->connected && state->session != 0;
+}
+
+void MoQOutput::CopyLastFailure(int *code, std::string *reason)
+{
+	std::lock_guard<std::mutex> lock(state->mutex);
+	if (code)
+		*code = state->last_failure_code;
+	if (reason)
+		*reason = state->last_failure_reason;
+}
+
 // libmoq status codes (>= 0.3.0): > 0 = (re)connected, carrying the connection
 // epoch; 0 = closed cleanly (terminal); < 0 = fatal, reconnection gave up (terminal).
 void MoQOutput::SessionStatus(void *user_data, int code)
@@ -252,36 +390,39 @@ void MoQOutput::SessionStatus(void *user_data, int code)
 	auto ref = static_cast<SessionRef *>(user_data);
 
 	if (code > 0) {
-		ref->output->SessionConnected(*ref, code);
+		ref->state->Connected(*ref, code);
 		return;
 	}
 
 	// Terminal: libmoq never touches user_data again, so we own the reference.
-	// SessionClosed is the last access to the output, but not to `ref`.
+	// Destroying it drops the last hold on the shared state when the output is
+	// already gone, so this is where a detached state is finally freed.
 	std::unique_ptr<SessionRef> owned(ref);
-	owned->output->SessionClosed(*owned, code);
+	owned->state->Closed(*owned, code);
 }
 
-void MoQOutput::SessionConnected(const SessionRef &ref, int epoch)
+void MoQOutput::SessionState::Connected(const SessionRef &ref, int connect_epoch)
 {
 	auto elapsed = std::chrono::steady_clock::now() - ref.started;
 	auto ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
 
 	{
-		std::lock_guard<std::mutex> lock(session_mutex);
-		if (session_attempt != ref.attempt)
+		std::lock_guard<std::mutex> lock(mutex);
+		if (attempt != ref.attempt)
 			return;
-		session_connected = true;
-		// The dock reads this as the live connected indicator, so publish it under
-		// the same lock as the stamp check: a restart must not be able to clear it
-		// between the two and leave the old attempt's time showing.
-		connect_time_ms = ms;
+		connected = true;
+		// OBS and older dock paths treat connect_time_ms == 0 as "never connected".
+		// Clamp sub-millisecond connects to 1 so that sentinel stays honest.
+		connect_time_ms = ms > 0 ? ms : 1;
+		epoch = connect_epoch;
+		last_failure_code = 0;
+		last_failure_reason.clear();
 	}
 
-	LOG_INFO("MoQ session connected (%d ms, epoch %d): %s", ms, epoch, ref.url.c_str());
+	LOG_INFO("MoQ session connected (%d ms, epoch %d): %s", ms, connect_epoch, MoQRedactUrl(ref.url).c_str());
 }
 
-void MoQOutput::SessionClosed(const SessionRef &ref, int code)
+void MoQOutput::SessionState::Closed(const SessionRef &ref, int code)
 {
 	// moq_error() only describes the most recent call on this thread, so copy the
 	// reason out before anything below can overwrite it.
@@ -292,57 +433,50 @@ void MoQOutput::SessionClosed(const SessionRef &ref, int code)
 	}
 
 	// Held across both the decision below and the signal itself. Taking it before
-	// session_mutex is the required lock order, and holding it through the signal
-	// is what stops a teardown from landing in between: without that, Stop() can
-	// retire the attempt after we decide to report, and OBS turns the late
-	// OBS_OUTPUT_DISCONNECTED into a reconnect of a stopped stream.
-	std::unique_lock<std::recursive_mutex> signal_lock(signal_mutex);
+	// mutex is the required lock order, and holding it through the signal is what
+	// stops a teardown from landing in between: without that, Stop() can retire
+	// the attempt after we decide to report, and OBS turns the late
+	// OBS_OUTPUT_DISCONNECTED into a reconnect of a stopped stream. It is also
+	// what Detach() waits on, so `output` cannot go away mid-report.
+	std::lock_guard<std::recursive_mutex> signal_lock(signal_mutex);
 
 	bool current;
-	bool connected = false;
+	bool was_connected = false;
 	{
-		std::lock_guard<std::mutex> lock(session_mutex);
-		current = session_attempt == ref.attempt;
+		std::lock_guard<std::mutex> lock(mutex);
+		current = attempt == ref.attempt;
 		if (current) {
-			connected = session_connected;
+			was_connected = connected;
 			// The session task has ended and dropped the handle, so retire it here
 			// rather than closing a handle libmoq no longer knows about.
 			session = 0;
-			session_attempt++;
-			session_connected = false;
+			attempt++;
+			connected = false;
 			connect_time_ms = 0;
+			epoch = 0;
+			if (code < 0) {
+				last_failure_code = code;
+				last_failure_reason = reason;
+			}
 		}
 	}
 
 	if (code == 0) {
-		LOG_INFO("MoQ session closed: %s", ref.url.c_str());
+		LOG_INFO("MoQ session closed: %s", MoQRedactUrl(ref.url).c_str());
 	} else {
-		LOG_ERROR("MoQ session failed (%d): %s: %s", code, ref.url.c_str(), reason.c_str());
+		LOG_ERROR("MoQ session failed (%d): %s: %s", code, MoQRedactUrl(ref.url).c_str(), reason.c_str());
 	}
 
 	// Reconnection gave up, so nothing is reaching the server any more. Without
 	// this OBS keeps encoding and reporting the stream as live forever. Only the
 	// current attempt signals, which is what keeps it to one signal per Start().
-	// `this` and `output` are still alive here because the destructor is blocked
-	// on the reference released below.
-	if (code < 0 && current) {
+	// A detached output has already been destroyed, so there is nobody to tell.
+	if (code < 0 && current && output) {
 		obs_output_set_last_error(output, reason.c_str());
 		// CONNECT_FAILED is terminal for OBS. DISCONNECTED lets its own reconnect
 		// logic retry, which is only worth offering once we know the server works.
-		obs_output_signal_stop(output, connected ? OBS_OUTPUT_DISCONNECTED : OBS_OUTPUT_CONNECT_FAILED);
+		obs_output_signal_stop(output, was_connected ? OBS_OUTPUT_DISCONNECTED : OBS_OUTPUT_CONNECT_FAILED);
 	}
-
-	// Nothing below reports to OBS, so narrow the hold: the destructor can be
-	// blocked in Reset() waiting for this lock, and it only reaches its
-	// session_cv wait once it has it.
-	signal_lock.unlock();
-
-	// Terminal callback: the session task has ended and will not touch `this`
-	// again. Release the lifetime reference the destructor waits on. This is the
-	// last access to `this`.
-	std::lock_guard<std::mutex> lock(session_mutex);
-	if (--outstanding_sessions == 0)
-		session_cv.notify_all();
 }
 
 void MoQOutput::Data(struct encoder_packet *packet)
@@ -350,9 +484,9 @@ void MoQOutput::Data(struct encoder_packet *packet)
 	if (!packet) {
 		// One report for the pair, so a session failure can't slip between the
 		// teardown and the encode error and report a second time.
-		std::lock_guard<std::recursive_mutex> signal_lock(signal_mutex);
+		std::lock_guard<std::recursive_mutex> signal_lock(state->signal_mutex);
 		Stop(false);
-		obs_output_signal_stop(output, OBS_OUTPUT_ENCODE_ERROR);
+		state->SignalStop(OBS_OUTPUT_ENCODE_ERROR);
 		return;
 	}
 
@@ -445,18 +579,10 @@ void MoQOutput::VideoInit(obs_encoder_t *encoder)
 		return;
 	}
 
-	// TODO Pass these along to the video catalog somehow.
-	/*
 	OBSDataAutoRelease settings = obs_encoder_get_settings(encoder);
-	if (!settings) {
-		LOG_ERROR("Failed to get video encoder settings");
-		return;
-	}
-
-	auto video_bitrate = (int)obs_data_get_int(settings, "bitrate");
-	auto video_width = obs_encoder_get_width(encoder);
-	auto video_height = obs_encoder_get_height(encoder);
-	*/
+	const auto video_width = obs_encoder_get_width(encoder);
+	const auto video_height = obs_encoder_get_height(encoder);
+	const int video_bitrate_kbps = settings ? (int)obs_data_get_int(settings, "bitrate") : 0;
 
 	uint8_t *extra_data = nullptr;
 	size_t extra_size = 0;
@@ -485,6 +611,23 @@ void MoQOutput::VideoInit(obs_encoder_t *encoder)
 
 	config.init = extra_data;
 	config.init_len = extra_size;
+
+	// Seed catalog fields a downstream moq-transcode needs before measured rates
+	// arrive: coded size (also from SPS once parsed) and configured CBR bitrate so
+	// same-height ladder rungs can undercut the mezzanine.
+	if (video_width > 0 && video_height > 0) {
+		config.hint.coded_width = video_width;
+		config.hint.coded_height = video_height;
+		config.hint.has_coded = true;
+	}
+	const std::string rate_control = settings ? obs_data_get_string(settings, "rate_control") : "";
+	if (video_bitrate_kbps > 0 && (rate_control == "CBR" || rate_control == "cbr")) {
+		config.hint.bitrate = (uint64_t)video_bitrate_kbps * 1000ULL;
+		config.hint.has_bitrate = true;
+	}
+	config.hint.optimize_for_latency = true;
+	config.hint.has_optimize_for_latency = true;
+
 	int handle = moq_publish_video(broadcast, &config);
 	video_tracks[encoder] = handle;
 	if (handle < 0) {
@@ -492,7 +635,7 @@ void MoQOutput::VideoInit(obs_encoder_t *encoder)
 		return;
 	}
 
-	LOG_INFO("Video track initialized successfully");
+	LOG_INFO("Video track initialized (%ux%u, %d kbps)", video_width, video_height, video_bitrate_kbps);
 }
 
 void MoQOutput::AudioInit(obs_encoder_t *encoder)

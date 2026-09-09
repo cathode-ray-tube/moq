@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Publish and consume human-readable audio and video rendition labels.
+- `moq_session_snapshot` for statistics and negotiated protocol from the same live connection
 
 ### Changed
 

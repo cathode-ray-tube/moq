@@ -920,31 +920,60 @@ impl OriginNode {
 	fn is_empty(&self) -> bool {
 		self.broadcast.is_none() && self.nested.is_empty()
 	}
+
+	/// Nodes in this subtree, counting self. Test-only: pruning is invisible
+	/// through the public surface, so the tests assert on the tree's size.
+	#[cfg(test)]
+	fn count(&self) -> usize {
+		1 + self.nested.values().map(|nested| nested.lock().count()).sum::<usize>()
+	}
 }
 
+/// A handle's view of an origin's path tree: the subtrees it may reach, named by
+/// path rather than by node handle.
+///
+/// Paths, because pruning removes empty nodes: a pinned `Lock<OriginNode>` outlives
+/// the prune as an orphan that publishes and resolves where no lookup can reach.
+/// Only [`Self::tree`] is stable, so every operation resolves against it and node
+/// identity lives in exactly one place. Scoping a handle therefore creates nothing
+/// in the tree; only a broadcast does.
 #[derive(Clone)]
 struct OriginNodes {
-	nodes: Vec<(PathOwned, Lock<OriginNode>)>,
+	// The tree root, shared by every handle derived from one origin. Never pruned:
+	// it hangs off no parent.
+	tree: Lock<OriginNode>,
+
+	// The reachable subtrees: the prefix relative to this handle's root (what
+	// `allowed()` advertises), paired with its absolute path under `tree`.
+	nodes: Vec<(PathOwned, PathOwned)>,
 }
 
 impl OriginNodes {
+	/// A view over a fresh tree with no reachable subtrees: it resolves nothing and
+	/// publishes nothing.
+	fn empty() -> Self {
+		Self {
+			tree: Lock::new(OriginNode::new()),
+			nodes: Vec::new(),
+		}
+	}
+
 	// Returns nested roots that match the prefixes.
 	// PathPrefixes guarantees no duplicates or overlapping prefixes.
 	pub fn select(&self, prefixes: &PathPrefixes) -> Option<Self> {
 		let mut roots = Vec::new();
 
-		for (root, state) in &self.nodes {
+		for (root, absolute) in &self.nodes {
 			for prefix in prefixes {
 				if root.has_prefix(prefix) {
-					// Keep the existing node if we're allowed to access it.
-					roots.push((root.to_owned(), state.clone()));
+					// Keep the existing subtree if we're allowed to access it.
+					roots.push((root.to_owned(), absolute.clone()));
 					continue;
 				}
 
 				if let Some(suffix) = prefix.strip_prefix(root) {
 					// If the requested prefix is larger than the allowed prefix, then we further scope it.
-					let nested = state.lock().leaf(&suffix);
-					roots.push((prefix.to_owned(), nested));
+					roots.push((prefix.to_owned(), absolute.join(&suffix).to_owned()));
 				}
 			}
 		}
@@ -952,7 +981,7 @@ impl OriginNodes {
 		if roots.is_empty() {
 			None
 		} else {
-			Some(Self { nodes: roots })
+			Some(self.with_nodes(roots))
 		}
 	}
 
@@ -964,32 +993,38 @@ impl OriginNodes {
 			return Some(self.clone());
 		}
 
-		for (root, state) in &self.nodes {
+		for (root, absolute) in &self.nodes {
 			if let Some(suffix) = root.strip_prefix(&new_root) {
 				// If the old root is longer than the new root, shorten the keys.
-				roots.push((suffix.to_owned(), state.clone()));
+				roots.push((suffix.to_owned(), absolute.clone()));
 			} else if let Some(suffix) = new_root.strip_prefix(root) {
 				// If the new root is longer than the old root, add a new root.
 				// NOTE: suffix can't be empty
-				let nested = state.lock().leaf(&suffix);
-				roots.push(("".into(), nested));
+				roots.push(("".into(), absolute.join(&suffix).to_owned()));
 			}
 		}
 
 		if roots.is_empty() {
 			None
 		} else {
-			Some(Self { nodes: roots })
+			Some(self.with_nodes(roots))
 		}
 	}
 
-	// Returns the root that has this prefix.
-	pub fn get(&self, path: impl AsPath) -> Option<(Lock<OriginNode>, PathOwned)> {
+	fn with_nodes(&self, nodes: Vec<(PathOwned, PathOwned)>) -> Self {
+		Self {
+			tree: self.tree.clone(),
+			nodes,
+		}
+	}
+
+	// Returns the absolute path under `tree`, if this handle is allowed to reach it.
+	pub fn get(&self, path: impl AsPath) -> Option<PathOwned> {
 		let path = path.as_path();
 
-		for (root, state) in &self.nodes {
+		for (root, absolute) in &self.nodes {
 			if let Some(suffix) = path.strip_prefix(root) {
-				return Some((state.clone(), suffix.to_owned()));
+				return Some(absolute.join(&suffix).to_owned());
 			}
 		}
 
@@ -1000,7 +1035,8 @@ impl OriginNodes {
 impl Default for OriginNodes {
 	fn default() -> Self {
 		Self {
-			nodes: vec![("".into(), Lock::new(OriginNode::new()))],
+			tree: Lock::new(OriginNode::new()),
+			nodes: vec![("".into(), "".into())],
 		}
 	}
 }
@@ -1153,7 +1189,7 @@ impl Producer {
 		let (tasks, _) = TaskSet::new();
 		Self {
 			info,
-			nodes: OriginNodes { nodes: Vec::new() },
+			nodes: OriginNodes::empty(),
 			root: PathOwned::default(),
 			shared: kio::Shared::default(),
 			pool: cache::Pool::default(),
@@ -1207,8 +1243,12 @@ impl Producer {
 			return Err(Error::Closed);
 		}
 
-		let (node, rest) = self.nodes.get(&path).ok_or(Error::Unauthorized)?;
-		let full = self.root.join(&path).to_owned();
+		// `get` resolves the path against the tree root, which is the same absolute
+		// path the handle's own root produces: an allowed prefix is always stored
+		// alongside its absolute position. So one path serves both the front's
+		// identity and its position in the tree.
+		let full = self.nodes.get(&path).ok_or(Error::Unauthorized)?;
+		let tree = self.nodes.tree.clone();
 
 		// A decoded prefix and suffix are each within the wire limit, but their
 		// join might not be. Enforcing here bounds the tree depth and guarantees the path
@@ -1247,16 +1287,16 @@ impl Producer {
 		let origin = self.info();
 		let ctx = AttachContext {
 			origin: &origin,
-			node: &node,
+			tree: &tree,
 			full: &full,
-			rest: &rest,
 			tasks: &self.tasks,
 			timers: &self.timers,
 		};
-		let leaf = if rest.is_empty() {
-			node.clone()
+		// The root is its own leaf and is never pruned.
+		let leaf = if full.is_empty() {
+			tree.clone()
 		} else {
-			node.lock().leaf(&rest)
+			tree.lock().leaf(&full)
 		};
 		let (state, broadcast, id) = attach_source(&ctx, &leaf, &consumer);
 
@@ -1425,6 +1465,12 @@ impl Producer {
 	/// Converts a relative path to an absolute path.
 	pub fn absolute(&self, path: impl AsPath) -> Path<'_> {
 		self.root.join(path)
+	}
+
+	/// Nodes in the whole path tree, counting the root. Test-only.
+	#[cfg(test)]
+	pub(crate) fn node_count(&self) -> usize {
+		self.nodes.tree.lock().count()
 	}
 }
 
@@ -1798,9 +1844,7 @@ impl DriverState {
 			}
 		}
 
-		for (_, node) in &self.nodes.nodes {
-			teardown_broadcasts(node);
-		}
+		teardown_broadcasts(&self.nodes.tree);
 	}
 }
 
@@ -1986,11 +2030,12 @@ async fn run_source(task: SourceTask) {
 /// Everything about a source's attach that does not change between attempts.
 struct AttachContext<'a> {
 	origin: &'a Info,
-	node: &'a Lock<OriginNode>,
-	/// Absolute path, for the front's identity and log lines.
+	/// The origin's tree root: the one node pruning never removes, so the leaf is
+	/// resolved from here rather than pinned by a handle that a prune can orphan.
+	tree: &'a Lock<OriginNode>,
+	/// Absolute path: the front's identity, its log lines, and its position under
+	/// `tree` are all the same path.
 	full: &'a PathOwned,
-	/// Path relative to `node`, for locating (and later pruning) the leaf.
-	rest: &'a PathOwned,
 	/// Driver submission handle, for queueing a fresh front's task.
 	tasks: &'a Tasks,
 	/// The driver's clock, threaded into fronts for the track idle linger.
@@ -2073,8 +2118,8 @@ fn attach_source(
 	ctx.tasks.push(run_front(
 		state.clone(),
 		broadcast.clone(),
-		ctx.node.clone(),
-		ctx.rest.clone(),
+		ctx.tree.clone(),
+		ctx.full.clone(),
 		ctx.tasks.clone(),
 		ctx.timers.clone(),
 	));
@@ -2087,8 +2132,8 @@ fn attach_source(
 async fn run_front(
 	state: kio::Producer<FrontState>,
 	mut broadcast: broadcast::Producer,
-	node: Lock<OriginNode>,
-	rest: PathOwned,
+	tree: Lock<OriginNode>,
+	full: PathOwned,
 	tasks: Tasks,
 	slot: TimersSlot,
 ) {
@@ -2135,7 +2180,7 @@ async fn run_front(
 
 	// Remove the broadcast from the tree (identity-checked, so a replacement is
 	// untouched) and prune empty nodes.
-	node.lock().remove(&state, &rest);
+	tree.lock().remove(&state, &full);
 }
 
 /// Serves one spliced logical track: splices in the best source's copy of the
@@ -3453,7 +3498,7 @@ impl Consumer {
 	/// rather than tearing the stream down.
 	pub(crate) fn empty(&self) -> Self {
 		Self {
-			nodes: OriginNodes { nodes: Vec::new() },
+			nodes: OriginNodes::empty(),
 			..self.clone()
 		}
 	}
@@ -3490,8 +3535,8 @@ impl Consumer {
 	/// Internal synchronous lookup: the local broadcast at `path`, if any.
 	fn resolve(&self, path: impl AsPath) -> Option<broadcast::Consumer> {
 		let path = path.as_path();
-		let (root, rest) = self.nodes.get(&path)?;
-		let state = root.lock();
+		let rest = self.nodes.get(&path)?;
+		let state = self.nodes.tree.lock();
 		state.resolve_broadcast(&rest)
 	}
 
@@ -4115,6 +4160,52 @@ mod tests {
 		announced.assert_next_active("room/alice");
 		announced.assert_next_active("room/bob");
 		announced.assert_next_wait();
+	}
+
+	/// A handle names its subtrees by path, so scoping or rooting one creates
+	/// nothing in the tree; only a broadcast does, and its teardown prunes it back
+	/// out. Otherwise a relay grows by one node per distinct scope for as long as
+	/// it runs.
+	#[tokio::test]
+	async fn scoping_creates_no_nodes() {
+		let producer = origin(1).produce();
+		let bare = producer.node_count();
+
+		let scoped = producer
+			.consume()
+			.scope(&[Path::new("room/a"), Path::new("room/b")])
+			.unwrap();
+		assert_eq!(producer.node_count(), bare, "scoping should not create nodes");
+		assert!(producer.consume().with_root("room/c").is_some());
+		assert_eq!(producer.node_count(), bare, "rooting should not create nodes");
+		drop(scoped);
+
+		let mut broadcast = producer.create_broadcast("room/a/chat").unwrap();
+		assert_eq!(producer.node_count(), bare + 3, "room, a and chat");
+		broadcast.finish();
+		settle(|| producer.node_count() == bare).await;
+	}
+
+	/// A scoped handle resolves by path against the tree rather than through a
+	/// node handle, so pruning its subtree between two broadcasts cannot strand it
+	/// on an orphan no lookup reaches.
+	#[tokio::test]
+	async fn scoped_handles_survive_a_prune() {
+		let producer = origin(1).produce();
+		let scoped = producer.scope(&[Path::new("channel")]).unwrap();
+		let consumer = producer.consume().scope(&[Path::new("channel")]).unwrap();
+
+		// Create the scoped subtree and prune it straight back out.
+		let mut first = scoped.create_broadcast("channel/chat").unwrap();
+		assert!(consumer.get_broadcast("channel/chat").is_some());
+		first.finish();
+		settle(|| consumer.get_broadcast("channel/chat").is_none()).await;
+
+		let _second = scoped.create_broadcast("channel/chat").unwrap();
+		assert!(
+			consumer.get_broadcast("channel/chat").is_some(),
+			"the source attached into an orphan"
+		);
 	}
 
 	#[tokio::test]

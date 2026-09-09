@@ -566,6 +566,20 @@ pub struct Resolved {
 }
 
 impl Resolved {
+	/// The congestion control family to install.
+	///
+	/// Delay-based unless the operator says otherwise: BBR keeps queues short and the
+	/// send rate steady enough for a live encoder to track, which is what this stack
+	/// carries. Every backend resolves the default here rather than each picking its
+	/// own, so the answer can't drift between them.
+	#[cfg_attr(
+		not(any(feature = "quinn", feature = "noq", feature = "quiche", feature = "iroh")),
+		allow(dead_code)
+	)]
+	pub(crate) fn congestion(&self) -> CongestionControl {
+		self.congestion_control.unwrap_or(CongestionControl::Delay)
+	}
+
 	/// The directory to write qlog traces into, if any.
 	///
 	/// Only meaningful once [`Config::validate`] has passed; a build without the

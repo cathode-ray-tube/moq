@@ -83,7 +83,7 @@ pub mod websocket;
 // new `pub` item in these modules doesn't silently join it.
 pub use client::Client;
 pub use connect::{Addrs, ConnectError};
-pub use connection::{Backoff, Connection, ConnectionStatsReader, GoawayConfig, Redirect, Status};
+pub use connection::{Backoff, Connection, ConnectionSnapshot, ConnectionStatsReader, GoawayConfig, Redirect, Status};
 pub use deprecated::Deprecated;
 pub use duration::Duration;
 pub use error::{Error, Result};

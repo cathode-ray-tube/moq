@@ -198,6 +198,62 @@ pub struct moq_video_init {
 	pub label: *const c_char,
 	/// Length of `label` in bytes.
 	pub label_len: usize,
+
+	/// Catalog fields the bitstream cannot reveal itself. Zeroed means none.
+	pub hint: moq_video_hint,
+}
+
+/// Optional catalog fields for [moq_video_init::hint].
+///
+/// Zero the struct and set only the `has_*` flags you want. Hints fill gaps the
+/// bitstream leaves (especially bitrate); a value the stream detects later wins
+/// for dimensions.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Default)]
+pub struct moq_video_hint {
+	/// Encoded width in pixels when `has_coded` is true.
+	pub coded_width: u32,
+	/// Encoded height in pixels when `has_coded` is true.
+	pub coded_height: u32,
+	/// Whether `coded_width` and `coded_height` are present.
+	pub has_coded: bool,
+
+	/// Maximum bitrate in bits per second when `has_bitrate` is true.
+	pub bitrate: u64,
+	/// Whether `bitrate` is present.
+	pub has_bitrate: bool,
+
+	/// Frame rate when `has_framerate` is true.
+	pub framerate: f64,
+	/// Whether `framerate` is present.
+	pub has_framerate: bool,
+
+	/// Latency-optimized decode when `has_optimize_for_latency` is true.
+	pub optimize_for_latency: bool,
+	/// Whether `optimize_for_latency` is present.
+	pub has_optimize_for_latency: bool,
+}
+
+impl moq_video_hint {
+	/// The catalog hint these flags describe.
+	fn resolve(&self) -> moq_mux::catalog::VideoHint {
+		let mut out = moq_mux::catalog::VideoHint::default();
+		if self.has_coded {
+			out.coded_width = Some(self.coded_width);
+			out.coded_height = Some(self.coded_height);
+		}
+		if self.has_bitrate {
+			out.bitrate = Some(self.bitrate);
+		}
+		if self.has_framerate {
+			out.framerate = Some(self.framerate);
+		}
+		if self.has_optimize_for_latency {
+			out.optimize_for_latency = Some(self.optimize_for_latency);
+		}
+		out
+	}
 }
 
 /// Configuration for [moq_publish_container].
@@ -545,6 +601,16 @@ pub struct moq_announced {
 	/// Whether the broadcast is active or has ended
 	/// This MUST toggle between true and false over the lifetime of the broadcast
 	pub active: bool,
+}
+
+/// Statistics and protocol sampled from the same connection by [moq_session_snapshot].
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct moq_connection_snapshot {
+	/// Transport statistics, with per-metric availability flags.
+	pub stats: moq_connection_stats,
+	/// Negotiated draft name, backed by static storage valid for the process lifetime.
+	pub protocol: moq_string,
 }
 
 /// A snapshot of connection statistics, filled in by [moq_session_stats].
@@ -1085,6 +1151,32 @@ pub unsafe extern "C" fn moq_session_stats(session: u32, dst: *mut moq_connectio
 	})
 }
 
+/// Snapshot statistics and the negotiated protocol from the same live connection.
+///
+/// Returns zero on success, or a negative code when the handle is unknown or offline
+/// between reconnects. On failure, `dst` is untouched. The protocol string points at
+/// static storage valid for the process lifetime and must not be freed.
+///
+/// # Safety
+/// - `dst` must point at a writable [moq_connection_snapshot] struct.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moq_session_snapshot(session: u32, dst: *mut moq_connection_snapshot) -> i32 {
+	ffi::enter(move || {
+		let session = ffi::parse_id(session)?;
+		let dst = unsafe { dst.as_mut() }.ok_or(Error::InvalidPointer)?;
+		let snapshot = State::lock().session.snapshot(session)?;
+		let name = snapshot.version.as_str();
+		*dst = moq_connection_snapshot {
+			stats: moq_connection_stats::from(&snapshot.stats),
+			protocol: moq_string {
+				data: name.as_ptr().cast::<c_char>(),
+				len: name.len(),
+			},
+		};
+		Ok(())
+	})
+}
+
 /// Create an origin for publishing broadcasts.
 ///
 /// Origins contain any number of broadcasts addressed by path.
@@ -1389,6 +1481,7 @@ pub unsafe extern "C" fn moq_publish_video(broadcast: u32, config: *const moq_vi
 
 		let mut video = moq_mux::import::VideoInit::new(video_format_from_u32(config.format)?, init.to_vec());
 		video.label = label.map(str::to_string);
+		video.hint = config.hint.resolve();
 
 		State::lock().publish.video(broadcast, video)
 	})

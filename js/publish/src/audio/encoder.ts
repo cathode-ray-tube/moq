@@ -154,6 +154,10 @@ export class Encoder {
 	// discontinuity and re-anchors on.
 	#pipeline: Pipeline | undefined;
 
+	// The fatal error an AudioEncoder reported, if any. That instance can never encode again and
+	// reconfiguring it would be a retry, so the rendition stays down for the life of this encoder.
+	#fatal = new Signal<Error | undefined>(undefined);
+
 	#signals = new Effect();
 
 	constructor(name: string, props?: EncoderProps) {
@@ -239,15 +243,32 @@ export class Encoder {
 		// Publish the resolved config; undefined (no capture) drops it from the catalog.
 		effect.proxy(rendition.config, this.out.catalog);
 
+		// The pipeline outlives any one subscription: it is built as soon as capture runs and
+		// #encode reads the live producer per frame rather than subscribing to it. Rebuilding on a
+		// swap would close the AudioEncoder, which discards every chunk the codec still holds, and
+		// would restart the framer mid-frame, so the output fell permanently behind its input.
+		effect.run((effect) => {
+			const enabled = effect.get(this.in.enabled);
+			const capture = effect.get(this.in.capture);
+			const format = capture ? effect.get(capture.out.format) : undefined;
+			const fatal = effect.get(this.#fatal);
+			if (!enabled || !format || fatal) return;
+
+			this.#encode(rendition.track, format, effect);
+		});
+
 		effect.run((effect) => {
 			const enabled = effect.get(this.in.enabled);
 			const capture = effect.get(this.in.capture);
 			const format = capture ? effect.get(capture.out.format) : undefined;
 			const track = effect.get(rendition.track);
-			effect.set(this.#out.active, enabled && !!format && !!track, false);
-			if (!enabled || !format || !track) return;
+			const fatal = effect.get(this.#fatal);
 
-			this.#encode(track, format, effect);
+			// A dead encoder can't serve anyone, so the current subscriber and every later one get
+			// the real error rather than a track that stays silent.
+			if (fatal) track?.close(fatal);
+
+			effect.set(this.#out.active, enabled && !!format && !!track && !fatal, false);
 		});
 	}
 
@@ -296,9 +317,9 @@ export class Encoder {
 		return opus;
 	}
 
-	// Encode captured audio frames into the track producer. The broadcast owns the track's lifetime, so
-	// this only aborts it on a fatal encoder error, never on teardown.
-	#encode(track: Moq.Track.Producer, format: Format, effect: Effect): void {
+	// Encode captured audio frames into whichever track producer is live. The broadcast owns the
+	// track's lifetime, so this never closes it; a fatal encoder error is reported through #fatal.
+	#encode(track: Getter<Moq.Track.Producer | undefined>, format: Format, effect: Effect): void {
 		effect.spawn(async () => {
 			// We're using an async polyfill temporarily for Safari support.
 			await Util.Libav.polyfill();
@@ -343,14 +364,16 @@ export class Encoder {
 
 						// Each audio frame is its own group so the relay can forward it without
 						// waiting for a group boundary. Loss is handled by the codec's PLC.
-						track.writeFrame({
+						track.peek()?.writeFrame({
 							payload: Container.Legacy.encodeFrame(frame, frame.timestamp as Time.Micro),
 							timestamp: Time.Timestamp.fromMicros(frame.timestamp as Time.Micro),
 						});
 					},
 					error: (err) => {
 						console.error("encoder error", err);
-						track.close(err);
+						// #runRegister owns the abort, so the current producer and every later one
+						// are closed with this in one place.
+						this.#fatal.set(err);
 					},
 				});
 				// A fatal error already closed the codec, and closing it twice throws.
@@ -368,6 +391,10 @@ export class Encoder {
 						if (!input) return;
 
 						for (const data of framer.push(input)) {
+							// The demand gate. The framer still consumes every sample so its timestamps stay
+							// on the capture clock, but there is nowhere to send a chunk with no subscriber.
+							if (!track.peek()) continue;
+
 							const joinedLength = data.channels.reduce((total, channel) => total + channel.length, 0);
 							const joined = new Float32Array(joinedLength);
 

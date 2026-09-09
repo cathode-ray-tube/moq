@@ -34,6 +34,9 @@ impl BackendError {
 pub struct Resampler {
 	resampler: Async<f32>,
 	chunk_frames: usize,
+	/// Rate the caller's input arrives at, for walking [`held`](Self::held) over
+	/// the frames each chunk consumes.
+	input_rate: u32,
 	/// Output frames per input frame, for sizing the flushed tail.
 	ratio: f64,
 	/// Output frames the sinc filter holds behind what it has already emitted.
@@ -49,6 +52,10 @@ pub struct Resampler {
 	output_planar: Vec<Vec<f32>>,
 	output_frames_max: usize,
 	pending: Vec<f32>,
+	/// Where the oldest input frame still buffered came from, walked forward as
+	/// chunks are consumed so it also names where the next input lands once
+	/// nothing is buffered. `None` until the first input.
+	held: Option<moq_net::Timestamp>,
 }
 
 impl Resampler {
@@ -86,6 +93,7 @@ impl Resampler {
 		Ok(Self {
 			resampler,
 			chunk_frames,
+			input_rate,
 			ratio,
 			delay,
 			started: false,
@@ -95,24 +103,38 @@ impl Resampler {
 			output_planar,
 			output_frames_max,
 			pending: Vec::new(),
+			held: None,
 		})
 	}
 
 	/// Output frames dropped so far as the filter's startup silence.
 	///
 	/// The output runs that much shorter than the input it was built from, so a
-	/// caller stamping its output has to reach back over this as well as over what
-	/// is still buffered.
+	/// caller stamping its output has to reach back this far from the buffered
+	/// input's source timestamp.
 	pub fn skipped(&self) -> usize {
 		self.delay - self.skip
 	}
 
 	/// Input frames buffered from earlier calls, waiting for enough to fill a chunk.
-	///
-	/// The next output starts with these, so a caller stamping its output has to
-	/// reach back this far.
 	pub fn pending_frames(&self) -> usize {
 		self.pending.len() / self.channels
+	}
+
+	/// Where the input the next output starts with came from.
+	///
+	/// The resampler works in fixed chunks, so it holds back whatever didn't fill
+	/// one and the next output begins with those held frames rather than with the
+	/// samples just fed in. This is the stamp they arrived under, taken from
+	/// [`process`](Self::process) rather than derived by counting backwards from
+	/// the newest one, so a jump in the source timeline moves the audio after it
+	/// and leaves the audio before it where it belongs. Once nothing is buffered it
+	/// names where the next input lands, which is where a
+	/// [`drain`](Self::drain) or [`flush`](Self::flush) tail begins.
+	///
+	/// `None` until the first input, where the caller's own stamp is the answer.
+	pub(crate) fn held_at(&self) -> Option<moq_net::Timestamp> {
+		self.held
 	}
 
 	/// Drop everything held, buffered input and filter state alike, returning to
@@ -126,6 +148,7 @@ impl Resampler {
 		self.pending.clear();
 		self.skip = self.delay;
 		self.started = false;
+		self.held = None;
 	}
 
 	/// Resample what is still buffered, ending the stream.
@@ -187,7 +210,7 @@ impl Resampler {
 			// neither the output nor the skip, which cannot repeat.
 			let skip_before = self.skip;
 			self.pending.resize(self.chunk_frames * self.channels, 0.0);
-			let produced = self.process(&[])?;
+			let produced = self.convert().map_err(BackendError::into_public)?;
 			if produced.is_empty() && self.skip == skip_before {
 				break;
 			}
@@ -200,9 +223,12 @@ impl Resampler {
 
 	/// Resample interleaved `f32` input into interleaved `f32` output.
 	///
+	/// `at` is where the first of `samples` was presented, so buffered input keeps
+	/// its source timestamp across calls.
+	///
 	/// Returns whatever the resampler can produce given the input and
 	/// the chunk size; remaining samples are buffered for the next call.
-	pub fn process(&mut self, samples: &[f32]) -> Result<Vec<f32>, Error> {
+	pub fn process(&mut self, samples: &[f32], at: moq_net::Timestamp) -> Result<Vec<f32>, Error> {
 		if !samples.len().is_multiple_of(self.channels) {
 			return Err(Error::Misaligned {
 				got: samples.len(),
@@ -210,13 +236,31 @@ impl Resampler {
 			});
 		}
 
+		// Nothing buffered means the output resumes with these samples.
+		if self.pending.is_empty() {
+			self.held = Some(at);
+		}
+
 		self.started |= !samples.is_empty();
-		self.process_inner(samples).map_err(BackendError::into_public)
+		self.pending.extend_from_slice(samples);
+		let buffered = self.pending.len();
+		let out = self.convert().map_err(BackendError::into_public)?;
+
+		// Earlier calls leave less than one chunk, so consuming any chunk also
+		// consumes all their samples. The remainder belongs to this packet.
+		// Convert its total consumed duration once to preserve fractional progress.
+		if self.pending.len() < buffered {
+			let consumed = (samples.len() - self.pending.len()) / self.channels;
+			let elapsed =
+				moq_net::Timestamp::from_scale(consumed as u64, self.input_rate as u64)?.convert(at.scale())?;
+			self.held = Some(at.checked_add(elapsed)?);
+		}
+
+		Ok(out)
 	}
 
-	fn process_inner(&mut self, samples: &[f32]) -> Result<Vec<f32>, BackendError> {
-		self.pending.extend_from_slice(samples);
-
+	/// Convert every whole chunk that is buffered, keeping the remainder.
+	fn convert(&mut self) -> Result<Vec<f32>, BackendError> {
 		let chunk_samples = self.chunk_frames * self.channels;
 		let mut out = Vec::new();
 		while self.pending.len() >= chunk_samples {
@@ -290,6 +334,11 @@ pub(crate) fn remix(samples: &[f32], input_channels: u32, output_channels: u32) 
 mod tests {
 	use super::*;
 
+	/// `frames` into a stream at `rate`, as a timestamp in the source's own scale.
+	fn at(frames: u64, rate: u64) -> moq_net::Timestamp {
+		moq_net::Timestamp::from_scale(frames, rate).unwrap()
+	}
+
 	#[test]
 	fn rejects_zero_chunk_frames() {
 		let r = Resampler::new(48_000, 48_000, 2, 0);
@@ -302,8 +351,8 @@ mod tests {
 		let input: Vec<f32> = (0..44_100)
 			.map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44_100.0).sin() * 0.5)
 			.collect();
-		let mut out = r.process(&input).unwrap();
-		out.extend(r.process(&vec![0.0; 1024]).unwrap());
+		let mut out = r.process(&input, at(0, 44_100)).unwrap();
+		out.extend(r.process(&vec![0.0; 1024], at(44_100, 44_100)).unwrap());
 		assert!(
 			(47_000..50_000).contains(&out.len()),
 			"expected ~48k samples, got {}",
@@ -326,7 +375,7 @@ mod tests {
 		let mut input = vec![0.0f32; 1024];
 		input[1000] = 1.0;
 
-		let body = r.process(&input).unwrap();
+		let body = r.process(&input, at(0, 44_100)).unwrap();
 		let tail = r.flush().unwrap();
 
 		let peak = |samples: &[f32]| samples.iter().fold(0.0f32, |max, s| max.max(s.abs()));
@@ -346,7 +395,7 @@ mod tests {
 		let mut input = vec![0.0f32; 1764];
 		input[1750] = 1.0;
 
-		let body = r.process(&input).unwrap();
+		let body = r.process(&input, at(0, 44_100)).unwrap();
 		assert_eq!(r.pending_frames(), 0, "the input should divide evenly");
 
 		let tail = r.flush().unwrap();
@@ -366,7 +415,7 @@ mod tests {
 	fn flush_sizes_a_stream_shorter_than_a_chunk() {
 		let mut r = Resampler::new(44_100, 48_000, 1, 882).unwrap();
 
-		let body = r.process(&[0.25f32; 441]).unwrap();
+		let body = r.process(&[0.25f32; 441], at(0, 44_100)).unwrap();
 		let tail = r.flush().unwrap();
 
 		// 441 frames at 44.1 kHz is 480 at 48 kHz, and that is all it can be.
@@ -382,7 +431,7 @@ mod tests {
 	fn flush_survives_a_chunk_smaller_than_the_delay() {
 		let mut r = Resampler::new(44_100, 48_000, 1, 32).unwrap();
 
-		let body = r.process(&[0.5f32; 20]).unwrap();
+		let body = r.process(&[0.5f32; 20], at(0, 44_100)).unwrap();
 		let tail = r.flush().unwrap();
 
 		let total = body.len() + tail.len();
@@ -403,7 +452,7 @@ mod tests {
 
 		let mut input = vec![0.0f32; 1024];
 		input[1000] = 1.0;
-		let body = r.process(&input).unwrap();
+		let body = r.process(&input, at(0, 44_100)).unwrap();
 		let tail = r.drain().unwrap();
 
 		let peak = |samples: &[f32]| samples.iter().fold(0.0f32, |max, s| max.max(s.abs()));
@@ -416,8 +465,61 @@ mod tests {
 
 		// Silence in, silence out: nothing is carried over the gap.
 		assert_eq!(r.pending_frames(), 0);
-		let after = r.process(&vec![0.0f32; 1024]).unwrap();
+		assert_eq!(r.held_at(), None, "the drain should forget where the old stream was");
+		let after = r.process(&vec![0.0f32; 1024], at(2048, 44_100)).unwrap();
 		assert!(peak(&after) < 0.01, "audio crossed the gap: peak {}", peak(&after));
+	}
+
+	/// The output starts with the frames held back from an earlier call, so it
+	/// begins where those arrived rather than where the newest input did. Counting
+	/// backwards from the newest stamp gets the same answer only while the source
+	/// runs contiguous; a jump moves it by the whole jump.
+	#[test]
+	fn held_frames_keep_the_stamp_they_arrived_under() {
+		let mut r = Resampler::new(44_100, 48_000, 1, 882).unwrap();
+
+		// Half a chunk, so all of it is held and nothing comes out.
+		assert!(r.process(&[0.25f32; 441], at(0, 44_100)).unwrap().is_empty());
+		assert_eq!(r.held_at(), Some(at(0, 44_100)));
+
+		// A second later, and the output it completes still starts back at zero.
+		assert!(!r.process(&[0.25f32; 441], at(44_100, 44_100)).unwrap().is_empty());
+		assert_eq!(
+			r.held_at(),
+			Some(at(44_541, 44_100)),
+			"the tail starts at the end of the last packet consumed"
+		);
+	}
+
+	/// With nothing buffered the next output starts with the next input, so a
+	/// stream that resumes somewhere else stamps from there and not from where the
+	/// old one left off.
+	#[test]
+	fn an_emptied_buffer_re_anchors_on_the_next_input() {
+		let mut r = Resampler::new(44_100, 48_000, 1, 882).unwrap();
+
+		r.process(&[0.25f32; 882], at(0, 44_100)).unwrap();
+		assert_eq!(r.pending_frames(), 0);
+
+		r.process(&[0.25f32; 441], at(44_100, 44_100)).unwrap();
+		assert_eq!(r.held_at(), Some(at(44_100, 44_100)));
+	}
+
+	#[test]
+	fn leftover_frames_keep_the_new_packet_timestamp() {
+		let mut r = Resampler::new(44_100, 48_000, 1, 882).unwrap();
+		r.process(&[0.25; 441], at(0, 44_100)).unwrap();
+		r.process(&[0.25; 882], at(44_100, 44_100)).unwrap();
+		assert_eq!(r.pending_frames(), 441);
+		assert_eq!(r.held_at(), Some(at(44_541, 44_100)));
+	}
+
+	#[test]
+	fn held_timestamp_preserves_fractional_chunk_progress() {
+		let mut r = Resampler::new(11_025, 48_000, 1, 220).unwrap();
+		r.process(&vec![0.25; 11_025], at(0, 1000)).unwrap();
+		assert_eq!(r.pending_frames(), 25);
+		assert_eq!(r.held_at(), Some(at(997, 1000)));
 	}
 
 	#[test]
