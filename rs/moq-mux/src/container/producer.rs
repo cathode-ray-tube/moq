@@ -1,5 +1,5 @@
 use super::{Container, Frame};
-use crate::container::{FrameEncrypter};
+use crate::container::FrameEncrypter;
 
 /// A producer for media tracks that manages group boundaries.
 ///
