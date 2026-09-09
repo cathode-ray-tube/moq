@@ -75,8 +75,3 @@ On main, additive.
 
 - [Lite stream](/quest/m2/auth/lite.md) - supplies `moq_net::auth` and the
   shared handle this binds to the IETF wire
-
-## Related
-
-- [IETF error codes](/quest/m0/ietf-error-codes.md) - the registered codes
-  AUTH_ERROR reuses

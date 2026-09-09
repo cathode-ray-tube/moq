@@ -22,7 +22,7 @@ FETCH in favor of the fill fetch streams moq-net already serves. `js/net` throws
 
 What the tree does today:
 
-- `write_fetch_ok` (`rs/moq-net/src/ietf/publisher.rs:1251`) encodes
+- `write_fetch_ok` (`rs/moq-net/src/ietf/publisher.rs:938`) encodes
   `ietf::FetchOk` only on draft-14. The `Draft15 | Draft16` arm and the `_`
   default both encode `ietf::RequestOk`, so drafts 15 through 20 answer with the
   wrong message. moq-playa reports it as
@@ -65,9 +65,8 @@ The work:
   smaller than Start. `end_of_track` stays false.
 - A joining fetch naming a request id with no subscription keeps the existing
   refusal, alongside the standalone, absolute joining and non-zero offset cases.
-  The literal `500` stays for now; [IETF error codes](/quest/m0/ietf-error-codes.md)
-  already lists `run_fetch_stream` as one of its sites and replaces it with the
-  registered value.
+  Those refusals already carry the registered code for the negotiated draft,
+  since #3531 routed `reject_fetch` through `write_fetch_error`.
 
 Tests, per version, since the message type is version-dependent and no test
 covers what the publisher actually writes:
@@ -91,6 +90,5 @@ covers what the publisher actually writes:
 
 ## Related
 
-- [IETF error codes](/quest/m0/ietf-error-codes.md) - replaces the 500 the refusals still use
 - [LARGEST_OBJECT](/quest/m0/3558-ietf-largest-object-encoding.md) - the other draft-18 interop defect from the same reporter
 - [TRACK_STATUS refusal](/quest/m0/3492-ietf-track-status-refusal.md) - the same shape: answer the request properly instead of leaving the peer guessing
