@@ -17,6 +17,9 @@ Keep the body short and structured, not narrated.
 When pushing additional commits to an existing PR, update the title and description if needed.
 When taking over someone else's PR, push commits on top of theirs so they keep credit.
 
+Create a draft PR.
+Switch it to "Ready for review" when you're finished and local `just check` and `just test` pass.
+
 # CI
 
 `Check` and `Test` compile the packages a branch changed and run their unit tests.
