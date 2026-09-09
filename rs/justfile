@@ -9,9 +9,8 @@
 
 set working-directory := '..'
 
-# Plain `cargo` unless set. A developer can select a compatible wrapper such as
-# mbx to share build artifacts across worktrees instead of using one target/
-# per worktree.
+# Plain `cargo` unless set. CI sets it to `mbx`, and so can a developer who
+# wants mbx's shared build store instead of a target/ per worktree.
 #
 # Every recipe that compiles reads it, with three exceptions. `package` hands
 # nfpm a literal target/release path, and a managed target/ is a symlink.
@@ -23,6 +22,13 @@ set working-directory := '..'
 # program name.
 _rust_cargo := env_var_or_default("RUST_CARGO", "cargo")
 cargo_compile := if _rust_cargo == "" { "cargo" } else { _rust_cargo }
+
+# `moq-net-fuzz` is a workspace member only so it shares the root lockfile; libFuzzer
+# needs a nightly toolchain and sanitizer flags, so `just rs fuzz` is the one recipe
+# that may compile it. Every `--workspace` below therefore carries this, and a new
+# one that forgets it pays a vendored C++ libFuzzer build for nothing. The root
+# justfile's `check-all` and `fix-all` spell it out, since a module cannot read this.
+no_fuzz := "--exclude moq-net-fuzz"
 
 default:
     just check
@@ -52,24 +58,9 @@ check *args:
     {{ cargo_compile }} clippy --locked --all-targets {{ args }} -- -D warnings
     cargo fmt --all --check
     just rs _doc-names
-    just rs _fuzz-lock
     RUSTDOCFLAGS="-D warnings" {{ cargo_compile }} doc --locked --no-deps {{ args }}
     cargo shear
     cargo sort --workspace --check --no-format
-
-# The fuzz harness is its own workspace, because libFuzzer needs nightly and
-# sanitizer flags. Nothing in `check` or `test` builds it, so its lockfile drifts
-# from the path dependencies it shares with the main workspace and nobody finds out
-# until a `just rs fuzz` silently re-resolves it. Re-resolving against the committed
-# lock is metadata only, so it costs no compilation and can sit in the PR gate.
-_fuzz-lock:
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    if ! cargo metadata --locked --format-version 1 --manifest-path rs/moq-net/fuzz/Cargo.toml > /dev/null; then
-        echo "rs: run: cargo update --manifest-path rs/moq-net/fuzz/Cargo.toml --workspace" >&2
-        exit 1
-    fi
 
 # Two targets whose names differ only by `-` vs `_` render to the same
 # `target/doc/<name>`, and a `cargo doc` that selects both races to clean it: the
@@ -183,8 +174,19 @@ _select $FILES:
     # `--no-deps` keeps this to workspace members and off the network.
     metadata=$(cargo metadata --format-version 1 --no-deps)
 
-    # Every crate directory is named after the crate it holds, which is what
-    # makes a changed path a seed below. Verify it rather than trust it: under-
+    # A seed is the first path segment under `rs/`, so only a crate whose manifest
+    # sits directly at `rs/<dir>/Cargo.toml` can ever be one. Drop the rest here:
+    # `moq-net-fuzz` lives at `rs/moq-net/fuzz`, so its seed is already `moq-net`,
+    # and leaving it in the graph would select it as a dependent of the crate it
+    # fuzzes and compile libFuzzer on every moq-net diff.
+    #
+    # `manifest_path` is a native path, so normalize the separator before splitting
+    # on it. Windows would otherwise match no segment, drop every package, and
+    # select nothing at all, where the assertion below fails safe to ALL.
+    metadata=$(jq '.packages |= map((.manifest_path |= gsub("\\\\"; "/")) | select(.manifest_path | split("/")[-3] == "rs"))' <<< "$metadata")
+
+    # Every remaining crate directory is named after the crate it holds, which is
+    # what makes a changed path a seed below. Verify it rather than trust it: under-
     # selecting silently checks nothing, so fall back to checking everything.
     if jq -e '.packages[] | select((.manifest_path | split("/")[-2]) != .name)' <<< "$metadata" > /dev/null; then
     	echo "rs: a crate directory no longer matches its crate name; selecting everything." >&2
@@ -251,8 +253,8 @@ _select $FILES:
 # spelling keeps those call sites working whatever spec form `_select` uses; the
 # previous alternation matched `--package <name>` literally and silently stopped
 # firing the moment the spec form changed. Ids are `path+file://<dir>#<version>`
-# and `_select` has already verified every crate directory matches its crate
-# name, so the last path segment is the name.
+# and `_select` only emits crates whose directory it has verified matches
+# their crate name, so the last path segment is the name.
 
 # True when a selection includes a crate the wasm32 pass covers. One predicate
 # rather than the same alternation in each gate, so the test below exercises what
@@ -324,6 +326,13 @@ _select-test:
     [[ -z "$(just rs _select "rs/scripts/package-binary.sh")" ]] \
     	|| fail "a non-crate seed must select nothing"
 
+    # A crate nested inside another crate's directory is covered by its parent's
+    # seed. Selecting it directly would compile libFuzzer on every moq-net diff,
+    # and its directory name is not its crate name, so it would also mis-report.
+    fuzz=$(just rs _names "$(just rs _select "rs/moq-net/fuzz/fuzz_targets/lite.rs")")
+    grep -qw moq-net <<< "$fuzz" || fail "a fuzz diff must select moq-net: $fuzz"
+    ! grep -qw fuzz <<< "$fuzz" || fail "a fuzz diff must not select the harness: $fuzz"
+
     echo "rs: selection ok"
 
 # Published crates need the current workspace version as the lower bound for
@@ -367,7 +376,7 @@ check-changed $FILES:
     packages=$(just rs _select "$FILES")
     case "$packages" in
     	"")    echo "rs: no crates affected; skipping." ;;
-    	ALL)   just rs check --workspace ;;
+    	ALL)   just rs check --workspace {{ no_fuzz }} ;;
     	*)     echo "rs: checking $(just rs _names "$packages")"; just rs check $packages ;;
     esac
 
@@ -425,7 +434,7 @@ fix-changed $FILES:
     packages=$(just rs _select "$FILES")
     case "$packages" in
     	"")    echo "rs: no crates affected; skipping." ;;
-    	ALL)   just rs fix --workspace ;;
+    	ALL)   just rs fix --workspace {{ no_fuzz }} ;;
     	*)     echo "rs: fixing $(just rs _names "$packages")"; just rs fix $packages ;;
     esac
 
@@ -456,7 +465,7 @@ fix-changed $FILES:
 
 # Compile the whole workspace on a Windows host. Must run ON Windows.
 windows *args:
-    {{ cargo_compile }} check --locked --workspace --exclude moq-gst --all-targets --features "moq-cli/play moq-cli/capture" {{ args }}
+    {{ cargo_compile }} check --locked --workspace --exclude moq-gst {{ no_fuzz }} --all-targets --features "moq-cli/play moq-cli/capture" {{ args }}
 
 # Compile and test the io_uring relay path, which is off the default feature set.
 # Linux-only, and the tests below the 6.12 kernel floor skip themselves.
@@ -587,16 +596,16 @@ relay-minimal:
 
 # Compile the workspace at the feature extremes.
 features:
-    {{ cargo_compile }} check --locked --workspace --all-targets --no-default-features
+    {{ cargo_compile }} check --locked --workspace {{ no_fuzz }} --all-targets --no-default-features
     {{ cargo_compile }} hack check --locked -p moq-tokio --each-feature --features aws-lc-rs
     {{ cargo_compile }} check --locked -p moq-relay --no-default-features
     just rs relay-minimal
     {{ cargo_compile }} check --locked -p moq-cli --no-default-features
     {{ cargo_compile }} check --locked -p moq-bench --no-default-features
     {{ cargo_compile }} check --locked -p moq-boy --no-default-features
-    {{ cargo_compile }} clippy --locked --workspace --all-targets --all-features -- -D warnings
-    RUSTDOCFLAGS="-D warnings" {{ cargo_compile }} doc --locked --workspace --all-features --no-deps
-    {{ cargo_compile }} nextest run --locked --workspace --all-targets --all-features
+    {{ cargo_compile }} clippy --locked --workspace {{ no_fuzz }} --all-targets --all-features -- -D warnings
+    RUSTDOCFLAGS="-D warnings" {{ cargo_compile }} doc --locked --workspace {{ no_fuzz }} --all-features --no-deps
+    {{ cargo_compile }} nextest run --locked --workspace {{ no_fuzz }} --all-targets --all-features
 
 # nextest, not `cargo test`, so a wedged test is killed instead of pinning a core
 # until someone notices (`.config/nextest.toml` sets the timeout). The trade is
@@ -646,7 +655,7 @@ test-changed $FILES:
     packages=$(just rs _select "$FILES")
     case "$packages" in
     	"")    echo "rs: no crates affected; skipping tests." ;;
-    	ALL)   just rs test --workspace ;;
+    	ALL)   just rs test --workspace {{ no_fuzz }} ;;
     	*)     echo "rs: testing $(just rs _names "$packages")"; just rs test --no-tests=pass $packages ;;
     esac
 

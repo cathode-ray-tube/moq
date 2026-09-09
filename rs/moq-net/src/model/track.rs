@@ -252,6 +252,16 @@ struct Slot {
 	visible: bool,
 }
 
+/// Heap the track keeps per cached group, excluding the group itself
+/// ([`group::CACHE_OVERHEAD`]).
+///
+/// One [`Slot`] under its sequence in `lookup`, plus a hint in each of `arrival` and
+/// `evict`. Doubled because both containers run half empty in the worst case: a
+/// `BTreeMap` node sits between half and fully packed, and a `VecDeque` holds up to
+/// twice the entries in it. Half of [`cache::ENTRY_OVERHEAD`]; see it for why this is
+/// derived rather than measured.
+pub(crate) const CACHE_OVERHEAD: u64 = 2 * (size_of::<u64>() + size_of::<Slot>() + 2 * size_of::<(u64, u32)>()) as u64;
+
 /// The registered subscriptions, aggregated by the producer.
 type Subscriptions = Vec<kio::Consumer<Subscription>>;
 
@@ -6953,7 +6963,11 @@ mod test {
 		assert!(consumer.peek_group(2).is_some(), "latest group survives");
 		// Steady state carries the protected live edge plus the just-demoted group
 		// (debt is charged before the demotion, so eviction lags one append).
-		assert!(pool.used() <= 21_000, "usage hovers near capacity: {}", pool.used());
+		assert!(
+			pool.used() <= 2 * (10_000 + cache::ENTRY_OVERHEAD),
+			"usage hovers near capacity: {}",
+			pool.used()
+		);
 
 		// A fresh subscriber skips the evicted groups entirely.
 		let mut subscriber = producer.subscribe(replay());
@@ -7030,21 +7044,24 @@ mod test {
 	/// far smaller write.
 	#[tokio::test]
 	async fn small_writes_carry_debt() {
-		let (mut producer, pool) = pooled_producer(22_000);
+		// Payloads dwarf the fixed per-group charge, so the budget arithmetic below is
+		// about bytes written rather than bookkeeping.
+		let unit = 100 * cache::ENTRY_OVERHEAD;
+		let (mut producer, pool) = pooled_producer(22 * unit);
 		let consumer = producer.consume();
 
-		finished_group(&mut producer, 20_000); // seq 0, the large victim-to-be
+		finished_group(&mut producer, 20 * unit as usize); // seq 0, the large victim-to-be
 
 		// The first few small writes owe far less than seq 0's size: the debt
 		// carries over instead of evicting it.
 		for _ in 0..3 {
-			finished_group(&mut producer, 1_000);
+			finished_group(&mut producer, unit as usize);
 		}
 		assert!(consumer.peek_group(0).is_some(), "debt smaller than the victim carries");
 
 		// Enough small writes accumulate the debt to finally evict it.
 		for _ in 0..20 {
-			finished_group(&mut producer, 1_000);
+			finished_group(&mut producer, unit as usize);
 		}
 		assert!(
 			consumer.peek_group(0).is_none(),
@@ -7052,7 +7069,7 @@ mod test {
 		);
 		// Steady state hovers within about one group of capacity: a victim smaller
 		// than the outstanding debt is never evicted, so the excess stays bounded.
-		assert!(pool.used() <= 24_000, "usage hovers near capacity: {}", pool.used());
+		assert!(pool.used() <= 24 * unit, "usage hovers near capacity: {}", pool.used());
 	}
 
 	/// One write pays at most twice what it produced, so a capacity shrink (or one
@@ -7147,14 +7164,17 @@ mod test {
 	/// content, so the freshly-written group survives and the empty one pays.
 	#[tokio::test]
 	async fn same_tick_write_outranks_inserted() {
+		// Payloads dwarf the fixed per-group charge, so the budget arithmetic below is
+		// about bytes written rather than bookkeeping.
+		let unit = 100 * cache::ENTRY_OVERHEAD;
 		// No time advances: every stamp lands in the same tick.
-		let (mut producer, _pool) = pooled_producer(10_000);
+		let (mut producer, _pool) = pooled_producer(10 * unit);
 
 		producer.append_group().unwrap().finish().unwrap(); // seq 0: empty
-		finished_group(&mut producer, 3_000); // seq 1: written
-		finished_group(&mut producer, 3_000); // seq 2
-		finished_group(&mut producer, 3_000); // seq 3
-		finished_group(&mut producer, 3_000); // seq 4: over budget, pays
+		finished_group(&mut producer, 3 * unit as usize); // seq 1: written
+		finished_group(&mut producer, 3 * unit as usize); // seq 2
+		finished_group(&mut producer, 3 * unit as usize); // seq 3
+		finished_group(&mut producer, 3 * unit as usize); // seq 4: over budget, pays
 
 		let consumer = producer.consume();
 		assert!(consumer.peek_group(0).is_none(), "insert-only content pays first");

@@ -46,15 +46,26 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
-use super::track::TrackState;
+use super::group;
+use super::track::{self, TrackState};
 
 /// Fixed bookkeeping charged per cached group on top of its frame payload bytes.
 ///
-/// Covers the group/track slot allocations so a track producing many tiny groups
-/// (e.g. one frame per group) is billed roughly for its real footprint instead of
-/// just its payload bytes. Also bounds the live group count (`used / 256`), which
-/// keeps the access-time sum below u64 (see [`TICK_MS`]).
-const ENTRY_OVERHEAD: u64 = 256;
+/// A group that holds one small frame is almost entirely bookkeeping: the kio channel
+/// carrying its state, the containers the track indexes it by, and the frame slots
+/// themselves dwarf a chat-sized payload. Billing payload alone lets such a track cache
+/// millions of groups while the pool believes it is inside budget, so the process is
+/// killed before anything is evicted.
+///
+/// Derived from `size_of` rather than pasted from a measured process, so it follows the
+/// structs instead of rotting: each half lives beside the types it sizes, in
+/// [`group::CACHE_OVERHEAD`] and [`track::CACHE_OVERHEAD`]. It excludes what the
+/// allocator rounds up and what a group with many frames grows into, both of which only
+/// matter for shapes payload already dominates.
+///
+/// Also bounds the live group count (`used / ENTRY_OVERHEAD`), which keeps the
+/// access-time sum below u64 (see [`TICK_MS`]).
+pub(crate) const ENTRY_OVERHEAD: u64 = group::CACHE_OVERHEAD + track::CACHE_OVERHEAD;
 
 /// Sub-tick boosts applied to the last-access stamp, breaking ties within one
 /// coarse tick: a frame write outranks merely-inserted content, and a read (a
@@ -68,10 +79,9 @@ const ACCESS_SHIFT: u32 = 2;
 /// Coarse ticks keep the count-weighted timestamp sum far from u64 overflow: the
 /// sum is bounded by `elapsed_ticks * live_groups`, plus two low tie-breaking
 /// bits. Live groups are bounded by `used / ENTRY_OVERHEAD`, and twenty years of
-/// ticks (6.3e9) times a 64 GiB target's worst-case ~270M groups is ~6.8e18 after
-/// that encoding, still below half of `u64::MAX`. A byte-weighted mean would
-/// overflow u64 even at whole-second ticks, which is why the mean is
-/// count-weighted.
+/// ticks (6.3e9) times a 64 GiB target's worst case of ~70M groups is ~1.8e18 after
+/// that encoding, a tenth of `u64::MAX`. A byte-weighted mean would overflow u64
+/// even at whole-second ticks, which is why the mean is count-weighted.
 const TICK_MS: u64 = 100;
 
 /// Default idle window for standalone origins and relays.
@@ -155,10 +165,11 @@ struct Inner {
 impl Pool {
 	/// Create a pool from an initial policy.
 	///
-	/// The budget counts frame payload bytes (plus a small fixed overhead per
-	/// group), not process RSS, and is a convergence target rather than a hard
-	/// limit; leave headroom when sizing it from real memory. The expiry is fixed,
-	/// while the capacity can later be changed with [`Self::resize`].
+	/// The budget counts frame payload bytes plus a fixed cost per cached group, which
+	/// is most of what a group carrying one small frame occupies. It is not process
+	/// RSS, and it is a convergence target rather than a hard limit; leave headroom
+	/// when sizing it from real memory. The expiry is fixed, while the capacity can
+	/// later be changed with [`Self::resize`].
 	pub fn new(config: Config) -> Self {
 		let expiry = config.expiry.map_or(u64::MAX, |expiry| {
 			let ms = u64::try_from(expiry.as_millis()).unwrap_or(u64::MAX);
@@ -288,6 +299,13 @@ impl Pool {
 		Arc::ptr_eq(&self.inner, &other.inner)
 	}
 
+	/// A handle that reaches this budget without keeping it alive.
+	pub fn downgrade(&self) -> PoolWeak {
+		PoolWeak {
+			inner: Arc::downgrade(&self.inner),
+		}
+	}
+
 	/// Charge `n` more cached bytes.
 	pub(crate) fn add(&self, n: u64) {
 		self.inner.used.fetch_add(n, Ordering::Relaxed);
@@ -365,6 +383,32 @@ impl std::fmt::Debug for Pool {
 			.field("capacity", &self.capacity())
 			.field("expiry", &self.expiry())
 			.finish()
+	}
+}
+
+/// A handle to a [`Pool`] that does not keep the budget alive.
+///
+/// [`upgrade`](Self::upgrade) stops returning a [`Pool`] once every strong handle has
+/// dropped, which is how a background resizer learns the budget it manages is gone and
+/// nothing can cache into it any more.
+#[derive(Clone)]
+pub struct PoolWeak {
+	inner: std::sync::Weak<Inner>,
+}
+
+impl PoolWeak {
+	/// Recover a [`Pool`], or `None` once every strong handle has dropped.
+	pub fn upgrade(&self) -> Option<Pool> {
+		self.inner.upgrade().map(|inner| Pool { inner })
+	}
+}
+
+impl std::fmt::Debug for PoolWeak {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self.upgrade() {
+			Some(pool) => pool.fmt(f),
+			None => f.debug_struct("PoolWeak").finish_non_exhaustive(),
+		}
 	}
 }
 
@@ -752,8 +796,23 @@ mod test {
 	}
 
 	#[test]
-	fn accrue_none_under_capacity() {
+	fn weak_follows_the_last_strong_handle() {
 		let pool = bounded(1000);
+		let clone = pool.clone();
+		let weak = pool.downgrade();
+
+		drop(pool);
+		let upgraded = weak.upgrade().expect("a strong handle remains");
+		assert!(upgraded.same_pool(&clone));
+
+		drop(upgraded);
+		drop(clone);
+		assert!(weak.upgrade().is_none());
+	}
+
+	#[test]
+	fn accrue_none_under_capacity() {
+		let pool = bounded(ENTRY_OVERHEAD + 1000);
 		let mut charge = charge(&pool);
 		charge.add(500);
 		assert_eq!(pool.accrue(100), None);

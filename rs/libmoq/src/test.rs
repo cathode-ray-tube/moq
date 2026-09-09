@@ -172,6 +172,7 @@ fn publish_video(broadcast: u32, format: moq_video_format, init: &[u8], label: O
 		init_len: init.len(),
 		label,
 		label_len,
+		hint: moq_video_hint::default(),
 	};
 
 	unsafe { moq_publish_video(broadcast, &config) }
@@ -376,6 +377,16 @@ fn publish_media_labels_config_without_naming_track() {
 	assert_eq!(moq_publish_media_finish(media2), 0);
 	assert_eq!(moq_publish_finish(broadcast), 0);
 	assert_eq!(moq_origin_close(origin), 0);
+}
+
+#[test]
+fn session_snapshot_error_preserves_destination() {
+	let mut dst: moq_connection_snapshot = unsafe { std::mem::zeroed() };
+	dst.stats.rtt_us = 123;
+	dst.protocol.len = 456;
+	assert!(unsafe { moq_session_snapshot(0, &mut dst) } < 0);
+	assert_eq!(dst.stats.rtt_us, 123);
+	assert_eq!(dst.protocol.len, 456);
 }
 
 #[test]

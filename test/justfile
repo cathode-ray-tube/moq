@@ -62,7 +62,7 @@ default $BASE="":
 # Run every language's unit tests, unscoped.
 all:
     just js test
-    just rs test --workspace
+    just rs test --workspace --exclude moq-net-fuzz
     just py test
 
 # Cross-language media interop smoke test, built from this checkout. Stands up a
@@ -73,18 +73,45 @@ all:
 smoke *args:
     ./smoke/smoke.sh {{ args }}
 
-# Full interop matrix: rust + python + browser publish; everyone subscribes
+# Full interop matrix: rust + python + go + browser publish; everyone subscribes
 # (incl. native node/bun JS, the C libmoq client, and the GStreamer moqsrc
 
 # plugin). --timeout 30 gives headless Chromium cold-start headroom.
 smoke-full:
-    ./smoke/smoke.sh --publishers rust,python,js --subscribers rust,python,js,js-native-node,js-native-bun,c,gst --timeout 30
+    ./smoke/smoke.sh --publishers rust,python,go,js --subscribers rust,python,go,js,js-native-node,js-native-bun,c,gst --timeout 30
 
 # Negative control: no publisher, every subscriber must time out (proves the
 
 # harness can actually report failure).
 smoke-negative *args:
     ./smoke/smoke.sh --negative {{ args }}
+
+# Browser-to-browser media QA against a deterministic fixture: presented frame progress, audible
+# tone, audio/video skew, and the publication lifecycle (cold start, pause, rejoin, detach,
+# republish, late join). Ends with negative controls that inject a frozen picture, silence, a
+# shifted tone, and a leaked session; each must fail the assertion it names. --timeout 30 gives
+
+# headless Chromium cold-start headroom.
+smoke-media *args:
+    ./smoke/smoke.sh --media --timeout 30 {{ args }}
+
+# Disrupts a real relay over real QUIC three ways: cancel a stalled reader, kill
+# the relay mid-group, and republish an interrupted publisher's name. Ordinary
+# tests, so `just test` runs them whenever moq-relay is selected; this is the
+# focused loop. Takes a filter, e.g. `just test drill relay_killed`. Includes the
+# no-publisher negative control. See drill/README.md.
+
+# Transport and lifecycle failure drills.
+drill *args:
+    just rs test -p moq-relay --test drills {{ args }}
+
+# Removes one recovery behavior at a time in a disposable copy of the tree and
+# requires the drill covering it to fail, for the reason the mutation names. The
+# checkout is never modified. `--list` shows the mutations.
+
+# Prove the drills fail without the fixes they cover.
+drill-sensitivity *args:
+    ./drill/sensitivity.sh {{ args }}
 
 # Round-trips a PCR-paced TS through a relay and checks the subscriber's `export
 # ts` output with TSDuck plus a custom analyzer (PCR jitter/repetition,

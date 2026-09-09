@@ -12,6 +12,7 @@ import { withTimeout } from "../util/timeout.ts";
 import * as Varint from "../varint.ts";
 import type { Session } from "./adapter.ts";
 import * as Cluster from "./cluster.ts";
+import { requestReason, toRequestCode } from "./error.ts";
 import { FetchHeader } from "./fetch.ts";
 import * as Filter from "./filter.ts";
 import { FetchFrame, Frame, Group as GroupMessage } from "./object.ts";
@@ -192,21 +193,21 @@ export class Publisher {
 		const broadcast = this.#broadcasts.peek()?.get(name);
 
 		if (!broadcast) {
-			// Write error response
+			const errorCode = toRequestCode("does_not_exist", "subscribe", version);
 			if (version === Version.DRAFT_14) {
 				await stream.writer.u53(SubscribeError.id);
 				const err = new SubscribeError({
 					requestId: msg.requestId,
-					errorCode: 404,
-					reasonPhrase: "Broadcast not found",
+					errorCode,
+					reasonPhrase: "broadcast not found",
 				});
 				await err.encode(stream.writer, version);
 			} else {
 				await stream.writer.u53(RequestError.id);
 				const err = new RequestError({
 					requestId: version === Version.DRAFT_15 || version === Version.DRAFT_16 ? msg.requestId : undefined,
-					errorCode: 404,
-					reasonPhrase: "Broadcast not found",
+					errorCode,
+					reasonPhrase: "broadcast not found",
 				});
 				await err.encode(stream.writer, version);
 			}
@@ -772,6 +773,7 @@ export class Publisher {
 			() => undefined,
 		);
 
+		let dispose: Dispose | undefined;
 		try {
 			// What the peer holds: keyed by path, valued by the routing front, so a republish
 			// diffs as withdraw-then-advertise rather than nothing.
@@ -789,14 +791,13 @@ export class Publisher {
 				// through it and leave the namespace unadvertised until something unrelated
 				// changed.
 				// TODO Make a better helper within Signals.
-				let dispose!: Dispose;
 				const changed = new Promise<ReadonlyMap<Path.Valid, broadcast.Consumer> | undefined>((resolve) => {
 					dispose = this.#broadcasts.changed(resolve);
 				});
 
 				const broadcasts = this.#broadcasts.peek();
 				if (!broadcasts) {
-					dispose();
+					dispose?.();
 					break;
 				}
 
@@ -848,7 +849,7 @@ export class Publisher {
 				const next = await (retry
 					? Promise.race([changed, closed, retryAfter(retry).then(() => broadcasts)])
 					: Promise.race([changed, closed]));
-				dispose();
+				dispose?.();
 				if (!next) break;
 			}
 		} catch (err: unknown) {
@@ -856,6 +857,7 @@ export class Publisher {
 			// discovery. Not a debug-level event.
 			console.warn(`publish_namespace loop failed: ${reason(error(err))}`);
 		} finally {
+			dispose?.();
 			// Close out every open PUBLISH_NAMESPACE request.
 			for (const path of [...requests.keys()]) {
 				await this.#withdraw(path, requests);
@@ -937,7 +939,14 @@ export class Publisher {
 								err.retryInterval === 0n ? "never" : Date.now() + Number(err.retryInterval),
 							);
 						}
-						throw new Error(`PublishNamespace rejected: ${err.errorCode} ${err.reasonPhrase}`);
+						throw new Error(
+							`PublishNamespace rejected: ${requestReason(
+								err.errorCode,
+								err.reasonPhrase,
+								"publish_namespace",
+								this.#session.version,
+							)}`,
+						);
 					}
 					if (respTypeId !== RequestOk.id) {
 						throw new Error(`PublishNamespace rejected: typeId=0x${respTypeId.toString(16)}`);
@@ -987,8 +996,14 @@ export class Publisher {
 			} catch {
 				// Stream might already be closed
 			}
+			request.stream.close();
+			return;
 		}
 		request.stream.close();
+		// Wait for transport acknowledgment before opening a replacement request.
+		// This assumes the peer processes the withdrawal by then; FIN acknowledgment
+		// does not itself acknowledge application processing across streams.
+		await request.stream.writer.closed;
 	}
 
 	/**

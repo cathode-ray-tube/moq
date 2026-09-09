@@ -163,6 +163,36 @@ test("subscriber options and updates are forwarded to the producer's aggregate",
 	expect(await next).toEqual({ priority: 7, maxAge: 250, startGroup: 2, endGroup: 9 });
 });
 
+test("a fractional maxAge is rounded up before the wire sees it", async () => {
+	const producer = new TrackProducer("test");
+
+	// Subscribers derive this from measurements (a jitter estimate scaled off RTT), so a
+	// fractional millisecond is expected. The wire encodes it as a varint, which throws on a
+	// non-integer, and rounding down would shorten a budget the subscriber asked for.
+	const track = producer.subscribe({ maxAge: 38.75 });
+	expect(producer.subscription.peek()?.maxAge).toBe(39);
+
+	const next = producer.subscription.changed();
+	track.update({ maxAge: 500.25 });
+	expect((await next)?.maxAge).toBe(501);
+
+	// The publisher half of the budget lands on the wire through TRACK_INFO, with the same hazard.
+	producer.accept({ maxAge: 1000.5 });
+	expect((await producer.info()).maxAge).toBe(1001);
+});
+
+test("a maxAge that is not a duration is refused, not rounded into one", () => {
+	const producer = new TrackProducer("test");
+
+	// The wire carries an unsigned varint, so rounding these would encode a budget the
+	// caller never asked for: -0.5 would ceil to zero and silently take the live edge.
+	expect(() => producer.subscribe({ maxAge: -0.5 })).toThrow(RangeError);
+	expect(() => producer.subscribe({ maxAge: -100 })).toThrow(RangeError);
+	expect(() => producer.subscribe({ maxAge: Number.NaN })).toThrow(RangeError);
+	expect(() => producer.subscribe({ maxAge: Number.POSITIVE_INFINITY })).toThrow(RangeError);
+	expect(() => producer.accept({ maxAge: -0.5 })).toThrow(RangeError);
+});
+
 test("multiple subscriber options aggregate like Rust", async () => {
 	const producer = new TrackProducer("test");
 	const bounded = producer.subscribe({ priority: 2, maxAge: 100, startGroup: 10, endGroup: 20 });

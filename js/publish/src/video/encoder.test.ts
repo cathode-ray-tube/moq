@@ -235,3 +235,135 @@ test("every published config was probed for its own codec and dimensions", async
 function probeKey(config: { codec: string; width: number; height: number }): string {
 	return `${config.codec}@${config.width}x${config.height}`;
 }
+
+test("hardware encoding takes priority over software H.264", async () => {
+	using _videoEncoder = installFakeVideoEncoder();
+	const probe = spyOn(FakeVideoEncoder, "isConfigSupported").mockImplementation(async (config) => ({
+		supported: config.codec.startsWith("avc1"),
+	}));
+	const capture = {
+		in: { source: new Signal({ getSettings: () => ({ frameRate: 30 }), getConstraints: () => ({}) }) },
+		out: { display: new Signal({ width: 1920, height: 1080 }) },
+	};
+	const encoder = new Encoder("video", { enabled: true, capture: capture as never });
+	try {
+		await settle();
+		expect(encoder.out.resolved.peek()?.hardwareAcceleration).toBe("prefer-hardware");
+		expect(probe.mock.calls.every(([config]) => config.hardwareAcceleration === "prefer-hardware")).toBe(true);
+	} finally {
+		encoder.close();
+		probe.mockRestore();
+	}
+});
+
+test("software-only AV1 is refused even when explicitly requested", async () => {
+	using _videoEncoder = installFakeVideoEncoder();
+	const probe = spyOn(FakeVideoEncoder, "isConfigSupported").mockImplementation(async (config) => ({
+		supported: config.codec.startsWith("av01") && config.hardwareAcceleration === "prefer-software",
+	}));
+	const error = spyOn(console, "error").mockImplementation(() => {});
+	const capture = {
+		in: { source: new Signal({ getSettings: () => ({ frameRate: 30 }), getConstraints: () => ({}) }) },
+		out: { display: new Signal({ width: 1920, height: 1080 }) },
+	};
+	const encoder = new Encoder("video", { enabled: true, capture: capture as never, config: { codec: "av01" } });
+	try {
+		await settle();
+		expect(probe).toHaveBeenCalled();
+		expect(probe.mock.calls.some(([config]) => config.hardwareAcceleration === "prefer-software")).toBe(false);
+		expect(encoder.out.resolved.peek()).toBeUndefined();
+		expect(error).toHaveBeenCalled();
+	} finally {
+		encoder.close();
+		probe.mockRestore();
+		error.mockRestore();
+	}
+});
+
+test("screen encoders default to logical pixels without scaling an already reduced capture twice", async () => {
+	using _videoEncoder = installFakeVideoEncoder();
+	const capture = {
+		in: {
+			source: new Signal({
+				scale: 2,
+				track: {
+					getSettings: () => ({ frameRate: 30 }),
+					getConstraints: () => ({}),
+					getCapabilities: () => ({ width: { max: 5120 }, height: { max: 2880 } }),
+				},
+			}),
+		},
+		out: { display: new Signal({ width: 5120, height: 2880, scale: 2 }) },
+	};
+	const encoder = new Encoder("video", { enabled: true, capture: capture as never });
+	try {
+		await settle();
+		expect(encoder.out.resolved.peek()).toMatchObject({ width: 2560, height: 1440 });
+		capture.out.display.set({ width: 2560, height: 1440, scale: 2 });
+		await settle();
+		expect(encoder.out.resolved.peek()).toMatchObject({ width: 2560, height: 1440 });
+
+		capture.out.display.set({ width: 5120, height: 2880, scale: 2 });
+		await settle();
+		capture.out.display.set({ width: 5120, height: 2880, scale: 1 });
+		await settle();
+		expect(encoder.out.resolved.peek()).toMatchObject({ width: 5120, height: 2880 });
+		capture.out.display.set({ width: 5120, height: 2880, scale: 2 });
+		encoder.config.set({ maxScale: 1 });
+		await settle();
+		expect(encoder.out.resolved.peek()).toMatchObject({ width: 5120, height: 2880 });
+		encoder.config.set({ maxPixels: 1920 * 1080 });
+		await settle();
+		expect(encoder.out.resolved.peek()).toMatchObject({ width: 1920, height: 1072 });
+	} finally {
+		encoder.close();
+	}
+});
+
+for (const version of [140, 142, 143, 152]) {
+	test(`Firefox ${version} uses trustworthy hardware probes only`, async () => {
+		using _videoEncoder = installFakeVideoEncoder();
+		const userAgent = Object.getOwnPropertyDescriptor(navigator, "userAgent");
+		Object.defineProperty(navigator, "userAgent", {
+			configurable: true,
+			value: `Mozilla/5.0 Firefox/${version}.0`,
+		});
+		const probe = spyOn(FakeVideoEncoder, "isConfigSupported").mockImplementation(async () => ({
+			supported: true,
+		}));
+		const capture = {
+			in: { source: new Signal({ getSettings: () => ({ frameRate: 30 }), getConstraints: () => ({}) }) },
+			out: { display: new Signal({ width: 1920, height: 1080 }) },
+		};
+		const encoder = new Encoder("video", { enabled: true, capture: capture as never });
+		try {
+			await settle();
+			expect(encoder.out.resolved.peek()?.hardwareAcceleration).toBe(
+				version < 143 ? "prefer-software" : "prefer-hardware",
+			);
+			if (version < 143) expect(encoder.out.resolved.peek()?.codec.startsWith("avc1")).toBe(true);
+		} finally {
+			encoder.close();
+			probe.mockRestore();
+			if (userAgent) Object.defineProperty(navigator, "userAgent", userAgent);
+			else Reflect.deleteProperty(navigator, "userAgent");
+		}
+	});
+}
+
+test("frame sources retain their dimensions and nominal frame rate", async () => {
+	using _videoEncoder = installFakeVideoEncoder();
+	const frames = new ReadableStream<VideoFrame>();
+	const capture = {
+		in: { source: new Signal({ frames, frameRate: 24 }) },
+		out: { display: new Signal({ width: 1920, height: 1080 }) },
+	};
+	const encoder = new Encoder("video", { enabled: true, capture: capture as never });
+	try {
+		await settle();
+		expect(encoder.out.resolved.peek()).toMatchObject({ width: 1920, height: 1072, framerate: 24 });
+	} finally {
+		encoder.close();
+		await frames.cancel();
+	}
+});

@@ -63,17 +63,32 @@ export interface Info {
 	 * Publisher Max Age: the maximum age (milliseconds) of a non-latest group before
 	 * the publisher evicts it. Reported in TRACK_INFO (Lite05+) so relays re-serve with the
 	 * same bound. The publisher-side half of the budget a subscriber sets for itself.
+	 * Rounded up to a whole millisecond by {@link infoDefaults}, which refuses a negative
+	 * or non-finite value.
 	 */
 	maxAge: number;
 	/** Tie-break priority between subscriptions of equal subscriber priority. */
 	priority: number;
 }
 
+// Normalize a latency budget for the wire, which carries it as an unsigned varint.
+//
+// Callers derive it from measurements (a jitter estimate scaled off RTT), so a fractional
+// millisecond is expected; ceil rather than round, because a budget shortened by rounding
+// skips a group the subscriber still wants. Anything that is not a duration is refused
+// here, where the field is named, rather than deep in the encoder.
+function maxAgeMillis(value: number): number {
+	if (!Number.isFinite(value) || value < 0) {
+		throw new RangeError(`maxAge must be a non-negative number of milliseconds: ${value}`);
+	}
+	return Math.ceil(value);
+}
+
 /** Fill in any unset {@link Info} fields with their defaults. */
 export function infoDefaults(info: Partial<Info> = {}): Info {
 	return {
 		timescale: info.timescale ?? Timescale.MILLI,
-		maxAge: info.maxAge ?? DEFAULT_MAX_AGE_MS,
+		maxAge: maxAgeMillis(info.maxAge ?? DEFAULT_MAX_AGE_MS),
 		priority: info.priority ?? 0,
 	};
 }
@@ -85,7 +100,11 @@ export function infoDefaults(info: Partial<Info> = {}): Info {
 export interface Subscription {
 	/** Delivery priority relative to this session's other subscriptions. Defaults to `0`. */
 	priority?: number;
-	/** Maximum age (milliseconds) of a non-latest group before it is skipped. Defaults to `0`. */
+	/**
+	 * Maximum age (milliseconds) of a non-latest group before it is skipped. Defaults to `0`.
+	 * Rounded up to a whole millisecond, so a value derived from a measurement is never
+	 * shortened. A negative or non-finite value is refused.
+	 */
 	maxAge?: number;
 	/**
 	 * The lowest group the publisher may deliver (a floor), or omit for none.
@@ -105,7 +124,7 @@ export interface Subscription {
 function subscriptionDefaults(subscription: Subscription = {}): Subscription {
 	return {
 		priority: subscription.priority ?? 0,
-		maxAge: subscription.maxAge ?? 0,
+		maxAge: maxAgeMillis(subscription.maxAge ?? 0),
 		startGroup: subscription.startGroup,
 		endGroup: subscription.endGroup,
 	};

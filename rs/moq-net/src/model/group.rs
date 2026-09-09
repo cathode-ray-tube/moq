@@ -33,6 +33,26 @@ use crate::{Error, IntoBytes, Result, Timestamp};
 /// fill a group's cache.
 pub const MAX_CACHE_BYTES: u64 = 32 * 1024 * 1024; // 32 MB
 
+/// Slots `VecDeque` rounds a group's first frame up to.
+///
+/// A `RawVec` detail rather than a knob, so it is asserted rather than trusted: std
+/// handing out more would silently undercharge every cached group.
+const FRAME_SLOTS: usize = 4;
+
+/// Heap one cached group costs beyond its frame payloads, excluding the track-side
+/// bookkeeping in [`track::CACHE_OVERHEAD`].
+///
+/// A group is one kio channel (allocated whether or not anything ever parks on it), the
+/// `Arc<Alive>` its producer clones share, and the frame slots the first write rounds up
+/// to. Half of [`cache::ENTRY_OVERHEAD`]; see it for why this is derived rather than
+/// measured.
+pub(crate) const CACHE_OVERHEAD: u64 = (kio::Producer::<GroupState>::HEAP
+	// `Alive` behind an `Arc`'s two reference counts, which it is pointer-aligned to sit
+	// straight after.
+	+ 2 * size_of::<usize>()
+	+ size_of::<Alive>()
+	+ FRAME_SLOTS * size_of::<Frame>()) as u64;
+
 /// A group contains a sequence number because they can arrive out of order.
 ///
 /// You can use [track::Producer::append_group] if you just want to +1 the sequence number.
@@ -234,16 +254,13 @@ impl GroupState {
 		}
 	}
 
-	fn poll_finished(&self) -> Poll<Result<u64>> {
-		// The count is recorded at finish, so a later abort that cleared the cache
-		// doesn't turn a complete group into an error.
-		if let Some(total) = self.fin {
-			Poll::Ready(Ok(total as u64))
-		} else if let Some(err) = &self.abort {
-			Poll::Ready(Err(err.clone()))
-		} else {
-			Poll::Pending
+	/// Resolve whether a reader at `index` can still make progress, answering the same
+	/// question as a read without consuming anything.
+	fn poll_end(&self, index: usize) -> Poll<Result<()>> {
+		if index < self.offset {
+			return Poll::Ready(Err(Error::Lagged));
 		}
+		self.poll_terminal(index)
 	}
 
 	/// Record where the group starts and currently ends in presentation time.
@@ -1502,7 +1519,7 @@ impl Consumer {
 		Ok(out.filled_mut())
 	}
 
-	/// Poll for the final number of frames in the group.
+	/// Poll until the group terminates, returning this cursor's next frame index.
 	pub fn poll_finished(&mut self, waiter: &kio::Waiter) -> Poll<Result<u64>> {
 		if self.ended {
 			return Poll::Ready(Ok(self.index()));
@@ -1511,7 +1528,12 @@ impl Consumer {
 			return Poll::Ready(Err(Error::Old));
 		}
 		let res = match &mut self.inner {
-			ConsumerKind::Plain(plain) => plain.poll(waiter, |state| state.poll_finished()),
+			ConsumerKind::Plain(plain) => {
+				let index = plain.index;
+				plain
+					.poll(waiter, |state| state.poll_end(index))
+					.map(|res| res.map(|()| index as u64))
+			}
 			ConsumerKind::Spliced(spliced) => spliced.poll_finished(waiter),
 		};
 		match res.is_pending().then(|| self.poll_expired_if_blocked(waiter)).flatten() {
@@ -1522,7 +1544,12 @@ impl Consumer {
 		}
 	}
 
-	/// Block until the group is finished, returning the number of frames in the group.
+	/// Block until the group terminates, returning this cursor's next frame index.
+	///
+	/// This answers for the cursor, not the group: a reader that drained every frame gets the
+	/// clean end even if the group was aborted afterwards to release its cache, while one that
+	/// stopped short gets that abort. A prior [`Self::skip_to`] contributes to the index even
+	/// though those frames were not read. Use [`Self::frame_count`] for the producer's total.
 	pub async fn finished(&mut self) -> Result<u64> {
 		kio::wait(|waiter| self.poll_finished(waiter)).await
 	}
@@ -1744,6 +1771,22 @@ mod test {
 	use crate::model::test_tracing::count_drop_warnings;
 	use bytes::Bytes;
 	use futures::FutureExt;
+
+	/// [`FRAME_SLOTS`] is std's rounding, not ours, so measure it: a larger real value
+	/// would undercharge every cached group without touching a line of this crate.
+	#[test]
+	fn one_frame_fits_the_charged_slots() {
+		let mut frames: VecDeque<Frame> = VecDeque::new();
+		frames.push_back(Frame {
+			timestamp: Timestamp::ZERO,
+			payload: Bytes::new(),
+		});
+		let capacity = frames.capacity();
+		assert!(
+			capacity <= FRAME_SLOTS,
+			"a one-frame deque now allocates {capacity} slots"
+		);
+	}
 
 	#[test]
 	fn basic_frame_reading() {
@@ -2117,19 +2160,44 @@ mod test {
 		assert!(matches!(behind.read_frame().now_or_never().unwrap(), Err(Error::Old)));
 	}
 
-	/// The frame count is fixed at finish, so an abort that clears the cache can't turn a
-	/// complete group into an error.
+	/// `finished` answers for the cursor: a drained reader gets the clean end even after the
+	/// abort that released the cache, and one that stopped short gets that abort. The
+	/// producer's total stays available on `frame_count`.
 	#[test]
-	fn finished_survives_a_later_abort() {
+	fn finished_answers_for_the_cursor() {
 		let mut producer = Info { sequence: 0 }.produce();
 		producer.write_frame(Timestamp::ZERO, Bytes::from_static(b"a")).unwrap();
 		producer.write_frame(Timestamp::ZERO, Bytes::from_static(b"b")).unwrap();
 		producer.finish().unwrap();
 
-		let mut consumer = producer.consume();
+		let mut drained = producer.consume();
+		let mut behind = producer.consume();
+		while drained.read_frame().now_or_never().unwrap().unwrap().is_some() {}
+		behind.read_frame().now_or_never().unwrap().unwrap().unwrap();
+
 		producer.abort(Error::Old).unwrap();
 
-		assert_eq!(consumer.finished().now_or_never().unwrap().unwrap(), 2);
+		assert_eq!(drained.finished().now_or_never().unwrap().unwrap(), 2);
+		assert!(matches!(behind.finished().now_or_never().unwrap(), Err(Error::Old)));
+		assert_eq!(behind.frame_count(), 2);
+	}
+
+	/// A cursor whose next frame was evicted from the front of a live group can never reach
+	/// the end, so `finished` reports the gap instead of parking forever.
+	#[test]
+	fn finished_reports_a_lagged_cursor() {
+		let mut producer = Info { sequence: 0 }.produce();
+		let mut consumer = producer.consume();
+
+		// Two frames at the cache budget, so the second write evicts the first.
+		let big = Bytes::from(vec![0u8; MAX_CACHE_BYTES as usize]);
+		producer.write_frame(Timestamp::ZERO, big.clone()).unwrap();
+		producer.write_frame(Timestamp::ZERO, big).unwrap();
+
+		assert!(matches!(
+			consumer.finished().now_or_never().unwrap(),
+			Err(Error::Lagged)
+		));
 	}
 
 	/// `next_frame` drains frames a prior `read_frame` prefetched, preserving order.
@@ -2271,10 +2339,14 @@ mod test {
 		assert_eq!(producer.frame_count(), 4);
 
 		let mut consumer = producer.consume();
-		assert_eq!(consumer.finished().now_or_never().unwrap().unwrap(), 4);
+		assert_eq!(consumer.frame_count(), 4);
 
 		// A reader positioned at the start is missing the head, exactly like one that
-		// fell behind an eviction.
+		// fell behind an eviction, and `finished` answers for that cursor.
+		assert!(matches!(
+			consumer.finished().now_or_never().unwrap(),
+			Err(Error::Lagged)
+		));
 		assert!(matches!(
 			consumer.read_frame().now_or_never().unwrap(),
 			Err(Error::Lagged)

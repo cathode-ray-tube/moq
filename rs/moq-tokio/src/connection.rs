@@ -498,6 +498,25 @@ impl ConnectionStatsReader {
 	pub fn stats(&self) -> Option<moq_net::ConnectionStats> {
 		self.state.read().session.as_ref().map(moq_net::Session::stats)
 	}
+
+	/// Snapshot statistics and protocol together, or `None` while disconnected.
+	pub fn snapshot(&self) -> Option<ConnectionSnapshot> {
+		let state = self.state.read();
+		let session = state.session.as_ref()?;
+		Some(ConnectionSnapshot {
+			stats: session.stats(),
+			version: session.version(),
+		})
+	}
+}
+
+/// Statistics and protocol sampled from the same live connection.
+#[non_exhaustive]
+pub struct ConnectionSnapshot {
+	/// Transport statistics at the time of the snapshot.
+	pub stats: moq_net::ConnectionStats,
+	/// Protocol negotiated by the connection that supplied these statistics.
+	pub version: Version,
 }
 
 /// Handle to a connection maintained by a background task.

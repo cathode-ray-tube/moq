@@ -52,10 +52,9 @@ evicted prefix.
   exactly 100,000 one-byte frames to assert there is no count cap; it is
   rewritten rather than deleted, since the byte-budget half of what it proves
   still holds.
-- **The IETF wire keeps its own mapping.** Sending the new code on the
-  moq-transport wire belongs to
-  [IETF error codes](/quest/m0/ietf-error-codes.md),
-  which is fixing the whole registry confusion rather than one variant.
+- **The IETF wire keeps its own mapping.** `rs/moq-net/src/ietf/error.rs` picks
+  the registered value for the negotiated draft, and it registers nothing for
+  this condition, so the moq-transport wire says INTERNAL_ERROR.
 
 ### What actually gets deleted
 
@@ -104,8 +103,13 @@ throwing"`. `js/net/src/broadcast.test.ts` and
 `js/net/src/ietf/publisher.test.ts:886` also lean on eviction. Add a test that
 the writer sees `GroupTooLarge`, which nothing covers today.
 
-Note `js/json/src/window/encoder.ts` keeps its own unrelated
-`MAX_GROUP_FRAMES = 256`; leave it.
+`js/json/src/window/encoder.ts` and the Rust `snapshot` and `window`
+encoders keep their own `MAX_GROUP_FRAMES = 256` roll trigger, sized "well
+below moq-net's per-group frame cap", which today means js/net's 1024. Once
+both languages cap at 8192, raise those roll caps in step (1024 or more, and
+still under 8192 so a roll always precedes `GroupTooLarge`) so a window
+timeline restates its checkpoint less often; the caps are self-imposed and a
+roll is invisible to a window consumer.
 
 ### The benchmark breaks
 
@@ -123,5 +127,4 @@ already claims its top end "intentionally reaches the raised
 
 ## Related
 
-- [Group charge](/quest/m0/group-charge.md) - pool-level budget accounting, unaffected by this change
-- [IETF error codes](/quest/m0/ietf-error-codes.md) - the moq-transport half of the code mapping
+- [Control timeout code](/quest/m1/control-timeout-code.md) - the other condition whose wire code is under review
