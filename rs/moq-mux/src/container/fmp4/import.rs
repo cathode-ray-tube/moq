@@ -8,15 +8,12 @@ use super::Error;
 use crate::Result;
 use crate::catalog::Estimator;
 
-use crate::{
-    container::writer::{
+use crate:::container::writer::{
         FrameEncrypter,
         FrameWriter,
         MoqFrameWriter,
         ProtectedFrame,
-    },
-
-};
+    };
 
 /// Converts fMP4/CMAF files into MoQ broadcast streams using CMAF passthrough.
 ///
@@ -979,9 +976,11 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 				track.estimator.cut(Some(timestamp));
 				sync_bitrate(&mut self.catalog, track)?;
 			}
+			let fragment_len = fragment_bytes.len();
+
 			{
-		     	let output = MoqFrameWriter { group: &mut g };
-		
+			    let output = MoqFrameWriter { group: &mut g };
+			
 			    match self.encrypter.as_mut() {
 			        Some(encrypter) => {
 			            let mut protected =
@@ -995,9 +994,9 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			        }
 			    }
 			}
-			
+
 			track.group = Some(g);
-			track.estimator.write(timestamp, fragment_bytes.len());
+			track.estimator.write(timestamp, fragment_len);
 
 			// Report how far this fragment presents. Every group but the last is bounded by the
 			// next one's open, so this is what keeps the final segment from being published a
