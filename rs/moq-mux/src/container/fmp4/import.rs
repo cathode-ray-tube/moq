@@ -8,7 +8,7 @@ use super::Error;
 use crate::Result;
 use crate::catalog::Estimator;
 
-use crate:::container::writer::{
+use crate::container::writer::{
         FrameEncrypter,
         FrameWriter,
         MoqFrameWriter,
