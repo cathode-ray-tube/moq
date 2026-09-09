@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Track suffixes derive from the typed import format, so the suffix and the codec cannot disagree.
 
+## [0.3.10](https://github.com/moq-dev/moq/compare/moq-gst-v0.3.9...moq-gst-v0.3.10) - 2026-09-09
+
+### Fixed
+
+- *(moq-net)* answer for a name the broadcast never served ([#3366](https://github.com/moq-dev/moq/pull/3366))
+
 ## [0.3.9](https://github.com/moq-dev/moq/compare/moq-gst-v0.3.8...moq-gst-v0.3.9) - 2026-09-02
 
 ### Fixed
