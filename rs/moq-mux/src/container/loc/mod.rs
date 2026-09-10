@@ -9,15 +9,17 @@ use std::task::Poll;
 
 use moq_net::{Timescale, Timestamp};
 
-use crate::container::{Container, Frame, FrameWriter};
+use crate::container::{Container, Frame, FrameWriter, Kind};
 
 /// LOC's catalog convention: timestamps are in microseconds when no per-frame
 /// 0x08 timescale property is present.
 const DEFAULT_TIMESCALE: Timescale = Timescale::MICRO;
 
-/// LOC wire format. Each moq frame holds one LOC frame.
-#[derive(Default)]
-pub struct Wire;
+/// LOC wire format configured for the track's media role.
+pub struct Wire(
+	/// The kind of content carried by the track.
+	pub Kind,
+);
 
 impl Container for Wire {
     type Error = crate::Error;
@@ -56,32 +58,41 @@ impl Container for Wire {
     ) -> Poll<Result<Option<Vec<Frame>>, Self::Error>> {
         use std::task::ready;
 
-        let Some(frame) = ready!(group.poll_read_frame(waiter)?) else {
-            return Poll::Ready(Ok(None));
-        };
+let Some(frame) = ready!(group.poll_read_frame(waiter)?) else {
+    return Poll::Ready(Ok(None));
+};
 
-        let loc = moq_loc::decode(frame.payload)?;
+let loc = moq_loc::decode(frame.payload)?;
 
-        // `loc.timescale == Some(0)` is malformed and is rejected by
-        // `moq_loc::decode`. Any remaining Some(_) value is non-zero.
-        let scale = loc
-            .timescale
-            .and_then(|s| Timescale::new(s).ok())
-            .unwrap_or(DEFAULT_TIMESCALE);
+// `loc.timescale == Some(0)` is malformed and is rejected by
+// `moq_loc::decode`. Any remaining Some(_) value is non-zero.
+let scale = loc
+    .timescale
+    .and_then(|s| Timescale::new(s).ok())
+    .unwrap_or(DEFAULT_TIMESCALE);
 
-        let timestamp = Timestamp::new(loc.timestamp, scale)
-            .map_err(hang::Error::from)?;
+let timestamp = Timestamp::new(loc.timestamp, scale)
+    .map_err(hang::Error::from)?;
 
-        Poll::Ready(Ok(Some(vec![Frame {
-            timestamp,
-            payload: loc.payload,
+Poll::Ready(Ok(Some(vec![Frame {
+    timestamp,
+    payload: loc.payload,
 
-            // LOC does not carry the keyframe bit on the wire; the wrapping
-            // Consumer fills it in from group position.
-            keyframe: false,
+    // LOC does not carry the keyframe bit on the wire; the wrapping
+    // Consumer fills it in from group position.
+    keyframe: false,
 
-            // LOC carries no per-frame duration.
-            duration: None,
-        }])))
-    }
+    // LOC carries no per-frame duration.
+    duration: None,
+}])))
+}
+
+fn kind(&self) -> Kind {
+    self.0
+}
+
+fn end(&self, frame: &Frame) -> Option<moq_net::Timestamp> {
+    (self.0 != Kind::Data && frame.payload.is_empty()).then_some(frame.timestamp)
+}
+
 }

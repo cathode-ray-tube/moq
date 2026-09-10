@@ -6,18 +6,42 @@
 
 use std::task::Poll;
 
-use crate::container::{Container, Frame, FrameWriter};
+use crate::container::{Container, Frame, FrameWriter, Kind};
 
-/// Hang Legacy wire format. Stateless; one instance serves every track.
-#[derive(Default)]
-pub struct Wire;
+/// Hang Legacy wire format configured for the track's media role.
+pub struct Wire(
+	/// The kind of content carried by the track.
+	pub Kind,
+);
 
 impl Container for Wire {
     type Error = crate::Error;
 
-    fn end(&self, frame: &Frame) -> Option<moq_net::Timestamp> {
-        frame.payload.is_empty().then_some(frame.timestamp)
+fn end(&self, frame: &Frame) -> Option<moq_net::Timestamp> {
+    (self.0 != Kind::Data && frame.payload.is_empty()).then_some(frame.timestamp)
+}
+
+fn kind(&self) -> Kind {
+    self.0
+}
+
+fn finish_group(
+    &self,
+    group: &mut moq_net::group::Producer,
+    end: Option<moq_net::Timestamp>,
+) -> Result<(), Self::Error> {
+    if self.0 == Kind::Video
+        && let Some(timestamp) = end
+    {
+        hang::container::Frame {
+            timestamp,
+            payload: bytes::Bytes::new(),
+        }
+        .write_to(group)?;
     }
+
+    Ok(())
+}
 
     fn write<W>(
         &self,

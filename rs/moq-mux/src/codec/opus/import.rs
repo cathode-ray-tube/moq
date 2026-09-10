@@ -33,14 +33,14 @@ impl<E: CatalogExt> Import<E> {
 		tracing::debug!(name = ?track.name(), ?config, "starting track");
 		// The caller's config names the container; the writer is built from that same value so the
 		// wire cannot disagree with what the rendition advertises.
-		let wire = crate::catalog::hang::Container::try_from(&config.container)?;
+		let wire = crate::catalog::hang::Container::try_from(&config)?;
 		let name = track.name().to_string();
 		// Build the writer before advertising the rendition: it is fallible (enrolling the track in
 		// the broadcast timeline can collide), and a rendition published for a track we then fail to
 		// produce would be advertised to consumers but never served.
 		let media = reserved.producer().media_producer(track, wire)?;
 		let mut rendition = reserved.audio(name)?;
-		rendition.set(config);
+		rendition.set(config)?;
 		Ok(Self {
 			track: media,
 			rendition,
@@ -60,7 +60,7 @@ impl<E: CatalogExt> Import<E> {
 	/// Finish the track, flushing the current group.
 	pub fn finish(&mut self) -> crate::Result<()> {
 		self.track.finish()?;
-		self.estimate();
+		self.estimate()?;
 		Ok(())
 	}
 
@@ -72,14 +72,14 @@ impl<E: CatalogExt> Import<E> {
 
 	/// Publish what the track measured (bitrate, jitter) into the catalog rendition, filling only
 	/// the fields its config didn't supply.
-	fn estimate(&mut self) {
-		self.rendition.estimate(self.track.estimate());
+	fn estimate(&mut self) -> crate::Result<()> {
+		self.rendition.estimate(self.track.estimate())
 	}
 
 	/// Cut the current group at `end` without finishing the track.
 	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> crate::Result<()> {
 		self.track.cut(end)?;
-		self.estimate();
+		self.estimate()?;
 		Ok(())
 	}
 
@@ -88,14 +88,14 @@ impl<E: CatalogExt> Import<E> {
 	/// [`Producer::discontinuity`](crate::container::Producer::discontinuity).
 	pub fn discontinuity(&mut self) -> crate::Result<()> {
 		self.track.discontinuity()?;
-		self.estimate();
+		self.estimate()?;
 		Ok(())
 	}
 
 	/// Close the current group and open the next one at `sequence`.
 	pub fn seek(&mut self, sequence: u64) -> crate::Result<()> {
 		self.track.seek(sequence)?;
-		self.estimate();
+		self.estimate()?;
 		Ok(())
 	}
 
@@ -115,7 +115,7 @@ impl<E: CatalogExt> Import<E> {
 			keyframe,
 			duration: None,
 		})?;
-		self.estimate();
+		self.estimate()?;
 		Ok(())
 	}
 }
@@ -167,7 +167,10 @@ mod tests {
 		import
 			.decode(payload, Some(Timestamp::from_micros(1_000).unwrap()))
 			.unwrap();
-		let mut media = crate::container::Consumer::new(subscriber, crate::catalog::hang::Container::Loc);
+		let mut media = crate::container::Consumer::new(
+			subscriber,
+			crate::catalog::hang::Container::Loc(crate::container::Kind::Data),
+		);
 		let frame = tokio::time::timeout(Duration::from_secs(1), media.read())
 			.await
 			.unwrap()

@@ -11,9 +11,9 @@ and the merge itself.
 ## Plan
 
 Branch a quest from `dev` when it breaks a published API or wire. A merge
-gate that lands on `main` (the duration marker, the additive Resolve and
-Demand halves of the wildcard line) branches from `main` and ranks here only
-because the merge waits on it. A quest stays here only if it breaks a
+gate that lands on `main` (the additive Resolve and Demand halves of the
+wildcard line) branches from `main` and ranks here only because the merge
+waits on it. A quest stays here only if it breaks a
 published API or wire, or gates the merge. Work that is identical on
 `main`, additive, or targets a `0.0.x` crate lives in
 [m2](/quest/m2/README.md) even when it builds on dev-only code; it starts on
@@ -23,7 +23,6 @@ with the dev tree.
 ## Quests
 
 - [Archive](/quest/m1/archive/README.md) - record selected tracks to any object_store and replay them over FETCH or derived HLS; the whole line gates the dev merge
-- [Duration marker](/quest/m1/duration-marker.md) - every video group ends with an empty frame at its exclusive end; audio loses its end marker; lands on main but gates gap-discontinuity
 - [Gap discontinuity](/quest/m1/gap-discontinuity.md) - a hole in the delivered group sequence resets the decoder unless the boundary is contiguous within 1 ms; empty groups stop meaning anything
 - [Monotonic timeline](/quest/m1/monotonic-timeline.md) - producers refuse a group below the live edge and consumers drop rewind detection
 - [#3190](/quest/m1/3190-align-origin-broadcast-creation-naming-across-language.md) - every native binding, Dart included, creates unadvertised, announces from the broadcast, and takes a path Pattern in `dynamic(pattern, route)`
@@ -45,7 +44,8 @@ with the dev tree.
 - [A/V clock](/quest/m1/plan-av-clock.md) - the audio playhead drives Sync.reference while audio plays, through per-track sync handles
 - [Config provenance](/quest/m1/config-provenance.md) - the merge records which source set a value, so an empty TOML list survives the environment and env outranks the file
 - [Cluster construction](/quest/m1/cluster-construction.md) - construct one stable origin after its cache settings are known, deleting the rebuilding builder
-- [#3046](/quest/m1/3046-fold-moq-token-into-moq-token-via-a-usage-executable-view.md) - retire the standalone moq-token binary after one deprecation release; `moq token` is the only spelling
+- [LAN discovery app id](/quest/m1/lan-app.md) - every advertisement names an application as a DNS-SD subtype bound into the proofs, so unrelated apps on one network never meet
+- [One LAN mesh](/quest/m1/lan-mesh.md) - moq-cli drives the relay's Cluster, LAN peers authenticate by mDNS credential, and the two binaries mesh with each other
 - [Native Go context](/quest/m1/go-native-context.md) - the Go generator emits context.Context itself, retiring the hand-rolled cancellation token
 - [#2152](/quest/m1/2152-libmoq-c-abi-catch-up-with-the-moq-ffi-surface.md) - libmoq serves tracks on demand and accepts sessions, the two moq-ffi calls C still lacks
 - [Transport feature](/quest/m1/tokio-transport-feature.md) - moq-tokio has one `_transport` gate and its backend-less build passes `-D warnings`

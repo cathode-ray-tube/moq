@@ -24,8 +24,8 @@ pub(crate) fn message(err: impl std::error::Error) -> String {
 ///
 /// Most variants are delegations to underlying layers: [`moq_net::Error`]
 /// for transport / pub-sub failures, [`hang::Error`] for catalog/codec
-/// parsing, the per-format errors for container shape problems, and the
-/// per-codec errors for bitstream parsing problems.
+/// parsing, the per-format errors for container shape problems, and
+/// the per-codec errors for bitstream parsing problems.
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -134,7 +134,10 @@ pub enum Error {
     UnknownFormat(String),
 
     /// A video format that a raw byte stream cannot be split into.
-    #[error("{0} is not self-describing, so its frame boundaries can't be inferred from a stream")]
+    #[error(
+        "{0} is not self-describing, so its frame boundaries \
+         can't be inferred from a stream"
+    )]
     NotSelfDescribing(String),
 
     /// A format was handed to a constructor for a different kind of import.
@@ -149,9 +152,13 @@ pub enum Error {
     #[error("encryption: {0}")]
     Encryption(#[from] EncryptionError),
 
-    /// A non-keyframe frame was received before any keyframe opened a group.
-    #[error("{0}")]
+    /// A non-keyframe was written before a keyframe opened the track.
+    #[error(transparent)]
     MissingKeyframe(#[from] crate::container::MissingKeyframe),
+
+    /// An explicit video endpoint precedes its last frame.
+    #[error("{0}")]
+    InvalidEnd(#[from] crate::container::InvalidEnd),
 
     /// A FLV video frame resolved to a negative presentation timestamp.
     #[error(
@@ -159,7 +166,10 @@ pub enum Error {
          dts={dts_ms}ms composition_time={composition_time_ms}ms"
     )]
     NegativeFlvPts {
+        /// The FLV tag decode timestamp in milliseconds.
         dts_ms: u64,
+
+        /// The signed FLV composition-time offset in milliseconds.
         composition_time_ms: i32,
     },
 

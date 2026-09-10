@@ -666,7 +666,8 @@ impl Connection {
 			let budget = retry_budget(client.reconnect, retry_start, timeout);
 
 			match Self::dial_any(shared, &client, &addrs, &mut draining, budget).await {
-				Ok((url, session)) => {
+				Ok((addr, session)) => {
+					let url = addr.url().clone();
 					tracing::info!(peer = %Endpoint(&url), "connected");
 					shared.connected(&session);
 
@@ -679,6 +680,14 @@ impl Connection {
 					// A session that stayed up past the initial backoff is healthy; one that
 					// ended sooner counts as a failed attempt however it ended.
 					let healthy = connected.elapsed() >= initial;
+
+					// The connected target owns the policy, including in one-shot mode.
+					if let Ended::Goaway(msg) = &ended
+						&& addr.addresses().is_some()
+						&& goaway.redirect().target(&msg.uri, &url).is_some()
+					{
+						return Err(Error::PinnedRedirect);
+					}
 
 					// One-shot mode leaves rather than migrating: there is no replacement to
 					// dial, and a GOAWAY naming no deadline never force-closes, so the peer
@@ -843,11 +852,12 @@ impl Connection {
 		addrs: &Addrs,
 		draining: &mut Option<Draining>,
 		budget: Option<tokio::time::Instant>,
-	) -> crate::Result<(Url, moq_net::Session)> {
+	) -> crate::Result<(crate::connect::Addr, moq_net::Session)> {
 		let candidates = addrs.as_slice();
 		let mut last = None;
 
-		for (index, url) in candidates.iter().enumerate() {
+		for (index, addr) in candidates.iter().enumerate() {
+			let url = addr.url();
 			// The retry window can run out mid-walk. Stop rather than starting an
 			// attempt with no time to finish; the caller reports the budget error.
 			if budget.is_some_and(|budget| tokio::time::Instant::now() >= budget) {
@@ -856,7 +866,7 @@ impl Connection {
 
 			tracing::info!(peer = %Endpoint(url), "connecting");
 
-			let mut dial = std::pin::pin!(client.dial(url.clone()));
+			let mut dial = std::pin::pin!(client.dial(addr.clone()));
 			let dialed = kio::wait(|waiter| {
 				if poll_draining(draining, waiter) {
 					shared.disconnected();
@@ -874,7 +884,7 @@ impl Connection {
 			};
 
 			match dialed {
-				Ok(session) => return Ok((url.clone(), session)),
+				Ok(session) => return Ok((addr.clone(), session)),
 				// A status the peer actually sent is its answer, not this address's, so
 				// unless it invites another attempt it settles the whole walk. Carrying
 				// on would offer the same rejected credentials at the peer's other
@@ -1690,7 +1700,7 @@ mod tests {
 		.await
 		.expect("the walk must not hang")
 		.expect("the live address must connect");
-		assert_eq!(connected, live, "the walk must land on the one that answers");
+		assert_eq!(connected.url(), &live, "the walk must land on the one that answers");
 	}
 
 	/// With nothing reachable the walk reports a failure rather than hanging.
