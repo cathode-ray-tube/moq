@@ -211,8 +211,9 @@ impl<S: Stream> Export<S> {
 	/// an fMP4 import. Setting this caps each fragment to roughly `duration` of frames,
 	/// useful for downstream consumers that throttle by fragment rate, or to bound an
 	/// audio track whose publisher never cuts it. [`Duration::ZERO`] emits one fragment
-	/// per frame (the historical behavior); otherwise the cap applies in addition to
-	/// the group boundary.
+	/// per frame. Video with unknown duration waits for the next timestamp or endpoint
+	/// marker; audio and samples with explicit durations remain immediate. Otherwise
+	/// the cap applies in addition to the group boundary.
 	///
 	/// Accepts either `Duration` or `Option<Duration>` (where `None` restores
 	/// the per-group default).
@@ -302,6 +303,18 @@ impl<S: Stream> Export<S> {
 							track.pending = Some(frame);
 							break;
 						}
+						Poll::Ready(Some(Event::FrameEnd(end))) => {
+							if track.is_video
+								&& let Some(last) = track.buffer.last_mut()
+								&& last.duration.is_none()
+							{
+								last.duration =
+									timestamp_gap(last.timestamp, end, moq_net::Timescale::new(track.timescale)?)?;
+								if self.fragment_duration == Some(Duration::ZERO) && last.duration.is_some() {
+									break;
+								}
+							}
+						}
 						Poll::Ready(Some(Event::GroupEnd)) => {
 							if track.buffer.is_empty() {
 								continue;
@@ -364,9 +377,8 @@ impl<S: Stream> Export<S> {
 				let frag = self.fragment_duration;
 				let track = self.tracks.get_mut(&name).unwrap();
 				let frame = track.pending.take().unwrap();
-				// A zero cap is one fragment per frame, which never depends on the
-				// successor, so emit immediately instead of buffering the frame until
-				// the next one flushes it.
+				// A zero cap emits one sample at a time. Unknown video duration still
+				// needs a successor timestamp or endpoint before it can be encoded.
 				if frag == Some(Duration::ZERO) {
 					// A catalog change can leave buffered frames behind. Drain them
 					// first and retry this frame on the next poll.
@@ -377,6 +389,10 @@ impl<S: Stream> Export<S> {
 						return Poll::Ready(Ok(Some(Chunk::Fragment(fragment))));
 					}
 					track.buffer_independent = frame.keyframe;
+					if track.is_video && frame.duration.is_none() {
+						track.buffer.push(frame);
+						continue;
+					}
 					let fragment = emit_fragment(track, &mut self.sequence_number, vec![frame], None)?;
 					return Poll::Ready(Ok(Some(Chunk::Fragment(fragment))));
 				}
@@ -439,7 +455,13 @@ impl<S: Stream> Export<S> {
 		let earliest = self.tracks.values().filter_map(Fmp4Track::next_start).min()?;
 		self.tracks
 			.iter()
-			.filter(|(_, track)| (track.finished || track.group_finished) && !track.buffer.is_empty())
+			.filter(|(_, track)| {
+				!track.buffer.is_empty()
+					&& (track.finished
+						|| track.group_finished
+						|| (self.fragment_duration == Some(Duration::ZERO)
+							&& track.buffer.last().is_some_and(|frame| frame.duration.is_some())))
+			})
 			.map(|(name, track)| (Duration::from(track.buffer[0].timestamp), !track.is_video, name))
 			.filter(|(start, _, _)| *start <= earliest)
 			.min()
@@ -677,8 +699,8 @@ pub(crate) fn extract_init(
 /// Triggers when `frame` opens a group, or on the duration cap. The keyframe bit is the
 /// group boundary on every track: a video keyframe closes a GOP, and an audio frame
 /// carries it only where the publisher cut a group, which is the boundary the file
-/// should keep rather than one invented here. The per-frame mode never buffers and is
-/// handled before this check.
+/// should keep rather than one invented here. Per-frame output is handled before
+/// this check.
 fn should_flush(track: &Fmp4Track, frame: &Frame, fragment_duration: Option<Duration>) -> bool {
 	if track.buffer.is_empty() {
 		return false;
@@ -736,7 +758,7 @@ fn emit_fragment(
 	let independent = !track.is_video || track.buffer_independent;
 	let timescale = moq_net::Timescale::new(track.timescale)?;
 	infer_missing_durations(&mut frames, successor, track.default_frame, timescale)?;
-	let duration = fragment_duration(&frames, track.default_frame);
+	let duration = fragment_duration(&frames, track.default_frame, timescale)?;
 	let data = encode_fragment(track, sequence_number, frames)?;
 	Ok(Fragment {
 		data,
@@ -751,18 +773,21 @@ fn emit_fragment(
 /// tile the timeline, so their sum is exact. Legacy / LOC sources carry none, so
 /// fall back to the presentation span plus one `default_frame` for the trailing
 /// sample (which has no successor to bound it).
-fn fragment_duration(frames: &[Frame], default_frame: Duration) -> Duration {
+fn fragment_duration(frames: &[Frame], default_frame: Duration, timescale: moq_net::Timescale) -> Result<Duration> {
 	if frames.is_empty() {
-		return Duration::ZERO;
+		return Ok(Duration::ZERO);
 	}
 	if frames
 		.iter()
 		.all(|f| f.duration.is_some_and(|duration| !duration.is_zero()))
 	{
-		return frames
-			.iter()
-			.map(|f| Duration::from(f.duration.unwrap()))
-			.sum::<Duration>();
+		// Sum output ticks before converting once, so per-sample nanosecond rounding cannot accumulate.
+		let ticks = frames.iter().try_fold(0u64, |sum, frame| -> Result<u64> {
+			let ticks = super::trun_duration(frame.duration.unwrap(), timescale)?;
+			sum.checked_add(u64::from(ticks))
+				.ok_or_else(|| moq_net::TimeOverflow.into())
+		})?;
+		return Ok(Timestamp::new(ticks, timescale)?.into());
 	}
 	let mut min = Duration::MAX;
 	let mut max = Duration::ZERO;
@@ -771,7 +796,7 @@ fn fragment_duration(frames: &[Frame], default_frame: Duration) -> Duration {
 		min = min.min(pts);
 		max = max.max(pts);
 	}
-	(max - min) + default_frame
+	Ok((max - min) + default_frame)
 }
 
 /// Fill in the durations the codec states outright, before anything has to be inferred
@@ -868,7 +893,11 @@ fn fallback_duration(default_frame: Duration, timescale: moq_net::Timescale) -> 
 /// Quantizing endpoints instead of each gap independently carries fractional ticks forward:
 /// a microsecond clock alternating 33,333 and 33,334 microsecond steps at 30 kHz produces
 /// consecutive 1,000-tick samples instead of either drifting or failing as inexact.
-fn timestamp_gap(start: Timestamp, end: Timestamp, timescale: moq_net::Timescale) -> Result<Option<Timestamp>> {
+pub(super) fn timestamp_gap(
+	start: Timestamp,
+	end: Timestamp,
+	timescale: moq_net::Timescale,
+) -> Result<Option<Timestamp>> {
 	let start_scale = u128::from(start.scale().as_u64());
 	let end_scale = u128::from(end.scale().as_u64());
 	let end_numerator = u128::from(end.value()) * start_scale;
@@ -985,7 +1014,7 @@ mod tests {
 		assert_eq!(frames[1].duration, Some(ts(41_667)));
 		assert_eq!(frames[2].duration, Some(ts(33_000)));
 		assert_eq!(
-			fragment_duration(&frames, Duration::from_millis(33)),
+			fragment_duration(&frames, Duration::from_millis(33), frames[0].duration.unwrap().scale()).unwrap(),
 			Duration::from_micros(116_334)
 		);
 	}
@@ -997,7 +1026,7 @@ mod tests {
 
 		assert_eq!(frames[0].duration, Some(ts(40_000)));
 		assert_eq!(
-			fragment_duration(&frames, Duration::from_millis(40)),
+			fragment_duration(&frames, Duration::from_millis(40), frames[0].duration.unwrap().scale()).unwrap(),
 			Duration::from_millis(40)
 		);
 	}
@@ -1016,7 +1045,7 @@ mod tests {
 
 		assert_eq!(frames[0].duration, Some(ts(41_667)));
 		assert_eq!(
-			fragment_duration(&frames, Duration::from_millis(33)),
+			fragment_duration(&frames, Duration::from_millis(33), frames[0].duration.unwrap().scale()).unwrap(),
 			Duration::from_micros(41_667)
 		);
 	}
@@ -1055,7 +1084,7 @@ mod tests {
 
 		assert_eq!(frames[0].duration, Some(ts(33_000)));
 		assert_eq!(
-			fragment_duration(&frames, Duration::from_millis(33)),
+			fragment_duration(&frames, Duration::from_millis(33), frames[0].duration.unwrap().scale()).unwrap(),
 			Duration::from_millis(33)
 		);
 	}
@@ -1161,7 +1190,7 @@ mod tests {
 		assert_eq!(frames[1].duration, Some(ts(33_000)));
 		assert_eq!(frames[2].duration, Some(ts(33_000)));
 		assert_eq!(
-			fragment_duration(&frames, Duration::from_millis(33)),
+			fragment_duration(&frames, Duration::from_millis(33), frames[0].duration.unwrap().scale()).unwrap(),
 			Duration::from_micros(99_000)
 		);
 	}

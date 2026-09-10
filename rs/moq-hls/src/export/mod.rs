@@ -652,7 +652,10 @@ mod tests {
 		// Three GOPs, 2s apart: groups 0 and 1 are complete, group 2 is the live edge.
 		let track = broadcast.create_track("video0", None).unwrap();
 		let mut media = catalog
-			.media_producer(track, moq_mux::catalog::hang::Container::Legacy)
+			.media_producer(
+				track,
+				moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Data),
+			)
 			.unwrap();
 		media.write(vp8_frame(0, true)).unwrap();
 		media.write(vp8_frame(1_000_000, false)).unwrap();
@@ -706,6 +709,45 @@ mod tests {
 		drop((media, registration, broadcast));
 	}
 
+	/// A duration marker times the trailing sample of a fetched HLS segment.
+	#[tokio::test]
+	async fn a_duration_marker_times_the_hls_trailing_sample() {
+		let origin = produce_origin();
+		let mut broadcast = origin.create_broadcast("live").expect("publish allowed");
+		broadcast.announce(Default::default()).expect("publish allowed");
+		settle().await;
+		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+
+		let reserved = catalog.reserve();
+		let mut registration = reserved.video("video0").unwrap();
+		registration.set(video_config()).unwrap();
+		drop(reserved);
+
+		let track = broadcast.create_track("video0", None).unwrap();
+		let mut media = catalog
+			.media_producer(
+				track,
+				moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Video),
+			)
+			.unwrap();
+		media.write(vp8_frame(0, true)).unwrap();
+		media.write(vp8_frame(1_000_000, false)).unwrap();
+		media.write(vp8_frame(2_000_000, true)).unwrap();
+		media.finish().unwrap();
+
+		let source = moq_mux::Source::new(origin.consume(), "live");
+		let broadcaster = Broadcaster::new(source, Config::default()).await.unwrap();
+		let _ = tokio::time::timeout(Duration::from_secs(5), broadcaster.ready()).await;
+		let rendition = broadcaster
+			.rendition(Kind::Video, "video0")
+			.expect("rendition discovered from the catalog");
+		let _ = tokio::time::timeout(Duration::from_secs(5), rendition.playable()).await;
+
+		let segment = rendition.segment(0).await.unwrap().expect("segment fetched on demand");
+		assert_eq!(&segment[4..8], b"moof");
+		drop((media, registration, broadcast));
+	}
+
 	// The DASH half of the fetch-on-demand path: the manifest renders from the same timeline
 	// windows as the HLS playlists (dynamic while live, aligned S entries across renditions),
 	// and $Time$ addressing resolves a segment's pts to the same bytes its number does.
@@ -727,11 +769,17 @@ mod tests {
 
 		let video_track = broadcast.create_track("video0", None).unwrap();
 		let mut video = catalog
-			.media_producer(video_track, moq_mux::catalog::hang::Container::Legacy)
+			.media_producer(
+				video_track,
+				moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Data),
+			)
 			.unwrap();
 		let audio_track = broadcast.create_track("audio0", None).unwrap();
 		let mut audio = catalog
-			.media_producer(audio_track, moq_mux::catalog::hang::Container::Legacy)
+			.media_producer(
+				audio_track,
+				moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Data),
+			)
 			.unwrap();
 
 		// Video keyframes every 2s cut the segments; audio contributes one group per cut.
@@ -804,7 +852,10 @@ mod tests {
 
 		let track = broadcast.create_track("video0", None).unwrap();
 		let mut media = catalog
-			.media_producer(track, moq_mux::catalog::hang::Container::Legacy)
+			.media_producer(
+				track,
+				moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Data),
+			)
 			.unwrap();
 		media.write(frame(0, true)).unwrap();
 		media.write(frame(2_000_000, true)).unwrap();
@@ -867,7 +918,10 @@ mod tests {
 		// 3s GOPs against the default 1s minimum: every segment is one whole GOP.
 		let track = broadcast.create_track("video0", None).unwrap();
 		let mut media = catalog
-			.media_producer(track, moq_mux::catalog::hang::Container::Legacy)
+			.media_producer(
+				track,
+				moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Data),
+			)
 			.unwrap();
 		media.write(frame(0, true)).unwrap();
 		media.write(frame(3_000_000, true)).unwrap();
@@ -905,11 +959,17 @@ mod tests {
 
 		let video_track = broadcast.create_track("video0", None).unwrap();
 		let mut video = catalog
-			.media_producer(video_track, moq_mux::catalog::hang::Container::Legacy)
+			.media_producer(
+				video_track,
+				moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Data),
+			)
 			.unwrap();
 		let audio_track = broadcast.create_track("audio0", None).unwrap();
 		let mut audio = catalog
-			.media_producer(audio_track, moq_mux::catalog::hang::Container::Legacy)
+			.media_producer(
+				audio_track,
+				moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Data),
+			)
 			.unwrap();
 
 		// Interleaved by pts, as a muxer would demux them: video keyframes every 2s open the
@@ -989,7 +1049,10 @@ mod tests {
 		// publisher finishes.
 		let track = broadcast.create_track("video0", None).unwrap();
 		let mut media = catalog
-			.media_producer(track, moq_mux::catalog::hang::Container::Legacy)
+			.media_producer(
+				track,
+				moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Data),
+			)
 			.unwrap();
 		media.write(frame(0, true)).unwrap();
 		media.write(frame(2_000_000, true)).unwrap();
@@ -1079,7 +1142,10 @@ mod tests {
 
 			let track = broadcast.create_track("video0", None).unwrap();
 			let mut media = catalog
-				.media_producer(track, moq_mux::catalog::hang::Container::Legacy)
+				.media_producer(
+					track,
+					moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Data),
+				)
 				.unwrap();
 			media.write(payload_frame(0, true, payload)).unwrap();
 			media.write(payload_frame(2_000_000, true, payload)).unwrap();
@@ -1170,7 +1236,10 @@ mod tests {
 			broadcast.announce(Default::default()).expect("publish allowed");
 			let track = broadcast.create_track("video0", None).unwrap();
 
-			let mut media = moq_mux::container::Producer::new(track, moq_mux::catalog::hang::Container::Legacy);
+			let mut media = moq_mux::container::Producer::new(
+				track,
+				moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Data),
+			);
 			if let Some(recorder) = recorder {
 				media = media.with_recorder(recorder);
 			}
@@ -1315,7 +1384,10 @@ mod tests {
 
 		let track = broadcast.create_track("video0", None).unwrap();
 		let mut media = catalog
-			.media_producer(track, moq_mux::catalog::hang::Container::Legacy)
+			.media_producer(
+				track,
+				moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Data),
+			)
 			.unwrap();
 		media.write(frame(0, true)).unwrap();
 		media.write(frame(2_000_000, true)).unwrap();
@@ -1372,7 +1444,10 @@ mod tests {
 		// Groups 0 and 1 are complete; group 2 is the live edge until the publisher drops.
 		let track = broadcast.create_track("video0", None).unwrap();
 		let mut media = catalog
-			.media_producer(track, moq_mux::catalog::hang::Container::Legacy)
+			.media_producer(
+				track,
+				moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Data),
+			)
 			.unwrap();
 		media.write(frame(0, true)).unwrap();
 		media.write(frame(2_000_000, true)).unwrap();

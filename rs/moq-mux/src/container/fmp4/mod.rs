@@ -54,6 +54,10 @@ pub enum Error {
 	#[error("missing keyframe: a group must open on a keyframe")]
 	MissingKeyframe(#[from] crate::container::MissingKeyframe),
 
+	/// An explicit video endpoint precedes its last frame.
+	#[error("{0}")]
+	InvalidEnd(#[from] crate::container::InvalidEnd),
+
 	#[error("timestamp overflow")]
 	TimestampOverflow(#[from] moq_net::TimeOverflow),
 
@@ -283,6 +287,14 @@ impl Wire {
 }
 
 impl Container for Wire {
+	fn kind(&self) -> crate::container::Kind {
+		match self.trak.mdia.hdlr.handler.as_ref() {
+			b"soun" => crate::container::Kind::Audio,
+			b"vide" => crate::container::Kind::Video,
+			_ => crate::container::Kind::Data,
+		}
+	}
+
 	type Error = Error;
 
 	fn write(&self, group: &mut moq_net::group::Producer, frames: &[Frame]) -> std::result::Result<(), Self::Error> {

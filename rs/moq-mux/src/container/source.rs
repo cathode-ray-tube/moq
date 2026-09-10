@@ -115,7 +115,7 @@ impl ExportSource {
 		max_age: std::time::Duration,
 		transform: Option<VideoTransform>,
 	) -> Result<Option<Self>, crate::Error> {
-		let media: HangContainer = (&config.container).try_into()?;
+		let media: HangContainer = config.try_into()?;
 		let description = config.description.as_ref().filter(|b| !b.is_empty()).cloned();
 		let Some(request) = source.try_request(config.broadcast.as_ref()) else {
 			return Ok(None);
@@ -144,7 +144,7 @@ impl ExportSource {
 		config: &AudioConfig,
 		max_age: std::time::Duration,
 	) -> Result<Option<Self>, crate::Error> {
-		let media: HangContainer = (&config.container).try_into()?;
+		let media: HangContainer = config.try_into()?;
 		let description = config.description.as_ref().filter(|b| !b.is_empty()).cloned();
 		let Some(request) = source.try_request(config.broadcast.as_ref()) else {
 			return Ok(None);
@@ -170,7 +170,7 @@ impl ExportSource {
 	pub fn for_stream(source: &crate::Source, name: &str, max_age: std::time::Duration) -> Result<Self, crate::Error> {
 		Ok(Self {
 			state: SourceState::Requesting(source.request_catalog(), name.to_string()),
-			media: Some(HangContainer::Legacy),
+			media: Some(HangContainer::Legacy(crate::container::Kind::Data)),
 			max_age,
 			transform: None,
 			description: None,
@@ -234,7 +234,7 @@ impl ExportSource {
 		loop {
 			match ready!(self.poll_event(waiter))? {
 				Some(Event::Frame(frame)) => return Poll::Ready(Ok(Some(frame))),
-				Some(Event::GroupEnd) => continue,
+				Some(Event::GroupEnd | Event::FrameEnd(_)) => continue,
 				None => return Poll::Ready(Ok(None)),
 			}
 		}

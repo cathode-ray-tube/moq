@@ -26,8 +26,14 @@ impl Live {
 			)
 			.unwrap();
 		insert(&mut catalog, track.name().to_string());
+		let kind = if catalog.lock().video.renditions.contains_key(track.name()) {
+			crate::container::Kind::Video
+		} else {
+			crate::container::Kind::Audio
+		};
+		let format = crate::catalog::hang::Container::Legacy(kind);
 		Self {
-			track: crate::container::Producer::new(track, crate::catalog::hang::Container::Legacy),
+			track: crate::container::Producer::new(track, format),
 			catalog,
 			consumer,
 			broadcast,
@@ -47,7 +53,10 @@ impl Live {
 			.create_track(name, hang::container::track_info(hang::catalog::PRIORITY.audio))
 			.unwrap();
 		insert(&mut self.catalog, track.name().to_string());
-		crate::container::Producer::new(track, crate::catalog::hang::Container::Legacy)
+		crate::container::Producer::new(
+			track,
+			crate::catalog::hang::Container::Legacy(crate::container::Kind::Data),
+		)
 	}
 
 	/// One Avc3-shape H.264 rendition (320x240 at 30 fps).
