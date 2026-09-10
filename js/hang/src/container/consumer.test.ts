@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test";
 import { Group, Time, Track, Varint } from "@moq/net";
-import type { InitSegment } from "./cmaf/decode.ts";
-import { encodeDataSegment } from "./cmaf/encode.ts";
+import { AudioConfigSchema } from "../catalog/audio.ts";
+import { decodeInitSegment, type InitSegment } from "./cmaf/decode.ts";
+import { createAudioInitSegment, encodeDataSegment } from "./cmaf/encode.ts";
 import { Format as CmafFormat } from "./cmaf/format.ts";
 import { Consumer } from "./consumer.ts";
 import type { Format as ContainerFormat } from "./format.ts";
@@ -12,6 +13,7 @@ const TIMESCALE = 90_000;
 const TEST_INIT: InitSegment = {
 	timescale: TIMESCALE,
 	trackId: 1,
+	kind: "video",
 	defaultSampleDuration: 0,
 	defaultSampleSize: 0,
 	defaultSampleFlags: 0,
@@ -27,7 +29,14 @@ function encodeLegacyFrame(timestamp: Time.Micro, payload: Uint8Array): Uint8Arr
 
 /** A one-byte CMAF sample at `timestamp` ticks, lasting one 3000-tick (33_333µs) frame. */
 function encodeCmafFrame(data: number, timestamp: number, sequence: number): Uint8Array {
-	return encodeDataSegment({ data: new Uint8Array([data]), timestamp, duration: 3000, keyframe: true, sequence });
+	return encodeDataSegment({
+		kind: "video",
+		data: new Uint8Array([data]),
+		timestamp,
+		duration: 3000,
+		keyframe: true,
+		sequence,
+	});
 }
 
 /** Yield long enough for the consumer's spawned group readers to drain what's been written. */
@@ -100,6 +109,7 @@ test("LegacyFormat throws on truncated input", () => {
 test("CmafFormat decodes a valid keyframe segment", () => {
 	const format = new CmafFormat(TEST_INIT);
 	const segment = encodeDataSegment({
+		kind: "video",
 		data: new Uint8Array([0xca, 0xfe]),
 		timestamp: 0,
 		duration: 3000,
@@ -115,9 +125,51 @@ test("CmafFormat decodes a valid keyframe segment", () => {
 	expect(result[0].keyframe).toBe(true);
 });
 
+// Packagers flag every audio sample a sync sample. Reported as a keyframe, each would open
+// its own group, so audio never decodes one: the consumer marks the group start instead.
+test("CmafFormat never reports an audio keyframe", () => {
+	const config = AudioConfigSchema.parse({
+		codec: "opus",
+		container: { kind: "legacy" },
+		sampleRate: 48000,
+		numberOfChannels: 2,
+	});
+	const init = decodeInitSegment(createAudioInitSegment(config));
+	expect(init.kind).toBe("audio");
+
+	const format = new CmafFormat(init);
+	const segment = encodeDataSegment({
+		kind: "audio",
+		data: new Uint8Array([0xca, 0xfe]),
+		timestamp: 0,
+		duration: 20000,
+		keyframe: true,
+		sequence: 0,
+	});
+
+	const result = format.decode(segment);
+	expect(result).toHaveLength(1);
+	expect(result[0].keyframe).toBe(false);
+});
+
+test("CMAF init rejects an unsupported track handler", () => {
+	const config = AudioConfigSchema.parse({
+		codec: "opus",
+		container: { kind: "legacy" },
+		sampleRate: 48000,
+		numberOfChannels: 2,
+	});
+	const init = createAudioInitSegment(config);
+	const offset = Buffer.from(init).indexOf("soun");
+	expect(offset).toBeGreaterThanOrEqual(0);
+	init.set(new TextEncoder().encode("text"), offset);
+	expect(() => decodeInitSegment(init)).toThrow("Unsupported track handler: text");
+});
+
 test("CmafFormat decodes a delta frame segment", () => {
 	const format = new CmafFormat(TEST_INIT);
 	const segment = encodeDataSegment({
+		kind: "video",
 		data: new Uint8Array([0xbe, 0xef]),
 		timestamp: 3000,
 		duration: 3000,
@@ -135,6 +187,7 @@ test("CmafFormat converts timescale units to microseconds", () => {
 	const format = new CmafFormat(TEST_INIT);
 	// 90000 timescale units = 1 second = 1_000_000 microseconds
 	const segment = encodeDataSegment({
+		kind: "video",
 		data: new Uint8Array([0x01]),
 		timestamp: TIMESCALE,
 		duration: 3000,
@@ -731,6 +784,7 @@ test("Consumer with CmafFormat delivers correct timestamps", async () => {
 	const group = new Group.Producer(0);
 	group.writeFrame({
 		payload: encodeDataSegment({
+			kind: "video",
 			data: new Uint8Array([0xca, 0xfe]),
 			timestamp: 0,
 			duration: 3000,
@@ -741,6 +795,7 @@ test("Consumer with CmafFormat delivers correct timestamps", async () => {
 	});
 	group.writeFrame({
 		payload: encodeDataSegment({
+			kind: "video",
 			data: new Uint8Array([0xbe, 0xef]),
 			timestamp: 3000,
 			duration: 3000,
@@ -765,6 +820,7 @@ test("Consumer with CmafFormat delivers correct timestamps", async () => {
 test("CmafFormat decodes the per-sample duration", () => {
 	const format = new CmafFormat(TEST_INIT);
 	const segment = encodeDataSegment({
+		kind: "video",
 		data: new Uint8Array([0xca, 0xfe]),
 		timestamp: 0,
 		duration: 3000,
@@ -875,6 +931,7 @@ test("Consumer delivers a PTS-contiguous next group whose sequence jumped (CMAF)
 	const a = new Group.Producer(1_000_000);
 	a.writeFrame({
 		payload: encodeDataSegment({
+			kind: "video",
 			data: new Uint8Array([0x01]),
 			timestamp: 0,
 			duration: 3000,
@@ -900,6 +957,7 @@ test("Consumer delivers a PTS-contiguous next group whose sequence jumped (CMAF)
 	track.writeGroup(b);
 	b.writeFrame({
 		payload: encodeDataSegment({
+			kind: "video",
 			data: new Uint8Array([0x02]),
 			timestamp: 3045,
 			duration: 3000,
@@ -934,6 +992,7 @@ test("Consumer waits on a PTS gap instead of skipping to a later buffered group 
 	const a = new Group.Producer(1_000_000);
 	a.writeFrame({
 		payload: encodeDataSegment({
+			kind: "video",
 			data: new Uint8Array([0x01]),
 			timestamp: 0,
 			duration: 3000,
@@ -957,6 +1016,7 @@ test("Consumer waits on a PTS gap instead of skipping to a later buffered group 
 	track.writeGroup(c);
 	c.writeFrame({
 		payload: encodeDataSegment({
+			kind: "video",
 			data: new Uint8Array([0x03]),
 			timestamp: 90_000,
 			duration: 3000,
@@ -978,6 +1038,7 @@ test("Consumer waits on a PTS gap instead of skipping to a later buffered group 
 	track.writeGroup(b);
 	b.writeFrame({
 		payload: encodeDataSegment({
+			kind: "video",
 			data: new Uint8Array([0x02]),
 			timestamp: 3000,
 			duration: 3000,
