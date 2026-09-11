@@ -82,6 +82,7 @@ cargo run -- \\
   --relay https://relay.example.com/anon \\
   --broadcast my-stream.hang \\
   --track video
+```
 
 The `--track` value must match the track name created by the publisher. The default track name is `video`.
 
