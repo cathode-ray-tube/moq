@@ -14,7 +14,7 @@ The example:
 - Assigns each frame a unique counter (`ctr`) value for nonce construction.
 - Writes the encrypted frames as hexadecimal to standard output.
 
-This example does not use the network. It only demonstrates local frame encryption and output.
+**This example does not use the network. It only demonstrates local frame encryption and output.**
 
 ## Running
 
@@ -49,7 +49,7 @@ A small debugging application that:
 4. Subscribes directly to a named track.
 5. Prints the received raw frame payloads.
 
-This application is intended for testing and debugging only. It does not implement production security, secure key handling, authentication, authorization, access control, or hardened error handling. Do not use it with production media, credentials, or sensitive keys.
+**This application is intended for testing and debugging only. It does not implement production security, secure key handling, authentication, authorization, access control, or hardened error handling. Do not use it with production media, credentials, or sensitive keys.**
 
 ## Requirements
 
@@ -140,7 +140,7 @@ Examples:
 
 This is a debug application only.
 
-It does not provide:
+It **does not** provide:
 
 - Production-grade key management
 - Secure memory handling or key zeroization
