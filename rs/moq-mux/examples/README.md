@@ -106,12 +106,12 @@ Track:     video
 ```
 ## Output
 
-Without --raw, each received frame is printed as hexadecimal text:
+Without `--raw`, each received frame is printed as hexadecimal text:
 
 ```text
 encrypted_frame len=1234 hex=...
 ```
-With --raw, frame payloads are written directly to standard output:
+With `--raw`, frame payloads are written directly to standard output:
 
 ```bash
 MOQ_AEAD_KEY=<key> \\
@@ -142,14 +142,14 @@ This is a debug application only.
 
 It does not provide:
 
-    - Production-grade key management
-    - Secure memory handling or key zeroization
-    - User authentication
-    - Relay authentication
-    - Authorization
-    - Replay protection
-    - Input validation suitable for hostile input
-    - Secure logging
-    - Protection against accidental exposure through command-line arguments, environment variables, stdout, or files
+- Production-grade key management
+- Secure memory handling or key zeroization
+- User authentication
+- Relay authentication
+- Authorization
+- Replay protection
+- Input validation suitable for hostile input
+- Secure logging
+- Protection against accidental exposure through command-line arguments, environment variables, stdout, or files
 
 **Do not use real production keys or sensitive media with this application. Use disposable test credentials and a test relay.**
