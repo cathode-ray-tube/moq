@@ -97,7 +97,7 @@ pub struct Import<E: crate::catalog::hang::CatalogExt = ()> {
 	// wire, and `Recorder::end` still reports real content time.
 	segment_start: Option<Timestamp>,
 
-	encrypter: Option<Box<dyn FrameEncrypter>>,
+	encrypter: Option<Box<dyn FrameEncrypter + Send>>,
 }
 
 /// The catalog entry for one imported track, whichever section it lives in.
@@ -177,11 +177,12 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	/// Enable encryption for imported fMP4 payloads.
 	pub fn with_encrypter<E2>(mut self, encrypter: E2) -> Self
 		where
-		    E2: crate::container::FrameEncrypter + 'static,
+		    E2: FrameEncrypter + Send + 'static,
 		{
 		    self.encrypter = Some(Box::new(encrypter));
 		    self
 		}
+
 
 	/// Declare that the next fragment starts a new segment, for callers that know the source's
 	/// segmentation out of band (e.g. an HLS import following its playlist).
