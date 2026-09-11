@@ -78,10 +78,10 @@ pub struct Producer<C: Container> {
 	/// Measures the jitter and bitrate of what gets written, for the catalog. Always on: it costs
 	/// two counters, and a caller who doesn't publish a rendition simply never reads it.
 	estimator: crate::catalog::Estimator,
-      
-	  /// Optional encrypter
-	  /// Persistent across immediate writes and flushes.
-    encrypter: Option<Box<dyn FrameEncrypter>>,
+
+	/// Optional encrypter
+	/// Persistent across immediate writes and flushes.
+	encrypter: Option<Box<dyn FrameEncrypter>>,
 }
 
 impl<C: Container<Error = crate::error::Error>> Producer<C> {
@@ -118,60 +118,52 @@ impl<C: Container<Error = crate::error::Error>> Producer<C> {
 	/// Usage:
 	/// let encrypter = MoqSecureEncrypter::new(
 	/// &key_store,
-    /// &signing_key,
-    /// key_id...
-	/// 
+	/// &signing_key,
+	/// key_id...
+	///
 	/// TODO: tear-down behavior will zero-ize credentials.
 	/// Key management will generally be left to the application,
 	/// however, safeguards may be applied here to prevent nonce reuse
 	/// in the event of restart (mandate new key, for instance)
 	pub fn with_encrypter<E>(mut self, encrypter: E) -> Self
 	where
-    E: crate::container::FrameEncrypter + 'static,
+		E: crate::container::FrameEncrypter + 'static,
 	{
-    self.encrypter = Some(Box::new(encrypter));
-    self
+		self.encrypter = Some(Box::new(encrypter));
+		self
 	}
 
 	/// Writes encoded container payloads through the configured writer chain.
 	///
 	/// Every call uses the current group. If an encrypter is configured, the
 	/// encoded payload is passed through ProtectedFrame before reaching MoQ.
-	fn write_container(
-	    &mut self,
-	    frames: &[Frame],
-	) -> Result<(), C::Error> {
-	    let group = match self.group.as_mut() {
-	        Some(group) => group,
-	        None => return Ok(()),
-	    };
-	
-	    let container = &mut self.container;
-	    let encrypter = &mut self.encrypter;
-	
-	    let output = crate::container::MoqFrameWriter { group };
-	
-	    match encrypter.as_mut() {
-	        Some(encrypter) => {
-	            let mut protected =
-	                crate::container::ProtectedFrame::new(
-	                    output,
-	                    encrypter.as_mut(),
-	                );
-	
-	            container.write(&mut protected, frames)?;
-	        }
-	
-	        None => {
-	            let mut plain = output;
-	
-	            container.write(&mut plain, frames)?;
-	        }
-	    }
-	
-	    Ok(())
-	}
+	fn write_container(&mut self, frames: &[Frame]) -> Result<(), C::Error> {
+		let group = match self.group.as_mut() {
+			Some(group) => group,
+			None => return Ok(()),
+		};
 
+		let container = &mut self.container;
+		let encrypter = &mut self.encrypter;
+
+		let output = crate::container::MoqFrameWriter { group };
+
+		match encrypter.as_mut() {
+			Some(encrypter) => {
+				let mut protected = crate::container::ProtectedFrame::new(output, encrypter.as_mut());
+
+				container.write(&mut protected, frames)?;
+			}
+
+			None => {
+				let mut plain = output;
+
+				container.write(&mut plain, frames)?;
+			}
+		}
+
+		Ok(())
+	}
 
 	/// The jitter and bitrate measured from the frames written so far.
 	///
@@ -310,8 +302,7 @@ impl<C: Container<Error = crate::error::Error>> Producer<C> {
 		}
 
 		Ok(())
-
-    }
+	}
 
 	/// Cut the current group, flushing buffered frames and closing it.
 	///
@@ -447,50 +438,45 @@ impl<C: Container<Error = crate::error::Error>> Producer<C> {
 	}
 
 	/// Flush any buffered frames into the current group without closing it.
-///
-/// Backfills the per-sample duration the source didn't provide. A CMAF fragment
-/// reconstructs each sample's DTS by accumulating durations, so every non-final
-/// sample packed into one fragment needs one or the decoder collapses their
-/// timestamps. Frames are in decode order, so a sample's duration is the gap to the
-/// next buffered sample; the final sample borrows `next` (the timestamp of the
-/// keyframe that rolled the group over), which is already in hand so this adds no
-/// latency. Frames that already carry a duration (e.g. fMP4 passthrough) keep it,
-/// and a backwards gap (a B-frame whose successor presents earlier) is left unset.
-/// Containers that don't use per-frame durations (Legacy, LOC) ignore the field.
-fn flush(&mut self, next: Option<moq_net::Timestamp>) -> Result<(), C::Error> {
-	if self.buffer.is_empty() {
-		return Ok(());
-	}
-
-	for i in 0..self.buffer.len() {
-		if self.buffer[i].duration.is_some() {
-			continue;
+	///
+	/// Backfills the per-sample duration the source didn't provide. A CMAF fragment
+	/// reconstructs each sample's DTS by accumulating durations, so every non-final
+	/// sample packed into one fragment needs one or the decoder collapses their
+	/// timestamps. Frames are in decode order, so a sample's duration is the gap to the
+	/// next buffered sample; the final sample borrows `next` (the timestamp of the
+	/// keyframe that rolled the group over), which is already in hand so this adds no
+	/// latency. Frames that already carry a duration (e.g. fMP4 passthrough) keep it,
+	/// and a backwards gap (a B-frame whose successor presents earlier) is left unset.
+	/// Containers that don't use per-frame durations (Legacy, LOC) ignore the field.
+	fn flush(&mut self, next: Option<moq_net::Timestamp>) -> Result<(), C::Error> {
+		if self.buffer.is_empty() {
+			return Ok(());
 		}
 
-		let boundary = self
-			.buffer
-			.get(i + 1)
-			.map(|frame| frame.timestamp)
-			.or(next);
+		for i in 0..self.buffer.len() {
+			if self.buffer[i].duration.is_some() {
+				continue;
+			}
 
-		if let Some(boundary) = boundary
-			&& let Ok(duration) = boundary.checked_sub(self.buffer[i].timestamp)
-		{
-			self.buffer[i].duration = Some(duration);
+			let boundary = self.buffer.get(i + 1).map(|frame| frame.timestamp).or(next);
+
+			if let Some(boundary) = boundary
+				&& let Ok(duration) = boundary.checked_sub(self.buffer[i].timestamp)
+			{
+				self.buffer[i].duration = Some(duration);
+			}
 		}
+
+		if self.group.is_none() {
+			return Ok(());
+		}
+
+		let buffered = std::mem::take(&mut self.buffer);
+
+		self.write_container(&buffered)?;
+
+		Ok(())
 	}
-
-	if self.group.is_none() {
-    return Ok(());
-	}
-
-	let buffered = std::mem::take(&mut self.buffer);
-
-	self.write_container(&buffered)?;
-
-	Ok(())
-}
-
 
 	/// Finish the track, flushing any buffered frames and closing any open group.
 	pub fn finish(&mut self) -> Result<(), C::Error> {

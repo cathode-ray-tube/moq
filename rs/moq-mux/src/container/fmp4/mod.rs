@@ -1,5 +1,5 @@
 //TODO: if moq_net::group::Producer::frame_count() is not public or does not represent the next fragment sequence number,
-// the sequence number must instead be tracked in fmp4::Wire or supplied through the writer API. 
+// the sequence number must instead be tracked in fmp4::Wire or supplied through the writer API.
 // The original direct-Producer implementation relied on that value, so the abstraction must preserve access to it somewhere.
 
 //! Fragmented MP4 (fMP4 / CMAF).
@@ -38,8 +38,8 @@ use mp4_atom::Atom;
 
 use moq_net::Timestamp;
 
-use crate::container::{Container, Frame};
 use crate::container::FrameWriter;
+use crate::container::{Container, Frame};
 
 /// Aliased as MuxError to avoid collision with local fmp4 error
 use crate::error::Error as MuxError;
@@ -295,76 +295,61 @@ impl Wire {
 }
 
 impl Container for Wire {
+	fn kind(&self) -> crate::container::Kind {
+		match self.trak.mdia.hdlr.handler.as_ref() {
+			b"soun" => crate::container::Kind::Audio,
+			b"vide" => crate::container::Kind::Video,
+			_ => crate::container::Kind::Data,
+		}
+	}
 
-fn kind(&self) -> crate::container::Kind {
-    match self.trak.mdia.hdlr.handler.as_ref() {
-        b"soun" => crate::container::Kind::Audio,
-        b"vide" => crate::container::Kind::Video,
-        _ => crate::container::Kind::Data,
-    }
+	type Error = MuxError;
+
+	fn write<W>(&self, output: &mut W, frames: &[Frame]) -> std::result::Result<(), Self::Error>
+	where
+		W: FrameWriter<Error = crate::error::Error>,
+	{
+		let timescale = moq_net::Timescale::new(self.trak.mdia.mdhd.timescale as u64)?;
+		let track_id = self.trak.tkhd.track_id;
+		let sequence_number = output.next_sequence_number();
+
+		encode(
+			output,
+			frames,
+			FragmentInfo {
+				timescale,
+				track_id,
+				sequence_number,
+				kind: self.kind()?,
+			},
+		)
+	}
+
+	fn poll_read(
+		&self,
+		group: &mut moq_net::group::Consumer,
+		waiter: &kio::Waiter,
+	) -> Poll<std::result::Result<Option<Vec<Frame>>, Self::Error>> {
+		use std::task::ready;
+
+		let Some(frame) = ready!(group.poll_read_frame(waiter)?) else {
+			return Poll::Ready(Ok(None));
+		};
+
+		let timescale = moq_net::Timescale::new(self.trak.mdia.mdhd.timescale as u64)?;
+
+		Poll::Ready(Ok(Some(decode(
+			frame.payload,
+			timescale,
+			match self.kind()? {
+				Kind::Audio => crate::container::Kind::Audio,
+				Kind::Video => crate::container::Kind::Video,
+			},
+		)?)))
+	}
 }
 
-type Error = MuxError;
-
-fn write<W>(
-    &self,
-    output: &mut W,
-    frames: &[Frame],
-) -> std::result::Result<(), Self::Error>
-where
-    W: FrameWriter<Error = crate::error::Error>,
-{
-    let timescale =
-        moq_net::Timescale::new(self.trak.mdia.mdhd.timescale as u64)?;
-    let track_id = self.trak.tkhd.track_id;
-    let sequence_number = output.next_sequence_number();
-
-    encode(
-        output,
-        frames,
-        FragmentInfo {
-            timescale,
-            track_id,
-            sequence_number,
-            kind: self.kind()?,
-        },
-    )
-}
-
-
-fn poll_read(
-    &self,
-    group: &mut moq_net::group::Consumer,
-    waiter: &kio::Waiter,
-) -> Poll<std::result::Result<Option<Vec<Frame>>, Self::Error>> {
-    use std::task::ready;
-
-    let Some(frame) = ready!(group.poll_read_frame(waiter)?) else {
-        return Poll::Ready(Ok(None));
-    };
-
-    let timescale =
-        moq_net::Timescale::new(self.trak.mdia.mdhd.timescale as u64)?;
-
-    Poll::Ready(Ok(Some(decode(
-    frame.payload,
-    timescale,
-    match self.kind()? {
-        Kind::Audio => crate::container::Kind::Audio,
-        Kind::Video => crate::container::Kind::Video,
-    },
-)?)))
-
-}
-
-}
-
-pub(crate) fn decode(
-    data: Bytes,
-    timescale: moq_net::Timescale,
-    kind: crate::container::Kind,
-) -> Result<Vec<Frame>> {
-
+pub(crate) fn decode(data: Bytes, timescale: moq_net::Timescale, kind: crate::container::Kind) -> Result<Vec<Frame>> {
 	use mp4_atom::DecodeMaybe;
 
 	let mut cursor = std::io::Cursor::new(&data);
@@ -418,9 +403,7 @@ pub(crate) fn decode(
 			let payload = Bytes::copy_from_slice(&mdat_data[offset..end]);
 			let flags = entry.flags.unwrap_or(0);
 			// depends_on_no_other (bits 24-25 == 0x2) means keyframe
-			let keyframe =
-   				 kind == crate::container::Kind::Video &&
-    			 (flags >> 24) & 0x3 == 0x2;
+			let keyframe = kind == crate::container::Kind::Video && (flags >> 24) & 0x3 == 0x2;
 
 			// Carry the sample-duration through at the track's scale when present, so
 			// the jitter buffer can use it and an exporter can write it back.
@@ -453,27 +436,22 @@ pub(crate) fn decode(
 	Ok(frames)
 }
 
-pub(crate) fn encode<W>(
-    output: &mut W,
-    frames: &[Frame],
-    info: FragmentInfo,
-) -> crate::error::Result<()>
+pub(crate) fn encode<W>(output: &mut W, frames: &[Frame], info: FragmentInfo) -> crate::error::Result<()>
 where
-    W: FrameWriter<Error = crate::error::Error>,
+	W: FrameWriter<Error = crate::error::Error>,
 {
-    if frames.is_empty() {
-        return Ok(());
-    }
+	if frames.is_empty() {
+		return Ok(());
+	}
 
-    let bytes = encode_fragment(info, frames)?;
+	let bytes = encode_fragment(info, frames)?;
 
-    // The fragment may carry several samples; the net frame's timestamp is the
-    // fragment's earliest presentation time so a relay can order it.
-    output.write_frame(frames[0].timestamp, bytes)?;
+	// The fragment may carry several samples; the net frame's timestamp is the
+	// fragment's earliest presentation time so a relay can order it.
+	output.write_frame(frames[0].timestamp, bytes)?;
 
-    Ok(())
+	Ok(())
 }
-
 
 /// Which track a fragment belongs to, and where it sits in that track.
 ///

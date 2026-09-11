@@ -8,12 +8,7 @@ use super::{Error, Kind};
 use crate::Result;
 use crate::catalog::Estimator;
 
-use crate::container::writer::{
-        FrameEncrypter,
-        FrameWriter,
-        MoqFrameWriter,
-        ProtectedFrame,
-    };
+use crate::container::writer::{FrameEncrypter, FrameWriter, MoqFrameWriter, ProtectedFrame};
 
 /// Converts fMP4/CMAF files into MoQ broadcast streams using CMAF passthrough.
 ///
@@ -176,13 +171,12 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 
 	/// Enable encryption for imported fMP4 payloads.
 	pub fn with_encrypter<E2>(mut self, encrypter: E2) -> Self
-		where
-		    E2: FrameEncrypter + Send + 'static,
-		{
-		    self.encrypter = Some(Box::new(encrypter));
-		    self
-		}
-
+	where
+		E2: FrameEncrypter + Send + 'static,
+	{
+		self.encrypter = Some(Box::new(encrypter));
+		self
+	}
 
 	/// Declare that the next fragment starts a new segment, for callers that know the source's
 	/// segmentation out of band (e.g. an HLS import following its playlist).
@@ -958,20 +952,19 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			let fragment_len = fragment_bytes.len();
 
 			{
-			    let output = MoqFrameWriter { group: &mut g };
-			
-			    match self.encrypter.as_mut() {
-			        Some(encrypter) => {
-			            let mut protected =
-			                ProtectedFrame::new(output, encrypter.as_mut());
-			
-			            protected.write_frame(timestamp, fragment_bytes)?;
-			        }
-			        None => {
-			            let mut plain = output;
-			            plain.write_frame(timestamp, fragment_bytes)?;
-			        }
-			    }
+				let output = MoqFrameWriter { group: &mut g };
+
+				match self.encrypter.as_mut() {
+					Some(encrypter) => {
+						let mut protected = ProtectedFrame::new(output, encrypter.as_mut());
+
+						protected.write_frame(timestamp, fragment_bytes)?;
+					}
+					None => {
+						let mut plain = output;
+						plain.write_frame(timestamp, fragment_bytes)?;
+					}
+				}
 			}
 
 			track.group = Some(g);

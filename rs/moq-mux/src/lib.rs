@@ -29,6 +29,7 @@ pub mod catalog;
 mod clock;
 pub mod codec;
 pub mod container;
+pub mod encryption;
 mod error;
 pub mod import;
 pub mod json;
@@ -36,7 +37,6 @@ mod pace;
 pub mod select;
 mod source;
 pub mod timeline;
-pub mod encryption;
 
 pub use clock::Clock;
 pub use error::*;

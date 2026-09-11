@@ -37,12 +37,7 @@ pub(crate) use source::ExportSource;
 
 pub use crate::error::Error;
 
-pub use writer::{
-    FrameEncrypter,
-    FrameWriter,
-    MoqFrameWriter,
-    ProtectedFrame,
-};
+pub use writer::{FrameEncrypter, FrameWriter, MoqFrameWriter, ProtectedFrame};
 
 /// The media role that determines how a container represents frame durations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,13 +53,13 @@ pub enum Kind {
 /// A decoded media frame: timestamp, payload bytes, keyframe flag.
 #[derive(Clone, Debug)]
 pub struct Frame {
-    /// Presentation timestamp.
-    ///
-    /// Each container picks its own native scale: fmp4 uses the source
-    /// `mdhd.timescale`, mkv uses nanoseconds, legacy is fixed at microseconds.
-    /// LOC defaults to microseconds but a decoded frame keeps whatever
-    /// per-frame timescale the wire carried.
-    pub timestamp: moq_net::Timestamp,
+	/// Presentation timestamp.
+	///
+	/// Each container picks its own native scale: fmp4 uses the source
+	/// `mdhd.timescale`, mkv uses nanoseconds, legacy is fixed at microseconds.
+	/// LOC defaults to microseconds but a decoded frame keeps whatever
+	/// per-frame timescale the wire carried.
+	pub timestamp: moq_net::Timestamp,
 
 	/// Sample duration in the frame's own scale, when the container reports it.
 	///
@@ -76,8 +71,8 @@ pub struct Frame {
 	/// covered instead of waiting out the max age budget.
 	pub duration: Option<moq_net::Timestamp>,
 
-    /// Encoded codec payload.
-    pub payload: Bytes,
+	/// Encoded codec payload.
+	pub payload: Bytes,
 
 	/// Whether this frame opens a group, or is a video keyframe.
 	///
@@ -123,7 +118,6 @@ pub struct InvalidEnd;
 
 /// Encode and decode media frames over a moq-lite group.
 pub trait Container {
-
 	/// Container-specific error. Must be convertible from [`moq_net::Error`]
 	/// (so IO errors propagate), [`MissingKeyframe`], and [`InvalidEnd`]
 	/// (so the producer can reject invalid group boundaries).
@@ -135,22 +129,18 @@ pub trait Container {
 		+ From<MissingKeyframe>
 		+ From<InvalidEnd>;
 
-    /// Encode one or more frames and send them through `output`.
-    fn write<W>(
-        &self,
-        output: &mut W,
-        frames: &[Frame],
-    ) -> Result<(), Self::Error>
-    where
-        W: FrameWriter<Error = Self::Error>;
+	/// Encode one or more frames and send them through `output`.
+	fn write<W>(&self, output: &mut W, frames: &[Frame]) -> Result<(), Self::Error>
+	where
+		W: FrameWriter<Error = Self::Error>;
 
-    /// Poll the next moq-lite frame from `group` and decode it into media
-    /// frames.
-    fn poll_read(
-        &self,
-        group: &mut moq_net::group::Consumer,
-        waiter: &kio::Waiter,
-    ) -> Poll<Result<Option<Vec<Frame>>, Self::Error>>;
+	/// Poll the next moq-lite frame from `group` and decode it into media
+	/// frames.
+	fn poll_read(
+		&self,
+		group: &mut moq_net::group::Consumer,
+		waiter: &kio::Waiter,
+	) -> Poll<Result<Option<Vec<Frame>>, Self::Error>>;
 
 	/// Return the endpoint timestamp when `frame` carries empty-payload metadata.
 	///
@@ -188,5 +178,4 @@ pub trait Container {
 	{
 		async { kio::wait(|waiter| self.poll_read(group, waiter)).await }
 	}
-
 }

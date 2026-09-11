@@ -1,14 +1,12 @@
 use std::task::{Poll, ready};
 
-use crate::container::{Container as ContainerTrait, Frame, Kind, fmp4, legacy, loc, FrameWriter};
-
+use crate::container::{Container as ContainerTrait, Frame, FrameWriter, Kind, fmp4, legacy, loc};
 
 /// Runtime-dispatched wire format for a track described by a hang catalog.
 ///
 /// Built from a track's audio or video configuration, including its container.
 pub enum Container {
 	/// VarInt timestamp + raw codec bitstream. The original hang wire format.
-
 	Legacy(Kind),
 
 	/// ISO-BMFF moof+mdat fragments. The wrapped [`fmp4::Wire`] holds
@@ -57,17 +55,10 @@ impl TryFrom<&crate::catalog::VideoHint> for Container {
 ///
 /// The hang spec requires a consumer to ignore a rendition whose container `kind` it does not
 /// recognize, so filter on this instead of failing the entire broadcast.
-pub(crate) fn supported(
-	rendition: &str,
-	container: &hang::catalog::Container,
-) -> bool {
+pub(crate) fn supported(rendition: &str, container: &hang::catalog::Container) -> bool {
 	match container {
 		hang::catalog::Container::Unknown(unknown) => {
-			tracing::warn!(
-				rendition,
-				kind = unknown.kind(),
-				"ignoring unknown container"
-			);
+			tracing::warn!(rendition, kind = unknown.kind(), "ignoring unknown container");
 			false
 		}
 		_ => true,
@@ -104,11 +95,7 @@ impl ContainerTrait for Container {
 		}
 	}
 
-	fn write<W>(
-		&self,
-		output: &mut W,
-		frames: &[Frame],
-	) -> Result<(), Self::Error>
+	fn write<W>(&self, output: &mut W, frames: &[Frame]) -> Result<(), Self::Error>
 	where
 		W: FrameWriter<Error = Self::Error>,
 	{
