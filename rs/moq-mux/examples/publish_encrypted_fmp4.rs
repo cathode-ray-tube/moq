@@ -74,7 +74,7 @@ impl Options {
 
                 "-h" | "--help" => {
                     println!(
-                        "usage: debug_moq_secure <input.mp4> [options]\n\
+                        "usage: publish_encrypted_fmp4 <input.mp4> [options]\n\
                          \n\
                          options:\n\
                            --relay <url>       relay URL\n\
