@@ -1,6 +1,7 @@
 - [Encrypted stdout](#encrypted_stdout)
 - [Publish encrypted fMP4](#publish_encrypted_fmp4)
 
+
 <a id="encrypted_stdout"></a>
 # encrypted_stdout
 
@@ -35,6 +36,7 @@ For production use, never reuse the same encryption key with a previously used `
    - restore a securely stored counter value and continue from it.
 
 **Reusing the same key and counter can reuse a nonce and compromise encryption security.**
+
 
 <a id="publish_encrypted_fmp4"></a>
 # publish_encrypted_fmp4
