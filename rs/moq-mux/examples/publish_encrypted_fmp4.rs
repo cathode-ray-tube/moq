@@ -30,6 +30,7 @@ struct Options {
     input: PathBuf,
     relay_url: String,
     broadcast_name: String,
+    track_name: String,
     raw: bool,
 }
 
@@ -44,11 +45,14 @@ impl Options {
 
         let mut relay_url = "relay.example.com".to_owned();
         let mut broadcast_name = "my-stream.hang".to_owned();
+        let mut track_name = "video".to_owned();
         let mut raw = false;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
-                "--raw" => raw = true,
+                "--raw" => {
+                    raw = true;
+                }
 
                 "--relay" => {
                     relay_url = args
@@ -62,6 +66,12 @@ impl Options {
                         .ok_or_else(|| anyhow!("--broadcast requires a name"))?;
                 }
 
+                "--track" => {
+                    track_name = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--track requires a track name"))?;
+                }
+
                 "-h" | "--help" => {
                     println!(
                         "usage: debug_moq_secure <input.mp4> [options]\n\
@@ -69,12 +79,14 @@ impl Options {
                          options:\n\
                            --relay <url>       relay URL\n\
                            --broadcast <name>  broadcast name\n\
+                           --track <name>       raw track to subscribe to\n\
                            --raw               write binary encrypted frames\n\
                          \n\
                          environment:\n\
                            MOQ_AEAD_KEY        32-byte hex or base64 AEAD key\n\
                            MOQ_SIGNING_KEY     32-byte hex or base64 Ed25519 seed\n"
                     );
+
                     std::process::exit(0);
                 }
 
@@ -88,6 +100,7 @@ impl Options {
             input,
             relay_url,
             broadcast_name,
+            track_name,
             raw,
         })
     }
@@ -142,6 +155,7 @@ async fn main() -> Result<()> {
     let (publisher_done_tx, publisher_done_rx) = watch::channel(false);
 
     let subscriber_name = options.broadcast_name.clone();
+    let subscriber_track = options.track_name.clone();
     let subscriber_raw = options.raw;
     let subscriber_origin = origin.clone();
 
@@ -149,6 +163,7 @@ async fn main() -> Result<()> {
         run_subscriber(
             subscriber_origin,
             subscriber_name,
+            subscriber_track,
             subscriber_raw,
             publisher_done_rx,
         )
@@ -171,8 +186,8 @@ async fn main() -> Result<()> {
         .await
         .context("subscriber task panicked")??;
 
-    // The connection task only tracks the relay connection. The publisher
-    // and subscriber are complete at this point.
+    // The connection task tracks the relay connection for the lifetime of
+    // the publisher and subscriber.
     session.connection_task.abort();
 
     Ok(())
@@ -295,6 +310,7 @@ async fn run_publisher(
 async fn run_subscriber(
     origin: moq_net::origin::Producer,
     broadcast_name: String,
+    track_name: String,
     raw: bool,
     mut publisher_done: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -305,28 +321,107 @@ async fn run_subscriber(
         .await
         .ok_or_else(|| {
             anyhow!(
-                "origin closed before broadcast `{broadcast_name}` \
-                 was announced"
+                "origin closed before broadcast `{broadcast_name}` was announced"
             )
         })?;
 
-    let source = moq_mux::Source::new(consumer, &broadcast_name);
+    let path: moq_net::Path<'_> = broadcast_name.as_str().into();
 
-    /*
-     * TODO: Add subscriber code to consume track
-     *
-     */
+    let mut origin = origin
+        .scope(&[path])
+        .context("scoping subscriber origin")?
+        .consume()
+        .announced();
 
-    let _ = source;
+    loop {
+        tokio::select! {
+            update = origin.next() => {
+                let Some(moq_net::announce::Update { path, broadcast }) = update else {
+                    return Err(anyhow!("subscriber origin closed"));
+                };
 
-    while !*publisher_done.borrow() {
-        publisher_done
-            .changed()
-            .await
-            .context("waiting for publisher completion")?;
+                match broadcast {
+                    Some(broadcast) => {
+                        let track = broadcast
+                            .track(&track_name)
+                            .with_context(|| {
+                                format!(
+                                    "locating track `{track_name}` in broadcast `{path}`"
+                                )
+                            })?
+                            .subscribe(None)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "subscribing to track `{track_name}`"
+                                )
+                            })?;
+
+                        consume_raw_track(
+                            track,
+                            raw,
+                            &mut publisher_done,
+                        )
+                        .await?;
+
+                        return Ok(());
+                    }
+
+                    None => {
+                        // The broadcast was withdrawn. Continue waiting for
+                        // another announce.
+                        continue;
+                    }
+                }
+            }
+
+            result = publisher_done.changed() => {
+                result.context("waiting for publisher completion")?;
+
+                if *publisher_done.borrow() {
+                    return Ok(());
+                }
+            }
+        }
     }
+}
 
-    Ok(())
+async fn consume_raw_track(
+    mut track: moq_net::track::Subscriber,
+    raw: bool,
+    publisher_done: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    loop {
+        let group = tokio::select! {
+            result = track.recv_group() => {
+                result.context("receiving MoQ group")?
+            }
+
+            result = publisher_done.changed() => {
+                result.context("waiting for publisher completion")?;
+
+                if *publisher_done.borrow() {
+                    return Ok(());
+                }
+
+                continue;
+            }
+        };
+
+        let Some(mut group) = group else {
+            return Ok(());
+        };
+
+        while let Some(frame) = group
+            .read_frame()
+            .await
+            .context("reading raw MoQ frame")?
+        {
+            // frame.payload is the exact payload received from the relay.
+            // No decryption, parsing, remuxing, or validation occurs here.
+            print_encrypted_frame(&frame.payload, raw)?;
+        }
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -385,4 +480,3 @@ fn print_encrypted_frame(payload: &[u8], raw: bool) -> Result<()> {
 
     Ok(())
 }
-
