@@ -1,5 +1,5 @@
 - [Encrypted stdout](#encrypted_stdout)
-- Publish encrypted fMP4](#publish_encrypted_fmp4)
+- [Publish encrypted fMP4](#publish_encrypted_fmp4)
 
 <a id="encrypted_stdout"></a>
 # encrypted_stdout
