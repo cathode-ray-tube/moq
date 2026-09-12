@@ -24,6 +24,10 @@ struct ConnectTest<'a> {
 	path: &'a str,
 	/// The request path the server must observe, when the test cares.
 	expect_path: Option<&'a str>,
+	/// The authority the server must observe via [`moq_tokio::Request::authority`], when the
+	/// test cares. `None` skips the check; `Some(None)` asserts no authority (a bare-IP dial that
+	/// sends no SNI); `Some(Some(host))` asserts that host.
+	expect_authority: Option<Option<&'a str>>,
 	backend: moq_tokio::QuicBackend,
 	/// The transport knobs both ends are built with.
 	quic: moq_tokio::quic::Config,
@@ -45,6 +49,7 @@ async fn backend_test(scheme: &str, backend: moq_tokio::QuicBackend) {
 		authority: "localhost",
 		path: "",
 		expect_path: Some(""),
+		expect_authority: Some(Some("localhost")),
 		backend,
 		quic: Default::default(),
 		payload: b"hello",
@@ -66,6 +71,7 @@ async fn path_test(scheme: &str, backend: moq_tokio::QuicBackend) {
 		authority: "localhost",
 		path: "/room?jwt=abc",
 		expect_path: Some("/room"),
+		expect_authority: Some(Some("localhost")),
 		backend,
 		quic: Default::default(),
 		payload: b"hello",
@@ -86,6 +92,7 @@ async fn no_sni_test(scheme: &str, backend: moq_tokio::QuicBackend) {
 		authority: "127.0.0.1",
 		path: "",
 		expect_path: Some(""),
+		expect_authority: Some(None),
 		backend,
 		quic: Default::default(),
 		payload: b"hello",
@@ -104,6 +111,7 @@ async fn connect_test(config: ConnectTest<'_>) {
 		authority,
 		path,
 		expect_path,
+		expect_authority,
 		backend,
 		quic,
 		payload,
@@ -149,6 +157,7 @@ async fn connect_test(config: ConnectTest<'_>) {
 
 	// ── run server and client concurrently ──────────────────────────
 	let expect_path = expect_path.map(str::to_string);
+	let expect_authority = expect_authority.map(|a| a.map(str::to_string));
 	let server_handle = tokio::spawn(async move {
 		let request = server.accept().await.expect("no incoming connection");
 		// The client wired only a subscriber, so its advertised role reaches the server
@@ -159,6 +168,11 @@ async fn connect_test(config: ConnectTest<'_>) {
 			assert_eq!(request.path(), expect_path);
 		}
 		assert_eq!(request.query(), expect_query.as_deref());
+		// The dialed authority is readable at accept, before the session is accepted: the TLS
+		// SNI on raw QUIC, the CONNECT authority on WebTransport.
+		if let Some(expect_authority) = expect_authority {
+			assert_eq!(request.authority(), expect_authority.as_deref());
+		}
 		let session = request.with_publisher(&pub_origin).ok().await?;
 
 		let _broadcast = broadcast;
@@ -628,6 +642,8 @@ async fn quiche_dual_stack_ipv4() {
 		authority: "127.0.0.1",
 		path: "",
 		expect_path: None,
+		// BoringSSL sends an IP-literal SNI where rustls sends none, so the server sees it.
+		expect_authority: Some(Some("127.0.0.1")),
 		backend: moq_tokio::QuicBackend::Quiche,
 		quic: Default::default(),
 		payload: b"hello",
@@ -877,6 +893,7 @@ async fn qlog_test(scheme: &str, backend: moq_tokio::QuicBackend) -> Vec<std::pa
 		authority: "localhost",
 		path: "",
 		expect_path: None,
+		expect_authority: None,
 		backend,
 		quic,
 		payload: b"hello",
@@ -985,6 +1002,7 @@ async fn window_test(scheme: &str, backend: moq_tokio::QuicBackend, send_window:
 		authority: "localhost",
 		path: "",
 		expect_path: Some(""),
+		expect_authority: Some(Some("localhost")),
 		backend,
 		quic,
 		payload: &payload,

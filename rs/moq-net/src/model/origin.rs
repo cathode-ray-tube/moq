@@ -4755,6 +4755,32 @@ mod tests {
 		assert!(matches!(err, Error::Unroutable));
 	}
 
+	/// A path outside the consumer's scope never reaches a live dynamic handler.
+	///
+	/// `scope` is a read filter, so an out-of-scope path looks like "nothing here",
+	/// and that is exactly what would otherwise send a request to the handler. A
+	/// `Request` carries only a path, so the handler cannot tell who asked.
+	#[tokio::test]
+	async fn out_of_scope_request_never_reaches_the_dynamic_handler() {
+		let producer = origin(1).produce();
+		let dynamic = producer.dynamic(Pattern::all(), Route::default()).unwrap();
+		let scoped = producer.consume().scope(&[Path::new("tenant-a")]).unwrap();
+
+		// `tenant-a-other` shares a character prefix but not a segment, so this
+		// also pins that the check is segment-aware rather than textual.
+		for path in ["tenant-b/live", "tenant-a-other/live"] {
+			let refused = scoped
+				.request_broadcast(path)
+				.now_or_never()
+				.expect("an out-of-scope request must be refused synchronously, not queued");
+			assert!(matches!(refused, Err(Error::Unroutable)));
+			assert!(
+				dynamic.requested_broadcast().now_or_never().is_none(),
+				"the dynamic handler was asked to create a broadcast the requester may not read"
+			);
+		}
+	}
+
 	#[tokio::test]
 	async fn routed_waits_for_coverage() {
 		let producer = origin(1).produce();

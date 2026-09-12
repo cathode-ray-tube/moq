@@ -22,7 +22,7 @@ Include a recommended option.
 
 For each quest to work on, spawn a background sub-agent to /start-quest.
 Determine the base branch for the quest and create a fresh worktree.
-Limit the concurrency to at most N agents in parallel, where N is half the number of CPU cores.
+Limit the concurrency to at most N agents in parallel, where N is half the number of physical CPU cores.
 
 Monitor the sub-agents and report their final status, but do not monitor their PRs.
 Prompt the user if they want to /plan-quests for any suggested follow-ups.

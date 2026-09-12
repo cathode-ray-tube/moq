@@ -287,14 +287,12 @@ impl EndpointConfig {
 
 /// Accept an iroh connection, negotiate WebTransport or raw QUIC, and complete the
 /// handshake. Returns the established session plus the request URL (raw QUIC carries
-/// none). iroh exposes no client-certificate identity, so the identity is always `None`.
+/// none). iroh exposes no client-certificate identity, so the identity is always `None`,
+/// and it addresses peers by EndpointId rather than a dialed hostname, so the authority
+/// is always `None` too.
 pub(crate) async fn accept(
 	conn: iroh::endpoint::Incoming,
-) -> Result<(
-	web_transport_iroh::Session,
-	Option<Url>,
-	Option<crate::tls::PeerIdentity>,
-)> {
+) -> Result<crate::server::Accepted<web_transport_iroh::Session>> {
 	let conn = conn.accept()?.await?;
 	let alpn = String::from_utf8(conn.alpn().to_vec())?;
 	tracing::Span::current().record("id", conn.stable_id());
@@ -314,12 +312,22 @@ pub(crate) async fn accept(
 				.respond(response)
 				.await
 				.map_err(|err| Error::Server(crate::error::message(err)))?;
-			Ok((session, url, None))
+			Ok(crate::server::Accepted {
+				session,
+				url,
+				identity: None,
+				authority: None,
+			})
 		}
 		// Raw QUIC carries no request URL; the path rides the SETUP.
 		alpn if moq_net::ALPNS.contains(&alpn) => {
 			let session = web_transport_iroh::QuicRequest::accept(conn).ok();
-			Ok((session, None, None))
+			Ok(crate::server::Accepted {
+				session,
+				url: None,
+				identity: None,
+				authority: None,
+			})
 		}
 		_ => Err(Error::UnsupportedAlpn(alpn)),
 	}
