@@ -43,4 +43,4 @@ clock-free estimates from the media span of each emitted batch.
 
 ## Related
 
-- [Auto latency](/quest/m0/3477-watch-auto-latency.md) - reads this field as its floor
+- [Audio jitter target](/quest/m0/audio-jitter-target/README.md) - reads this field as its floor

@@ -4943,7 +4943,7 @@ version = "0.19.17"
 
 [[package]]
 name = "moq-net"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "arrayvec",
  "bytes",
