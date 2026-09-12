@@ -43,4 +43,4 @@ separate timeline change or weakening the current discontinuity behavior.
 
 ## Related
 
-- [#3056](/quest/m1/3056-watch-video-decoder-captures-the-rewind-generation-at.md) - discontinuity reset
+- [#3056](/quest/m2/3056-watch-video-decoder-captures-the-rewind-generation-at.md) - discontinuity reset

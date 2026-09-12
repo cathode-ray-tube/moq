@@ -78,11 +78,5 @@ browser/native integration recipes and cross-language smoke as appropriate.
 ## Related
 
 - [Merge dev](/quest/m1/merge-dev.md) - records the final release and interop proof
-- [Binding announce parity](/quest/m1/3190-align-origin-broadcast-creation-naming-across-language.md) - already owns create/announce/dynamic naming across native wrappers
-- [Structured binding errors](/quest/m1/3187-preserve-structured-protocol-error-codes-across-ffi-and-c.md) - already owns error representation
-- [Binding rate control](/quest/m1/binding-rate-control.md) - already owns allocator parity
-- [Browser allocator](/quest/m1/2709-per-broadcast-bandwidth-estimates-and-reservation.md) - already owns browser bandwidth sharing
-- [Group overflow](/quest/m1/group-overflow-abort.md) - already owns group caps and writer-visible overrun
-- [Close classification](/quest/m1/js-close-classification.md) - already owns media error visibility
-- [C ABI parity](/quest/m1/2152-libmoq-c-abi-catch-up-with-the-moq-ffi-surface.md) - already owns C request/server omissions
+- [C ABI parity](/quest/m2/2152-libmoq-c-abi-catch-up-with-the-moq-ffi-surface.md) - already owns C request/server omissions
 - [C fetch](https://github.com/moq-dev/moq/blob/e2350b39a6ce9bd0734841fc4b4ce399ee195562/quest/m2/libmoq-fetch.md) - already owns the missing C fetch entry point

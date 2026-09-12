@@ -34,5 +34,5 @@ relay checks/tests and `just test smoke-full` if gateway paths change.
 
 ## Related
 
-- [Worker lifetime](/quest/m1/2964-quic-workers-dropping-one-split-server-resizes-the.md) - correctness inside a split worker group
+- [Worker lifetime](/quest/m2/2964-quic-workers-dropping-one-split-server-resizes-the.md) - correctness inside a split worker group
 - [Relay drain API](/quest/m2/drain/relay-drain-api.md) - policy for new arrivals during drain

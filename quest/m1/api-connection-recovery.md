@@ -33,7 +33,3 @@ fixture; no timer-based workaround for the state-machine discrepancy.
 
 Public API: likely breaking lifecycle/close observation changes. Wire: no
 format change. Run JS checks and tests and the browser reconnect proof.
-
-## Related
-
-- [Close classification](/quest/m1/js-close-classification.md) - owns stream failure classes and media error visibility, not Connection lifetime
