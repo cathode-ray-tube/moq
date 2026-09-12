@@ -16,6 +16,7 @@ mod millis;
 mod mode;
 mod priority;
 mod root;
+pub mod stalled;
 mod text;
 mod timeline;
 mod video;

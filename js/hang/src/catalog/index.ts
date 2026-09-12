@@ -19,6 +19,7 @@ export * from "./mode";
 export * from "./path";
 export * from "./priority";
 export * from "./root";
+export * as Stalled from "./stalled";
 export * from "./text";
 export * from "./timeline";
 export * from "./track";

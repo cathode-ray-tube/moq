@@ -205,6 +205,13 @@ pub(crate) async fn rung_entry(
 	Ok(entry)
 }
 
+/// Rungs inherit the state of the rendition the pipeline actually decodes.
+pub(crate) fn inherit_stalled(rungs: &mut [Published], source: &VideoConfig) {
+	for published in rungs {
+		published.entry.stalled = source.stalled;
+	}
+}
+
 /// Fill the derivative catalog: rung entries plus, when `source_rel` is set,
 /// every source rendition referenced through it (so players fetch those tracks
 /// from the source broadcast directly). Called again on each source catalog
@@ -280,6 +287,40 @@ mod tests {
 		config.bitrate = bitrate;
 		config.framerate = Some(30.0);
 		config
+	}
+
+	#[test]
+	fn rungs_inherit_a_stalled_source() {
+		let mut source_catalog = moq_mux::catalog::hang::Catalog::default();
+		let mut src = source(1280, 720, Some(2_500_000));
+		src.stalled = Some(true);
+		source_catalog.video.insert("video", src).unwrap();
+
+		let mut published = [Published {
+			rung: Resolved {
+				name: "video/360p".into(),
+				height: 360,
+				size: moq_video::Size::new(640, 360),
+				bitrate: moq_net::bandwidth::Rate::from_bps(600_000),
+				framerate: 30,
+			},
+			entry: source(640, 360, Some(600_000)),
+		}];
+
+		inherit_stalled(&mut published, &source_catalog.video.renditions["video"]);
+		let mut out = moq_mux::catalog::hang::Catalog::default();
+		populate(&mut out, &source_catalog, &published, None).unwrap();
+		assert_eq!(
+			out.video.renditions.get("video/360p").and_then(|c| c.stalled),
+			Some(true)
+		);
+
+		// A different local rendition may stay stalled after the selected input recovers.
+		let healthy = source(1920, 1080, Some(5_000_000));
+		source_catalog.video.insert("healthy", healthy.clone()).unwrap();
+		inherit_stalled(&mut published, &healthy);
+		populate(&mut out, &source_catalog, &published, None).unwrap();
+		assert_eq!(out.video.renditions["video/360p"].stalled, None);
 	}
 
 	#[test]
