@@ -128,8 +128,13 @@ mod tests {
 	// watcher, so `new` must fall back to the current directory rather than error.
 	#[test]
 	fn bare_filename_watches_current_dir() {
-		FileWatcher::new(&[PathBuf::from("cert.pem"), PathBuf::from("key.pem")])
-			.expect("bare filenames should watch the current directory");
+		match FileWatcher::new(&[PathBuf::from("cert.pem"), PathBuf::from("key.pem")]) {
+			Ok(_) => {}
+			Err(err) if matches!(err.kind, notify::ErrorKind::MaxFilesWatch) => {
+				eprintln!("skipping bare_filename_watches_current_dir: {err}");
+			}
+			Err(err) => panic!("bare filenames should watch the current directory: {err}"),
+		}
 	}
 
 	// The reload reads its own files; reads and bare removals must not re-trigger it.
