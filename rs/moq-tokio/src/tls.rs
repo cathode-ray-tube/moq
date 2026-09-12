@@ -2193,27 +2193,36 @@ mod tests {
 	#[cfg(all(feature = "watch", any(feature = "quinn", feature = "noq", feature = "quiche")))]
 	#[tokio::test]
 	async fn dropping_the_reload_guard_stops_the_watcher() {
-		use std::io::Write;
-
 		let key = rcgen::KeyPair::generate().unwrap();
 		let params = rcgen::CertificateParams::new(vec!["file.invalid".to_string()]).unwrap();
 		let cert = params.self_signed(&key).unwrap();
 
-		let mut cert_file = tempfile::NamedTempFile::new().unwrap();
-		cert_file.write_all(cert.pem().as_bytes()).unwrap();
-		let mut key_file = tempfile::NamedTempFile::new().unwrap();
-		key_file.write_all(key.serialize_pem().as_bytes()).unwrap();
+		// A dedicated directory, not `/tmp`: the watcher registers the parent, and
+		// `/tmp` is shared by every other tempfile in the process (and the host), so
+		// it is the first path to hit inotify's per-user cap.
+		let dir = tempfile::TempDir::new().unwrap();
+		let cert_path = dir.path().join("cert.pem");
+		let key_path = dir.path().join("key.pem");
+		std::fs::write(&cert_path, cert.pem()).unwrap();
+		std::fs::write(&key_path, key.serialize_pem()).unwrap();
 
 		// File-backed, so the watcher actually parks rather than returning early.
 		let config = Listen {
-			cert: vec![cert_file.path().to_path_buf()],
-			key: vec![key_file.path().to_path_buf()],
+			cert: vec![cert_path],
+			key: vec![key_path],
 			..Default::default()
 		};
 
 		let certs = Arc::new(ServeCerts::new(crypto::provider()));
 		certs.load_certs(&config).unwrap();
 		let weak = Arc::downgrade(&certs);
+
+		if let Err(err) = crate::watch::FileWatcher::new(&config.cert) {
+			// The host is out of inotify watches; Reload::spawn becomes inert and
+			// this test cannot observe the abort. CI still exercises the real path.
+			eprintln!("skipping dropping_the_reload_guard_stops_the_watcher: {err}");
+			return;
+		}
 
 		let reload = Reload::spawn(certs.clone(), config);
 		// Let the task run far enough to be parked on the watcher, holding its Arc.
