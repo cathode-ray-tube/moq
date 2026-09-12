@@ -354,6 +354,12 @@ async fn reload_test(backend: moq_tokio::QuicBackend) {
 	server_config.tls.key = vec![key.clone()];
 	server_config.backend = Some(backend);
 
+	#[cfg(feature = "watch")]
+	if moq_tokio::watch::FileWatcher::new(std::slice::from_ref(&cert)).is_err() {
+		eprintln!("skipping reload_test: host cannot start an inotify watcher");
+		return;
+	}
+
 	let server = server_config
 		.init(moq_tokio::quic::Config::default())
 		.expect("failed to init server");
