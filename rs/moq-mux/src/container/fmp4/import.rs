@@ -308,11 +308,21 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			// emitted at this same scale (see below), so they satisfy the track's
 			// timescale invariant and ride the wire for the relay, redundant with the
 			// timing already inside each CMAF fragment.
-			let timescale = moq_net::Timescale::new(trak.mdia.mdhd.timescale as u64)?;
+			let timescale =
+			    moq_net::Timescale::new(trak.mdia.mdhd.timescale as u64)?;
+
+			let track_name = self.broadcast.unique_name(suffix);
+
+            // For debugging
+			println!("Creating track: {track_name}");
+
 			let track = self.broadcast.create_track(
-				self.broadcast.unique_name(suffix),
-				self.catalog.track_info(kind.priority()).with_timescale(timescale),
+			    track_name,
+			    self.catalog
+			        .track_info(kind.priority())
+			        .with_timescale(timescale),
 			)?;
+
 
 			// Enroll every track in the broadcast's timeline: passthrough writes groups by hand
 			// (no `container::Producer`), so the recorder is fed directly at each group open.
@@ -959,6 +969,15 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 						let mut protected = ProtectedFrame::new(output, encrypter.as_mut());
 
 						protected.write_frame(timestamp, fragment_bytes)?;
+
+						eprintln!(
+						    "producer: protected frame written: plaintext={} bytes, \
+						     timestamp={:?}, new_group={}",
+						    fragment_len,
+						    timestamp,
+						    start_group,
+						);
+
 					}
 					None => {
 						let mut plain = output;
