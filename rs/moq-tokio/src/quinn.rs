@@ -10,7 +10,6 @@ use crate::tls::{FingerprintVerifier, ServeCerts};
 use std::net;
 use std::sync::Arc;
 use std::time::Duration;
-use url::Url;
 
 pub use web_transport_quinn;
 
@@ -812,6 +811,7 @@ impl quinn::ConnectionIdGenerator for ServerIdGenerator {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use url::Url;
 
 	fn connect_rejected(status: u16) -> Error {
 		web_transport_quinn::ClientError::HttpError(web_transport_quinn::ConnectError::ErrorStatus(

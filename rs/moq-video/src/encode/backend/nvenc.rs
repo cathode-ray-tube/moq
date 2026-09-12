@@ -639,7 +639,7 @@ mod tests {
 		let (w, h) = (1280u32, 720u32);
 		let mut config = crate::encode::Config::new(w, h, 30);
 		config.kind = crate::encode::Kind::Named(NAME.into());
-		config.bitrate = Some(4_000_000);
+		config.bitrate = Some(moq_net::bandwidth::Rate::from_bps(4_000_000));
 		config.gop = 30;
 		let mut encoder = crate::encode::Encoder::new(&config).ok()?;
 

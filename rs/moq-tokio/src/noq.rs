@@ -10,7 +10,6 @@ use crate::tls::{FingerprintVerifier, ServeCerts};
 use std::net;
 use std::sync::Arc;
 use std::time::Duration;
-use url::Url;
 use web_transport_noq::noq;
 
 pub use web_transport_noq;
@@ -797,6 +796,7 @@ impl noq::ConnectionIdGenerator for ServerIdGenerator {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use url::Url;
 
 	/// noq exposes no getters for the flow-control windows, but its `Debug` prints
 	/// them, which is enough to prove each one reached the transport config and that
