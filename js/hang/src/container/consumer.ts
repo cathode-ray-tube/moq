@@ -1,6 +1,6 @@
 import type { Time } from "@moq/net";
 import * as Moq from "@moq/net";
-import { Effect, type Getter, type GetterInit, getter, Signal } from "@moq/signals";
+import { Effect, type Getter, type GetterInit, getter, Once, Signal } from "@moq/signals";
 
 import type { Format } from "./format";
 import type { BufferedRanges, Frame } from "./types";
@@ -28,6 +28,7 @@ interface Group {
 	latest?: Time.Micro; // The timestamp of the latest known frame
 	end?: Time.Micro; // The furthest presentation point so far, i.e. max(timestamp + duration)
 	done?: boolean; // Set when #runGroup finishes reading all frames
+	truncated?: boolean; // The missing tail becomes a gap after the buffered frames are delivered.
 }
 
 /**
@@ -145,6 +146,7 @@ export class Consumer {
 	readonly buffered: Getter<BufferedRanges> = this.#buffered;
 
 	#signals = new Effect();
+	#closed = new Once<Error | null>();
 
 	/** Start consuming the given track, decoding frames with `props.format`. */
 	constructor(track: Moq.Track.Subscriber, props: ConsumerProps) {
@@ -162,47 +164,58 @@ export class Consumer {
 		});
 	}
 
+	#finish(end: Error | null): void {
+		if (this.#closed.peek() === undefined) this.#closed.set(end);
+		this.#notify?.();
+		this.#notify = undefined;
+	}
+
 	async #run() {
 		// Start fetching groups in the background
-		for (;;) {
-			const consumer = await this.#track.recvGroup();
-			if (!consumer) break;
+		try {
+			for (;;) {
+				const consumer = await this.#track.recvGroup();
+				if (!consumer) break;
 
-			// To improve TTV, we always start with the first group.
-			// For higher latencies we might need to figure something else out, as its racey.
-			if (this.#active === undefined) {
-				this.#active = consumer.sequence;
+				// To improve TTV, we always start with the first group.
+				// For higher latencies we might need to figure something else out, as its racey.
+				if (this.#active === undefined) {
+					this.#active = consumer.sequence;
+				}
+
+				// Arriving below the delivery cursor is not a reason to drop a group. Groups are
+				// sent newest-first, so the head of a subscription arrives after the live edge it
+				// was served alongside, and both consumers can still place one: audio writes into
+				// a timestamp-indexed ring, video drops a late frame at render. How far back one
+				// may be is the subscription's own max age, applied before it ever reaches here.
+				//
+				// A group the reset boundary proves reneged is different, and still dropped: it
+				// belongs to a timeline the publisher withdrew rather than one that arrived late.
+				// An ambiguous one is admitted so #runGroup can rule on it once its timestamps
+				// arrive.
+				if (this.#rewind.boundary?.bySequence(consumer.sequence) === true) {
+					console.warn(`skipping reneged group: track=${this.#track.name} ${consumer.sequence}`);
+					consumer.close();
+					continue;
+				}
+
+				const group: Group = {
+					consumer,
+					frames: [],
+					empty: true,
+				};
+
+				// Insert into #groups based on the group sequence number (ascending).
+				// This is used to cancel old groups.
+				this.#groups.push(group);
+				this.#groups.sort((a, b) => a.consumer.sequence - b.consumer.sequence);
+
+				// Start buffering frames from this group
+				this.#signals.spawn(this.#runGroup.bind(this, group));
 			}
-
-			// Arriving below the delivery cursor is not a reason to drop a group. Groups are
-			// sent newest-first, so the head of a subscription arrives after the live edge it
-			// was served alongside, and both consumers can still place one: audio writes into
-			// a timestamp-indexed ring, video drops a late frame at render. How far back one
-			// may be is the subscription's own max age, applied before it ever reaches here.
-			//
-			// A group the reset boundary proves reneged is different, and still dropped: it
-			// belongs to a timeline the publisher withdrew rather than one that arrived late.
-			// An ambiguous one is admitted so #runGroup can rule on it once its timestamps
-			// arrive.
-			if (this.#rewind.boundary?.bySequence(consumer.sequence) === true) {
-				console.warn(`skipping reneged group: track=${this.#track.name} ${consumer.sequence}`);
-				consumer.close();
-				continue;
-			}
-
-			const group: Group = {
-				consumer,
-				frames: [],
-				empty: true,
-			};
-
-			// Insert into #groups based on the group sequence number (ascending).
-			// This is used to cancel old groups.
-			this.#groups.push(group);
-			this.#groups.sort((a, b) => a.consumer.sequence - b.consumer.sequence);
-
-			// Start buffering frames from this group
-			this.#signals.spawn(this.#runGroup.bind(this, group));
+			this.#finish(null);
+		} catch (err) {
+			this.#finish(err instanceof Error ? err : new Error(String(err)));
 		}
 	}
 
@@ -283,12 +296,13 @@ export class Consumer {
 					}
 				}
 			}
-		} catch (_err) {
+		} catch (err) {
 			// Stop reading the group but keep already-decoded frames.
 			// A decode error or stream RESET truncates the tail of the GoP;
 			// frames decoded before the error are still valid and playable.
 			// The tail is gone though, so the next group does not continue this one.
-			this.#gap = true;
+			group.truncated = true;
+			if (!(err instanceof Moq.StreamError)) throw err;
 		} finally {
 			group.done = true;
 
@@ -547,6 +561,7 @@ export class Consumer {
 	 * It reports what this consumer dropped plus empty-group discontinuities the publisher declared.
 	 * An unmarked forward timestamp jump still reads as continuous because nothing on the wire says
 	 * the missing span will never arrive.
+	 * After buffered groups drain, a finished track returns undefined and an aborted track throws.
 	 */
 	async next(): Promise<
 		| {
@@ -559,6 +574,14 @@ export class Consumer {
 		| undefined
 	> {
 		for (;;) {
+			const ended = this.#closed.peek();
+			if (this.#groups.length === 0) {
+				if (ended !== undefined) {
+					if (ended instanceof Error) throw ended;
+					return undefined;
+				}
+			}
+
 			// A group may have buffered a rewind while the live edge was still behind it; catch it
 			// now that delivery has advanced the edge.
 			this.#checkBufferedReset();
@@ -572,13 +595,15 @@ export class Consumer {
 			// Otherwise a real gap sits before it and an in-transit group may still arrive, so wait.
 			// #checkMaxAge skips the gap once the buffered span exceeds the budget, and
 			// #tryDurationSkip once the duration covers it.
+			// After track termination no missing group can arrive, so drain across any remaining gap.
 			if (this.#active !== undefined && this.#groups.length > 0) {
 				const head = this.#groups[0];
+				const contiguous = ptsContiguous(this.#presentedEnd, head.frames.at(0)?.timestamp);
 				if (
 					head.consumer.sequence > this.#active &&
-					((head.empty && head.consumer.done) ||
-						ptsContiguous(this.#presentedEnd, head.frames.at(0)?.timestamp))
+					((head.empty && head.consumer.done) || contiguous || ended !== undefined)
 				) {
+					if (!contiguous) this.#gap = true;
 					this.#active = head.consumer.sequence;
 				}
 			}
@@ -636,6 +661,7 @@ export class Consumer {
 					const group = this.#groups.shift();
 					if (group) {
 						const seq = group.consumer.sequence;
+						if (group.truncated) this.#gap = true;
 						if (group.empty) this.#markDiscontinuity();
 						this.#updateBuffered();
 						return {
@@ -724,6 +750,7 @@ export class Consumer {
 
 	/** Stop consuming and release the track and all buffered groups. */
 	close(): void {
+		this.#finish(null);
 		this.#signals.close();
 	}
 }

@@ -1,6 +1,6 @@
 import * as Catalog from "@moq/hang/catalog";
 import * as Container from "@moq/hang/container";
-import { Time } from "@moq/net";
+import { StreamError, Time } from "@moq/net";
 import { Effect, type Getter, getter, type Inputs, type Readonlys } from "@moq/signals";
 import { CaptionsRenderer, parseText, VTTCue, type VTTRegion } from "media-captions";
 // media-captions positions and styles cues purely through these stylesheets (via `[part]`
@@ -252,6 +252,7 @@ export class Renderer {
 			priority: Catalog.PRIORITY.text,
 			maxAge: this.sync.out.maxAge,
 		});
+		if (!sub) return;
 		const store: CueStore = { cues: [], regions: new Map(), clears: [] };
 		const commit = () => renderer.changeTrack({ cues: [...store.cues], regions: [...store.regions.values()] });
 
@@ -272,7 +273,11 @@ export class Renderer {
 		// group whose stream stalls then delays only its own cue instead of every later one.
 		effect.spawn(async () => {
 			for (;;) {
-				const group = await sub.recvGroup();
+				const group = await sub.recvGroup().catch((err) => {
+					if (!(err instanceof StreamError)) throw err;
+					console.debug("captions subscription ended", err);
+					return undefined;
+				});
 				if (!group) break;
 
 				effect.spawn(async () => {
@@ -285,7 +290,7 @@ export class Renderer {
 							}
 						}
 					} catch (err) {
-						console.warn("captions: group read error", err);
+						if (!(err instanceof StreamError)) throw err;
 					} finally {
 						group.close();
 					}
