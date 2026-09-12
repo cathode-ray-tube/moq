@@ -39,7 +39,10 @@ CodeRabbit may be rate-limited, treat it as optional.
 For each finding:
 
 - If you don't agree with it, reply to the finding and move on.
-- If it's a simple improvement, fix it and push. Update the summary if needed.
-- If it's out of scope, trigger `/plan-quests` to create/update a follow-up quest.
+- If it's a relatively easy improvement, fix it and push. Update the summary if needed.
+- If you disagree with the finding, reply and move on.
 
-Otherwise, interactively prompt the user what to do next, including a recommended course of action.
+# Follow-ups
+If you encounter issues, or findings that are out of scope, create follow-up quests.
+They should be unplanned and just a summary of the problem, maybe with a potential solution.
+The user will need to run `/plan-quests` to fully scope them.
