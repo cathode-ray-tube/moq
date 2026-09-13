@@ -47,7 +47,7 @@ A small debugging application that:
 2. Encrypts the CMAF/fMP4 data (as MoQ Frame Payloads).
 3. Publishes the resulting frames to a MoQ relay.
 4. Subscribes directly to a named track.
-5. Prints the received raw frame payloads.
+5. Prints the received raw frame payloads (First 150 bytes...Last 150 bytes).
 
 **This application is intended for testing and debugging only. It does not implement production security, secure key handling, authentication, authorization, access control, or hardened error handling. Do not use it with production media, credentials, or sensitive keys.**
 
@@ -80,11 +80,11 @@ MOQ_SIGNING_KEY=<32-byte-seed> \\
 cargo run -- \\
   input.mp4 \\
   --relay https://relay.example.com/anon \\
-  --broadcast my-stream.hang \\
-  --track video
+  --broadcast stream.hang \\
+  --track 0.m4s
 ```
 
-The `--track` value must match the track name created by the publisher. The default track name is `video`.
+The `--track` value must match the track name created by the publisher. The default track name is `0.m4s`.
 
 ## Command-line options
 
@@ -101,16 +101,22 @@ Default values:
 
 ```text
 Relay:     relay.example.com
-Broadcast: my-stream.hang
-Track:     video
+Broadcast: stream.hang
+Track:     0.m4s
 ```
 ## Output
 
-Without `--raw`, each received frame is printed as hexadecimal text:
+Without `--raw`, each received frame is printed as hexadecimal text. Example output:
 
 ```text
-encrypted_frame len=1234 hex=...
+received MoQ group #16
+producer: protected frame written: plaintext=133143 bytes, timestamp=80041666666ns, new_group=true
+received chunk #46: 29639 bytes (2042082 bytes total)
+received frame #16: 133180 bytes
+encrypted_frame len=133180 hex=4d4f51530100000000000000000f0000014d6dc9671948444cabfa0376716cc9dd23b97fd61dc6b1196d85d1918234cbd8dd2e97b818e93d488a7d9dbd5e4eba4bd2cabb1a5b70973e1f170061c55d13b338ca9191242903ce47e0b132281a6b8dff064dcf733075f0cac12c4b59ecfc96e85ae03e1095257dec822779a10c9fdb1ad9425803e7611ba4cdf328a6be99b230de956aea...4de463ff436a99af0ac0dc3bb641458bd03559bcf40741a331bc2e3d495154b98717382f96a348025a28eb98b8b491f04aa27404fa4f8cf65d5896a913c10e8ea61459bf626af7d50fda6a0fab4b54bbc17e5664e2df1d5474fb22133dca76b3ae7b8415e794b2a80b8c912aee0925301be098faaf64134342195f65b2fddfb740274e315c5b3338d478b2d61e7b117ff4e55db5848d
 ```
+This relates to the ffmpeg process (`received chunk...`), encryption (`producer: protected frame written...`) and subscriber received frame payload (`encrypted_frame...`). 
+
 With `--raw`, frame payloads are written directly to standard output:
 
 ```bash
@@ -118,8 +124,8 @@ MOQ_AEAD_KEY=<key> \\
 cargo run -- \\
   input.mp4 \\
   --relay https://relay.example.com/anon \\
-  --broadcast my-stream.hang \\
-  --track video \\
+  --broadcast stream.hang \\
+  --track 0.m4s \\
   --raw > encrypted-frames.bin
 ```
 
@@ -131,10 +137,10 @@ If the importer creates separate video and audio tracks, run separate subscriber
 
 Examples:
 ```bash
---track video
+--track 0.m4s
 ```
 ```bash
---track audio
+--track 1.m4s
 ```
 ## Security warning
 
