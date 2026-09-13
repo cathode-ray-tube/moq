@@ -24,6 +24,7 @@ use moq_mux::{
 
 const READ_BUFFER_SIZE: usize = 64 * 1024;
 const DEFAULT_KEY_ID: u8 = 0;
+const PREVIEW_BYTES: usize = 150;
 
 #[derive(Debug)]
 struct Options {
@@ -163,10 +164,10 @@ async fn main() -> Result<()> {
 
     eprintln!("relay connection initialized");
 
-    let origin = session.origin.clone();
+    let (publisher_ready_tx, publisher_ready_rx) = watch::channel(false);
     let (publisher_done_tx, publisher_done_rx) = watch::channel(false);
 
-    let publisher_origin = origin.clone();
+    let publisher_origin = session.publisher_origin.clone();
     let publisher_input = options.input.clone();
     let publisher_broadcast = options.broadcast_name.clone();
 
@@ -178,11 +179,12 @@ async fn main() -> Result<()> {
             encrypter,
             &publisher_input,
             &publisher_broadcast,
+            publisher_ready_tx,
         )
         .await
     });
 
-    let subscriber_origin = origin.clone();
+    let subscriber_origin = session.subscriber_origin.clone();
     let subscriber_name = options.broadcast_name.clone();
     let subscriber_track = options.track_name.clone();
     let subscriber_raw = options.raw;
@@ -190,6 +192,8 @@ async fn main() -> Result<()> {
     eprintln!("starting subscriber task...");
 
     let subscriber_task = tokio::spawn(async move {
+        wait_for_publisher_ready(publisher_ready_rx).await?;
+
         run_subscriber(
             subscriber_origin,
             subscriber_name,
@@ -213,6 +217,10 @@ async fn main() -> Result<()> {
 
         subscriber_task.abort();
 
+        for task in session.connection_tasks {
+            task.abort();
+        }
+
         return Err(error);
     }
 
@@ -222,12 +230,11 @@ async fn main() -> Result<()> {
         .await
         .context("subscriber task panicked")??;
 
-    eprintln!("waiting for connection task");
+    eprintln!("waiting for connection tasks");
 
-    session
-        .connection_task
-        .await
-        .context("connection task panicked")??;
+    for task in session.connection_tasks {
+        task.await.context("connection task panicked")??;
+    }
 
     eprintln!("program finished successfully");
 
@@ -239,48 +246,84 @@ async fn main() -> Result<()> {
 // -------------------------------------------------------------------------
 
 struct MoqSession {
-    origin: moq_net::origin::Producer,
-    connection_task: tokio::task::JoinHandle<Result<()>>,
+    publisher_origin: moq_net::origin::Producer,
+    subscriber_origin: moq_net::origin::Producer,
+    connection_tasks: Vec<tokio::task::JoinHandle<Result<()>>>,
 }
 
 async fn connect_to_relay(relay_url: &str) -> Result<MoqSession> {
-    let origin = moq_tokio::origin::spawn(moq_net::Hop::random());
+    let publisher_origin = moq_tokio::origin::spawn(moq_net::Hop::random());
+    let subscriber_origin = moq_tokio::origin::spawn(moq_net::Hop::random());
 
     let url = url::Url::parse(relay_url)
         .with_context(|| format!("parsing relay URL `{relay_url}`"))?;
 
     eprintln!("parsed relay URL: {url}");
 
-    let quic = moq_tokio::quic::Config::default();
-    let config = moq_tokio::connect::Config::default();
+    let publisher_client = moq_tokio::connect::Config::default()
+        .init(moq_tokio::quic::Config::default())
+        .context("initializing publisher client")?
+        .with_publisher(&publisher_origin);
 
-    let client = config
-        .init(quic)
-        .context("initializing MoQ client")?
-        .with_publisher(&origin)
-        .with_subscriber(origin.clone());
+    let subscriber_client = moq_tokio::connect::Config::default()
+        .init(moq_tokio::quic::Config::default())
+        .context("initializing subscriber client")?
+        .with_subscriber(subscriber_origin.clone());
 
-    let reconnect = client.connect(url);
+    let publisher_connection = publisher_client.connect(url.clone());
+    let subscriber_connection = subscriber_client.connect(url);
 
-    let connection_task = tokio::spawn(async move {
-        eprintln!("MoQ connection task started");
+    let publisher_task = tokio::spawn(async move {
+        eprintln!("publisher connection task started");
 
-        let result = reconnect
+        let result = publisher_connection
             .closed()
             .await
-            .context("MoQ connection closed");
+            .context("publisher connection closed");
 
-        eprintln!("MoQ connection task ended: {result:?}");
+        eprintln!("publisher connection task ended: {result:?}");
+
+        result
+    });
+
+    let subscriber_task = tokio::spawn(async move {
+        eprintln!("subscriber connection task started");
+
+        let result = subscriber_connection
+            .closed()
+            .await
+            .context("subscriber connection closed");
+
+        eprintln!("subscriber connection task ended: {result:?}");
 
         result
     });
 
     Ok(MoqSession {
-        origin,
-        connection_task,
+        publisher_origin,
+        subscriber_origin,
+        connection_tasks: vec![publisher_task, subscriber_task],
     })
 }
 
+// -------------------------------------------------------------------------
+// Publisher readiness
+// -------------------------------------------------------------------------
+
+async fn wait_for_publisher_ready(
+    mut ready: watch::Receiver<bool>,
+) -> Result<()> {
+    while !*ready.borrow() {
+        ready
+            .changed()
+            .await
+            .context("waiting for publisher readiness")?;
+    }
+
+    eprintln!("publisher is ready; starting subscriber");
+
+    Ok(())
+}
 
 // -------------------------------------------------------------------------
 // Publisher
@@ -291,6 +334,7 @@ async fn run_publisher(
     encrypter: MoqSecureEncrypter,
     input: &Path,
     broadcast_name: &str,
+    publisher_ready: watch::Sender<bool>,
 ) -> Result<()> {
     eprintln!("creating broadcast `{broadcast_name}`");
 
@@ -298,7 +342,6 @@ async fn run_publisher(
         .create_broadcast(broadcast_name)
         .context("creating broadcast")?;
 
-    // This is where the broadcast is announced in the newer API.
     broadcast
         .announce(Default::default())
         .context("announcing broadcast")?;
@@ -343,6 +386,7 @@ async fn run_publisher(
     let mut buffer = vec![0u8; READ_BUFFER_SIZE];
     let mut total_bytes = 0usize;
     let mut read_count = 0usize;
+    let mut publisher_ready_sent = false;
 
     loop {
         let count = stdout
@@ -364,6 +408,18 @@ async fn run_publisher(
         importer
             .decode(&buffer[..count])
             .context("decoding fMP4 fragment")?;
+
+        if !publisher_ready_sent {
+            publisher_ready_sent = true;
+
+            eprintln!(
+                "first fMP4 fragment decoded; publisher is ready for subscriptions"
+            );
+
+            publisher_ready
+                .send(true)
+                .map_err(|_| anyhow!("subscriber task exited"))?;
+        }
     }
 
     eprintln!(
@@ -435,20 +491,20 @@ async fn run_subscriber(
 
                         Err(error) => {
                             eprintln!(
-                                "track `{track_name}` is not ready: {error}; retrying"
+                                "track `{track_name}` subscription failed: {error}; retrying"
                             );
                         }
                     },
 
                     Err(error) => {
                         eprintln!(
-                            "track `{track_name}` not found: {error}; retrying"
+                            "track `{track_name}` not available: {error}; retrying"
                         );
                     }
                 }
 
                 tokio::time::sleep(
-                    std::time::Duration::from_millis(100),
+                    std::time::Duration::from_millis(500),
                 )
                 .await;
             }
@@ -462,6 +518,9 @@ async fn run_subscriber(
     consume_raw_track(track, raw, &mut publisher_done).await
 }
 
+// -------------------------------------------------------------------------
+// Subscriber track consumption
+// -------------------------------------------------------------------------
 
 async fn consume_raw_track(
     mut track: moq_net::track::Subscriber,
@@ -473,10 +532,30 @@ async fn consume_raw_track(
 
     eprintln!("waiting for MoQ groups");
 
-    loop {
-        let group = tokio::select! {
+    'groups: loop {
+        if *publisher_done.borrow() {
+            eprintln!(
+                "publisher completed; received {frame_count} frames \
+                 in {group_count} groups"
+            );
+
+            return Ok(());
+        }
+
+        let mut group = tokio::select! {
             result = track.recv_group() => {
-                result.context("receiving MoQ group")?
+                match result.context("receiving MoQ group")? {
+                    Some(group) => group,
+
+                    None => {
+                        eprintln!(
+                            "track ended; received {frame_count} frames \
+                             in {group_count} groups"
+                        );
+
+                        return Ok(());
+                    }
+                }
             }
 
             result = publisher_done.changed() => {
@@ -484,28 +563,70 @@ async fn consume_raw_track(
 
                 if *publisher_done.borrow() {
                     eprintln!(
-                        "publisher completed; waiting for the track to close"
+                        "publisher completed; received {frame_count} frames \
+                         in {group_count} groups"
                     );
+
+                    return Ok(());
                 }
 
                 continue;
             }
         };
 
-        let Some(mut group) = group else {
-            eprintln!("track ended");
-            return Ok(());
-        };
-
         group_count += 1;
 
         eprintln!("received MoQ group #{group_count}");
 
-        while let Some(frame) = group
-            .read_frame()
-            .await
-            .context("reading raw MoQ frame")?
-        {
+        loop {
+            let frame = tokio::select! {
+                result = group.read_frame() => {
+                    match result {
+                        Ok(Some(frame)) => frame,
+
+                        Ok(None) => {
+                            eprintln!(
+                                "MoQ group #{group_count} ended; \
+                                 total frames: {frame_count}"
+                            );
+
+                            continue 'groups;
+                        }
+
+                        Err(error) if error.to_string() == "old" => {
+                            eprintln!(
+                                "MoQ group #{group_count} became old; \
+                                 skipping stale group"
+                            );
+
+                            // Do not terminate the subscriber. Continue
+                            // waiting for the next available group.
+                            continue 'groups;
+                        }
+
+                        Err(error) => {
+                            return Err(error)
+                                .context("reading raw MoQ frame");
+                        }
+                    }
+                }
+
+                result = publisher_done.changed() => {
+                    result.context("waiting for publisher completion")?;
+
+                    if *publisher_done.borrow() {
+                        eprintln!(
+                            "publisher completed while reading group \
+                             #{group_count}; received {frame_count} frames"
+                        );
+
+                        return Ok(());
+                    }
+
+                    continue;
+                }
+            };
+
             frame_count += 1;
 
             eprintln!(
@@ -517,6 +638,7 @@ async fn consume_raw_track(
         }
     }
 }
+
 
 // -------------------------------------------------------------------------
 // Key decoding and output
@@ -545,8 +667,6 @@ fn decode_32_bytes(value: &str) -> Result<[u8; 32]> {
         .map_err(|_| anyhow!("base64 key must decode to exactly 32 bytes"))
 }
 
-const PREVIEW_BYTES: usize = 150;
-
 fn print_encrypted_frame(payload: &[u8], raw: bool) -> Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -557,6 +677,7 @@ fn print_encrypted_frame(payload: &[u8], raw: bool) -> Result<()> {
             .context("writing raw encrypted frame")?;
 
         stdout.flush().context("flushing raw output")?;
+
         return Ok(());
     }
 
@@ -564,30 +685,30 @@ fn print_encrypted_frame(payload: &[u8], raw: bool) -> Result<()> {
         .context("writing frame prefix")?;
 
     if payload.len() <= PREVIEW_BYTES * 2 {
-        // The entire payload is short enough to print.
         for byte in payload {
             write!(stdout, "{byte:02x}")
                 .context("writing frame byte")?;
         }
     } else {
-        // Print the first 150 bytes.
         for byte in &payload[..PREVIEW_BYTES] {
             write!(stdout, "{byte:02x}")
                 .context("writing frame prefix bytes")?;
         }
 
-        write!(stdout, "...").context("writing frame separator")?;
+        write!(stdout, "...")
+            .context("writing frame separator")?;
 
-        // Print the last 150 bytes.
         for byte in &payload[payload.len() - PREVIEW_BYTES..] {
             write!(stdout, "{byte:02x}")
                 .context("writing frame suffix bytes")?;
         }
     }
 
-    writeln!(stdout).context("writing frame newline")?;
-    stdout.flush().context("flushing frame output")?;
+    writeln!(stdout)
+        .context("writing frame newline")?;
+
+    stdout.flush()
+        .context("flushing frame output")?;
 
     Ok(())
 }
-
