@@ -5,7 +5,13 @@
  */
 import { type Dispose, type GetPromise, type Getter, Once, Signal } from "@moq/signals";
 import type { Datagram } from "./datagram.ts";
-import { type Frame, type Consumer as GroupConsumer, Producer as GroupProducer, Lagged } from "./group.ts";
+import {
+	type Frame,
+	type Consumer as GroupConsumer,
+	Producer as GroupProducer,
+	GroupTooLarge,
+	Lagged,
+} from "./group.ts";
 import { hooks, type Recv, type TrackRequestOptions, type TrackSequence, type TrackSequences } from "./internal.ts";
 import { Timescale, type Timestamp } from "./time.ts";
 
@@ -421,6 +427,16 @@ export class Producer {
 	 */
 	info(): Promise<Info> {
 		return resolveInfo(this.#state);
+	}
+
+	/**
+	 * Publisher priority from the committed {@link Info}, or 0 before {@link accept}.
+	 *
+	 * Higher is served first. Hang publishers set this from `Catalog.PRIORITY` so
+	 * audio outranks video on the wire and in the bandwidth allocator.
+	 */
+	get priority(): number {
+		return this.#state.info.peek()?.priority ?? 0;
 	}
 
 	/**
@@ -1248,8 +1264,8 @@ export class Subscriber {
 	 * Groups are acquired through the same sequence cursor as {@link Ordered.nextGroup},
 	 * so frames never run backwards: a late lower-sequence group is skipped, and so is
 	 * one every frame of which `maxAge` proves is too old. A group the budget abandons
-	 * mid-stall ends cleanly and the cursor resyncs from the next group; an eviction gap
-	 * inside a group still surfaces as {@link Lagged}.
+	 * mid-stall ends cleanly and the cursor resyncs from the next group; a gap inside a
+	 * group still surfaces as {@link Lagged} or {@link GroupTooLarge}.
 	 */
 	async #readFrameSequence(): Promise<({ group: number; frame: number } & Frame) | undefined> {
 		for (;;) {
@@ -1267,7 +1283,7 @@ export class Subscriber {
 				// only what the caller can act on (a gap, or the track's own abort).
 				this.#frameGroup = undefined;
 				group.close();
-				if (err instanceof Lagged) throw err;
+				if (err instanceof Lagged || err instanceof GroupTooLarge) throw err;
 				const closed = this.#state.closed.peek();
 				if (closed instanceof Error) throw closed;
 				continue;

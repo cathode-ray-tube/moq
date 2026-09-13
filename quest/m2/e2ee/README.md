@@ -17,9 +17,9 @@ Every application payload and semantic track name is confidential and authentica
 
 ### Keys and object identity
 
-- The application supplies an immutable `(broadcast context, generation, KID, broadcast secret)` credential. The secret is 32 bytes from a cryptographically secure random generator, never a password or other guessable input. One secret authorizes the whole broadcast; HKDF-SHA-256 derives separate AES-128-GCM keys for each physical track and for grouped-frame versus datagram domains.
+- The application supplies an immutable `(profile, broadcast context, generation, KID, broadcast secret)` credential. The secret is 32 bytes from a cryptographically secure random generator, never a password or other guessable input. One secret authorizes the whole broadcast; HKDF-SHA-256 derives separate AES-128-GCM keys for each physical track and for grouped-frame versus datagram domains.
 - Rotation starts a new broadcast generation. A generation and KID never change in place, and every publisher restart or replacement that can reset transport sequence numbers requires a new generation. The application pins the authorized generation, so a relay-replayed catalog or announcement is never a freshness authority.
-- A grouped frame uses the 96-bit nonce `uint64_be(group ID) || uint32_be(frame ID)`. A datagram uses its 64-bit sequence with frame ID zero under the separate datagram key domain. AES-GCM's internal block counter is not the frame ID; implementations use the standard AEAD API and fail at the strictest interoperable identity bound. Current TypeScript rejects before an ID exceeds `Number.MAX_SAFE_INTEGER`, and every implementation rejects before the 32-bit frame ID or AEAD invocation limit is exhausted.
+- A grouped frame uses the 96-bit nonce `uint64_be(group ID) || uint32_be(frame ID)`. A datagram uses its 64-bit sequence with frame ID zero under the separate datagram key domain. AES-GCM's internal block counter is not the frame ID; implementations use the standard AEAD API and fail at the strictest interoperable identity bound. Current TypeScript rejects before an ID exceeds `Number.MAX_SAFE_INTEGER`, and every implementation rejects before the 32-bit frame ID, AEAD invocation limit, or per-key plaintext-byte limit is exhausted.
 - Retransmission and cache replay reuse the original ciphertext. Re-encrypting different bytes at an existing `(credential, track, domain, group, frame)` identity is forbidden. No random per-group salt or per-frame KID header is carried.
 - The profile authenticates its version and every immutable property that has one canonical end-to-end value in both moq-lite and MoQ Transport. The broadcast context, generation, KID, full physical track name, domain, group, and frame are bound through derivation or the nonce; rewritten timestamps and mutable routing properties are excluded.
 
@@ -30,13 +30,14 @@ Every application payload and semantic track name is confidential and authentica
 - A platform that forwards and meters protected bytes must never preview, record, archive, transmux, transcode, transcribe, compose, or inspect them, rejecting those paths before opening a processing session or writing product state. Applications needing those operations terminate E2EE outside the platform. The moq.pro (downstream) exclusion classifier and dashboard work build on that rule and stay downstream.
 - The first proof covers browser TypeScript and native Rust publication and playback in both directions, with grouped audio and video over both moq-lite and MoQ Transport. Shared vectors cover groups and moq-lite datagrams; MoQ Transport has no datagram delivery.
 
-The profile starts from IETF Secure Objects where its object model maps exactly, specifies the moq-lite and datagram bindings it does not cover, and records intentional differences from SFrame and the experimental `moq-secure` format linked from [#3023](https://github.com/moq-dev/moq/issues/3023).
+The contract is [draft-lcurley-moq-e2ee](/drafts/draft-lcurley-moq-e2ee.md) and
+`drafts/moq-e2ee-01.json`. It starts from IETF Secure Objects where its object
+model maps exactly, specifies the moq-lite and datagram bindings that draft
+does not cover, and records intentional differences from SFrame and the
+experimental `moq-secure` format linked from [#3023](https://github.com/moq-dev/moq/issues/3023).
 
 ## Quests
 
-- [Encryption profile](/quest/m2/e2ee/profile.md) - a versioned MoQ E2EE
-  profile: payload protection, identity binding, key derivation, failure
-  behavior, and shared vectors
 - [Explicit datagram insertion](/quest/m2/e2ee/datagram-insert.md) - name and
   shape the explicit-sequence datagram API as insertion in both languages,
   reserving append for automatic allocation
@@ -65,5 +66,5 @@ The profile starts from IETF Secure Objects where its object model maps exactly,
 
 ## Related
 
-- [archive](/quest/m1/archive/README.md) - protected broadcasts are deliberately outside recording and replay formats
+- [archive](/quest/m2/archive/README.md) - protected broadcasts are deliberately outside recording and replay formats
 - [Merge dev](/quest/m1/merge-dev.md) - its HLS soak (a fresh viewer joining a days-old broadcast, playable since #3240) covers plaintext broadcasts only; stock HLS and DASH exclude `.e2ee` broadcasts

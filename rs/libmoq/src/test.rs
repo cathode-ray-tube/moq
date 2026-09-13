@@ -13,15 +13,18 @@ fn id(raw: i32) -> u32 {
 	raw as u32
 }
 
-/// Create a live broadcast at `path` on `origin` via `moq_origin_publish`.
+/// Create a broadcast at `path` on `origin` and announce it.
 fn publish_broadcast(origin: u32, path: &[u8]) -> u32 {
-	id(unsafe { moq_origin_publish(origin, path.as_ptr() as *const c_char, path.len()) })
+	let broadcast = id(unsafe { moq_origin_create_broadcast(origin, path.as_ptr() as *const c_char, path.len()) });
+	assert_eq!(unsafe { moq_publish_announce(broadcast, std::ptr::null()) }, 0);
+	broadcast
 }
 
 /// Request a published broadcast via `moq_origin_request` and return its handle.
 ///
-/// A broadcast created with `moq_origin_publish` becomes visible asynchronously, so an
-/// early request can race the attach and fail as unroutable; retry until the deadline.
+/// A broadcast created with `moq_origin_create_broadcast` becomes reachable
+/// asynchronously, so an early request can race the attach and fail as unroutable;
+/// retry until the deadline.
 fn request_broadcast(origin: u32, path: &[u8]) -> u32 {
 	let deadline = std::time::Instant::now() + TIMEOUT;
 	loop {
@@ -224,6 +227,110 @@ fn last_error_set_before_callback() {
 	cb.call(Err::<(), Error>(Error::OriginNotFound));
 
 	assert_eq!(captured.as_deref(), Some("origin not found"));
+}
+
+#[test]
+fn last_error_protocol_is_none_for_a_local_failure() {
+	assert!(moq_origin_close(9999) < 0);
+	let mut out = moq_protocol_error {
+		scope: 99,
+		code: 99,
+		kind: 99,
+	};
+	assert!(unsafe { moq_error_protocol(&mut out) } < 0);
+	assert_eq!(out.scope, 99, "a non-protocol error must not write the record");
+}
+
+#[test]
+fn last_error_protocol_captures_a_stream_app_code() {
+	use crate::Error;
+	use crate::ffi::OnStatus;
+
+	extern "C" fn capture(user_data: *mut c_void, code: i32) {
+		assert!(code < 0, "expected a negative status, got {code}");
+		let slot = unsafe { &mut *(user_data as *mut Option<moq_protocol_error>) };
+		let mut out = moq_protocol_error {
+			scope: 0,
+			code: 0,
+			kind: 0,
+		};
+		assert_eq!(unsafe { moq_error_protocol(&mut out) }, 0);
+		*slot = Some(out);
+	}
+
+	let mut captured: Option<moq_protocol_error> = None;
+	let cb = unsafe { OnStatus::new(&mut captured as *mut _ as *mut c_void, Some(capture)) };
+	cb.call(Err::<(), Error>(Error::Moq(moq_net::StreamError::App(404).into())));
+
+	let protocol = captured.expect("expected a protocol error");
+	assert_eq!(protocol.scope, moq_error_scope::MOQ_ERROR_SCOPE_STREAM as u32);
+	assert_eq!(protocol.code, 64 + 404);
+	assert_eq!(protocol.kind, moq_protocol_kind::MOQ_PROTOCOL_KIND_APP as u32);
+}
+
+#[test]
+fn last_error_protocol_captures_session_known_app_and_unknown() {
+	use crate::Error;
+	use crate::ffi::OnStatus;
+
+	extern "C" fn capture(user_data: *mut c_void, code: i32) {
+		assert!(code < 0, "expected a negative status, got {code}");
+		let slot = unsafe { &mut *(user_data as *mut Option<moq_protocol_error>) };
+		let mut out = moq_protocol_error {
+			scope: 0,
+			code: 0,
+			kind: 0,
+		};
+		assert_eq!(unsafe { moq_error_protocol(&mut out) }, 0);
+		*slot = Some(out);
+	}
+
+	for (err, scope, code, kind) in [
+		(
+			moq_net::Error::from(moq_net::SessionError::Cancel),
+			moq_error_scope::MOQ_ERROR_SCOPE_SESSION as u32,
+			0,
+			moq_protocol_kind::MOQ_PROTOCOL_KIND_CANCEL as u32,
+		),
+		(
+			moq_net::Error::from(moq_net::StreamError::Internal),
+			moq_error_scope::MOQ_ERROR_SCOPE_STREAM as u32,
+			0,
+			moq_protocol_kind::MOQ_PROTOCOL_KIND_INTERNAL as u32,
+		),
+		(
+			moq_net::Error::from(moq_net::SessionError::Unauthorized),
+			moq_error_scope::MOQ_ERROR_SCOPE_SESSION as u32,
+			0x2,
+			moq_protocol_kind::MOQ_PROTOCOL_KIND_UNAUTHORIZED as u32,
+		),
+		(
+			moq_net::Error::from(moq_net::SessionError::App(7)),
+			moq_error_scope::MOQ_ERROR_SCOPE_SESSION as u32,
+			64 + 7,
+			moq_protocol_kind::MOQ_PROTOCOL_KIND_APP as u32,
+		),
+		(
+			moq_net::Error::from(moq_net::SessionError::Unknown(0x1f)),
+			moq_error_scope::MOQ_ERROR_SCOPE_SESSION as u32,
+			0x1f,
+			moq_protocol_kind::MOQ_PROTOCOL_KIND_UNKNOWN as u32,
+		),
+		(
+			moq_net::Error::from(moq_net::StreamError::App(404)),
+			moq_error_scope::MOQ_ERROR_SCOPE_STREAM as u32,
+			64 + 404,
+			moq_protocol_kind::MOQ_PROTOCOL_KIND_APP as u32,
+		),
+	] {
+		let mut captured: Option<moq_protocol_error> = None;
+		let cb = unsafe { OnStatus::new(&mut captured as *mut _ as *mut c_void, Some(capture)) };
+		cb.call(Err::<(), Error>(Error::Moq(err)));
+		let protocol = captured.expect("expected a protocol error");
+		assert_eq!(protocol.scope, scope);
+		assert_eq!(protocol.code, code);
+		assert_eq!(protocol.kind, kind);
+	}
 }
 
 #[test]
@@ -1883,7 +1990,7 @@ fn announced_deactivation() {
 
 	// Going non-live unannounces the broadcast without tearing it down: it stays
 	// reachable by exact path for subscribes and fetches.
-	assert_eq!(moq_publish_set_announce(broadcast, false), 0);
+	assert_eq!(moq_publish_unannounce(broadcast), 0);
 
 	let deactivated_id = id(cb.recv());
 	assert_eq!(unsafe { moq_origin_announced_info(deactivated_id, &mut info) }, 0);
@@ -1892,6 +1999,118 @@ fn announced_deactivation() {
 	assert_eq!(moq_origin_announced_close(announced_task), 0);
 	assert_eq!(cb.recv_terminal(), 0, "announced close delivers terminal 0");
 	assert_eq!(moq_publish_finish(broadcast), 0);
+	assert_eq!(moq_origin_close(origin), 0);
+}
+
+#[test]
+fn create_broadcast_does_not_announce() {
+	let origin = id(moq_origin_create());
+	let cb = Callback::new();
+	let announced_task = id(unsafe { moq_origin_announced(origin, Some(channel_callback), cb.ptr) });
+
+	let path = b"quiet";
+	let broadcast = id(unsafe { moq_origin_create_broadcast(origin, path.as_ptr() as *const c_char, path.len()) });
+	// Reachable by exact path without being announced.
+	let _ = request_broadcast(origin, path);
+
+	assert_eq!(unsafe { moq_publish_announce(broadcast, std::ptr::null()) }, 0);
+	let announced_id = id(cb.recv());
+	let mut info = moq_announced {
+		path: std::ptr::null(),
+		path_len: 0,
+		active: false,
+	};
+	assert_eq!(unsafe { moq_origin_announced_info(announced_id, &mut info) }, 0);
+	assert!(info.active);
+
+	assert_eq!(moq_origin_announced_close(announced_task), 0);
+	assert_eq!(cb.recv_terminal(), 0);
+	assert_eq!(moq_publish_finish(broadcast), 0);
+	assert_eq!(moq_origin_close(origin), 0);
+}
+
+#[test]
+fn dynamic_serves_a_request_under_a_prefix() {
+	let origin = id(moq_origin_create());
+	let cb = Callback::new();
+	let pattern = b"live/**";
+	let dynamic = id(unsafe {
+		moq_origin_dynamic(
+			origin,
+			pattern.as_ptr() as *const c_char,
+			pattern.len(),
+			std::ptr::null(),
+			Some(channel_callback),
+			cb.ptr,
+		)
+	});
+
+	let path = b"live/cam";
+	let req_cb = Callback::new();
+	let _task = id(unsafe {
+		moq_origin_request(
+			origin,
+			path.as_ptr() as *const c_char,
+			path.len(),
+			Some(channel_callback),
+			req_cb.ptr,
+		)
+	});
+
+	let request = id(cb.recv());
+	let mut info = moq_string {
+		data: std::ptr::null(),
+		len: 0,
+	};
+	assert_eq!(unsafe { moq_broadcast_request_path(request, &mut info) }, 0);
+	let got = unsafe { std::str::from_utf8(std::slice::from_raw_parts(info.data.cast::<u8>(), info.len)).unwrap() };
+	assert_eq!(got, "live/cam");
+
+	let served = id(unsafe { moq_origin_create_broadcast(origin, b"unused".as_ptr() as *const c_char, 6) });
+	assert_eq!(moq_broadcast_request_accept(request, served), 0);
+	assert!(req_cb.recv() > 0);
+	req_cb.recv_terminal();
+
+	assert_eq!(moq_origin_dynamic_close(dynamic), 0);
+	assert_eq!(cb.recv_terminal(), 0);
+	assert_eq!(moq_publish_finish(served), 0);
+	assert_eq!(moq_origin_close(origin), 0);
+}
+
+#[test]
+fn dynamic_refuses_a_non_prefix_pattern() {
+	let origin = id(moq_origin_create());
+	let cb = Callback::new();
+	let pattern = b"live/*";
+	let code = unsafe {
+		moq_origin_dynamic(
+			origin,
+			pattern.as_ptr() as *const c_char,
+			pattern.len(),
+			std::ptr::null(),
+			Some(channel_callback),
+			cb.ptr,
+		)
+	};
+	assert!(code < 0, "a non-prefix pattern must be refused, got {code}");
+	assert_eq!(moq_origin_close(origin), 0);
+}
+
+#[test]
+fn dynamic_refuses_a_missing_callback() {
+	let origin = id(moq_origin_create());
+	let pattern = b"live/**";
+	let code = unsafe {
+		moq_origin_dynamic(
+			origin,
+			pattern.as_ptr() as *const c_char,
+			pattern.len(),
+			std::ptr::null(),
+			None,
+			std::ptr::null_mut(),
+		)
+	};
+	assert!(code < 0, "a missing on_request must be refused, got {code}");
 	assert_eq!(moq_origin_close(origin), 0);
 }
 
@@ -2293,8 +2512,16 @@ fn audio_raw_publish() {
 		bitrate: 0,
 		frame_duration_us: 20_000,
 	};
-	let producer =
-		id(unsafe { moq_encode_audio(broadcast, name.as_ptr() as *const c_char, name.len(), &input, &output) });
+	let producer = id(unsafe {
+		moq_encode_audio(
+			broadcast,
+			name.as_ptr() as *const c_char,
+			name.len(),
+			&input,
+			&output,
+			0,
+		)
+	});
 
 	// 20 ms of silence: interleaved stereo f32 at 48 kHz, one encoded frame's worth.
 	let samples = vec![0.0f32; 960 * 2];
@@ -2340,7 +2567,16 @@ fn audio_raw_publish_frame_durations() {
 			bitrate: 0,
 			frame_duration_us,
 		};
-		unsafe { moq_encode_audio(broadcast, name.as_ptr() as *const c_char, name.len(), &input, &output) }
+		unsafe {
+			moq_encode_audio(
+				broadcast,
+				name.as_ptr() as *const c_char,
+				name.len(),
+				&input,
+				&output,
+				0,
+			)
+		}
 	};
 
 	let producer = id(encode(b"fine", 2_500));
@@ -2393,7 +2629,7 @@ fn video_raw_publish_consume() {
 		encoder: std::ptr::null(),
 		encoder_len: 0,
 	};
-	let producer = id(unsafe { moq_encode_video(broadcast, &input, &output) });
+	let producer = id(unsafe { moq_encode_video(broadcast, &input, &output, 0) });
 
 	let rgba = gray_rgba(320, 240);
 	let publish = |index: u64| {
@@ -2489,7 +2725,7 @@ fn video_raw_publish_from_many_threads() {
 		encoder: std::ptr::null(),
 		encoder_len: 0,
 	};
-	let producer = id(unsafe { moq_encode_video(broadcast, &input, &output) });
+	let producer = id(unsafe { moq_encode_video(broadcast, &input, &output, 0) });
 
 	// A fresh caller thread per frame, never the one that published.
 	let rgba = std::sync::Arc::new(gray_rgba(320, 240));
@@ -2558,8 +2794,8 @@ fn a_stalled_encode_does_not_block_unrelated_calls() {
 		encoder: std::ptr::null(),
 		encoder_len: 0,
 	};
-	let stalled = id(unsafe { moq_encode_video(broadcast, &input, &output) });
-	let other = id(unsafe { moq_encode_video(broadcast, &input, &output) });
+	let stalled = id(unsafe { moq_encode_video(broadcast, &input, &output, 0) });
+	let other = id(unsafe { moq_encode_video(broadcast, &input, &output, 0) });
 
 	// Hold the lock a publish takes for the duration of its encode.
 	let handle = State::lock().video.producer(Id::try_from(stalled).unwrap()).unwrap();
@@ -2637,7 +2873,7 @@ fn video_raw_publish_rejects_frame_size_mismatch() {
 		encoder: std::ptr::null(),
 		encoder_len: 0,
 	};
-	let producer = id(unsafe { moq_encode_video(broadcast, &input, &output) });
+	let producer = id(unsafe { moq_encode_video(broadcast, &input, &output, 0) });
 
 	// A 640x480 buffer against a 320x240 encoder: the frame carries no dimensions
 	// of its own, so this is caught as a wrong-sized picture.
@@ -2676,20 +2912,20 @@ fn video_raw_publish_rejects_invalid_config() {
 		encoder_len: 0,
 	};
 
-	assert!(unsafe { moq_encode_video(broadcast, std::ptr::null(), &valid_output) } < 0);
-	assert!(unsafe { moq_encode_video(broadcast, &valid_input, std::ptr::null()) } < 0);
+	assert!(unsafe { moq_encode_video(broadcast, std::ptr::null(), &valid_output, 0) } < 0);
+	assert!(unsafe { moq_encode_video(broadcast, &valid_input, std::ptr::null(), 0) } < 0);
 
 	let bad_format = moq_video_encoder_input {
 		format: 99,
 		..valid_input
 	};
-	assert!(unsafe { moq_encode_video(broadcast, &bad_format, &valid_output) } < 0);
+	assert!(unsafe { moq_encode_video(broadcast, &bad_format, &valid_output, 0) } < 0);
 
 	let zero_framerate = moq_video_encoder_input {
 		framerate: 0,
 		..valid_input
 	};
-	assert!(unsafe { moq_encode_video(broadcast, &zero_framerate, &valid_output) } < 0);
+	assert!(unsafe { moq_encode_video(broadcast, &zero_framerate, &valid_output, 0) } < 0);
 
 	// Regression: dimensions arrive as a raw `u32` pair, and their product used to
 	// overflow the default-bitrate estimate inside the encoder. A panic here is an
@@ -2700,7 +2936,7 @@ fn video_raw_publish_rejects_invalid_config() {
 		height: u32::MAX - 1,
 		..valid_input
 	};
-	assert!(unsafe { moq_encode_video(broadcast, &unrepresentable, &valid_output) } < 0);
+	assert!(unsafe { moq_encode_video(broadcast, &unrepresentable, &valid_output, 0) } < 0);
 
 	// A size no encoder can take, but whose arithmetic is fine, is the backend's
 	// call rather than the boundary's: it must not be swept up by the check above.
@@ -2711,7 +2947,7 @@ fn video_raw_publish_rejects_invalid_config() {
 		height: 65534,
 		..valid_input
 	};
-	let huge = unsafe { moq_encode_video(broadcast, &merely_huge, &valid_output) };
+	let huge = unsafe { moq_encode_video(broadcast, &merely_huge, &valid_output, 0) };
 	if huge > 0 {
 		assert_eq!(moq_encode_video_finish(id(huge)), 0);
 	} else {
@@ -2726,13 +2962,13 @@ fn video_raw_publish_rejects_invalid_config() {
 		codec: 99,
 		..valid_output
 	};
-	assert!(unsafe { moq_encode_video(broadcast, &valid_input, &bad_codec) } < 0);
+	assert!(unsafe { moq_encode_video(broadcast, &valid_input, &bad_codec, 0) } < 0);
 
 	let bad_kind = moq_video_encoder_output {
 		kind: 99,
 		..valid_output
 	};
-	assert!(unsafe { moq_encode_video(broadcast, &valid_input, &bad_kind) } < 0);
+	assert!(unsafe { moq_encode_video(broadcast, &valid_input, &bad_kind, 0) } < 0);
 
 	// Handles for a producer that was never created.
 	assert!(moq_encode_video_cut(0) < 0);
@@ -3461,4 +3697,189 @@ fn dial_applies_the_config() {
 
 	assert_eq!(moq_session_close(session), 0);
 	assert!(cb.recv() <= 0, "session close delivers a terminal code");
+}
+
+fn test_allocator() -> (u32, moq_net::bandwidth::Producer) {
+	let estimate = moq_net::bandwidth::Producer::new();
+	let allocator = moq_net::bandwidth::Allocator::new(estimate.consume());
+	let bandwidth = {
+		let mut state = State::lock();
+		id(i32::from(state.bandwidth.insert(allocator).unwrap()))
+	};
+	(bandwidth, estimate)
+}
+
+fn grant(reservation: u32) -> Option<u64> {
+	let mut bps = 0;
+	let mut present = false;
+	assert_eq!(unsafe { moq_reservation_grant(reservation, &mut bps, &mut present) }, 0);
+	present.then_some(bps)
+}
+
+fn wait_grant(reservation: u32) -> u64 {
+	let deadline = std::time::Instant::now() + TIMEOUT;
+	loop {
+		if let Some(bps) = grant(reservation) {
+			return bps;
+		}
+		assert!(
+			std::time::Instant::now() < deadline,
+			"timed out waiting for a reservation grant"
+		);
+		std::thread::sleep(Duration::from_millis(10));
+	}
+}
+
+fn publish_named_track(broadcast: u32, name: &[u8]) -> u32 {
+	id(unsafe { moq_publish_track(broadcast, name.as_ptr() as *const c_char, name.len(), std::ptr::null()) })
+}
+
+fn subscribe_named_track(consume: u32, name: &[u8]) -> (u32, Callback) {
+	let cb = Callback::new();
+	let consumer = id(unsafe {
+		moq_consume_track(
+			consume,
+			name.as_ptr() as *const c_char,
+			name.len(),
+			std::ptr::null(),
+			Some(channel_callback),
+			cb.ptr,
+		)
+	});
+	(consumer, cb)
+}
+
+/// Two reservations on one allocator split a 3 Mbps estimate to at most 3 Mbps.
+#[test]
+fn bandwidth_reservations_split_the_estimate() {
+	let (bandwidth, estimate) = test_allocator();
+	let origin = id(moq_origin_create());
+	let path = b"bandwidth-split";
+	let broadcast = publish_broadcast(origin, path);
+	let consume = request_broadcast(origin, path);
+
+	let first_track = publish_named_track(broadcast, b"a");
+	let second_track = publish_named_track(broadcast, b"b");
+	let (first_sub, first_cb) = subscribe_named_track(consume, b"a");
+	let (second_sub, second_cb) = subscribe_named_track(consume, b"b");
+
+	let first = id(moq_bandwidth_reserve(bandwidth, first_track, 4_000_000));
+	let second = id(moq_bandwidth_reserve(bandwidth, second_track, 2_000_000));
+	estimate
+		.set(Some(moq_net::bandwidth::Rate::from_bps(3_000_000)))
+		.unwrap();
+
+	wait_grant(first);
+	wait_grant(second);
+	let a = grant(first).expect("first grant");
+	let b = grant(second).expect("second grant");
+	assert!(a + b <= 3_000_000, "{a} + {b} oversubscribed");
+	assert_eq!(a, 1_500_000);
+	assert_eq!(b, 1_500_000);
+
+	assert_eq!(moq_reservation_close(first), 0);
+	assert_eq!(grant(second), Some(2_000_000));
+
+	assert_eq!(moq_reservation_close(second), 0);
+	assert_eq!(moq_bandwidth_close(bandwidth), 0);
+	assert_eq!(moq_consume_track_close(first_sub), 0);
+	assert_eq!(moq_consume_track_close(second_sub), 0);
+	let _ = first_cb.recv_terminal();
+	let _ = second_cb.recv_terminal();
+	assert_eq!(moq_consume_close(consume), 0);
+	assert_eq!(moq_publish_finish(broadcast), 0);
+	assert_eq!(moq_origin_close(origin), 0);
+}
+
+/// Two allocator handles share one registry.
+#[test]
+fn bandwidth_handles_share_the_registry() {
+	let estimate = moq_net::bandwidth::Producer::new();
+	estimate
+		.set(Some(moq_net::bandwidth::Rate::from_bps(3_000_000)))
+		.unwrap();
+	let allocator = moq_net::bandwidth::Allocator::new(estimate.consume());
+	let (first, second) = {
+		let mut state = State::lock();
+		let first = id(i32::from(state.bandwidth.insert(allocator.clone()).unwrap()));
+		let second = id(i32::from(state.bandwidth.insert(allocator).unwrap()));
+		(first, second)
+	};
+
+	let origin = id(moq_origin_create());
+	let path = b"bandwidth-shared";
+	let broadcast = publish_broadcast(origin, path);
+	let consume = request_broadcast(origin, path);
+	let first_track = publish_named_track(broadcast, b"a");
+	let second_track = publish_named_track(broadcast, b"b");
+	let (first_sub, first_cb) = subscribe_named_track(consume, b"a");
+	let (second_sub, second_cb) = subscribe_named_track(consume, b"b");
+
+	let reserved = id(moq_bandwidth_reserve(first, first_track, 4_000_000));
+	assert_eq!(wait_grant(reserved), 3_000_000);
+	let other = id(moq_bandwidth_reserve(second, second_track, 4_000_000));
+	assert_eq!(wait_grant(other), 1_500_000);
+	assert_eq!(grant(reserved), Some(1_500_000));
+
+	assert_eq!(moq_reservation_close(reserved), 0);
+	assert_eq!(moq_reservation_close(other), 0);
+	assert_eq!(moq_bandwidth_close(first), 0);
+	assert_eq!(moq_bandwidth_close(second), 0);
+	assert_eq!(moq_consume_track_close(first_sub), 0);
+	assert_eq!(moq_consume_track_close(second_sub), 0);
+	let _ = first_cb.recv_terminal();
+	let _ = second_cb.recv_terminal();
+	assert_eq!(moq_consume_close(consume), 0);
+	assert_eq!(moq_publish_finish(broadcast), 0);
+	assert_eq!(moq_origin_close(origin), 0);
+}
+
+/// `moq_encode_video_bitrate` is the manual ceiling: a later grant cannot exceed it.
+#[test]
+fn encode_video_bitrate_caps_the_reservation() {
+	let (bandwidth, estimate) = test_allocator();
+	let origin = id(moq_origin_create());
+	let path = b"bitrate-cap";
+	let broadcast = publish_broadcast(origin, path);
+	let consume = request_broadcast(origin, path);
+
+	let input = moq_video_encoder_input {
+		format: moq_video_pixel_format::MOQ_VIDEO_PIXEL_FORMAT_RGBA as u32,
+		width: 320,
+		height: 240,
+		framerate: 30,
+	};
+	let output = moq_video_encoder_output {
+		codec: moq_video_codec::MOQ_VIDEO_CODEC_H264 as u32,
+		bitrate: 4_000_000,
+		gop: 0,
+		kind: moq_video_encoder_kind::MOQ_VIDEO_ENCODER_KIND_SOFTWARE as u32,
+		encoder: std::ptr::null(),
+		encoder_len: 0,
+	};
+	let producer = id(unsafe { moq_encode_video(broadcast, &input, &output, bandwidth) });
+	let reservation = id(moq_encode_video_reservation(producer));
+	let (sub, cb) = subscribe_named_track(consume, b"0.avc3");
+
+	estimate
+		.set(Some(moq_net::bandwidth::Rate::from_bps(4_000_000)))
+		.unwrap();
+	assert_eq!(wait_grant(reservation), 4_000_000);
+
+	assert_eq!(moq_encode_video_bitrate(producer, 1_000_000), 0);
+	assert_eq!(grant(reservation), Some(1_000_000));
+
+	estimate
+		.set(Some(moq_net::bandwidth::Rate::from_bps(3_000_000)))
+		.unwrap();
+	assert_eq!(grant(reservation), Some(1_000_000));
+
+	assert_eq!(moq_reservation_close(reservation), 0);
+	assert_eq!(moq_consume_track_close(sub), 0);
+	let _ = cb.recv_terminal();
+	assert_eq!(moq_encode_video_finish(producer), 0);
+	assert_eq!(moq_bandwidth_close(bandwidth), 0);
+	assert_eq!(moq_consume_close(consume), 0);
+	assert_eq!(moq_publish_finish(broadcast), 0);
+	assert_eq!(moq_origin_close(origin), 0);
 }

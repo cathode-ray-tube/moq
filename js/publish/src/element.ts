@@ -14,9 +14,6 @@ import * as Source from "./source";
 import * as Video from "./video";
 
 const OBSERVED = ["url", "name", "muted", "invisible", "source", "preview", "announce"] as const;
-
-/** How often the encoder's bitrate cap resamples the transport's send estimate. */
-const BANDWIDTH_POLL = 100; // ms
 type Observed = (typeof OBSERVED)[number];
 
 /** The built-in capture sources selectable via the `source` attribute. */
@@ -82,16 +79,16 @@ export default class MoqPublish extends HTMLElement {
 		invisible: new Signal(false),
 		// What a <canvas> preview renders: the raw capture, or a decoded copy of the encoded video.
 		preview: new Signal<Preview.Mode>("source"),
-		// When to announce/publish the broadcast: always, never, or only once a source is selected.
+		// When to advertise the broadcast: always, never, or only once a source is live.
 		announce: new Signal<AnnounceMode>("source"),
 	};
 
 	/**
 	 * The relay connection, shared with every other element on the page pointing at the
-	 * same URL; see `Moq.Connection.Shared`. The broadcast publishes into its `origin`, so
-	 * a `<moq-watch>` on the same page and URL resolves it locally with no round trip.
+	 * same URL. The broadcast publishes into its `origin`, so a `<moq-watch>` on the same
+	 * page and URL resolves it locally with no round trip.
 	 */
-	connection: Moq.Connection.Shared;
+	connection: Moq.Connection;
 	/** The video capture, shared by every video rendition. Also reachable as `video.capture`. */
 	capture: Video.Capture;
 	broadcast: Broadcast;
@@ -121,9 +118,6 @@ export default class MoqPublish extends HTMLElement {
 	// Whether to flip the video horizontally on playback. No attribute yet.
 	#flip = new Signal(false);
 
-	// The estimated send bandwidth (bits/sec), the encoder's bitrate cap.
-	#bandwidth = new Signal<number | undefined>(undefined);
-
 	// The preview element, either a <video> (raw source via srcObject) or a <canvas> (rendered frames).
 	#preview = new Signal<HTMLVideoElement | HTMLCanvasElement | undefined>(undefined);
 
@@ -135,8 +129,8 @@ export default class MoqPublish extends HTMLElement {
 	// Set when the element is connected to the DOM.
 	#enabled = new Signal(false);
 
-	// Whether to actually publish the broadcast: connected to the DOM and allowed by the `announce` mode.
-	#publishEnabled = new Signal(false);
+	// Whether to advertise the broadcast, driven by the `announce` mode.
+	#announcing = new Signal(false);
 
 	/**
 	 * Effects scoped to this element's lifetime, closed on disconnect.
@@ -151,7 +145,7 @@ export default class MoqPublish extends HTMLElement {
 
 		cleanup.register(this, this.signals);
 
-		this.connection = new Moq.Connection.Shared({
+		this.connection = new Moq.Connection({
 			enabled: this.#enabled,
 		});
 		this.signals.cleanup(() => this.connection.close());
@@ -171,41 +165,13 @@ export default class MoqPublish extends HTMLElement {
 		});
 
 		this.signals.run((effect) => {
-			const enabled = effect.get(this.#enabled);
 			const announce = effect.get(this.controls.announce);
 			// "source" waits until media is actually being captured -- a live audio or
 			// video track exists -- not merely a source *type* selected. Otherwise we'd
 			// announce an empty broadcast while the getUserMedia/getDisplayMedia
 			// permission prompt is still pending (or after the user denies it).
 			const hasMedia = effect.get(this.#videoSource) !== undefined || effect.get(this.#audioSource) !== undefined;
-			const announcing = announce === "always" || (announce === "source" && hasMedia);
-			this.#publishEnabled.set(enabled && announcing);
-		});
-
-		// Track the connection's send bandwidth estimate, the encoder's bitrate cap. The
-		// transport has no event for it, so sample on our own schedule and skip a tick
-		// while the previous snapshot is outstanding.
-		this.signals.run((effect) => {
-			effect.set(this.#bandwidth, undefined);
-			if (effect.get(this.connection.status) !== "connected") return;
-
-			let pending = false;
-			const sample = async () => {
-				if (pending) return;
-				pending = true;
-				try {
-					// A snapshot that lands after this run was torn down describes a
-					// connection we no longer have, so drop it rather than capping the
-					// encoder at a dead peer's estimate.
-					const stats = await Promise.race([effect.cancel, this.connection.stats()]);
-					if (stats) this.#bandwidth.set(stats.estimatedSendRate);
-				} finally {
-					pending = false;
-				}
-			};
-
-			void sample();
-			effect.interval(sample, BANDWIDTH_POLL);
+			this.#announcing.set(announce === "always" || (announce === "source" && hasMedia));
 		});
 
 		this.capture = new Video.Capture({ source: this.#videoSource });
@@ -220,7 +186,8 @@ export default class MoqPublish extends HTMLElement {
 
 		this.broadcast = new Broadcast({
 			origin: this.connection.origin,
-			enabled: this.#publishEnabled,
+			enabled: this.#enabled,
+			announce: this.#announcing,
 			name: this.#name,
 			display: this.capture.out.display,
 			flip: this.#flip,
@@ -231,7 +198,7 @@ export default class MoqPublish extends HTMLElement {
 			broadcast: this.broadcast,
 			capture: this.capture,
 			enabled: this.#videoEnabled,
-			bandwidth: this.#bandwidth,
+			bandwidth: this.connection.bandwidth,
 		});
 		this.signals.cleanup(() => this.video.close());
 
@@ -239,6 +206,7 @@ export default class MoqPublish extends HTMLElement {
 			broadcast: this.broadcast,
 			enabled: this.#audioEnabled,
 			capture: audioCapture,
+			bandwidth: this.connection.bandwidth,
 		});
 		this.signals.cleanup(() => this.audio.close());
 

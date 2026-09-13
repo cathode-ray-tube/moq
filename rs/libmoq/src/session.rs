@@ -16,6 +16,9 @@ struct TaskEntry {
 	callback: ffi::OnStatus,
 	/// Reads live connection stats, reporting `None` while reconnecting.
 	stats: moq_tokio::ConnectionStatsReader,
+	/// One allocator for the session. Every `moq_session_bandwidth` handle clones
+	/// it, so they share one reservation registry.
+	bandwidth: moq_net::bandwidth::Allocator,
 }
 
 /// Everything needed to prepare a session without holding the global state lock.
@@ -82,12 +85,14 @@ impl Session {
 		// before moving it into the spawned task.
 		let reconnect = client.connect(url);
 		let stats = reconnect.stats();
+		let bandwidth = moq_net::bandwidth::Allocator::new(reconnect.send_bandwidth());
 
 		let closed = oneshot::channel();
 		let entry = TaskEntry {
 			close: Some(closed.0),
 			callback,
 			stats,
+			bandwidth,
 		};
 		let id = self.task.insert(Some(entry))?;
 
@@ -113,6 +118,17 @@ impl Session {
 		});
 
 		Ok(id)
+	}
+
+	/// The session's bandwidth allocator. Clones share one reservation registry.
+	pub fn bandwidth(&self, id: Id) -> Result<moq_net::bandwidth::Allocator, Error> {
+		Ok(self
+			.task
+			.get(id)
+			.and_then(|entry| entry.as_ref())
+			.ok_or(Error::SessionNotFound)?
+			.bandwidth
+			.clone())
 	}
 
 	/// Snapshot the current connection's stats.
@@ -177,10 +193,16 @@ impl Session {
 }
 
 fn map_connect_error(err: moq_tokio::Error) -> Error {
-	match err.connect_error() {
-		Some(moq_tokio::ConnectError::Unauthorized) => Error::Unauthorized,
-		Some(moq_tokio::ConnectError::Forbidden) => Error::Forbidden,
-		_ => Error::Connect(Arc::new(err.into())),
+	match err {
+		// Local auth stays the dedicated C status. A scoped protocol close is `Error::Moq`
+		// so `moq_error_protocol` can recover the registry and code.
+		moq_tokio::Error::MoqNet(moq_net::Error::Unauthorized) => Error::Unauthorized,
+		moq_tokio::Error::MoqNet(err) => err.into(),
+		err => match err.connect_error() {
+			Some(moq_tokio::ConnectError::Unauthorized) => Error::Unauthorized,
+			Some(moq_tokio::ConnectError::Forbidden) => Error::Forbidden,
+			_ => Error::Connect(Arc::new(err.into())),
+		},
 	}
 }
 
@@ -204,11 +226,20 @@ mod tests {
 			Error::Unauthorized
 		));
 		assert!(matches!(
+			map_connect_error(moq_net::Error::from(moq_net::SessionError::Unauthorized).into()),
+			Error::Moq(moq_net::Error::Session(moq_net::SessionError::Unauthorized))
+		));
+		assert!(matches!(
 			map_connect_error(moq_tokio::Error::ConnectFailed),
 			Error::Connect(_)
 		));
 		assert_eq!(Error::Unauthorized.code(), -34);
 		assert_eq!(Error::Forbidden.code(), -35);
+		assert_eq!(map_connect_error(moq_net::Error::Unauthorized.into()).code(), -34);
+		assert_eq!(
+			map_connect_error(moq_net::Error::from(moq_net::SessionError::Unauthorized).into()).code(),
+			-2
+		);
 		assert_eq!(map_connect_error(moq_tokio::Error::ConnectFailed).code(), -5);
 	}
 }

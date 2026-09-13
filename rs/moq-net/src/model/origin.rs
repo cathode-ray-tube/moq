@@ -16,7 +16,7 @@ use web_transport_trait::{MaybeSend, MaybeSync};
 
 use super::{Requests, WeakCache, WeakEntry};
 use crate::{
-	AsPath, Error, Path, PathOwned, PathPrefixes,
+	AsPath, Error, Path, PathOwned, PathPrefixes, Pattern,
 	coding::{BoundsExceeded, Decode, DecodeError, Encode, EncodeError},
 	runtime::{AnyTimers, Instant, Timers, TimersSlot},
 	util::{TaskSet, Tasks, TasksWeak},
@@ -530,7 +530,7 @@ impl std::fmt::Display for Prefix {
 /// The path a route took through the mesh and what using it costs.
 ///
 /// The metadata half of an advertisement: [`Producer::dynamic`] pairs it with
-/// the [`Prefix`] it covers, [`broadcast::Producer::announce`] with the
+/// the pattern it covers, [`broadcast::Producer::announce`] with the
 /// broadcast's exact path, and [`Consumer::announced`] yields both. A route
 /// claims capability, not inventory: it says paths under its prefix are
 /// servable, never that any specific broadcast exists. The common convention is
@@ -1348,9 +1348,13 @@ impl Producer {
 
 	/// Advertise a route and serve the requests beneath it.
 	///
+	/// `pattern` is in the [`Pattern`] dialect; a prefix is spelled `foo/**`.
+	/// Until wildcard advertisements land, anything but a prefix-shaped pattern
+	/// (literal segments then `**`) is [`Error::Unsupported`].
+	///
 	/// The advertisement is visible to [`Consumer::announced`] and forwarded by
 	/// sessions for as long as the returned [`Dynamic`] (and every clone) lives.
-	/// A consumer resolving a path under `prefix` that no local broadcast covers
+	/// A consumer resolving a path under the pattern that no local broadcast covers
 	/// is handed to the handler as a [`Request`] to materialize on demand. This is
 	/// how a service answers a whole subtree without publishing each path, and how
 	/// sessions land the routes a peer announces to them; a publisher that knows
@@ -1358,13 +1362,14 @@ impl Producer {
 	/// [`broadcast::Producer::announce`] instead, so subscribers can enumerate
 	/// them.
 	///
-	/// The prefix is clamped to the intersection with this producer's allowed
-	/// scope, so a broad route announced through a narrow token advertises exactly
-	/// what the token may serve. Fails with [`Error::Unauthorized`] when they are
-	/// disjoint, and [`Error::Closed`] once the origin's [`Driver`] has been
-	/// dropped.
-	pub fn dynamic(&self, prefix: impl Into<Prefix>, route: Route) -> Result<Dynamic, Error> {
-		let announcing = Announcing::new(self, prefix.into())?;
+	/// The covered prefix is clamped to the intersection with this producer's
+	/// allowed scope, so a broad route announced through a narrow token advertises
+	/// exactly what the token may serve. Fails with [`Error::Unauthorized`] when
+	/// they are disjoint, and [`Error::Closed`] once the origin's [`Driver`] has
+	/// been dropped.
+	pub fn dynamic(&self, pattern: Pattern, route: Route) -> Result<Dynamic, Error> {
+		let prefix = pattern.as_prefix().ok_or(Error::Unsupported)?;
+		let announcing = Announcing::new(self, Prefix::new(prefix))?;
 		let serve = kio::Shared::<ServeState>::default();
 		serve.lock().requests.add_handler();
 		let announcement = announcing.announce(route, Some(serve.clone()))?;
@@ -1916,6 +1921,9 @@ struct FrontState {
 	/// tie toward the newest source.
 	next_source: u64,
 	sources: Vec<FrontSource>,
+	/// Immutable track metadata, retained across idle release and aborted attempts.
+	/// Every source of this broadcast must serve the same content.
+	track_info: HashMap<Arc<str>, track::Info>,
 	/// The source tracks are dispatched to: the newest attached. Backups park
 	/// until promoted.
 	active: Option<u64>,
@@ -1925,6 +1933,26 @@ struct FrontState {
 }
 
 impl FrontState {
+	/// Admit only copies with the broadcast's established track properties.
+	fn accept_track_info(&mut self, name: &Arc<str>, info: track::Info) -> Result<(), Error> {
+		if self.closed {
+			return Err(Error::Closed);
+		}
+		if let Some(expected) = self.track_info.get(name) {
+			let track::Info {
+				timescale,
+				max_age,
+				priority,
+			} = info;
+			if timescale != expected.timescale || max_age != expected.max_age || priority != expected.priority {
+				return Err(Error::Unsupported);
+			}
+		} else {
+			self.track_info.insert(name.clone(), info);
+		}
+		Ok(())
+	}
+
 	/// The newest attached source: the one new work dispatches to. Local sources
 	/// carry no route metadata, so recency is the whole order: a publisher
 	/// re-creating a path over a fresh handle wins the moment it attaches instead
@@ -2103,6 +2131,7 @@ fn attach_source(
 			id: 0,
 			source: source.clone(),
 		}],
+		track_info: HashMap::new(),
 		active: Some(0),
 		closed: false,
 	});
@@ -2185,9 +2214,9 @@ async fn run_front(
 
 /// Serves one spliced logical track: splices in the best source's copy of the
 /// track, re-splicing on handover or failure, until the track completes or the
-/// front closes. A refusal (a source rejecting the track, or its copy dying
-/// before delivering anything) is authoritative and never retried: the refuser
-/// is skipped for this track so a joining standby cannot kill a subscription
+/// front closes. A refusal (a source rejecting the track, returning incompatible
+/// metadata, or dying before delivering anything) is authoritative and never
+/// retried: the refuser is skipped for this track so a joining standby cannot kill a subscription
 /// the incumbent is serving, and once every attached source has refused, the
 /// track aborts with the last refusal's error. The verdict belongs to this
 /// request; a later consumer request asks afresh (see `track_inner`). Failures
@@ -2433,9 +2462,14 @@ async fn serve_track(
 							None => continue,
 							// A copy that is already aborted can't be spliced;
 							// its error is the source's answer for the track.
-							Some(Ok(_)) => match track.poll_complete(&kio::Waiter::noop()) {
+							// One that claims the same content with different
+							// metadata is refused rather than reinterpreted.
+							Some(Ok(info)) => match track.poll_complete(&kio::Waiter::noop()) {
 								Poll::Ready(Err(err)) => Err(err),
-								_ => Ok(track),
+								_ => match state.write() {
+									Ok(mut state) => state.accept_track_info(&name, info).map(|()| track),
+									Err(_) => Err(Error::Dropped),
+								},
 							},
 							Some(Err(err)) => Err(err),
 						}
@@ -3043,7 +3077,7 @@ struct PendingBroadcast {
 	resolved: Option<Result<broadcast::Consumer, Error>>,
 }
 
-/// A served route, from [`Producer::dynamic`]: advertises a [`Prefix`] and
+/// A served route, from [`Producer::dynamic`]: advertises a path pattern and
 /// answers the [`Consumer::request_broadcast`] calls beneath it.
 ///
 /// The origin-level analogue of [`broadcast::Dynamic`]: where that serves tracks
@@ -3735,6 +3769,7 @@ impl Consumer {
 		let front_state = kio::Producer::new(FrontState {
 			next_source: 0,
 			sources: Vec::new(),
+			track_info: HashMap::new(),
 			active: None,
 			closed: false,
 		});
@@ -4031,6 +4066,10 @@ mod tests {
 			list.push(origin(*id)).unwrap();
 		}
 		list
+	}
+
+	fn subtree(prefix: &str) -> Pattern {
+		Pattern::subtree(prefix).unwrap()
 	}
 
 	/// Yield to the driver until `check` passes, bounded so a bug fails instead
@@ -4399,6 +4438,16 @@ mod tests {
 		assert!(matches!(err, Error::Unroutable));
 	}
 
+	#[test]
+	fn dynamic_refuses_a_non_prefix_pattern() {
+		let producer = origin(1).produce();
+		let err = producer
+			.dynamic("live/*".parse().unwrap(), Route::default())
+			.err()
+			.expect("a non-prefix pattern is refused");
+		assert!(matches!(err, Error::Unsupported));
+	}
+
 	#[tokio::test]
 	async fn local_broadcast_is_not_announced() {
 		let producer = origin(1).produce();
@@ -4412,7 +4461,7 @@ mod tests {
 		let producer = origin(1).produce();
 		let consumer = producer.consume();
 
-		let server = producer.dynamic("room", Route::default()).unwrap();
+		let server = producer.dynamic(subtree("room"), Route::default()).unwrap();
 
 		let pending = consumer.request_broadcast("room/alice");
 		let request = queued(&server).await;
@@ -4438,7 +4487,7 @@ mod tests {
 	async fn served_requests_coalesce() {
 		let producer = origin(1).produce();
 		let consumer = producer.consume();
-		let server = producer.dynamic("room", Route::default()).unwrap();
+		let server = producer.dynamic(subtree("room"), Route::default()).unwrap();
 
 		let first = consumer.request_broadcast("room/alice");
 		let second = consumer.request_broadcast("room/alice");
@@ -4459,7 +4508,7 @@ mod tests {
 	async fn retract_rejects_pending_requests() {
 		let producer = origin(1).produce();
 		let consumer = producer.consume();
-		let server = producer.dynamic("room", Route::default()).unwrap();
+		let server = producer.dynamic(subtree("room"), Route::default()).unwrap();
 
 		let pending = consumer.request_broadcast("room/alice");
 		drop(server);
@@ -4484,9 +4533,9 @@ mod tests {
 
 		// Three identical routes, oldest first: the newest identical route wins
 		// requests, and swapping between them emits no announce update.
-		let standby_server = producer.dynamic("room", Route::default()).unwrap();
-		let second_server = producer.dynamic("room", Route::default()).unwrap();
-		let incumbent_server = producer.dynamic("room", Route::default()).unwrap();
+		let standby_server = producer.dynamic(subtree("room"), Route::default()).unwrap();
+		let second_server = producer.dynamic(subtree("room"), Route::default()).unwrap();
+		let incumbent_server = producer.dynamic(subtree("room"), Route::default()).unwrap();
 
 		let mut resolving = Box::pin(consumer.routed_broadcast("room/alice"));
 		assert!((&mut resolving).now_or_never().is_none());
@@ -4513,7 +4562,7 @@ mod tests {
 	async fn split_horizon_skips_routes_through_the_requester() {
 		let producer = origin(1).produce();
 		let _server = producer
-			.dynamic("room", Route::default().with_hops(hops(&[7])))
+			.dynamic(subtree("room"), Route::default().with_hops(hops(&[7])))
 			.unwrap();
 
 		// The requester's own bytes must not be served back to it.
@@ -4539,7 +4588,7 @@ mod tests {
 	async fn handler_rejection_is_final() {
 		let producer = origin(1).produce();
 		let consumer = producer.consume();
-		let server = producer.dynamic("room", Route::default()).unwrap();
+		let server = producer.dynamic(subtree("room"), Route::default()).unwrap();
 
 		let pending = consumer.request_broadcast("room/alice");
 		let request = queued(&server).await;
@@ -4566,7 +4615,7 @@ mod tests {
 	async fn routed_broadcast_waits_out_a_rejection() {
 		let producer = origin(1).produce();
 		let consumer = producer.consume();
-		let server = producer.dynamic("room", Route::default()).unwrap();
+		let server = producer.dynamic(subtree("room"), Route::default()).unwrap();
 
 		let mut resolving = Box::pin(consumer.routed_broadcast("room/alice"));
 		assert!((&mut resolving).now_or_never().is_none());
@@ -4595,7 +4644,7 @@ mod tests {
 	async fn routed_broadcast_wakes_for_a_local_broadcast() {
 		let producer = origin(1).produce();
 		let consumer = producer.consume();
-		let server = producer.dynamic("room", Route::default()).unwrap();
+		let server = producer.dynamic(subtree("room"), Route::default()).unwrap();
 
 		let mut resolving = Box::pin(consumer.routed_broadcast("room/alice"));
 		assert!((&mut resolving).now_or_never().is_none());
@@ -4618,7 +4667,7 @@ mod tests {
 	async fn late_track_on_a_served_front_replays() {
 		let producer = origin(1).produce();
 		let consumer = producer.consume();
-		let server = producer.dynamic("room", Route::default()).unwrap();
+		let server = producer.dynamic(subtree("room"), Route::default()).unwrap();
 
 		let mut source = broadcast::Info::new().produce();
 		for name in ["a", "b"] {
@@ -4657,7 +4706,7 @@ mod tests {
 		let producer = origin(1).produce();
 		let consumer = producer.consume();
 
-		let broad_server = producer.dynamic("", Route::default()).unwrap();
+		let broad_server = producer.dynamic(Pattern::all(), Route::default()).unwrap();
 		// A narrow advertise-only claim: requests under it must NOT route to the
 		// broad server; they fall through to the (absent) fallback handler.
 		let _narrow = producer.announce(".dash", Route::default()).unwrap();
@@ -4681,7 +4730,7 @@ mod tests {
 		let producer = origin(1).produce();
 		let consumer = producer.consume();
 		let mut announced = consumer.announced();
-		let dynamic = producer.dynamic("", Route::default()).unwrap();
+		let dynamic = producer.dynamic(Pattern::all(), Route::default()).unwrap();
 		// The root claim is advertised like any other prefix.
 		announced.assert_next_active("");
 
@@ -4704,6 +4753,32 @@ mod tests {
 			.err()
 			.unwrap();
 		assert!(matches!(err, Error::Unroutable));
+	}
+
+	/// A path outside the consumer's scope never reaches a live dynamic handler.
+	///
+	/// `scope` is a read filter, so an out-of-scope path looks like "nothing here",
+	/// and that is exactly what would otherwise send a request to the handler. A
+	/// `Request` carries only a path, so the handler cannot tell who asked.
+	#[tokio::test]
+	async fn out_of_scope_request_never_reaches_the_dynamic_handler() {
+		let producer = origin(1).produce();
+		let dynamic = producer.dynamic(Pattern::all(), Route::default()).unwrap();
+		let scoped = producer.consume().scope(&[Path::new("tenant-a")]).unwrap();
+
+		// `tenant-a-other` shares a character prefix but not a segment, so this
+		// also pins that the check is segment-aware rather than textual.
+		for path in ["tenant-b/live", "tenant-a-other/live"] {
+			let refused = scoped
+				.request_broadcast(path)
+				.now_or_never()
+				.expect("an out-of-scope request must be refused synchronously, not queued");
+			assert!(matches!(refused, Err(Error::Unroutable)));
+			assert!(
+				dynamic.requested_broadcast().now_or_never().is_none(),
+				"the dynamic handler was asked to create a broadcast the requester may not read"
+			);
+		}
 	}
 
 	#[tokio::test]
@@ -4749,7 +4824,7 @@ mod tests {
 		let mut announced = consumer.announced();
 		announced.assert_next_active("room");
 
-		let _server = producer.dynamic("served", Route::default()).unwrap();
+		let _server = producer.dynamic(subtree("served"), Route::default()).unwrap();
 		let pending = consumer.request_broadcast("served/path");
 
 		drop(driver);
@@ -4794,7 +4869,7 @@ mod tests {
 			let consumer = producer.consume();
 
 			let server = producer
-				.dynamic("room", Route::default().with_hops(hops(first)))
+				.dynamic(subtree("room"), Route::default().with_hops(hops(first)))
 				.unwrap();
 
 			let pending = consumer.request_broadcast("room/alice");
@@ -4837,7 +4912,7 @@ mod tests {
 		/// back its handle, ready to answer the front's re-request.
 		fn standby(&self, first: &[u64]) -> Dynamic {
 			self.producer
-				.dynamic("room", Route::default().with_hops(hops(first)))
+				.dynamic(subtree("room"), Route::default().with_hops(hops(first)))
 				.unwrap()
 		}
 	}
@@ -4896,6 +4971,43 @@ mod tests {
 
 		// The standby shares the first hop, so the subscription resumes there.
 		assert_resumes(&mut rig, &standby_server).await;
+	}
+
+	/// A source claiming the same content cannot change immutable track metadata:
+	/// the successor is refused instead of the subscriber's samples being read on
+	/// a different grid, and the verdict outlives the aborted logical track.
+	#[tokio::test]
+	async fn incompatible_successor_is_refused() {
+		for replacement in [
+			track::Info::default().with_timescale(crate::Timescale::MICRO),
+			track::Info::default().with_priority(7),
+			track::Info::default().with_max_age(Duration::from_secs(7)),
+		] {
+			let (mut rig, incumbent, source) = ResumeRig::new(&[10]).await;
+			let standby_server = rig.standby(&[10, 20]);
+			drop(incumbent);
+			drop(source);
+
+			// The standby shares the first hop, so the front re-requests through it,
+			// but its copy of the track is on another grid.
+			let request = queued(&standby_server).await;
+			let mut successor = broadcast::Info::new().produce();
+			let mut track = successor.create_track("video", replacement).unwrap();
+			let mut group = track.append_group().unwrap();
+			group.write_frame(crate::Timestamp::ZERO, b"before".as_ref()).unwrap();
+			group.finish().unwrap();
+			request.accept(&successor);
+
+			assert!(
+				matches!(rig.subscription.recv_group().await, Err(Error::Unsupported)),
+				"the subscription must abort rather than resume onto incompatible metadata"
+			);
+
+			// Reopening the aborted logical track must not forget the broadcast's metadata.
+			let reopened = rig.resolved.track("video").unwrap();
+			assert!(matches!(reopened.info().await, Err(Error::Unsupported)));
+			assert!(matches!(reopened.subscribe(None).await, Err(Error::Unsupported)));
+		}
 	}
 
 	#[tokio::test]
@@ -5014,6 +5126,55 @@ mod tests {
 		// The path is free again for a fresh broadcast.
 		let _third = producer.create_broadcast("room/alice").unwrap();
 		assert!(consumer.get_broadcast("room/alice").is_some());
+	}
+
+	/// A newer local source wins dispatch the moment it attaches, but one whose copy
+	/// of the track carries different metadata is refused: the incumbent keeps
+	/// serving, and the refusal is never retried once the incumbent leaves.
+	#[tokio::test]
+	async fn incompatible_local_source_keeps_the_incumbent() {
+		let producer = origin(1).produce();
+		let consumer = producer.consume();
+
+		let mut first = producer.create_broadcast("room/alice").unwrap();
+		let mut track = first.create_track("video", None).unwrap();
+		let resolved = consumer
+			.request_broadcast("room/alice")
+			.now_or_never()
+			.expect("resolves")
+			.expect("resolves");
+		let mut subscription = resolved
+			.track("video")
+			.unwrap()
+			.subscribe(None)
+			.await
+			.expect("subscribe");
+		let mut group = track.append_group().unwrap();
+		group.write_frame(crate::Timestamp::ZERO, b"before".as_ref()).unwrap();
+		group.finish().unwrap();
+		let mut group = subscription.recv_group().await.unwrap().unwrap();
+		assert_eq!(&group.read_frame().await.unwrap().unwrap().payload[..], b"before");
+
+		// The newest source is dispatched the track, and refused for its metadata.
+		let mut second = producer.create_broadcast("room/alice").unwrap();
+		let _incompatible = second
+			.create_track("video", track::Info::default().with_timescale(crate::Timescale::MICRO))
+			.unwrap();
+		for _ in 0..10 {
+			tokio::task::yield_now().await;
+		}
+
+		// Still spliced to the incumbent, still delivering.
+		let mut group = track.append_group().unwrap();
+		group.write_frame(crate::Timestamp::ZERO, b"still".as_ref()).unwrap();
+		group.finish().unwrap();
+		let mut group = subscription.recv_group().await.unwrap().unwrap();
+		assert_eq!(&group.read_frame().await.unwrap().unwrap().payload[..], b"still");
+
+		// The incumbent leaving exhausts the table: the refusal is never retried.
+		drop(track);
+		first.finish();
+		assert!(matches!(subscription.recv_group().await, Err(Error::Unsupported)));
 	}
 
 	#[tokio::test]

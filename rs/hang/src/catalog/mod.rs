@@ -5,6 +5,7 @@
 //! resolution, bitrates, and other metadata, plus the `json` and `binary` sections
 //! listing the data tracks that aren't media.
 
+mod archive;
 mod audio;
 mod binary;
 mod compression;
@@ -15,10 +16,12 @@ mod millis;
 mod mode;
 mod priority;
 mod root;
+pub mod stalled;
 mod text;
 mod timeline;
 mod video;
 
+pub use archive::*;
 pub use audio::*;
 pub use binary::*;
 pub use compression::*;

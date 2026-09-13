@@ -118,9 +118,10 @@ impl SessionError {
 /// The counterpart to [`SessionError`], and a disjoint space: a stream reset of 0 is
 /// [`Internal`](Self::Internal), not a cancellation ([`Cancel`](Self::Cancel) is 1).
 ///
-/// Variants above the shared codes encode into the draft's reserved 32-63 range. Those are
-/// placeholders, not assignments: we send them because there has to be *some* code, but a
-/// receiver must not read one back (see [`from_code`](Self::from_code)).
+/// Conditions the shared codes don't cover encode into 32-63. 32 through 47 is reserved:
+/// those are placeholders, not assignments, and a receiver must not read one back (see
+/// [`from_code`](Self::from_code)). 48 through 63 is moq-lite's own assigned range and
+/// does round-trip.
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StreamError {
@@ -181,6 +182,10 @@ pub enum StreamError {
 	#[error("frame too large")]
 	FrameTooLarge,
 
+	/// A group grew past its cache budget and was aborted.
+	#[error("group too large")]
+	GroupTooLarge,
+
 	/// A frame's timestamp doesn't match its track's negotiated timescale.
 	#[error("frame timestamp doesn't match track timescale")]
 	TimestampMismatch,
@@ -207,10 +212,14 @@ impl StreamError {
 			Self::GoingAway => 0x4,
 			Self::TooFarBehind => 0x5,
 			Self::MalformedTrack => 0x12,
-			Self::NotFound => 0x20,
+			// 0x30 NO_CAPACITY, 0x31 CONTROL_TIMEOUT: assigned by other work in this
+			// range. Do not reuse them.
+			Self::GroupTooLarge => 0x32,
+			Self::NotFound => 0x33,
+			Self::Old => 0x34,
+			Self::Evicted => 0x35,
+			// Placeholders in the reserved 32-47 range: sent, not read back.
 			Self::Unroutable => 0x21,
-			Self::Old => 0x22,
-			Self::Evicted => 0x23,
 			Self::WrongSize => 0x24,
 			Self::FrameTooLarge => 0x25,
 			Self::TimestampMismatch => 0x26,
@@ -221,10 +230,11 @@ impl StreamError {
 
 	/// Decode a code received off the wire.
 	///
-	/// Only the registered codes decode. 32-63 is the reserved range: we emit placeholders
+	/// Only the registered codes decode. 32 through 47 is reserved: we emit placeholders
 	/// there for conditions the shared codes don't cover, but the draft assigns it no
 	/// meaning, so a received one stays [`Unknown`](Self::Unknown) rather than being read
-	/// as our own placeholder. `to_code` is deliberately not injective as a result.
+	/// as our own placeholder. 48 through 63 is moq-lite's own and does round-trip.
+	/// `to_code` is deliberately not injective for the reserved placeholders.
 	///
 	/// `SESSION_CLOSED` decodes to `Session(SessionError::Internal)`: the peer's actual
 	/// session code is not on this stream, so the specific reason is unknown here.
@@ -237,6 +247,10 @@ impl StreamError {
 			0x4 => Self::GoingAway,
 			0x5 => Self::TooFarBehind,
 			0x12 => Self::MalformedTrack,
+			0x32 => Self::GroupTooLarge,
+			0x33 => Self::NotFound,
+			0x34 => Self::Old,
+			0x35 => Self::Evicted,
 			code @ 64.. => match u16::try_from(code - 64) {
 				Ok(app) => Self::App(app),
 				Err(_) => Self::Unknown(code),
@@ -322,7 +336,8 @@ pub enum Error {
 	#[error("protocol violation")]
 	ProtocolViolation,
 
-	/// The peer's token does not grant the requested path or operation.
+	/// The requested path or operation is not granted, either by the peer's token
+	/// or by the scope of the handle it was requested through.
 	#[error("unauthorized")]
 	Unauthorized,
 
@@ -359,16 +374,23 @@ pub enum Error {
 	#[error("closed")]
 	Closed,
 
-	/// The reader fell behind the group's byte budget: the frame it wanted was dropped
-	/// to keep the group under its size limit. Named from the consumer's side (nothing is
-	/// "full"); distinct from [`Self::Evicted`], which drops a whole group under the
-	/// pool's memory pressure.
+	/// The reader asked for a frame the group never held: below
+	/// [`crate::group::Producer::start_at`], or skipped past a splice. Named from the
+	/// consumer's side; distinct from [`Self::GroupTooLarge`], which aborts the whole
+	/// group when a write exceeds the cache budget, and from [`Self::Evicted`], which
+	/// drops a whole group under the pool's memory pressure.
 	#[error("lagged")]
 	Lagged,
 
 	/// A frame declared a payload size larger than the receiver accepts.
 	#[error("frame too large")]
 	FrameTooLarge,
+
+	/// A write would grow the group past its cache budget (byte size or frame count).
+	/// The write is refused and the group is aborted, so every reader sees the same
+	/// failure rather than a prefix some of them missed.
+	#[error("group too large")]
+	GroupTooLarge,
 
 	/// A whole-frame write was refused because a frame is already open on the group.
 	///
@@ -412,7 +434,23 @@ pub enum Error {
 	#[error("session closed")]
 	SessionClosed,
 
-	/// A remote error received via a stream/session reset code.
+	/// A session-scoped protocol error, with its registry and verbatim code.
+	///
+	/// Produced by [`from_transport`](Self::from_transport) for a session close, and by
+	/// converting a [`SessionError`]. Local conditions use the specific variants above.
+	#[error(transparent)]
+	Session(SessionError),
+
+	/// A stream-scoped protocol error, with its registry and verbatim code.
+	///
+	/// The stream counterpart to [`Self::Session`]. The two registries are disjoint, so
+	/// the same integer is a different failure in each.
+	#[error(transparent)]
+	Stream(StreamError),
+
+	/// An unrecognized request-rejection code (the IETF request registry).
+	///
+	/// Session and stream unknowns are [`Self::Session`] / [`Self::Stream`], not this.
 	#[error("remote error: code={0}")]
 	Remote(u32),
 }
@@ -445,6 +483,7 @@ impl Error {
 			Self::Closed => 25,
 			Self::Lagged => 26,
 			Self::FrameTooLarge => 27,
+			Self::GroupTooLarge => 34,
 			// 22 was unused in the 0-31 library range.
 			Self::FrameOpen => 22,
 			// 28 is reserved (was per-frame decompression, removed in draft-05).
@@ -456,7 +495,25 @@ impl Error {
 			Self::MalformedTrack => 22,
 			Self::SessionClosed => 25,
 			Self::App(app) => *app as u32 + 64,
+			Self::Session(err) => err.to_code(),
+			Self::Stream(err) => err.to_code(),
 			Self::Remote(code) => *code,
+		}
+	}
+
+	/// The session-scoped protocol error, if this was received as one.
+	pub fn session(&self) -> Option<&SessionError> {
+		match self {
+			Self::Session(err) => Some(err),
+			_ => None,
+		}
+	}
+
+	/// The stream-scoped protocol error, if this was received as one.
+	pub fn stream(&self) -> Option<&StreamError> {
+		match self {
+			Self::Stream(err) => Some(err),
+			_ => None,
 		}
 	}
 
@@ -481,54 +538,17 @@ impl Error {
 	}
 }
 
-/// Map a decoded session code back into the crate's error type.
+/// Preserve the session registry when carrying a protocol error.
 impl From<SessionError> for Error {
 	fn from(err: SessionError) -> Self {
-		match err {
-			SessionError::Cancel => Self::Cancel,
-			SessionError::Unauthorized => Self::Unauthorized,
-			SessionError::ProtocolViolation => Self::ProtocolViolation,
-			SessionError::Version => Self::Version,
-			SessionError::RequiredExtension => Self::RequiredExtension,
-			SessionError::InvalidRole => Self::InvalidRole,
-			SessionError::UnexpectedStream => Self::UnexpectedStream,
-			SessionError::KeyValueFormatting => Self::TooManyParameters,
-			SessionError::GoawayTimeout => Self::GoawayTimeout,
-			SessionError::Timeout => Self::Timeout,
-			SessionError::App(app) => Self::App(app),
-			// No local counterpart, so keep the code rather than inventing a meaning.
-			SessionError::Internal => Self::Remote(err.to_code()),
-			SessionError::Unknown(code) => Self::Remote(code),
-		}
+		Self::Session(err)
 	}
 }
 
-/// Map a decoded stream code back into the crate's error type.
+/// Preserve the stream registry when carrying a protocol error.
 impl From<StreamError> for Error {
 	fn from(err: StreamError) -> Self {
-		match err {
-			StreamError::Cancel => Self::Cancel,
-			StreamError::DeliveryTimeout => Self::Timeout,
-			StreamError::GoingAway => Self::GoingAway,
-			StreamError::TooFarBehind => Self::Lagged,
-			StreamError::NotFound => Self::NotFound,
-			StreamError::Unroutable => Self::Unroutable,
-			StreamError::Old => Self::Old,
-			StreamError::Evicted => Self::Evicted,
-			StreamError::WrongSize => Self::WrongSize,
-			StreamError::FrameTooLarge => Self::FrameTooLarge,
-			StreamError::TimestampMismatch => Self::TimestampMismatch,
-			StreamError::App(app) => Self::App(app),
-			// Deliberately not `inner.into()`: that yields a session-space value, which the
-			// stream re-encode would then put back on a stream. The inner reason is always
-			// Internal off the wire anyway, since the stream never carried it.
-			StreamError::Session(_) => Self::SessionClosed,
-			// No local counterpart, so keep the code rather than inventing a meaning.
-			StreamError::MalformedTrack => Self::MalformedTrack,
-			// No local counterpart, so keep the code rather than inventing a meaning.
-			StreamError::Internal => Self::Remote(err.to_code()),
-			StreamError::Unknown(code) => Self::Remote(code),
-		}
+		Self::Stream(err)
 	}
 }
 
@@ -540,6 +560,11 @@ impl From<StreamError> for Error {
 impl From<&Error> for SessionError {
 	fn from(err: &Error) -> Self {
 		match err {
+			Error::Session(err) => err.clone(),
+			// App codes share the 64+ range in both registries.
+			Error::Stream(StreamError::App(app)) => Self::App(*app),
+			// A stream-scoped code has no meaning in this registry; don't forward the number.
+			Error::Stream(_) => Self::Internal,
 			Error::Cancel | Error::Closed | Error::GoingAway | Error::SessionClosed => Self::Cancel,
 			Error::Unauthorized => Self::Unauthorized,
 			Error::Version | Error::UnknownAlpn(_) => Self::Version,
@@ -574,6 +599,11 @@ impl From<&Error> for SessionError {
 impl From<&Error> for StreamError {
 	fn from(err: &Error) -> Self {
 		match err {
+			Error::Stream(err) => err.clone(),
+			// App codes share the 64+ range in both registries.
+			Error::Session(SessionError::App(app)) => Self::App(*app),
+			// A session-scoped code has no meaning in this registry; don't forward the number.
+			Error::Session(_) => Self::Internal,
 			Error::Cancel | Error::Closed => Self::Cancel,
 			Error::SessionClosed => Self::Session(SessionError::Cancel),
 			Error::Old => Self::Old,
@@ -583,6 +613,7 @@ impl From<&Error> for StreamError {
 			Error::Unroutable => Self::Unroutable,
 			Error::WrongSize => Self::WrongSize,
 			Error::FrameTooLarge => Self::FrameTooLarge,
+			Error::GroupTooLarge => Self::GroupTooLarge,
 			Error::TimestampMismatch => Self::TimestampMismatch,
 			Error::Timeout => Self::DeliveryTimeout,
 			Error::GoingAway => Self::GoingAway,
@@ -631,6 +662,7 @@ mod tests {
 		assert_eq!(Error::Version.to_code(), 9);
 		assert_eq!(Error::UnknownAlpn(String::new()).to_code(), 21);
 		assert_eq!(Error::Lagged.to_code(), 26);
+		assert_eq!(Error::GroupTooLarge.to_code(), 34);
 		assert_eq!(Error::Evicted.to_code(), 31);
 		assert_eq!(Error::GoingAway.to_code(), 32);
 		assert_eq!(Error::GoawayTimeout.to_code(), 33);
@@ -698,25 +730,45 @@ mod tests {
 			StreamError::GoingAway,
 			StreamError::TooFarBehind,
 			StreamError::MalformedTrack,
+			StreamError::GroupTooLarge,
+			StreamError::NotFound,
+			StreamError::Old,
+			StreamError::Evicted,
 			StreamError::App(7),
 		];
 		for err in registered {
 			assert_eq!(StreamError::from_code(err.to_code()), err, "{err:?} did not round trip");
 		}
 
-		// The rest encode into the reserved 32-63 range and decode back as Unknown, for
-		// the same reason as the session codes above.
+		assert_eq!(StreamError::GroupTooLarge.to_code(), 0x32);
+
+		// moq-lite's own 48-63 range: assigned, so they round-trip, and they stay
+		// off 0x30-0x31 (NO_CAPACITY / CONTROL_TIMEOUT).
 		for err in [
+			StreamError::GroupTooLarge,
 			StreamError::NotFound,
-			StreamError::Unroutable,
 			StreamError::Old,
 			StreamError::Evicted,
+		] {
+			let code = err.to_code();
+			assert!((0x30..0x40).contains(&code), "{err:?} left moq-lite's 48-63 range");
+			assert!(!matches!(code, 0x30 | 0x31), "{err:?} collided with 0x30-0x31");
+		}
+
+		// The rest encode into the reserved 32-47 range and decode back as Unknown, for
+		// the same reason as the session codes above. 0x20-0x23 stay unreadable so a
+		// peer that still emits the old placeholders is not given a meaning.
+		for err in [
+			StreamError::Unroutable,
 			StreamError::WrongSize,
 			StreamError::FrameTooLarge,
 			StreamError::TimestampMismatch,
 		] {
 			let code = err.to_code();
-			assert!((0x20..0x40).contains(&code), "{err:?} left the reserved range");
+			assert!((0x20..0x30).contains(&code), "{err:?} left the reserved range");
+			assert_eq!(StreamError::from_code(code), StreamError::Unknown(code));
+		}
+		for code in [0x20, 0x22, 0x23] {
 			assert_eq!(StreamError::from_code(code), StreamError::Unknown(code));
 		}
 
@@ -745,7 +797,7 @@ mod tests {
 		assert_eq!(relayed.to_code(), 0x3);
 
 		// Registered stream codes survive the hop unchanged.
-		for code in [0x0, 0x1, 0x2, 0x4, 0x5, 0x12] {
+		for code in [0x0, 0x1, 0x2, 0x4, 0x5, 0x12, 0x32, 0x33, 0x34, 0x35] {
 			let relayed = StreamError::from(&Error::from(StreamError::from_code(code)));
 			assert_eq!(relayed.to_code(), code, "stream {code:#x} changed across a relay");
 		}
@@ -807,18 +859,22 @@ mod tests {
 		};
 
 		// A MoQ-layer auth rejection is now classifiable, because the code is specified.
-		assert!(matches!(session(0x2), Error::Unauthorized));
-		assert!(matches!(session(0x0), Error::Cancel));
+		assert!(matches!(session(0x2), Error::Session(SessionError::Unauthorized)));
+		assert_eq!(session(0x2).session(), Some(&SessionError::Unauthorized));
+		assert!(matches!(session(0x0), Error::Session(SessionError::Cancel)));
 
 		// Same integer, different space: 0 ends a session cleanly but fails a stream.
-		assert!(matches!(stream(0x1), Error::Cancel));
-		assert!(matches!(stream(0x0), Error::Remote(0)));
-		assert!(matches!(stream(0x5), Error::Lagged));
+		assert!(matches!(stream(0x1), Error::Stream(StreamError::Cancel)));
+		assert_eq!(stream(0x1).stream(), Some(&StreamError::Cancel));
+		assert!(matches!(stream(0x0), Error::Stream(StreamError::Internal)));
+		assert!(matches!(stream(0x5), Error::Stream(StreamError::TooFarBehind)));
+		assert!(matches!(stream(0x32), Error::Stream(StreamError::GroupTooLarge)));
 
-		// 0x22 is what our own `Old` encodes to, but the draft reserves 32-63 rather than
-		// assigning it, so a peer's 0x22 stays opaque instead of being read as `Old`.
-		assert!(matches!(stream(0x22), Error::Remote(0x22)));
-		assert!(matches!(session(0x22), Error::Remote(0x22)));
+		// Assigned lite codes round-trip to the named error. The old 32-47 placeholders
+		// stay opaque: the draft still forbids reading a meaning out of that range.
+		assert!(matches!(stream(0x34), Error::Stream(StreamError::Old)));
+		assert!(matches!(stream(0x22), Error::Stream(StreamError::Unknown(0x22))));
+		assert!(matches!(session(0x22), Error::Session(SessionError::Unknown(0x22))));
 
 		// Neither: the transport itself failed.
 		assert!(matches!(

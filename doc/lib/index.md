@@ -34,15 +34,17 @@ The wrapped bindings share one feature set, so the language pages only show
 how it looks in that language:
 
 - **Connect** to a relay with TLS options (system roots, custom CA, fingerprint pinning, mTLS) and a JWT in the URL, or **serve** sessions yourself and accept or reject each request by path.
+- **Reconnect** automatically with backoff when the transport drops, with `status`/`epoch` reporting each (re)connect and backoff tunable down to retrying forever. The peer's inbound QUIC stream limit is configurable for subscribe-heavy clients.
 - **Discover** broadcasts by prefix, wait for a specific one, or request an unannounced one.
-- **Publish and subscribe to media** with the hang catalog filled in from the bitstream, plus raw pixels or PCM in and out with the codec running inside the binding (VideoToolbox, Media Foundation, NVENC, openh264, Opus).
+- **Publish and subscribe to media** with the hang catalog filled in from the bitstream, plus raw pixels or PCM in and out with the codec running inside the binding (VideoToolbox, Media Foundation, NVENC, openh264, Opus). A publisher follows the connection's send estimate through `session.bandwidth()`: reserve a share for an app-owned encoder, or pass the handle when encoding so the built-in video encoder follows the grant.
+- **Connection health.** `stats()` snapshots RTT, send/receive estimates, and byte/packet counters. `bandwidth()` divides that send estimate among tracks sharing the connection.
 - **Raw tracks** of arbitrary bytes with timestamps, sparse or replayed groups, per-subscriber priority and max age, and best-effort datagrams.
 - **JSON tracks** in snapshot mode (latest value, merge-patch deltas, optional compression) or stream mode (append log).
 - **Fetch** a single group by sequence from the cache, decoded through the container or raw.
 - **Serve on demand**: accept track and broadcast requests as they arrive instead of publishing up front.
 - **Catalog extensions**: write your own section next to `video` and `audio`, and read others' back.
 - **Routes**: see which relays a broadcast came through, and advertise a cost as a standby publisher.
-- **Errors** distinguish auth rejection (don't retry) from shutdown (expected) from transport failure.
+- **Errors** distinguish auth rejection (don't retry) from shutdown (expected) from transport failure. A protocol error carries the peer's session or stream code, a known kind when recognized, and keeps an application or unknown code without loss.
 
 Dart is the exception on codecs: its published binaries carry no encoder or
 decoder, so it moves already-encoded frames.

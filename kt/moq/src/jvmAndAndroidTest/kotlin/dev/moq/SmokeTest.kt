@@ -1,5 +1,6 @@
 package dev.moq
 
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.test.runTest
@@ -30,6 +31,20 @@ private fun opusHead(): ByteArray =
     )
 
 class SmokeTest {
+    @Test
+    fun `stream abort preserves protocol details`() = runTest {
+        BroadcastProducer().use { broadcast ->
+            val track = broadcast.publishTrack("errors", null)
+            val producer = track.appendGroup()
+            val group = broadcast.consume().fetchGroup("errors", 0uL, FetchGroupOptions())
+            producer.abort(404u)
+            val error = assertFailsWith<MoqException.Protocol> { group.readFrame() }
+            assertEquals(ErrorScope.STREAM, error.details.scope)
+            assertEquals(468u, error.details.code)
+            assertEquals(ProtocolKind.APP, error.details.kind)
+        }
+    }
+
     /**
      * Exercises the [Moq.connect] facade end to end without a network: a bogus
      * URL fails fast, and the failure surfaces as a [MoqException]. Also proves
@@ -57,7 +72,7 @@ class SmokeTest {
     fun `origin alias constructs and consumes`() = runTest {
         OriginProducer(OriginOptions()).use { origin ->
             origin.consume().use { /* lifecycle smoke */ }
-            origin.dynamic().use { /* dynamic origin smoke */ }
+            origin.dynamic("**", Route()).use { /* dynamic origin smoke */ }
         }
     }
 
@@ -189,9 +204,52 @@ class SmokeTest {
             assertEquals(64, fingerprints[0].length)
 
             server.createBroadcast("live").use { broadcast ->
-                broadcast.setAnnounce(false)
+                broadcast.announce(Route())
+                broadcast.unannounce()
                 broadcast.finish()
             }
+        }
+    }
+
+    @Test
+    fun `announce then unannounce is visible`() = runTest {
+        OriginProducer(OriginOptions()).use { origin ->
+            origin.createBroadcast("live").use { broadcast ->
+                broadcast.publishTrack("events", null)
+                broadcast.announce(Route())
+                val announced = origin.consume().announced("")
+                val first = announced.next()!!
+                assertEquals("live", first.path())
+                assertTrue(first.active())
+                broadcast.unannounce()
+                val retracted = announced.next()!!
+                assertEquals("live", retracted.path())
+                assertTrue(!retracted.active())
+            }
+        }
+    }
+
+    @Test
+    fun `dynamic serves a request under a prefix`() = runTest {
+        OriginProducer(OriginOptions()).use { origin ->
+            origin.dynamic("live/**", Route()).use { dynamic ->
+                val pending = async {
+                    origin.consume().requestBroadcast("live/cam")
+                }
+                val request = dynamic.requestedBroadcast()
+                assertEquals("live/cam", request.path())
+                BroadcastProducer().use { served ->
+                    request.accept(served)
+                    pending.await()
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `dynamic refuses a non-prefix pattern`() {
+        OriginProducer(OriginOptions()).use { origin ->
+            assertFailsWith<MoqException> { origin.dynamic("live/*", Route()) }
         }
     }
 

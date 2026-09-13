@@ -57,7 +57,10 @@ const MALFORMED_TRACK: u32 = 0x12;
 /// Draft-16 and 17 assign it to UNKNOWN_OBJECT_STATUS, which draft-18 moved to 0x6 when it
 /// took 0x4 for this. Draft-14 and 15 assign it nothing.
 fn has_going_away(version: Version) -> bool {
-	matches!(version, Version::Draft18 | Version::Draft19 | Version::Draft20)
+	matches!(
+		version,
+		Version::Draft18 | Version::Draft19 | Version::Draft20 | Version::Draft21
+	)
 }
 
 /// Whether the draft assigns TOO_FAR_BEHIND. Added in draft-17.
@@ -96,7 +99,7 @@ pub fn to_stream_code(err: &StreamError, version: Version) -> u32 {
 /// Read a stream reset (or STOP_SENDING) code received on the negotiated draft.
 ///
 /// A code the draft does not assign stays [`StreamError::Unknown`], which surfaces as
-/// [`Error::Remote`](crate::Error::Remote): an error, but never one given a meaning it did
+/// [`Error::Stream`](crate::Error::Stream): an error, but never one given a meaning it did
 /// not carry. That includes the codes this crate has no local counterpart for
 /// (UNKNOWN_OBJECT_STATUS, EXPIRED_AUTH_TOKEN, EXCESSIVE_LOAD) and every value a later
 /// draft may add.
@@ -138,7 +141,7 @@ pub fn from_stream_code(code: u32, version: Version) -> StreamError {
 /// without the draft in hand tells the peer the opposite of what happened.
 pub(crate) mod request {
 	use super::Version;
-	use crate::Error;
+	use crate::{Error, SessionError, StreamError};
 
 	/// Which request the error answers, so draft-14 picks the right registry.
 	///
@@ -247,21 +250,26 @@ pub(crate) mod request {
 	/// would say something the peer's registry gives a different meaning.
 	pub(crate) fn to_code(err: &Error, kind: Kind, version: Version) -> u64 {
 		let registered = match err {
-			Error::Unauthorized => return UNAUTHORIZED,
-			Error::Timeout => return TIMEOUT,
-			Error::Unsupported | Error::Version => return NOT_SUPPORTED,
-			Error::NotFound => does_not_exist(kind, version),
+			Error::Unauthorized | Error::Session(SessionError::Unauthorized) => return UNAUTHORIZED,
+			Error::Timeout | Error::Stream(StreamError::DeliveryTimeout) | Error::Session(SessionError::Timeout) => {
+				return TIMEOUT;
+			}
+			Error::Unsupported | Error::Version | Error::Session(SessionError::Version) => return NOT_SUPPORTED,
+			Error::NotFound | Error::Stream(StreamError::NotFound) => does_not_exist(kind, version),
 			// A path with no route is one we will not carry. A subscriber that asked for it
 			// cannot act on "we do not want it": what it needs to know is that we do not have
 			// it, which is the same refusal from its side. Only the requests that offer content
 			// say UNINTERESTED.
-			Error::Unroutable => match kind {
+			Error::Unroutable | Error::Stream(StreamError::Unroutable) => match kind {
 				Kind::Subscribe | Kind::Fetch => does_not_exist(kind, version),
 				Kind::Publish | Kind::PublishNamespace | Kind::SubscribeNamespace => uninterested(kind, version),
 			},
 			// Our own parse failure is, from the peer's side, a malformed track.
-			Error::Decode(_) | Error::BoundsExceeded(_) | Error::MalformedTrack => malformed_track(kind, version),
-			Error::GoingAway => going_away(version),
+			Error::Decode(_)
+			| Error::BoundsExceeded(_)
+			| Error::MalformedTrack
+			| Error::Stream(StreamError::MalformedTrack) => malformed_track(kind, version),
+			Error::GoingAway | Error::Stream(StreamError::GoingAway) => going_away(version),
 			// Everything else, a duplicate included: no draft assigns it a value, and
 			// INTERNAL_ERROR is how a peer reads an unregistered code anyway.
 			_ => return INTERNAL_ERROR,
@@ -291,7 +299,7 @@ pub(crate) mod request {
 	mod tests {
 		use super::*;
 
-		const ALL: [Version; 7] = [
+		const ALL: [Version; 8] = [
 			Version::Draft14,
 			Version::Draft15,
 			Version::Draft16,
@@ -299,6 +307,7 @@ pub(crate) mod request {
 			Version::Draft18,
 			Version::Draft19,
 			Version::Draft20,
+			Version::Draft21,
 		];
 
 		const KINDS: [Kind; 5] = [
@@ -376,7 +385,13 @@ pub(crate) mod request {
 					assert!(matches!(from_code(GOING_AWAY, kind, version), Error::Remote(0x6)));
 				}
 
-				for version in [Version::Draft17, Version::Draft18, Version::Draft19, Version::Draft20] {
+				for version in [
+					Version::Draft17,
+					Version::Draft18,
+					Version::Draft19,
+					Version::Draft20,
+					Version::Draft21,
+				] {
 					assert_eq!(to_code(&Error::GoingAway, kind, version), GOING_AWAY);
 					assert!(matches!(from_code(GOING_AWAY, kind, version), Error::GoingAway));
 				}
@@ -467,7 +482,7 @@ mod tests {
 	use super::*;
 	use crate::Error;
 
-	const ALL: [Version; 7] = [
+	const ALL: [Version; 8] = [
 		Version::Draft14,
 		Version::Draft15,
 		Version::Draft16,
@@ -475,6 +490,7 @@ mod tests {
 		Version::Draft18,
 		Version::Draft19,
 		Version::Draft20,
+		Version::Draft21,
 	];
 
 	/// A routine unsubscribe must not read as a fault on our side. moq-lite's own error
@@ -487,7 +503,7 @@ mod tests {
 			assert_eq!(from_stream_code(CANCELLED, version), StreamError::Cancel);
 			assert!(matches!(
 				Error::from(from_stream_code(CANCELLED, version)),
-				Error::Cancel
+				Error::Stream(StreamError::Cancel)
 			));
 		}
 
@@ -545,7 +561,7 @@ mod tests {
 			assert_eq!(from_stream_code(GOING_AWAY, version), StreamError::Unknown(GOING_AWAY));
 		}
 
-		for version in [Version::Draft18, Version::Draft19, Version::Draft20] {
+		for version in [Version::Draft18, Version::Draft19, Version::Draft20, Version::Draft21] {
 			assert_eq!(to_stream_code(&StreamError::GoingAway, version), GOING_AWAY);
 			assert_eq!(from_stream_code(GOING_AWAY, version), StreamError::GoingAway);
 		}
@@ -600,6 +616,7 @@ mod tests {
 			StreamError::Evicted,
 			StreamError::WrongSize,
 			StreamError::FrameTooLarge,
+			StreamError::GroupTooLarge,
 			StreamError::TimestampMismatch,
 			StreamError::App(7),
 			StreamError::Unknown(0x1234),
@@ -613,18 +630,18 @@ mod tests {
 
 		// And nothing decodes back into them: an unregistered code keeps its number and
 		// stays opaque instead of being read as a meaning the wire did not carry.
-		for code in [0x6, 0x7, 0x9, 0x20, 0x22, 64 + 7] {
+		for code in [0x6, 0x7, 0x9, 0x20, 0x22, 0x33, 0x34, 0x35, 64 + 7] {
 			assert_eq!(from_stream_code(code, Version::Draft20), StreamError::Unknown(code));
 			assert!(matches!(
 				Error::from(from_stream_code(code, Version::Draft20)),
-				Error::Remote(remote) if remote == code
+				Error::Stream(StreamError::Unknown(remote)) if remote == code
 			));
 		}
 	}
 
 	/// Every stream error this crate can hold, so the conformance check below covers the
 	/// whole space rather than the variants someone remembered. A new variant belongs here.
-	const EVERY_ERROR: [StreamError; 16] = [
+	const EVERY_ERROR: [StreamError; 17] = [
 		StreamError::Session(SessionError::Cancel),
 		StreamError::Internal,
 		StreamError::Cancel,
@@ -638,6 +655,7 @@ mod tests {
 		StreamError::Evicted,
 		StreamError::WrongSize,
 		StreamError::FrameTooLarge,
+		StreamError::GroupTooLarge,
 		StreamError::TimestampMismatch,
 		StreamError::App(7),
 		StreamError::Unknown(0x22),

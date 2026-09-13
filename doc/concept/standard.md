@@ -11,10 +11,10 @@ with it, while shipping a simpler profile you can use today.
 
 | Spec | Scope | Here |
 | --- | --- | --- |
-| [moq-transport](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/) | The IETF pub/sub protocol | Drafts 14 through 20 negotiated by ALPN; [moq-lite](/concept/moq-lite) is a forward-compatible subset |
+| [moq-transport](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/) | The IETF pub/sub protocol | Drafts 14 through 21 negotiated by ALPN; [moq-lite](/concept/moq-lite) is a forward-compatible subset |
 | [MSF](https://datatracker.ietf.org/doc/draft-ietf-moq-msf/) | The IETF catalog format | Read and written; broadcasts ending in `.msf` select it |
 | [LOC](https://datatracker.ietf.org/doc/draft-ietf-moq-loc/) | The IETF low-overhead container | Supported as a hang container kind |
-| [moq-lite](/draft/moq-lite), [hang](/draft/moq-hang), and friends | This project's own drafts | Normative for the implementation, published to the datatracker from [`drafts/`](https://github.com/moq-dev/moq/tree/main/drafts) |
+| [moq-lite](/draft/moq-lite), [hang](/draft/moq-hang), [e2ee](/draft/moq-e2ee), and friends | This project's own drafts | Normative for the implementation, published to the datatracker from [`drafts/`](https://github.com/moq-dev/moq/tree/main/drafts) |
 
 ## moq-transport
 
@@ -26,10 +26,22 @@ maps everything else to "not supported" or a harmless equivalent. The
 [moq-lite page](/concept/moq-lite#what-moq-lite-leaves-out) lists the
 differences.
 
+On drafts 14–19, the Rust publisher serves relative joining `FETCH` requests
+with offset zero for `NextObject` subscriptions. The fetch delivers the saved
+current-group prefix, and the subscription delivers later objects. Standalone,
+absolute joining, and nonzero-offset fetches are refused. Draft-20 uses
+subscription fills instead. JavaScript publishing does not yet serve `FETCH`;
+Rust and JavaScript subscribers request unfiltered delivery on older drafts
+because they do not issue joining fetches. Other publishers may replay a cached
+backlog for that filter; selecting the next group instead would leave static
+tracks waiting for a group that never arrives.
+
 Several project drafts extend the IETF wire without breaking it, since `SETUP`
 ignores unknown parameters: [cluster](/draft/moq-cluster) routing hop lists,
 [solicit](/draft/moq-solicit) to make announcements opt-in, and
 [probe](/draft/moq-probe) for bandwidth estimation.
+[moq-e2ee](/draft/moq-e2ee) is not a transport extension: it encrypts application
+payloads so relays still forward named tracks they cannot read.
 
 ## MSF
 

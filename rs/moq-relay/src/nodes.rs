@@ -123,11 +123,6 @@ impl Nodes {
 		}
 	}
 
-	pub(crate) fn with_origin(mut self, origin: origin::Producer) -> Self {
-		self.origin = origin;
-		self
-	}
-
 	/// Record a dial this relay initiated, keyed by the URL it dialed.
 	///
 	/// `id` is the session's `conn` id from
@@ -293,7 +288,10 @@ mod tests {
 		.unwrap();
 		let path = moq_net::Path::new(MESH_PREFIX).join(node);
 		let announcement = origin
-			.dynamic(&path, moq_net::origin::Route::default().with_hops(hops).with_cost(cost))
+			.dynamic(
+				moq_net::Pattern::subtree(path.as_str()).unwrap(),
+				moq_net::origin::Route::default().with_hops(hops).with_cost(cost),
+			)
 			.unwrap();
 		origin.consume().routed(&path).await.expect("test node announced");
 		announcement

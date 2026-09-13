@@ -1186,6 +1186,12 @@ async fn broadcast_moq_transport_20() {
 	broadcast_test("moqt", Some("moq-transport-20"), Some("moq-transport-20")).await;
 }
 
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn broadcast_moq_transport_21() {
+	broadcast_test("moqt", Some("moq-transport-21"), Some("moq-transport-21")).await;
+}
+
 // ── Raw QUIC – server supports all versions, client pins one ─────────
 
 #[tracing_test::traced_test]
@@ -1482,6 +1488,12 @@ async fn broadcast_webtransport_moq_transport_20() {
 	broadcast_test("https", Some("moq-transport-20"), Some("moq-transport-20")).await;
 }
 
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn broadcast_webtransport_moq_transport_21() {
+	broadcast_test("https", Some("moq-transport-21"), Some("moq-transport-21")).await;
+}
+
 // ── WebTransport – server supports all, client pins one ─────────────
 
 #[tracing_test::traced_test]
@@ -1653,6 +1665,8 @@ async fn broadcast_websocket() {
 		let request = server.accept().await.expect("no incoming connection");
 		assert_eq!(request.transport(), moq_tokio::Transport::WebSocket);
 		assert_eq!(request.path(), "");
+		// The dialed host reaches the server as the authority, like the QUIC transports.
+		assert_eq!(request.authority(), Some("localhost"));
 		let session = request.with_publisher(&pub_origin).ok().await?;
 
 		let _broadcast = broadcast;
@@ -3214,7 +3228,10 @@ async fn abort_carries_its_code_to_the_peer() {
 		.await
 		.expect("the peer never saw the close")
 		.expect("server task gone");
-	assert!(matches!(reason, moq_net::Error::App(42)), "unexpected close: {reason}");
+	assert!(
+		matches!(reason, moq_net::Error::Session(moq_net::SessionError::App(42))),
+		"unexpected close: {reason}"
+	);
 
 	server_handle.abort();
 }

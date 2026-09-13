@@ -89,10 +89,12 @@ actually is. While video owns the clock, a frame arriving earlier than predicted
 pulls playback forward, so a late start catches up to live instead of staying
 behind it. Once the speaker owns the clock, video follows the speaker instead.
 
-Each role follows the catalog for as long as it lasts, so a publisher that
-retires the rendition being played ends that track and the role picks a
-replacement. Playback is behind the `play` feature, since it pulls in windowing
-and audio-device dependencies:
+Each role follows the catalog for as long as it lasts. Each decoder starts at
+the newest cached group, including when a rendition is reopened, so playback
+does not replay the retained backlog. A publisher that retires the rendition
+being played ends that track and the role picks a replacement. Playback is
+behind the `play` feature, since it pulls in windowing and audio-device
+dependencies:
 
 ```bash
 cargo install moq-cli --no-default-features --features "iroh,quinn,websocket,play"
@@ -160,6 +162,26 @@ interchangeable sources: relays hold both routes and fail over at a group
 boundary. They must produce identical tracks with aligned groups. Everywhere
 else leave `--hop` unset: a fresh id per run is what makes a restarted
 encoder take over cleanly instead of splicing mid-stream.
+
+## LAN mesh
+
+`--cluster-lan` advertises this process on the LAN over mDNS and meshes with
+every other participating MoQ process, no relay required. It reuses `--listen`,
+filling in an ephemeral port and a generated certificate when those are unset.
+
+```bash
+moq --cluster-lan import capture
+moq --cluster-lan --cluster-lan-secret /etc/moq/cluster.key import capture
+```
+
+`--cluster-lan-secret` restricts the mesh to peers holding the same key.
+Without it, anyone who can reach the listener joins, so leave it unset only
+on networks you trust.
+
+`--cluster-lan-app` names the DNS-SD application this process advertises
+under. Peers using a different name never discover this one. It defaults to
+`default`, which moq-relay shares, so the two find each other with no
+configuration. An application built on the library picks its own name.
 
 ## Tokens
 

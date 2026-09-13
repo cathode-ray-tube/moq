@@ -13,6 +13,7 @@ The reference implementation. Every crate is on
 | Crate | Does |
 | --- | --- |
 | [moq-net](/lib/rs/moq-net) | The pub/sub layer: sessions, origins, broadcasts, tracks, groups, frames. Transport-agnostic. |
+| [moq-pattern](https://docs.rs/moq-pattern) | Exact path patterns: grammar, matching, and set algebra. Re-exported by moq-net and moq-token. |
 | [moq-tokio](https://docs.rs/moq-tokio) | Stands up QUIC (quinn, quiche, or noq), TLS, WebSocket fallback, and iroh, from config or CLI flags. |
 | [hang](/lib/rs/hang) | The media layer: catalog, containers, ordered frame delivery. |
 | [moq-mux](/lib/rs/moq-mux) | Import and export fMP4/CMAF, MPEG-TS, Matroska, FLV, and Annex-B. |
@@ -63,7 +64,7 @@ let mut broadcast = origin.create_broadcast("my-stream.hang")?;
 // moq-mux (from a container) or moq-video / moq-audio (from a device) fill it.
 broadcast.announce(Default::default())?;
 // The route retracts on `unannounce()` or when the broadcast ends. To serve a whole
-// subtree on demand instead, `origin.dynamic("room/", Default::default())?` yields
+// subtree on demand instead, `origin.dynamic("room/**".parse()?, Default::default())?` yields
 // each requested path for the application to accept or reject.
 ```
 

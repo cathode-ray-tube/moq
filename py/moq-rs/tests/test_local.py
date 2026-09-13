@@ -8,6 +8,12 @@ import moq
 import pytest
 
 
+def create_announced(origin: moq.OriginProducer, path: str) -> moq.BroadcastProducer:
+    broadcast = origin.create_broadcast(path)
+    broadcast.announce()
+    return broadcast
+
+
 def opus_head() -> bytes:
     """Build a valid OpusHead init buffer (RFC 7845)."""
     return (
@@ -76,6 +82,46 @@ def test_origin_lifecycle():
     _consumer = origin.consume()
 
 
+async def test_fetch_abort_is_a_stream_app_code():
+    broadcast = moq.BroadcastProducer()
+    track = broadcast.publish_track("events")
+    dynamic = track.dynamic()
+    consumer = broadcast.consume()
+
+    async def reject():
+        request = await dynamic.requested_group()
+        request.abort(404)
+
+    task = asyncio.create_task(reject())
+    with pytest.raises(moq.Error.Protocol) as raised:  # type: ignore[attr-defined]
+        await consumer.fetch_group("events", 5)
+    await task
+    protocol = moq.protocol_error(raised.value)
+    assert protocol is not None
+    assert protocol.scope == moq.ErrorScope.STREAM
+    assert protocol.code == 64 + 404
+    assert protocol.kind == moq.ProtocolKind.APP
+
+
+def test_protocol_error_helper_covers_known_app_and_unknown():
+    cases = [
+        (moq.ErrorScope.SESSION, 0x2, moq.ProtocolKind.UNAUTHORIZED, True),
+        (moq.ErrorScope.SESSION, 64 + 404, moq.ProtocolKind.APP, False),
+        (moq.ErrorScope.SESSION, 0x1F, moq.ProtocolKind.UNKNOWN, False),
+        (moq.ErrorScope.STREAM, 64 + 7, moq.ProtocolKind.APP, False),
+    ]
+    for scope, code, kind, auth in cases:
+        details = moq.ProtocolError(scope=scope, code=code, kind=kind, message="x")
+        err = moq.Error.Protocol(details)
+        protocol = moq.protocol_error(err)
+        assert protocol is not None
+        assert protocol.scope == scope
+        assert protocol.code == code
+        assert protocol.kind == kind
+        assert moq.is_auth(err) is auth
+    assert moq.protocol_error(RuntimeError("nope")) is None
+
+
 def test_publish_media_lifecycle():
     broadcast = moq.BroadcastProducer()
     media = broadcast.publish_audio(moq.AudioFormat.OPUS, opus_head())
@@ -124,7 +170,7 @@ def test_audio_rejects_bad_init_bytes():
 
 async def test_local_publish_consume_audio():
     origin = moq.OriginProducer()
-    broadcast = origin.create_broadcast("live")
+    broadcast = create_announced(origin, "live")
     media = broadcast.publish_audio(moq.AudioFormat.OPUS, opus_head())
 
     consumer = origin.consume()
@@ -159,7 +205,7 @@ async def test_local_publish_consume_audio():
 
 async def test_video_publish_consume():
     origin = moq.OriginProducer()
-    broadcast = origin.create_broadcast("video-test")
+    broadcast = create_announced(origin, "video-test")
     media = broadcast.publish_video(moq.VideoFormat.AVC3, h264_init())
 
     consumer = origin.consume()
@@ -193,7 +239,7 @@ async def test_video_publish_consume():
 
 async def test_multiple_frames_ordering():
     origin = moq.OriginProducer()
-    broadcast = origin.create_broadcast("ordering-test")
+    broadcast = create_announced(origin, "ordering-test")
     media = broadcast.publish_audio(moq.AudioFormat.OPUS, opus_head())
 
     consumer = origin.consume()
@@ -220,7 +266,7 @@ async def test_multiple_frames_ordering():
 
 async def test_catalog_update_on_new_track():
     origin = moq.OriginProducer()
-    broadcast = origin.create_broadcast("catalog-update")
+    broadcast = create_announced(origin, "catalog-update")
     _media1 = broadcast.publish_audio(moq.AudioFormat.OPUS, opus_head())
 
     consumer = origin.consume()
@@ -253,7 +299,7 @@ def test_finish_closes_producer():
 
 async def test_announced_broadcast():
     origin = moq.OriginProducer()
-    _broadcast = origin.create_broadcast("test/broadcast")
+    _broadcast = create_announced(origin, "test/broadcast")
 
     consumer = origin.consume()
 
@@ -409,7 +455,7 @@ async def test_dynamic_track_request_can_publish_media():
 
 async def test_dynamic_broadcast_request():
     origin = moq.OriginProducer(cache_capacity_bytes=4096)
-    dynamic = origin.dynamic()
+    dynamic = origin.dynamic("**")
     consumer = origin.consume()
 
     request_broadcast = asyncio.create_task(consumer.request_broadcast("dynamic/broadcast"))
@@ -438,7 +484,7 @@ async def test_dynamic_broadcast_request():
 
 async def test_dynamic_broadcast_request_can_reject():
     origin = moq.OriginProducer()
-    dynamic = origin.dynamic()
+    dynamic = origin.dynamic("**")
     consumer = origin.consume()
 
     request_broadcast = asyncio.create_task(consumer.request_broadcast("missing"))
@@ -575,7 +621,7 @@ async def test_subscribe_media_default_latency_and_context_manager():
     """subscribe_media takes the catalog record directly and defaults the
     latency; the returned consumer is also an async context manager."""
     origin = moq.OriginProducer()
-    broadcast = origin.create_broadcast("live")
+    broadcast = create_announced(origin, "live")
     media = broadcast.publish_audio(moq.AudioFormat.OPUS, opus_head())
 
     consumer = origin.consume()
@@ -599,7 +645,7 @@ async def test_subscribe_media_default_latency_and_context_manager():
 
 async def test_raw_publish_consume():
     origin = moq.OriginProducer()
-    broadcast = origin.create_broadcast("robot/arm")
+    broadcast = create_announced(origin, "robot/arm")
     raw = broadcast.publish_track("events")
 
     consumer = origin.consume()
@@ -624,7 +670,7 @@ async def test_raw_publish_consume():
 
 async def test_raw_multiple_frames():
     origin = moq.OriginProducer()
-    broadcast = origin.create_broadcast("robot/io")
+    broadcast = create_announced(origin, "robot/io")
     raw = broadcast.publish_track("commands")
 
     consumer = origin.consume()
@@ -706,7 +752,7 @@ async def test_broadcast_producer_consume_direct():
 async def test_raw_group_sequence():
     """Consumer sees the same sequence numbers the producer assigned."""
     origin = moq.OriginProducer()
-    broadcast = origin.create_broadcast("track/seq")
+    broadcast = create_announced(origin, "track/seq")
     raw = broadcast.publish_track("seq")
 
     consumer = origin.consume()
@@ -741,7 +787,7 @@ async def test_default_iteration_is_sequence_order():
     this fails if the default iteration ever reverts to recv_group.
     """
     origin = moq.OriginProducer()
-    broadcast = origin.create_broadcast("track/ordering")
+    broadcast = create_announced(origin, "track/ordering")
     raw = broadcast.publish_track("ordering")
 
     subscription = moq.Subscription(max_age_ms=1_000)
@@ -773,7 +819,7 @@ async def _take(iterator, count: int):
 async def test_raw_multi_frame_group():
     """A single group can carry multiple frames, not just one per group."""
     origin = moq.OriginProducer()
-    broadcast = origin.create_broadcast("stream/chunks")
+    broadcast = create_announced(origin, "stream/chunks")
     raw = broadcast.publish_track("chunks")
 
     consumer = origin.consume()
@@ -899,3 +945,47 @@ def test_optional_binding_records_use_none_defaults():
     assert decoder.sample_rate is None
     assert decoder.channels is None
     assert decoder.max_age_ms is None
+
+
+async def test_announce_then_unannounce_is_visible():
+    origin = moq.OriginProducer()
+    broadcast = origin.create_broadcast("live")
+    track = broadcast.publish_track("events")
+    broadcast.announce()
+
+    consumer = origin.consume()
+    announced = consumer.announced()
+    first = await asyncio.wait_for(anext(announced), timeout=5.0)
+    assert first.path == "live"
+    assert first.active
+
+    broadcast.unannounce()
+    retracted = await asyncio.wait_for(anext(announced), timeout=5.0)
+    assert retracted.path == "live"
+    assert not retracted.active
+
+    await asyncio.wait_for(consumer.request_broadcast("live"), timeout=5.0)
+    announced.cancel()
+    track.finish()
+    broadcast.finish()
+
+
+async def test_dynamic_serves_a_request_under_a_prefix():
+    origin = moq.OriginProducer()
+    dynamic = origin.dynamic("live/**")
+    consumer = origin.consume()
+
+    pending = asyncio.create_task(consumer.request_broadcast("live/cam"))
+    request = await asyncio.wait_for(dynamic.requested_broadcast(), timeout=5.0)
+    assert request.path == "live/cam"
+    served = moq.BroadcastProducer()
+    request.accept(served)
+    await asyncio.wait_for(pending, timeout=5.0)
+    dynamic.cancel()
+    served.finish()
+
+
+def test_dynamic_refuses_a_non_prefix_pattern():
+    origin = moq.OriginProducer()
+    with pytest.raises(Exception):
+        origin.dynamic("live/*")

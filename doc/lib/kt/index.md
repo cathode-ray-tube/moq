@@ -46,16 +46,26 @@ Moq.connect("https://relay.example.com").use { moq ->
         VideoEncoderOutput(codec = VideoCodec.H264, track = "camera", bitrate = null, gop = null, kind = autoEncoder),
     )
     video.write(VideoFrame(timestampUs = pts, data = rgba))
+    broadcast.announce(Route())
 }
 ```
+
+Sessions reconnect with backoff when the transport drops and re-announce local
+broadcasts. `moq.epoch()` counts the connections, 1 on the first, pairing with
+`MoqSession.status` to log each reconnect; the `backoff` argument tunes the
+pacing (`timeoutMs = 0` retries forever); and `maxStreams` raises the peer's
+inbound stream cap.
 
 `Server.listen(bind, tlsGenerate = ...)` accepts sessions with per-request
 `accept()`/`reject()`. JSON tracks take `@Serializable` types
 (`publishJsonSnapshot`, `publishJsonStream`, `valuesAs<T>()`), and the rest of
 the [shared feature list](/lib/#what-every-binding-can-do) maps one to one:
-`fetchGroup`/`fetchMediaGroup`, `dynamic()`, `appendDatagram`/`datagrams()`,
-`setCatalogSection`, `used()`/`unused()`. `MoqException.isAuth` and
-`isShutdown` classify errors. Cancelling the collecting coroutine cancels the
+`fetchGroup`/`fetchMediaGroup`, `dynamic()` for tracks and `dynamic(pattern)` for broadcasts, `appendDatagram`/`datagrams()`,
+`setCatalogSection`, `used()`/`unused()`. `session.bandwidth()` divides the
+connection's send estimate; pass it to `encodeVideo` / `encodeAudio` or
+`reserve` a share for an app-owned track. `MoqException.isAuth` and
+`isShutdown` classify errors. `protocolError` is the structured protocol failure
+(scope, verbatim code, kind) when the peer sent one. Cancelling the collecting coroutine cancels the
 native side.
 
 - API reference: [javadoc.io/doc/dev.moq/moq](https://javadoc.io/doc/dev.moq/moq)

@@ -96,7 +96,8 @@ test("encoding tracks encoder config in its child effect", async () => {
 test("a bandwidth estimate updates the bitrate without blanking the config or re-probing", async () => {
 	using _videoEncoder = installFakeVideoEncoder();
 
-	const track = new Moq.Track.Producer("video").accept();
+	const track = new Moq.Track.Producer("video").accept({ priority: 60 });
+	const sub = track.subscribe();
 	const rendition = {
 		config: new Signal(undefined),
 		track: new Signal<Moq.Track.Producer | undefined>(track),
@@ -114,7 +115,8 @@ test("a bandwidth estimate updates the bitrate without blanking the config or re
 			frames: new Signal(undefined),
 		},
 	};
-	const bandwidth = new Signal<number | undefined>(10_000_000);
+	const estimate = new Signal<number | undefined>(10_000_000);
+	const bandwidth = new Moq.Bandwidth.Allocator(estimate);
 
 	const encoder = new Encoder("video", {
 		enabled: true,
@@ -133,12 +135,13 @@ test("a bandwidth estimate updates the bitrate without blanking the config or re
 		const probes = FakeVideoEncoder.probes;
 		expect(probes).toBeGreaterThan(0);
 
-		// A poll lands with an estimate low enough to cap the bitrate.
-		bandwidth.set(200_000);
+		// A poll lands with an estimate low enough to cap the bitrate. The grant
+		// is the whole estimate: the 10% headroom was the old stand-in for audio.
+		estimate.set(200_000);
 		await settle();
 
 		// The cap applied, and nothing went blank on the way there.
-		expect(encoder.out.resolved.peek()?.bitrate).toBe(180_000);
+		expect(encoder.out.resolved.peek()?.bitrate).toBe(200_000);
 		expect(encoder.out.resolved.peek()?.codec).toBe(resolved?.codec);
 		expect(encoder.out.catalog.peek()).toBeDefined();
 
@@ -147,7 +150,7 @@ test("a bandwidth estimate updates the bitrate without blanking the config or re
 
 		// Repeated samples, as the 100ms poll delivers. The config stays live throughout.
 		for (let i = 0; i < 20; i++) {
-			bandwidth.set(1_000_000 + i * 13_000);
+			estimate.set(1_000_000 + i * 13_000);
 			await Promise.resolve();
 			await Promise.resolve();
 			expect(encoder.out.resolved.peek()).toBeDefined();
@@ -157,6 +160,8 @@ test("a bandwidth estimate updates the bitrate without blanking the config or re
 		expect(FakeVideoEncoder.probes).toBe(probes);
 	} finally {
 		encoder.close();
+		bandwidth.close();
+		sub.close();
 	}
 });
 
@@ -172,7 +177,8 @@ test("every published config was probed for its own codec and dimensions", async
 	using _videoEncoder = installFakeVideoEncoder();
 	FakeVideoEncoder.accepted = [];
 
-	const track = new Moq.Track.Producer("video").accept();
+	const track = new Moq.Track.Producer("video").accept({ priority: 60 });
+	const sub = track.subscribe();
 	const rendition = {
 		config: new Signal(undefined),
 		track: new Signal<Moq.Track.Producer | undefined>(track),
@@ -190,7 +196,8 @@ test("every published config was probed for its own codec and dimensions", async
 			frames: new Signal(undefined),
 		},
 	};
-	const bandwidth = new Signal<number | undefined>(10_000_000);
+	const estimate = new Signal<number | undefined>(10_000_000);
+	const bandwidth = new Moq.Bandwidth.Allocator(estimate);
 
 	const encoder = new Encoder("video", {
 		enabled: true,
@@ -217,11 +224,11 @@ test("every published config was probed for its own codec and dimensions", async
 		expect(published.length).toBeGreaterThan(0);
 
 		// A resize landing in the same batch as a bandwidth sample, which is likely given the
-		// element polls the estimate every 100ms. The resize schedules the dimensions effect and
+		// connection polls the estimate every 100ms. The resize schedules the dimensions effect and
 		// the sample schedules the resolve effect, so the resolve effect runs with the new
 		// dimensions already written while the probe still holds the result for the old ones.
 		capture.out.display.set({ width: 640, height: 480 });
-		bandwidth.set(3_000_000);
+		estimate.set(3_000_000);
 		await settle();
 
 		expect(published.length).toBeGreaterThan(1);
@@ -229,6 +236,8 @@ test("every published config was probed for its own codec and dimensions", async
 	} finally {
 		unsubscribe();
 		encoder.close();
+		bandwidth.close();
+		sub.close();
 	}
 });
 
@@ -365,5 +374,119 @@ test("frame sources retain their dimensions and nominal frame rate", async () =>
 	} finally {
 		encoder.close();
 		await frames.cancel();
+	}
+});
+
+test.each(["encoder lag", "quiet startup"])("marks a rendition stalled for %s", async (reason) => {
+	const clock = spyOn(performance, "now").mockReturnValue(0);
+	class DelayedVideoEncoder {
+		static probes = 0;
+		state: CodecState = "unconfigured";
+		#output: VideoEncoderInit["output"];
+
+		constructor(init: VideoEncoderInit) {
+			this.#output = init.output;
+		}
+
+		static async isConfigSupported(config: VideoEncoderConfig): Promise<{ supported: boolean }> {
+			DelayedVideoEncoder.probes++;
+			return { supported: config.codec.startsWith("avc1") };
+		}
+
+		configure(): void {
+			this.state = "configured";
+		}
+
+		encode(): void {
+			// Hold the output: a throttled encoder never hands frames to the session.
+		}
+
+		close(): void {
+			this.state = "closed";
+			void this.#output;
+		}
+	}
+
+	const original = Object.getOwnPropertyDescriptor(globalThis, "VideoEncoder");
+	Object.defineProperty(globalThis, "VideoEncoder", {
+		configurable: true,
+		value: DelayedVideoEncoder,
+		writable: true,
+	});
+
+	class Frame {
+		codedWidth = 640;
+		codedHeight = 480;
+		timestamp: number;
+		closed = false;
+		constructor(timestamp: number) {
+			this.timestamp = timestamp;
+		}
+		clone(): Frame {
+			return new Frame(this.timestamp);
+		}
+		close(): void {
+			this.closed = true;
+		}
+	}
+
+	const { Fanout } = await import("../fanout");
+	let controller!: ReadableStreamDefaultController<VideoFrame>;
+	const stream = new ReadableStream<VideoFrame>({
+		start: (c) => {
+			controller = c;
+		},
+	});
+	const fanout = new Fanout(stream, {
+		clone: (frame) => frame.clone(),
+		release: (frame) => frame.close(),
+	});
+
+	const track = new Moq.Track.Producer("video/hd").accept();
+	const rendition = {
+		config: new Signal(undefined),
+		track: new Signal<Moq.Track.Producer | undefined>(track),
+		close: () => track.close(),
+	};
+	const capture = {
+		in: {
+			source: new Signal({
+				getSettings: () => ({ frameRate: 30 }),
+				getConstraints: () => ({}),
+			} as never),
+		},
+		out: {
+			display: new Signal({ width: 640, height: 480 }),
+			frames: new Signal(fanout),
+		},
+	};
+	const encoder = new Encoder("video/hd", {
+		enabled: true,
+		broadcast: { video: () => rendition } as never,
+		capture: capture as never,
+	});
+
+	try {
+		await settle();
+		expect(encoder.out.catalog.peek()?.stalled).toBeUndefined();
+
+		if (reason === "encoder lag") {
+			// Five frames at 30fps exceed three frame intervals of unaccepted capture.
+			for (let i = 0; i < 5; i++) {
+				controller.enqueue(new Frame(i * 33_333) as unknown as VideoFrame);
+				await new Promise((resolve) => setTimeout(resolve, 10));
+			}
+		} else {
+			clock.mockReturnValue(200);
+			await new Promise((resolve) => setTimeout(resolve, 60));
+		}
+		await settle();
+		expect(encoder.out.catalog.peek()?.stalled).toBe(true);
+	} finally {
+		encoder.close();
+		fanout.close();
+		clock.mockRestore();
+		if (original) Object.defineProperty(globalThis, "VideoEncoder", original);
+		else Reflect.deleteProperty(globalThis, "VideoEncoder");
 	}
 });

@@ -4,6 +4,8 @@
 //! Tokens specify which broadcast paths a client can publish to and consume from.
 //!
 //! See [`Claims`] for the JWT claims structure and [`Key`] for key management.
+//! Pattern types from [`moq-pattern`](moq_pattern) are re-exported for standalone use.
+//! Token claims and authorization still use path prefixes.
 
 mod algorithm;
 mod claims;
@@ -20,4 +22,5 @@ pub use claims::*;
 pub use error::*;
 pub use key::*;
 pub use key_id::*;
+pub use moq_pattern::{InvalidPattern, Pattern, Patterns, Segment, Specificity};
 pub use set::*;

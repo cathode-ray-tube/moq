@@ -394,7 +394,12 @@ pub struct ClusterConfig {
 	/// (the wire varint limit); an out-of-range value errors at startup. Keep it
 	/// below 2^53 for compatibility with older `@moq/lite` JS clients, which
 	/// decode hop ids as a `u53` and reject anything larger.
-	#[usage(name = "cluster-id", long = "cluster-id", env = "MOQ_CLUSTER_ID")]
+	#[usage(
+		name = "cluster-id",
+		long = "cluster-id",
+		env = "MOQ_CLUSTER_ID",
+		setting = "cluster.id"
+	)]
 	pub id: Option<u64>,
 
 	/// Connect to one or more other cluster nodes. Each peer is a full URL, e.g.
@@ -413,7 +418,8 @@ pub struct ClusterConfig {
 		name = "cluster-connect",
 		long = "cluster-connect",
 		env = "MOQ_CLUSTER_CONNECT",
-		delimiter = ','
+		delimiter = ',',
+		setting = "cluster.connect"
 	)]
 	#[serde_as(as = "serde_with::OneOrMany<_>")]
 	pub connect: Vec<String>,
@@ -432,7 +438,8 @@ pub struct ClusterConfig {
 	#[usage(
 		name = "cluster-connect-api",
 		long = "cluster-connect-api",
-		env = "MOQ_CLUSTER_CONNECT_API"
+		env = "MOQ_CLUSTER_CONNECT_API",
+		setting = "cluster.connect_api"
 	)]
 	pub connect_api: Option<String>,
 
@@ -440,7 +447,12 @@ pub struct ClusterConfig {
 	/// [`Self::connect_api`] as a `?node=` query param so the endpoint can return
 	/// this node's peers, and advertised to other relays when [`Self::mesh`] gossip
 	/// is enabled. On its own it neither opens nor accepts a connection.
-	#[usage(name = "cluster-node", long = "cluster-node", env = "MOQ_CLUSTER_NODE")]
+	#[usage(
+		name = "cluster-node",
+		long = "cluster-node",
+		env = "MOQ_CLUSTER_NODE",
+		setting = "cluster.node"
+	)]
 	pub node: Option<String>,
 
 	/// Enable gossip discovery: advertise this relay's [`Self::node`] URL on the
@@ -456,6 +468,7 @@ pub struct ClusterConfig {
 		name = "cluster-mesh",
 		long = "cluster-mesh",
 		env = "MOQ_CLUSTER_MESH",
+		setting = "cluster.mesh",
 		default_missing = "true",
 		num_args = 0..=1,
 		require_equals = true,
@@ -474,12 +487,22 @@ pub struct ClusterConfig {
 	/// any peer whose URL has no inline token). An inline `?jwt=` can provide a
 	/// per-peer credential for static or `connect_api` peers. Gossip should use
 	/// this shared token or mTLS because the advertised node URL is public.
-	#[usage(name = "cluster-token", long = "cluster-token", env = "MOQ_CLUSTER_TOKEN")]
+	#[usage(
+		name = "cluster-token",
+		long = "cluster-token",
+		env = "MOQ_CLUSTER_TOKEN",
+		setting = "cluster.token"
+	)]
 	pub token: Option<PathBuf>,
 
 	/// Billing tier label that cluster-peer (relay-to-relay) traffic records
 	/// stats under. Defaults to the unprefixed tier.
-	#[usage(name = "cluster-tier", long = "cluster-tier", env = "MOQ_CLUSTER_TIER")]
+	#[usage(
+		name = "cluster-tier",
+		long = "cluster-tier",
+		env = "MOQ_CLUSTER_TIER",
+		setting = "cluster.tier"
+	)]
 	pub tier: Option<String>,
 	// Accepted so existing configs keep parsing (`deny_unknown_fields`), but
 	// ignored: a broadcast now closes as soon as its last publisher is lost.
@@ -489,6 +512,7 @@ pub struct ClusterConfig {
 		name = "cluster-linger",
 		long = "cluster-linger",
 		env = "MOQ_CLUSTER_LINGER",
+		setting = "cluster.linger",
 		hide = true
 	)]
 	pub linger: Option<moq_tokio::Duration>,
@@ -510,21 +534,14 @@ pub struct LanConfig {
 	/// Enable mDNS discovery. Requires [`ClusterConfig::node`], so there is an
 	/// address to advertise, and [`Self::secret`]. Boolean flag: pass
 	/// `--cluster-lan` (or `=true` / `=false`).
-	/// `Option` rather than a materialized default: Usage reads a standing `false`
-	/// as an empty boolean, so `update_from` would refill it from the environment
-	/// (or a declared default) over whatever the TOML file said. An `Option` is
-	/// empty only when nothing set it. A bare `Vec<T>` has the same hazard, since
-	/// an empty list also reads as absent; see moq-dev/moq#3051.
 	#[usage(
 		name = "cluster-lan",
 		long = "cluster-lan",
 		env = "MOQ_CLUSTER_LAN",
-		default_missing = "true",
-		num_args = 0..=1,
-		require_equals = true,
+		setting = "cluster.lan.enabled",
+		bool_value
 	)]
-	#[serde(skip_serializing_if = "Option::is_none")]
-	pub enabled: Option<bool>,
+	pub enabled: bool,
 
 	/// The shared key admitting a peer to the LAN mesh, as 64 hexadecimal
 	/// characters or a path to a file containing them. Required by
@@ -539,9 +556,57 @@ pub struct LanConfig {
 		name = "cluster-lan-secret",
 		long = "cluster-lan-secret",
 		env = "MOQ_CLUSTER_LAN_SECRET",
-		value_name = "HEX_OR_PATH"
+		value_name = "HEX_OR_PATH",
+		setting = "cluster.lan.secret"
 	)]
 	pub secret: Option<String>,
+
+	/// DNS-SD application this relay advertises under. Peers using a different
+	/// name never discover this one. Defaults to `default`, which moq-cli
+	/// shares so they find each other with no configuration. An application
+	/// built on the library picks its own name.
+	#[usage(
+		name = "cluster-lan-app",
+		long = "cluster-lan-app",
+		env = "MOQ_CLUSTER_LAN_APP",
+		value_name = "NAME",
+		setting = "cluster.lan.app"
+	)]
+	pub app: Option<moq_tokio::mdns::App>,
+}
+
+/// Construction settings for a [`Cluster`]: identity, discovery, and the origin cache.
+///
+/// The origin is built once from these, so cache settings cannot detach a handle
+/// taken after construction. Independent services ([`Cluster::with_client`],
+/// [`Cluster::with_stats`]) attach afterwards without rebuilding it.
+#[derive(Default)]
+#[non_exhaustive]
+pub struct ClusterOptions {
+	/// Cluster identity, peers, and discovery.
+	pub config: ClusterConfig,
+
+	/// Shared group pool and per-track retention ceiling.
+	///
+	/// `None` uses an unbounded pool with the standard LRU window and no
+	/// media-timestamp ceiling.
+	pub cache: Option<crate::Cache>,
+}
+
+impl ClusterOptions {
+	/// Construct from cluster config, leaving the origin cache at its defaults.
+	pub fn new(config: ClusterConfig) -> Self {
+		Self {
+			config,
+			..Default::default()
+		}
+	}
+
+	/// Use this resolved cache when constructing the origin.
+	pub fn with_cache(mut self, cache: crate::Cache) -> Self {
+		self.cache = Some(cache);
+		self
+	}
 }
 
 /// A [`Cluster`] whose config is validated and whose resources are bound,
@@ -603,8 +668,8 @@ struct Work {
 ///
 /// Construct with [`Cluster::new`], then attach a QUIC client and (optionally)
 /// a [`stats::Registry`](moq_net::stats::Registry) with the `with_*` builder
-/// methods. A cluster without a client can serve local sessions but cannot
-/// dial remote peers.
+/// methods. Those builders do not rebuild the origin. A cluster without a
+/// client can serve local sessions but cannot dial remote peers.
 #[derive(Clone)]
 pub struct Cluster {
 	config: ClusterConfig,
@@ -615,11 +680,6 @@ pub struct Cluster {
 	/// alike, so one id space covers the whole process and an id in the `/nodes`
 	/// view always points at the same session in the logs.
 	connection_ids: Arc<AtomicU64>,
-
-	/// The origin's construction config (identity, cache pool). Kept so the
-	/// `with_*` builders can rebuild the origin without losing each other's
-	/// settings.
-	info: origin::Info,
 
 	/// Client TLS config used to build the `--cluster-connect-api` HTTP client, so
 	/// peer-list fetches present the same cluster cert the QUIC dials do. `Arc` so
@@ -646,11 +706,13 @@ pub struct Cluster {
 }
 
 impl Cluster {
-	/// Creates a new cluster with a fresh origin and no peers, client, or stats.
+	/// Creates a cluster with one origin, using [`ClusterOptions`] for identity
+	/// and cache.
 	///
 	/// Use [`with_client`](Self::with_client) to enable dialing remote peers
 	/// (required when `config.connect` is non-empty), and
-	/// [`with_stats`](Self::with_stats) to enable metrics publishing.
+	/// [`with_stats`](Self::with_stats) to enable metrics publishing. Those
+	/// builders do not rebuild the origin.
 	///
 	/// Must be called within a tokio runtime: the origin's lifecycle driver is
 	/// spawned here, so the origin serves sessions whether or not
@@ -658,7 +720,8 @@ impl Cluster {
 	///
 	/// Errors if `config.id` is set but invalid: it must be non-zero and below
 	/// 2^62 (the wire varint limit). An unset id picks a fresh random origin.
-	pub fn new(config: ClusterConfig) -> anyhow::Result<Self> {
+	pub fn new(options: ClusterOptions) -> anyhow::Result<Self> {
+		let ClusterOptions { config, cache } = options;
 		let id = match config.id {
 			Some(0) => anyhow::bail!("--cluster-id must be non-zero"),
 			Some(id) if id >= 1 << 62 => {
@@ -673,8 +736,11 @@ impl Cluster {
 				"cluster linger is deprecated and ignored; a broadcast closes as soon as its last publisher is lost"
 			);
 		}
-		let info = origin::Info::new(id);
-		let origin = moq_tokio::origin::spawn(info.clone());
+		let mut info = origin::Info::new(id);
+		if let Some(cache) = cache {
+			info = info.with_pool(cache.pool).with_cache_duration(cache.duration);
+		}
+		let origin = moq_tokio::origin::spawn(info);
 		let nodes = crate::nodes::Nodes::new(origin.clone());
 		tracing::info!(hop_id = %origin.id(), configured = config.id.is_some(), "cluster initialized");
 		Ok(Cluster {
@@ -683,29 +749,10 @@ impl Cluster {
 			nodes,
 			connection_ids: Arc::default(),
 			client_tls: None,
-			info,
 			origin,
 			stats: moq_net::stats::Registry::disabled(),
 			_stats_publisher: None,
 		})
-	}
-
-	/// Attach the resolved [`Cache`](crate::Cache) (the shared group pool and the
-	/// per-track retention ceiling) so every session's broadcasts cache into one
-	/// memory budget bounded by both bytes and age. Call before deriving any origin
-	/// handles (e.g. [`with_stats`](Self::with_stats)) so they inherit the settings.
-	///
-	/// Rebuilds the origin with the cache: safe because the cluster's origin is
-	/// still pristine here (no broadcasts published, no scopes derived).
-	pub fn with_cache(mut self, cache: crate::Cache) -> Self {
-		self.info = self
-			.info
-			.clone()
-			.with_pool(cache.pool)
-			.with_cache_duration(cache.duration);
-		self.origin = moq_tokio::origin::spawn(self.info.clone());
-		self.nodes = self.nodes.with_origin(self.origin.clone());
-		self
 	}
 
 	/// Attach a QUIC client used to dial cluster peers.
@@ -801,7 +848,7 @@ impl Cluster {
 	/// Whether `--cluster-lan` asked this relay to discover peers over mDNS.
 	fn lan(&self) -> bool {
 		#[cfg(feature = "cluster-lan")]
-		return self.config.lan.enabled.unwrap_or(false);
+		return self.config.lan.enabled;
 		#[cfg(not(feature = "cluster-lan"))]
 		false
 	}
@@ -894,7 +941,8 @@ impl Cluster {
 					.secret
 					.as_deref()
 					.expect("--cluster-lan requires --cluster-lan-secret");
-				Some(lan_discovery(node, secret).await?)
+				let app = self.config.lan.app.clone().unwrap_or_default();
+				Some(lan_discovery(node, secret, app).await?)
 			}
 			false => None,
 		};
@@ -1442,7 +1490,11 @@ impl Cluster {
 /// URL itself, which is what keeps the relay's normal name-and-certificate path
 /// intact. The key is what makes the advertised URL trustworthy enough to dial.
 #[cfg(feature = "cluster-lan")]
-async fn lan_discovery(node: &str, secret: &str) -> anyhow::Result<moq_tokio::mdns::Discovery> {
+async fn lan_discovery(
+	node: &str,
+	secret: &str,
+	app: moq_tokio::mdns::App,
+) -> anyhow::Result<moq_tokio::mdns::Discovery> {
 	let url = peer_url(node)?;
 	// The advertisement is multicast in the clear. The secret authenticates the
 	// record, it does not hide it, so anything in the query is handed to every
@@ -1465,7 +1517,7 @@ async fn lan_discovery(node: &str, secret: &str) -> anyhow::Result<moq_tokio::md
 	);
 	let port = url.port_or_known_default().unwrap_or(443);
 	let secret = moq_tokio::mdns::Secret::load(secret).context("invalid --cluster-lan-secret")?;
-	Ok(moq_tokio::mdns::Config::new(port)
+	Ok(moq_tokio::mdns::Config::new(app, port)
 		.with_node(url)
 		.with_secret(secret)
 		.advertise()
@@ -1623,6 +1675,10 @@ mod tests {
 	use super::*;
 	use crate::Config;
 
+	fn new_cluster(config: ClusterConfig) -> anyhow::Result<Cluster> {
+		Cluster::new(ClusterOptions::new(config))
+	}
+
 	/// The publish task holds only a `Weak` to its producer, so it stops when the
 	/// last `moq_stats::Producer` clone drops. Attaching one must therefore hand
 	/// its lifetime to the cluster: an embedder driving its own loop takes the
@@ -1637,12 +1693,12 @@ mod tests {
 	#[tokio::test]
 	async fn stats_publishing_outlives_the_producer_handle() {
 		let config = crate::StatsConfig {
-			enabled: Some(true),
+			enabled: true,
 			node: Some("test".to_string()),
 			..Default::default()
 		};
 
-		let cluster = Cluster::new(ClusterConfig::default()).expect("cluster");
+		let cluster = new_cluster(ClusterConfig::default()).expect("cluster");
 		let stats = config.build(cluster.origin.clone());
 		let cluster = cluster.with_stats(stats);
 
@@ -1691,10 +1747,10 @@ mod tests {
 
 	#[tokio::test]
 	async fn cluster_tier_defaults_to_unprefixed() {
-		let cluster = Cluster::new(ClusterConfig::default()).expect("cluster");
+		let cluster = new_cluster(ClusterConfig::default()).expect("cluster");
 		assert_eq!(cluster.cluster_tier(), Tier::default());
 
-		let cluster = Cluster::new(ClusterConfig {
+		let cluster = new_cluster(ClusterConfig {
 			tier: Some("region/sjc".to_string()),
 			..Default::default()
 		})
@@ -2027,7 +2083,7 @@ mod tests {
 	/// tear down or reconfigure the last-known-good dial set.
 	#[tokio::test]
 	async fn malformed_peer_list_preserves_current_dial() {
-		let cluster = Cluster::new(ClusterConfig::default()).expect("cluster");
+		let cluster = new_cluster(ClusterConfig::default()).expect("cluster");
 		let dialed = DialMap::default();
 		let current = DialTarget::parse("https://peer.example/?cost=1").unwrap();
 		let task = tokio::spawn(std::future::pending::<()>());
@@ -2094,7 +2150,7 @@ mod tests {
 			mesh: Some("true".to_string()),
 			..Default::default()
 		};
-		let err = Cluster::new(config).unwrap().start().await.expect_err("should error");
+		let err = new_cluster(config).unwrap().start().await.expect_err("should error");
 		let msg = format!("{err}");
 		assert!(msg.contains("--cluster-node"), "missing --cluster-node in: {msg}");
 		assert!(msg.contains("--cluster-mesh"), "missing --cluster-mesh in: {msg}");
@@ -2104,7 +2160,7 @@ mod tests {
 	/// node a stable identity across restarts.
 	#[tokio::test]
 	async fn cluster_id_sets_origin() {
-		let cluster = Cluster::new(ClusterConfig {
+		let cluster = new_cluster(ClusterConfig {
 			id: Some(42),
 			..Default::default()
 		})
@@ -2112,12 +2168,89 @@ mod tests {
 		assert_eq!(cluster.origin.id(), 42);
 	}
 
+	/// Cache settings land on the one origin serving, node discovery, and stats
+	/// share. A handle cloned at construction stays on that origin.
+	#[tokio::test]
+	async fn constructed_origin_keeps_cache_and_handles() {
+		let duration = Duration::from_secs(5);
+		let cache = crate::CacheConfig {
+			duration: Some(duration.into()),
+			..Default::default()
+		}
+		.init()
+		.expect("cache");
+		let pool = cache.pool.clone();
+
+		let cluster = Cluster::new(
+			ClusterOptions::new(ClusterConfig {
+				id: Some(42),
+				..Default::default()
+			})
+			.with_cache(cache),
+		)
+		.expect("cluster");
+
+		let origin = cluster.origin.clone();
+		assert_eq!(origin.id(), 42);
+		assert_eq!(origin.info().cache_duration, duration);
+		assert_eq!(origin.info().pool.expiry(), Some(duration));
+
+		let stats = crate::StatsConfig {
+			enabled: true,
+			node: Some("test".to_string()),
+			..Default::default()
+		}
+		.build(origin.clone());
+		let cluster = cluster.with_stats(stats);
+
+		assert_eq!(cluster.origin.id(), origin.id());
+		assert_eq!(cluster.origin.info().cache_duration, duration);
+		assert_eq!(cluster.origin.info().pool.expiry(), Some(duration));
+
+		let mut broadcast = origin.create_broadcast("cam").expect("create");
+		broadcast.announce(Default::default()).expect("announce");
+		let mut track = broadcast.create_track("data", None).expect("track");
+		track.write_frame(moq_net::Timestamp::ZERO, b"hello").expect("write");
+		assert!(pool.used() > 0, "writes charge the constructed cache pool");
+
+		let consumer = cluster.origin.consume();
+		tokio::time::timeout(Duration::from_secs(2), consumer.request_broadcast("cam"))
+			.await
+			.expect("broadcast resolves")
+			.expect("broadcast present");
+
+		let path = Path::new(MESH_PREFIX).join("https://peer.example/");
+		let mut announced = consumer
+			.clone()
+			.with_root(MESH_PREFIX)
+			.expect("mesh prefix")
+			.announced();
+		let registration = origin.create_broadcast(&path).expect("node advertise");
+		registration.announce(Default::default()).expect("announce node");
+		let update = tokio::time::timeout(Duration::from_secs(2), announced.next())
+			.await
+			.expect("node advertised")
+			.expect("announce");
+		assert!(update.active);
+		let snapshot = cluster.nodes.snapshot();
+		assert!(
+			snapshot.nodes.iter().any(|node| node.node.contains("peer.example")),
+			"node discovery reads the constructed origin: {snapshot:?}"
+		);
+
+		let stats_path = Path::new(".stats").join("node").join("test");
+		tokio::time::timeout(Duration::from_secs(5), consumer.routed(&stats_path))
+			.await
+			.expect("stats announced")
+			.expect("stats present");
+	}
+
 	/// A reserved (0) or out-of-range (>= 2^62) `cluster.id` is rejected rather
 	/// than producing an unencodable hop id.
 	#[test]
 	fn cluster_id_out_of_range_errors() {
 		for bad in [0, 1u64 << 62] {
-			let err = Cluster::new(ClusterConfig {
+			let err = new_cluster(ClusterConfig {
 				id: Some(bad),
 				..Default::default()
 			})
@@ -2133,7 +2266,7 @@ mod tests {
 	/// (i.e. not exit and drop the broadcast).
 	#[tokio::test(start_paused = true)]
 	async fn passive_rendezvous_runs_without_client_and_advertises_self() {
-		let cluster = Cluster::new(ClusterConfig {
+		let cluster = new_cluster(ClusterConfig {
 			node: Some("rendezvous.example.com:4443".to_string()),
 			mesh: Some("true".to_string()),
 			..Default::default()
@@ -2197,7 +2330,7 @@ mod tests {
 	/// backwards compatibility: it enables gossip and supplies the node URL.
 	#[tokio::test]
 	async fn legacy_mesh_url_enables_gossip_as_node() {
-		let cluster = Cluster::new(ClusterConfig {
+		let cluster = new_cluster(ClusterConfig {
 			mesh: Some("rendezvous.example.com:4443".to_string()),
 			..Default::default()
 		})
@@ -2374,7 +2507,7 @@ mod tests {
 	/// conflict, not a silent pick.
 	#[tokio::test]
 	async fn legacy_mesh_url_conflicting_with_node_errors() {
-		let cluster = Cluster::new(ClusterConfig {
+		let cluster = new_cluster(ClusterConfig {
 			mesh: Some("a.example.com:4443".to_string()),
 			node: Some("b.example.com:4443".to_string()),
 			..Default::default()
@@ -2390,9 +2523,10 @@ mod tests {
 	fn cluster_lan_survives_toml_merge() {
 		// Usage reads the environment while parsing, so serialize with the tests
 		// that mutate it.
-		let _env = crate::test_env::EnvGuard::clear(&["MOQ_CLUSTER_LAN", "MOQ_CLUSTER_LAN_SECRET"]);
+		let _env =
+			crate::test_env::EnvGuard::clear(&["MOQ_CLUSTER_LAN", "MOQ_CLUSTER_LAN_SECRET", "MOQ_CLUSTER_LAN_APP"]);
 
-		let toml = "[cluster]\nnode = \"https://relay.example.com\"\n\n[cluster.lan]\nenabled = true\nsecret = \"cluster.key\"\n";
+		let toml = "[cluster]\nnode = \"https://relay.example.com\"\n\n[cluster.lan]\nenabled = true\nsecret = \"cluster.key\"\napp = \"custom\"\n";
 		let dir = std::env::temp_dir().join("moq-relay-cluster-test");
 		std::fs::create_dir_all(&dir).unwrap();
 		let path = dir.join("cluster-lan-toml.toml");
@@ -2400,8 +2534,12 @@ mod tests {
 
 		let args = vec![std::ffi::OsString::from("moq-relay"), std::ffi::OsString::from(&path)];
 		let config = Config::parse_and_merge(args).expect("config load");
-		assert_eq!(config.cluster.lan.enabled, Some(true));
+		assert!(config.cluster.lan.enabled);
 		assert_eq!(config.cluster.lan.secret.as_deref(), Some("cluster.key"));
+		assert_eq!(
+			config.cluster.lan.app.as_ref().map(ToString::to_string).as_deref(),
+			Some("custom")
+		);
 		assert_eq!(config.cluster.node.as_deref(), Some("https://relay.example.com"));
 	}
 
@@ -2410,9 +2548,10 @@ mod tests {
 	#[cfg(feature = "cluster-lan")]
 	#[test]
 	fn cli_overrides_toml_cluster_lan() {
-		let _env = crate::test_env::EnvGuard::clear(&["MOQ_CLUSTER_LAN", "MOQ_CLUSTER_LAN_SECRET"]);
+		let _env =
+			crate::test_env::EnvGuard::clear(&["MOQ_CLUSTER_LAN", "MOQ_CLUSTER_LAN_SECRET", "MOQ_CLUSTER_LAN_APP"]);
 
-		let toml = "[cluster.lan]\nenabled = true\nsecret = \"from-toml.key\"\n";
+		let toml = "[cluster.lan]\nenabled = true\nsecret = \"from-toml.key\"\napp = \"from-toml\"\n";
 		let dir = std::env::temp_dir().join("moq-relay-cluster-test");
 		std::fs::create_dir_all(&dir).unwrap();
 		let path = dir.join("cluster-lan-override.toml");
@@ -2423,10 +2562,16 @@ mod tests {
 			std::ffi::OsString::from(&path),
 			std::ffi::OsString::from("--cluster-lan-secret"),
 			std::ffi::OsString::from("from-cli.key"),
+			std::ffi::OsString::from("--cluster-lan-app"),
+			std::ffi::OsString::from("from-cli"),
 		];
 		let config = Config::parse_and_merge(args).expect("config load");
 		assert_eq!(config.cluster.lan.secret.as_deref(), Some("from-cli.key"));
-		assert_eq!(config.cluster.lan.enabled, Some(true), "the untouched key survives");
+		assert_eq!(
+			config.cluster.lan.app.as_ref().map(ToString::to_string).as_deref(),
+			Some("from-cli")
+		);
+		assert!(config.cluster.lan.enabled, "the untouched key survives");
 	}
 
 	/// The LAN needs an address to advertise, like gossip does.
@@ -2435,12 +2580,12 @@ mod tests {
 	async fn lan_without_node_errors() {
 		let config = ClusterConfig {
 			lan: LanConfig {
-				enabled: Some(true),
+				enabled: true,
 				..Default::default()
 			},
 			..Default::default()
 		};
-		let err = Cluster::new(config)
+		let err = new_cluster(config)
 			.unwrap()
 			.start()
 			.await
@@ -2460,12 +2605,12 @@ mod tests {
 		let config = ClusterConfig {
 			node: Some("https://us-west.example.com".to_string()),
 			lan: LanConfig {
-				enabled: Some(true),
+				enabled: true,
 				..Default::default()
 			},
 			..Default::default()
 		};
-		let err = Cluster::new(config)
+		let err = new_cluster(config)
 			.unwrap()
 			.start()
 			.await

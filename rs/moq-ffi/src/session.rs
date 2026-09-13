@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use url::Url;
 
+use crate::bandwidth::MoqBandwidth;
 use crate::error::MoqError;
 use crate::ffi::Task;
 use crate::origin::{MoqOriginConsumer, MoqOriginProducer};
@@ -10,6 +11,8 @@ use crate::origin::{MoqOriginConsumer, MoqOriginProducer};
 #[cfg(not(target_arch = "wasm32"))]
 struct Client {
 	config: moq_tokio::connect::Config,
+	/// QUIC transport tuning the dial applies, e.g. `quic_max_streams`.
+	quic: moq_tokio::quic::Config,
 	publish: Option<Arc<MoqOriginProducer>>,
 	consume: Option<Arc<MoqOriginProducer>>,
 }
@@ -17,11 +20,7 @@ struct Client {
 #[cfg(not(target_arch = "wasm32"))]
 impl Client {
 	async fn connect(&self, url: Url) -> Result<Arc<MoqSession>, MoqError> {
-		let client = self
-			.config
-			.clone()
-			.init(Default::default())
-			.map_err(map_connect_error)?;
+		let client = self.config.clone().init(self.quic.clone()).map_err(map_connect_error)?;
 
 		// Materialize both origin sides so the session can publish/subscribe and the FFI can
 		// always hand back a publisher/consumer.
@@ -43,10 +42,13 @@ impl Client {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn map_connect_error(err: moq_tokio::Error) -> MoqError {
-	match err.connect_error() {
-		Some(moq_tokio::ConnectError::Unauthorized) => MoqError::Unauthorized,
-		Some(moq_tokio::ConnectError::Forbidden) => MoqError::Forbidden,
-		_ => MoqError::Connect(format!("{err}")),
+	match err {
+		moq_tokio::Error::MoqNet(err) => err.into(),
+		err => match err.connect_error() {
+			Some(moq_tokio::ConnectError::Unauthorized) => MoqError::Unauthorized,
+			Some(moq_tokio::ConnectError::Forbidden) => MoqError::Forbidden,
+			_ => MoqError::Connect(format!("{err}")),
+		},
 	}
 }
 
@@ -64,13 +66,15 @@ fn map_connect_error(err: moq_tokio::Error) -> MoqError {
 /// broken connection.
 #[cfg(not(target_arch = "wasm32"))]
 fn map_closed_error(err: moq_tokio::Error) -> MoqError {
-	match err.connect_error() {
-		Some(moq_tokio::ConnectError::Unauthorized) => MoqError::Unauthorized,
-		Some(moq_tokio::ConnectError::Forbidden) => MoqError::Forbidden,
-		_ => match err {
-			moq_tokio::Error::Stopped => MoqError::Closed,
-			moq_tokio::Error::MoqNet(err) => err.into(),
-			err => MoqError::Connect(format!("{err}")),
+	match err {
+		moq_tokio::Error::Stopped => MoqError::Closed,
+		// A peer's session/stream code stays structured. HTTP 401/403 are a
+		// connect-time rejection, not a protocol code, and land below.
+		moq_tokio::Error::MoqNet(err) => err.into(),
+		err => match err.connect_error() {
+			Some(moq_tokio::ConnectError::Unauthorized) => MoqError::Unauthorized,
+			Some(moq_tokio::ConnectError::Forbidden) => MoqError::Forbidden,
+			_ => MoqError::Connect(format!("{err}")),
 		},
 	}
 }
@@ -146,24 +150,36 @@ mod tests {
 	/// match on instead of being flattened into a `Connect` string.
 	#[test]
 	fn maps_closed_errors_without_flattening_the_reason() {
-		assert!(matches!(
-			map_closed_error(moq_net::Error::Remote(7).into()),
-			MoqError::Protocol(moq_net::Error::Remote(7))
-		));
+		match map_closed_error(moq_net::Error::from(moq_net::SessionError::Unknown(7)).into()) {
+			MoqError::Protocol { details: protocol } => {
+				assert_eq!(protocol.scope, crate::error::MoqErrorScope::Session);
+				assert_eq!(protocol.code, 7);
+				assert_eq!(protocol.kind, crate::error::MoqProtocolKind::Unknown);
+			}
+			other => panic!("expected Protocol Unknown(7), got {other:?}"),
+		}
 		assert!(matches!(
 			map_closed_error(moq_net::Error::Cancel.into()),
-			MoqError::Protocol(moq_net::Error::Cancel)
+			MoqError::Cancelled
 		));
 
 		// A local stop is an expected teardown, not a failed connection: the bindings'
 		// `is_shutdown` reads `Closed`, and `Connect` would read as a broken dial.
 		assert!(matches!(map_closed_error(moq_tokio::Error::Stopped), MoqError::Closed));
 
-		// Auth still wins, so `is_auth` keeps working on a rejection delivered as a close.
+		// HTTP auth still wins. A protocol Unauthorized is a structured Protocol error
+		// (kind Unauthorized), not this HTTP 401 variant.
 		assert!(matches!(
-			map_closed_error(moq_net::Error::Unauthorized.into()),
+			map_closed_error(moq_tokio::ConnectError::Unauthorized.into()),
 			MoqError::Unauthorized
 		));
+		match map_closed_error(moq_net::Error::from(moq_net::SessionError::Unauthorized).into()) {
+			MoqError::Protocol { details: protocol } => {
+				assert_eq!(protocol.kind, crate::error::MoqProtocolKind::Unauthorized);
+				assert_eq!(protocol.code, 0x2);
+			}
+			other => panic!("expected Protocol Unauthorized, got {other:?}"),
+		}
 		assert!(matches!(
 			map_closed_error(moq_tokio::ConnectError::Forbidden.into()),
 			MoqError::Forbidden
@@ -203,6 +219,15 @@ mod tests {
 		assert_eq!(state.config.tls.cert, None);
 		assert_eq!(state.config.tls.key, None);
 	}
+
+	#[test]
+	fn sets_the_quic_stream_cap() {
+		let client = MoqClient::new();
+		assert_eq!(client.task.lock().unwrap().quic.max_streams, None);
+
+		client.set_quic_max_streams(4096);
+		assert_eq!(client.task.lock().unwrap().quic.max_streams, Some(4096));
+	}
 }
 
 /// Retry pacing for the automatic reconnect (see [`MoqClient::set_backoff`]).
@@ -210,7 +235,8 @@ mod tests {
 /// The delay starts at `initial_ms`, multiplies by `multiplier` after each failed
 /// attempt, and caps at `max_ms`. After `timeout_ms` of consecutive failures the
 /// connection gives up for good (0 retries forever); the window resets whenever a
-/// session stays up past `initial_ms`.
+/// session stays up past `initial_ms`. The defaults mirror the native
+/// [`moq_tokio::Backoff`]: 1s, x2, 5s, and a 10s window.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct MoqBackoff {
@@ -221,10 +247,10 @@ pub struct MoqBackoff {
 	#[uniffi(default = 2)]
 	pub multiplier: u32,
 	/// Maximum delay between reconnect attempts, in milliseconds.
-	#[uniffi(default = 30000)]
+	#[uniffi(default = 5000)]
 	pub max_ms: u64,
 	/// Time spent retrying before giving up, in milliseconds. 0 retries forever.
-	#[uniffi(default = 300000)]
+	#[uniffi(default = 10000)]
 	pub timeout_ms: u64,
 }
 
@@ -379,6 +405,7 @@ impl MoqClient {
 		Arc::new(Self {
 			task: Task::new(Client {
 				config: moq_tokio::connect::Config::default(),
+				quic: moq_tokio::quic::Config::default(),
 				publish: None,
 				consume: None,
 			}),
@@ -460,6 +487,19 @@ impl MoqClient {
 		Ok(())
 	}
 
+	/// Cap the concurrent QUIC streams the peer may open toward this connection.
+	/// Defaults to 1024.
+	///
+	/// MoQ opens a stream per group, and for a subscriber those arrive from the relay,
+	/// so a client subscribing to many tracks wants this raised. A publisher's own
+	/// streams are bounded by the peer's advertised limit, not this one. Ignored by
+	/// the WebSocket fallback.
+	pub fn set_quic_max_streams(&self, max_streams: u64) {
+		if let Some(mut state) = self.task.lock() {
+			state.quic.max_streams = Some(max_streams);
+		}
+	}
+
 	/// Enable or disable automatic reconnecting. Enabled by default.
 	///
 	/// When enabled, the session returned by [`connect`](Self::connect) redials with
@@ -503,8 +543,8 @@ impl MoqClient {
 	/// The returned session automatically reconnects with backoff when the transport
 	/// drops (unless disabled via [`set_reconnect`](Self::set_reconnect)), and broadcasts
 	/// consumed through it ride out the gap. Watch [`MoqSession::status`] for the
-	/// connect/disconnect transitions and [`MoqSession::closed`] for the connection
-	/// giving up for good.
+	/// connect/disconnect transitions, [`MoqSession::epoch`] for the reconnect count,
+	/// and [`MoqSession::closed`] for the connection giving up for good.
 	///
 	/// Both origin sides are always accessible via [`MoqSession::publisher`] and
 	/// [`MoqSession::consumer`], without the caller constructing a [`MoqOriginProducer`]
@@ -618,6 +658,9 @@ pub struct MoqSession {
 	status: Task<Inner>,
 	publisher: Arc<MoqOriginProducer>,
 	consumer: Arc<MoqOriginConsumer>,
+	/// One allocator for the session. Every [`bandwidth`](Self::bandwidth) handle
+	/// clones it, so they share one reservation registry.
+	bandwidth: Arc<MoqBandwidth>,
 }
 
 impl MoqSession {
@@ -640,18 +683,33 @@ impl MoqSession {
 		Self::build(Inner::Session(session), publish, subscribe)
 	}
 
+	fn mint_allocator(inner: &Inner) -> moq_net::bandwidth::Allocator {
+		match inner {
+			// Persistent across reconnects: `None` while disconnected, then a grant
+			// again on the next connection. Reservations survive the gap.
+			#[cfg(not(target_arch = "wasm32"))]
+			Inner::Connection(connection) => moq_net::bandwidth::Allocator::new(connection.send_bandwidth()),
+			Inner::Session(session) => session
+				.send_bandwidth()
+				.map(moq_net::bandwidth::Allocator::new)
+				.unwrap_or_else(moq_net::bandwidth::Allocator::unlimited),
+		}
+	}
+
 	fn build(inner: Inner, publish: moq_net::origin::Producer, subscribe: moq_net::origin::Producer) -> Self {
 		// Eagerly wrap the wired origin sides so each publisher()/consumer()
 		// call hands back the same Arc. `publish` is published into; `subscribe`
 		// is where the remote's broadcasts land (read via its consumer view).
 		let publisher = Arc::new(MoqOriginProducer::from_inner(publish));
 		let consumer = Arc::new(MoqOriginConsumer::from_inner(subscribe.consume()));
+		let bandwidth = Arc::new(MoqBandwidth::new(Self::mint_allocator(&inner)));
 		Self {
 			inner: inner.clone(),
 			closed: Task::new(inner.clone()),
 			status: Task::new(inner),
 			publisher,
 			consumer,
+			bandwidth,
 		}
 	}
 
@@ -724,10 +782,24 @@ impl MoqSession {
 			.await
 	}
 
+	/// The connection epoch: 1 for the connect this session was built from, one more
+	/// on each reconnect. A server-accepted session is a single transport, so it stays 1.
+	///
+	/// The count pairs with [`status`](Self::status): a `Connected` transition whose
+	/// epoch grew is a reconnect, so a worker can log each one by number. Migrations
+	/// count too, since the replacement is a new session.
+	pub fn epoch(&self) -> u64 {
+		match &self.inner {
+			#[cfg(not(target_arch = "wasm32"))]
+			Inner::Connection(connection) => connection.epoch(),
+			Inner::Session(_) => 1,
+		}
+	}
+
 	/// Close the session with the given error code, stopping any reconnect loop.
 	pub fn cancel(&self, code: u32) {
 		let _guard = crate::ffi::enter();
-		self.teardown(moq_net::Error::Remote(code));
+		self.teardown(moq_net::SessionError::from_code(code).into());
 		// NOTE: we don't abort the closed Task; the teardown above resolves it
 		// (with the close reason, or Ok once the connection loop stops).
 	}
@@ -756,6 +828,18 @@ impl MoqSession {
 	/// neither was set.
 	pub fn consumer(&self) -> Arc<MoqOriginConsumer> {
 		self.consumer.clone()
+	}
+
+	/// The session's bandwidth allocator, used to divide the connection's send
+	/// estimate among tracks sharing it.
+	///
+	/// Every call returns a handle to the same registry, so reservations made
+	/// through one are visible to the others. A client handle survives
+	/// reconnects: the grant is `None` while disconnected and resumes on the
+	/// next connection. An accepted session with no congestion estimate mints
+	/// an unlimited allocator, which reports `None` for every reservation.
+	pub fn bandwidth(&self) -> Arc<MoqBandwidth> {
+		self.bandwidth.clone()
 	}
 
 	/// Snapshot the current connection statistics (RTT, bandwidth estimates,

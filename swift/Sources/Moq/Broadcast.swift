@@ -148,13 +148,17 @@ public final class BroadcastProducer: Sendable {
         BroadcastDynamic(try ffi.dynamic())
     }
 
-    /// Set whether the broadcast's exact path is announced as a route.
+    /// Advertise this broadcast's exact path as a route.
     ///
-    /// The origin advertises the path only while announced; an unannounced
-    /// broadcast stays reachable by exact path for subscribes and fetches. This is
-    /// how a publisher goes on and off the air without tearing down the broadcast.
-    public func setAnnounce(_ announce: Bool) throws {
-        try ffi.setAnnounce(announce: announce)
+    /// Announcing again re-prices the route in place. An unannounced broadcast
+    /// stays reachable by exact path; announcing only makes the path discoverable.
+    public func announce(route: Route = Route()) throws {
+        try ffi.announce(route: route)
+    }
+
+    /// Retract this broadcast's exact-path advertisement, if any.
+    public func unannounce() throws {
+        try ffi.unannounce()
     }
 
     /// Replace the catalog properties shared by every video rendition.
@@ -256,8 +260,16 @@ public final class BroadcastProducer: Sendable {
 
     /// Open a raw-audio track. PCM written via `AudioProducer.write` is encoded
     /// (e.g. to Opus) inside the FFI boundary per `input`/`output`.
-    public func encodeAudio(name: String, input: AudioEncoderInput, output: AudioEncoderOutput) throws -> AudioProducer {
-        AudioProducer(try ffi.encodeAudio(name: name, input: input, output: output))
+    ///
+    /// Pass `bandwidth` to reserve this track's bitrate against the session's
+    /// allocator so a co-resident video encoder sizes itself against what is left.
+    public func encodeAudio(
+        name: String,
+        input: AudioEncoderInput,
+        output: AudioEncoderOutput,
+        bandwidth: Bandwidth? = nil
+    ) throws -> AudioProducer {
+        AudioProducer(try ffi.encodeAudio(name: name, input: input, output: output, bandwidth: bandwidth?.ffi))
     }
 
     /// Open a raw-video track. Pixels written via `VideoProducer.write` are
@@ -266,8 +278,15 @@ public final class BroadcastProducer: Sendable {
     /// Set `output.track` to choose the track name; otherwise one is derived from
     /// the codec (`.avc3` / `.hev1`). The catalog rendition is published
     /// immediately so subscribers can discover it before the first frame exists.
-    public func encodeVideo(input: VideoEncoderInput, output: VideoEncoderOutput) throws -> VideoProducer {
-        VideoProducer(try ffi.encodeVideo(input: input, output: output))
+    ///
+    /// Pass `bandwidth` to reserve this track's configured bitrate and follow
+    /// the grant.
+    public func encodeVideo(
+        input: VideoEncoderInput,
+        output: VideoEncoderOutput,
+        bandwidth: Bandwidth? = nil
+    ) throws -> VideoProducer {
+        VideoProducer(try ffi.encodeVideo(input: input, output: output, bandwidth: bandwidth?.ffi))
     }
 
     /// Open a JSON snapshot track (lossy latest-value), encoding each value from `Value`.

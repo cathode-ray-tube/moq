@@ -25,8 +25,12 @@ var (
 // (Protocol, Media, ...) wrap a lower-level error whose detail survives in the
 // message.
 var (
-	// ErrProtocol matches a lower-level moq-net transport or protocol error; the underlying detail survives in the message.
+	// ErrProtocol matches a session or stream protocol error; inspect ProtocolError for the code.
 	ErrProtocol = ffi.ErrMoqErrorProtocol
+	// ErrTransport matches a QUIC/WebTransport connection failure, not a protocol code.
+	ErrTransport = ffi.ErrMoqErrorTransport
+	// ErrInternal matches a local failure without a protocol code.
+	ErrInternal = ffi.ErrMoqErrorInternal
 	// ErrMedia matches a media error from the hang layer, such as a malformed catalog or container.
 	ErrMedia = ffi.ErrMoqErrorMedia
 	// ErrMux matches a muxing or demuxing failure from moq-mux.
@@ -73,6 +77,8 @@ var (
 	ErrAlreadyCommitted = ffi.ErrMoqErrorAlreadyCommitted
 	// ErrInvalidRoute is returned when a route has an invalid hop ID or too many hops.
 	ErrInvalidRoute = ffi.ErrMoqErrorInvalidRoute
+	// ErrInvalidPattern is returned when a path pattern is empty, has a doubled slash, or uses a reserved segment form.
+	ErrInvalidPattern = ffi.ErrMoqErrorInvalidPattern
 	// ErrUnresolvableBroadcast is returned when a referenced sibling broadcast cannot be resolved without an origin.
 	ErrUnresolvableBroadcast = ffi.ErrMoqErrorUnresolvableBroadcast
 	// ErrLog is returned when installing or configuring the native log subscriber fails.
@@ -87,9 +93,25 @@ func IsShutdown(err error) bool {
 }
 
 // IsAuthError reports whether err is an authentication/authorization failure
-// (the FFI Unauthorized or Forbidden variants, i.e. HTTP 401/403).
+// (HTTP 401/403, or a protocol Unauthorized session close).
 func IsAuthError(err error) bool {
-	return errors.Is(err, ErrUnauthorized) || errors.Is(err, ErrForbidden)
+	if errors.Is(err, ErrUnauthorized) || errors.Is(err, ErrForbidden) {
+		return true
+	}
+	protocol, ok := ProtocolError(err)
+	return ok && protocol.Kind == ffi.MoqProtocolKindUnauthorized
+}
+
+// ProtocolError reports the structured protocol failure, if err is one.
+//
+// The record carries the peer's session or stream scope, the verbatim wire code,
+// a known kind when recognized, and a diagnostic message.
+func ProtocolError(err error) (ffi.MoqProtocolError, bool) {
+	var proto *ffi.MoqErrorProtocol
+	if !errors.As(err, &proto) || proto == nil {
+		return ffi.MoqProtocolError{}, false
+	}
+	return proto.Details, true
 }
 
 // handle is a native object the wrapper owns. Every uniffi-generated object has

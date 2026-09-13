@@ -49,6 +49,14 @@ public final class Client: Sendable {
         try ffi.setBind(addr: addr)
     }
 
+    /// Cap the concurrent QUIC streams the peer may open toward this connection
+    /// (defaults to 1024). MoQ opens a stream per group, and for a subscriber
+    /// those arrive from the relay, so subscribing to many tracks may want this
+    /// raised. Ignored by the WebSocket fallback.
+    public func setQuicMaxStreams(_ maxStreams: UInt64) {
+        ffi.setQuicMaxStreams(maxStreams: maxStreams)
+    }
+
     /// Wire the origin whose local broadcasts get advertised to the remote. If
     /// left unset, `connect` auto-creates one, reachable via `Session.publisher`.
     public func setPublish(_ origin: OriginProducer?) {
@@ -129,6 +137,15 @@ public final class Session: Sendable {
         try await ffi.status()
     }
 
+    /// The connection epoch: 1 for the connect that built this session, one more
+    /// on each reconnect. A server-accepted session stays at 1.
+    ///
+    /// Pair it with `status()` to log each reconnect by number: a `.connected`
+    /// status whose epoch grew is a reconnect.
+    public func epoch() -> UInt64 {
+        ffi.epoch()
+    }
+
     /// Close the session with the given error code. Code 0 means "no error";
     /// prefer `shutdown()` for that case.
     public func cancel(code: UInt32) {
@@ -145,5 +162,15 @@ public final class Session: Sendable {
     /// Individual fields are `nil` when the transport backend doesn't report them.
     public func stats() -> ConnectionStats {
         ffi.stats()
+    }
+
+    /// The session's bandwidth allocator.
+    ///
+    /// Every call returns a handle to the same registry, so reservations made
+    /// through one are visible to the others. A client handle survives
+    /// reconnects: the grant is `nil` while disconnected and resumes on the
+    /// next connection.
+    public func bandwidth() -> Bandwidth {
+        Bandwidth(ffi.bandwidth())
     }
 }

@@ -59,15 +59,25 @@ async def main():
         status = broadcast.publish_json_snapshot("status", compression=True)
         status.update({"state": "live", "viewers": 42})
 
+        broadcast.announce()
+
 asyncio.run(main())
 ```
+
+Sessions reconnect with backoff when the transport drops and re-announce local
+broadcasts. `session.epoch()` counts the connections, 1 on the first, pairing
+with `session.status()` to log each reconnect; `moq.Backoff` tunes the pacing
+(`timeout_ms=0` retries forever); and `moq.connect(..., max_streams=...)`
+raises the peer's inbound stream cap.
 
 Everything in the [shared feature list](/lib/#what-every-binding-can-do) is
 here: `moq.Server` with per-request accept/reject, `fetch_group` and
 `fetch_media_group`, `dynamic()` handlers for on-demand tracks and
-broadcasts, `append_datagram`/`recv_datagram`, `set_catalog_section`,
+`dynamic(pattern)` for broadcasts, `append_datagram`/`recv_datagram`, `set_catalog_section`,
 `route_updates()`, and `used()`/`unused()` so capture can idle when nobody is
-subscribed. `moq.is_auth(err)` and `moq.is_shutdown(err)` classify errors.
+subscribed. `session.bandwidth()` divides the connection's send estimate;
+pass it to `encode_video` / `encode_audio` or `reserve` a share for an
+app-owned track. `moq.is_auth(err)` and `moq.is_shutdown(err)` classify errors. `moq.protocol_error(err)` is the structured protocol failure (scope, verbatim code, kind) when the peer sent one.
 
 - API reference: [moq-rs.readthedocs.io](https://moq-rs.readthedocs.io)
 - Source and examples: [`py/moq-rs`](https://github.com/moq-dev/moq/tree/main/py/moq-rs)

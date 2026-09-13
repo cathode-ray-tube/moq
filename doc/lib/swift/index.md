@@ -49,6 +49,7 @@ let video = try broadcast.publishVideo(
     output: VideoEncoderOutput(codec: .h264, track: "camera", bitrate: nil, gop: nil, kind: .auto)
 )
 try video.write(VideoFrame(timestampUs: pts, data: rgba))
+try broadcast.announce()
 
 session.shutdown()
 ```
@@ -56,13 +57,21 @@ session.shutdown()
 For a self-signed relay on your own test network, `client.setTlsVerify(false)`
 accepts any certificate; prefer `setTlsRoots` or a fingerprint anywhere else.
 
+Sessions reconnect with backoff when the transport drops and re-announce local
+broadcasts. `session.epoch()` counts the connections, 1 on the first, pairing
+with `session.status()` to log each reconnect; `client.setBackoff` tunes the
+pacing; and `client.setQuicMaxStreams` raises the peer's inbound stream cap.
+
 `Server` binds, generates or loads TLS, and hands you each request to
 `accept()` or `reject(code:)`. JSON tracks take `Codable` types
 (`publishJsonSnapshot(name:of:)`, `subscribeJsonStream(name:as:)`), and the
 rest of the [shared feature list](/lib/#what-every-binding-can-do) maps one
-to one: `fetchGroup`/`fetchMediaGroup`, `dynamic()`, `appendDatagram`/
-`datagrams`, `setCatalogSection`, `used()`/`unused()`. `MoqError.isAuth` and
-`isShutdown` classify errors.
+to one: `fetchGroup`/`fetchMediaGroup`, `dynamic()` for tracks and `dynamic(pattern:)` for broadcasts, `appendDatagram`/
+`datagrams`, `setCatalogSection`, `used()`/`unused()`. `session.bandwidth()`
+divides the connection's send estimate; pass it to `encodeVideo` /
+`encodeAudio` or `reserve` a share for an app-owned track. `MoqError.isAuth` and
+`isShutdown` classify errors. `protocolError` is the structured protocol failure
+(scope, verbatim code, kind) when the peer sent one.
 
 - API reference: [Swift Package Index (DocC)](https://swiftpackageindex.com/moq-dev/moq-swift/documentation/moq)
 - Source: [`swift/`](https://github.com/moq-dev/moq/tree/main/swift); `just swift check` builds and tests on a Mac

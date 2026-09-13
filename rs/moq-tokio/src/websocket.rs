@@ -114,15 +114,12 @@ static WEBSOCKET_WON: LazyLock<Mutex<HashSet<(String, u16)>>> = LazyLock::new(||
 pub struct Config {
 	/// Whether to enable the WebSocket fallback. Defaults to true.
 	///
-	/// `Option` with the default resolved by [`Self::resolved_enabled`] rather than
-	/// a Usage `default`, which a config file could not override: Usage reads a
-	/// standing `false` as an empty boolean, so the re-parse over the CLI args
-	/// would refill it with the declared `true`. An `Option` is empty only when
-	/// nothing set it.
+	/// `None` means the default (on). Distinct from `Some(false)`, which turns it off.
 	#[usage(
 		name = "connect-websocket-enabled",
 		long = "connect-websocket-enabled",
 		env = "MOQ_CONNECT_WEBSOCKET_ENABLED",
+		setting = "connect.websocket.enabled",
 		default_missing = "true",
 		num_args = 0..=1,
 		require_equals = true,
@@ -136,7 +133,8 @@ pub struct Config {
 		name = "connect-websocket-delay",
 		long = "connect-websocket-delay",
 		env = "MOQ_CONNECT_WEBSOCKET_DELAY",
-		default = "200ms"
+		default = "200ms",
+		setting = "connect.websocket.delay"
 	)]
 	pub delay: CliDuration,
 
@@ -190,6 +188,11 @@ pub(crate) struct Legacy {
 const DEFAULT_DELAY: time::Duration = time::Duration::from_millis(200);
 
 impl Config {
+	/// Hidden CLI-only fields a TOML round-trip would drop.
+	pub fn keep_parse_only(&mut self, from: &Self) {
+		self.legacy = from.legacy.clone();
+	}
+
 	/// The released spellings in use, each paired with what replaced it. Reached
 	/// through [`crate::connect::Config::deprecated`].
 	pub(crate) fn deprecated(&self) -> crate::Deprecated {
@@ -400,10 +403,10 @@ async fn connect_tls_override(
 
 /// The QMux drafts a moq ALPN is allowed to ride on, for `qmux::ws::Client::with_protocols`.
 ///
-/// moq-transport-18 and -19 require qmux-01, so we never pair them with qmux-00.
+/// moq-transport-18 and newer require qmux-01, so we never pair them with qmux-00.
 /// This mirrors the policy in `js/net`'s `connect.ts`. Every other ALPN returns
 /// `&[]`, which qmux expands to every draft it knows about.
-const QMUX01_ONLY_ALPNS: &[&str] = &["moqt-18", "moqt-19", "moqt-20"];
+const QMUX01_ONLY_ALPNS: &[&str] = &["moqt-18", "moqt-19", "moqt-20", "moqt-21"];
 
 fn qmux_versions_for(alpn: &str) -> &'static [qmux::Version] {
 	if QMUX01_ONLY_ALPNS.contains(&alpn) {
@@ -757,7 +760,7 @@ mod tests {
 	}
 
 	#[test]
-	fn moqt_18_and_19_pin_to_qmux01() {
+	fn moqt_18_and_newer_pin_to_qmux01() {
 		// The literals in `qmux_versions_for` must stay the IETF draft ALPNs;
 		// otherwise the pin silently stops matching.
 		assert_eq!(
@@ -765,7 +768,7 @@ mod tests {
 				.iter()
 				.map(|&a| moq_net::Version::from_alpn(a).map(|v| v.code()))
 				.collect::<Vec<_>>(),
-			vec![Some(0xff000012), Some(0xff000013), Some(0xff000014)]
+			vec![Some(0xff000012), Some(0xff000013), Some(0xff000014), Some(0xff000015)]
 		);
 		for &alpn in QMUX01_ONLY_ALPNS {
 			assert_eq!(qmux_versions_for(alpn), &[qmux::Version::QMux01]);
@@ -785,6 +788,7 @@ mod legacy_tests {
 	use super::*;
 	#[derive(usage::Cli)]
 	#[usage(unknown_flags = "error", args_override_self = false)]
+	#[usage(settings)]
 	struct Cli {
 		#[usage(flatten)]
 		websocket: Config,

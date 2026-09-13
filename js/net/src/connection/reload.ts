@@ -1,5 +1,6 @@
 import { Effect, type Getter, Signal } from "@moq/signals";
 import * as Announce from "../announced.ts";
+import { Allocator } from "../bandwidth.ts";
 import { error, SessionCode, SessionError } from "../error.ts";
 import type { Consumer as OriginConsumer, Producer as OriginProducer } from "../origin.ts";
 import type * as Path from "../path.ts";
@@ -9,10 +10,12 @@ import type { Established } from "./established.ts";
 import type { Probe, Stats } from "./stats.ts";
 
 /**
- * Exponential backoff settings for {@link Reload}'s reconnect loop.
+ * Exponential backoff settings for the reconnect loop.
  *
  * The delays carry jitter, so a fleet of tabs knocked offline together doesn't reconnect in
  * lockstep. Every failure is retried; {@link ReloadDelay.timeout} is what stops the loop.
+ *
+ * @internal
  */
 export type ReloadDelay = {
 	/** The delay in milliseconds before reconnecting (default: 1000). */
@@ -37,6 +40,8 @@ export type ReloadDelay = {
  * {@link ConnectProps.transport} is excluded: a supplied session is good for exactly one
  * connection, so the reconnect loop has nothing to reuse once that session drops. Call
  * {@link connect} directly when you have a session to hand over.
+ *
+ * @internal
  */
 export type ReloadProps = Omit<ConnectProps, "signal" | "transport"> & {
 	/** A reload owns the abort signal for each connection attempt. */
@@ -69,10 +74,21 @@ const DEFAULT_DELAY: Required<ReloadDelay> = {
 	timeout: 10000,
 };
 
-/** Current state of a {@link Reload} connection. */
+/** How often the send-rate estimate is sampled from the live transport. */
+const BANDWIDTH_POLL = 100;
+
+/** Current state of a reconnecting connection.
+ *
+ * @internal
+ */
 export type ReloadStatus = "connecting" | "connected" | "disconnected";
 
-/** Maintains a MoQ connection, reconnecting with exponential backoff when it drops. */
+/**
+ * The reconnect loop behind a Connection handle: connects, waits for the session to end, then
+ * redials with exponential backoff.
+ *
+ * @internal
+ */
 export class Reload {
 	/** Relay URL to connect to; updating it triggers a reconnect. */
 	url: Signal<URL | undefined>;
@@ -93,6 +109,15 @@ export class Reload {
 	 * See {@link Established.probe}.
 	 */
 	readonly probe: Getter<Probe | undefined>;
+
+	/**
+	 * Divides this connection's send-rate estimate among the tracks sharing it.
+	 *
+	 * The same instance across reconnects, so reservations survive a drop. The
+	 * estimate is `undefined` while disconnected, which tells a sender to hold
+	 * its rate rather than encode at zero.
+	 */
+	readonly bandwidth: Allocator;
 
 	/** WebTransport options applied to each connection attempt (not reactive). */
 	webtransport?: WebTransportProps;
@@ -130,6 +155,9 @@ export class Reload {
 
 	/** The reactive effect scope driving the connect loop; closed by {@link Reload.close}. */
 	#signals = new Effect();
+
+	// Sampled from the live session; undefined while disconnected or the transport has none.
+	#estimate = new Signal<number | undefined>(undefined);
 
 	/**
 	 * Resolves when the reconnect loop stops via {@link Reload.close}.
@@ -196,6 +224,32 @@ export class Reload {
 		this.probe = this.#signals.computed((effect) => {
 			const connection = effect.get(this.established);
 			return connection && effect.get(connection.probe);
+		});
+
+		this.bandwidth = new Allocator(this.#estimate);
+		this.#signals.cleanup(() => this.bandwidth.close());
+
+		// The transport has no event for the send-rate estimate, so sample on our
+		// own schedule and skip a tick while the previous snapshot is outstanding.
+		this.#signals.run((effect) => {
+			effect.set(this.#estimate, undefined);
+			const connection = effect.get(this.established);
+			if (!connection) return;
+
+			let pending = false;
+			const sample = async () => {
+				if (pending) return;
+				pending = true;
+				try {
+					const stats = await Promise.race([effect.cancel, connection.stats()]);
+					if (stats) this.#estimate.set(stats.estimatedSendRate);
+				} finally {
+					pending = false;
+				}
+			};
+
+			void sample();
+			effect.interval(sample, BANDWIDTH_POLL);
 		});
 
 		this.#url = this.#signals.computed((effect) => effect.get(this.url)?.href);

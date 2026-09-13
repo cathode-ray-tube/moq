@@ -29,7 +29,7 @@ implement in an afternoon. The wire spec is
 The ALPN picks the protocol family, and a single `SETUP` message from each side
 negotiates the version and capabilities. Neither side waits for the other. The
 Rust and TypeScript stacks currently speak moq-lite 01 through 05 (06 is in
-progress) and moq-transport drafts 14 through 20, and a client offers all of
+progress) and moq-transport drafts 14 through 21, and a client offers all of
 them by default.
 
 ## Discovery
@@ -155,3 +155,13 @@ still enforces this simpler model, faking or refusing the rest.
 | moq-lite | moq-transport | yes |
 | moq-transport | moq-lite | without moq-transport-only features |
 | moq-transport | moq-transport | depends on the implementations |
+
+## Protocol errors
+
+Session close codes and stream reset codes use separate registries: session code 0
+is a clean close, while stream code 0 is an internal error. Rust preserves received
+codes as `moq_net::Error::Session(SessionError)` or `Error::Stream(StreamError)`;
+JavaScript exposes `SessionError` and `StreamError`. Match the registry before
+interpreting the number. Native bindings expose scope, code, kind, and a diagnostic
+message; unknown and application codes retain their numeric value. Transport
+failures without a protocol code remain separate.

@@ -60,8 +60,10 @@ track := "camera"
 video, _ := broadcast.EncodeVideo(
     moq.VideoEncoderInput{Format: moq.VideoPixelFormatRgba, Width: 1280, Height: 720, Framerate: 30},
     moq.VideoEncoderOutput{Codec: moq.VideoCodecH264, Track: &track, Kind: moq.AutoEncoder()},
+    nil,
 )
 _ = video.Write(moq.VideoFrame{TimestampUs: pts, Data: rgba})
+_ = broadcast.Announce(moq.Route{})
 broadcast.Finish()   // keep the producer reachable while publishing, then finish explicitly
 ```
 
@@ -74,12 +76,20 @@ usable, while a stream read (`Next`, `RecvGroup`, `ReadFrame`, and the
 `iter.Seq2` iterators over them) cancels the stream it reads, which is what a
 range loop over a cancelled context wants.
 
+Sessions reconnect with backoff when the transport drops and re-announce local
+broadcasts, so a worker rides out a relay restart. `Session().Epoch()` counts
+the connections, 1 on the first, pairing with `Session().Status(ctx)` to log
+each reconnect by number; `moq.WithBackoff` tunes the pacing, with
+`moq.RetryForever` as the timeout; and `moq.WithQUICMaxStreams` raises the
+peer's inbound stream cap for a subscriber to many tracks.
+
 `moq.Listen` accepts sessions with per-request `Accept`/`Reject`. JSON tracks
 take anything `encoding/json` handles and return `json.RawMessage`. The rest
 of the [shared feature list](/lib/#what-every-binding-can-do) maps one to
 one: `FetchGroup`/`FetchMediaGroup`, `Dynamic()` with `Requests(ctx)`,
+`Session.Bandwidth()` to divide the send estimate,
 `AppendDatagram`/`Datagrams(ctx)`, `SetCatalogSection`, `Used`/`Unused`,
-`Session().Stats()`. `moq.IsAuthError` and `moq.IsShutdown` classify errors.
+`Session().Stats()`. `moq.IsAuthError` and `moq.IsShutdown` classify errors. `moq.ProtocolError(err)` is the structured protocol failure (scope, verbatim code, kind) when the peer sent one.
 
 - API reference: [pkg.go.dev/moq.dev/moq](https://pkg.go.dev/moq.dev/moq)
 - Source: [`go/`](https://github.com/moq-dev/moq/tree/main/go); `just go check` builds and tests locally

@@ -760,17 +760,14 @@ fn load_certified(cert_path: &Path, key_path: &Path) -> crate::tls::Result<Certi
 
 /// A raw QUIC connection request via the quiche backend (not using HTTP/3).
 /// Accept a quiche QUIC connection, negotiate WebTransport or raw moq, and complete the
-/// handshake (a `200 OK` for WebTransport). Returns the established connection plus the
-/// request URL and any validated client identity. Raw QUIC carries no request URL
-/// because the path rides the SETUP instead.
+/// handshake (a `200 OK` for WebTransport). Returns the established connection, the request
+/// URL and any validated client identity, and the dialed authority (the CONNECT authority
+/// on WebTransport, the TLS SNI on raw QUIC). Raw QUIC carries no request URL because the
+/// path rides the SETUP instead.
 pub(crate) async fn accept(
 	incoming: web_transport_quiche::ez::Incoming,
 	alpns: Vec<&'static str>,
-) -> Result<(
-	web_transport_quiche::Connection,
-	Option<Url>,
-	Option<crate::tls::PeerIdentity>,
-)> {
+) -> Result<crate::server::Accepted<web_transport_quiche::Connection>> {
 	tracing::debug!(ip = %incoming.peer_addr(), "accepting via quiche");
 
 	// Accept the connection and wait for it to be established
@@ -789,6 +786,8 @@ pub(crate) async fn accept(
 				.await
 				.map_err(|err| Error::AcceptRequest(crate::error::message(err)))?;
 			let url = Some(request.url.clone());
+			// The authority the client put in its CONNECT URL.
+			let authority = request.url.host_str().filter(|h| !h.is_empty()).map(str::to_owned);
 
 			let mut response = web_transport_quiche::proto::ConnectResponse::OK;
 			// Pick the first sub-protocol that we actually support.
@@ -800,15 +799,27 @@ pub(crate) async fn accept(
 				.respond(response)
 				.await
 				.map_err(|err| Error::Accept(crate::error::message(err)))?;
-			Ok((session, url, identity))
+			Ok(crate::server::Accepted {
+				session,
+				url,
+				identity,
+				authority,
+			})
 		}
 		// Recognize any moq ALPN this server actually offered (its configured versions),
 		// not the global default set, so opt-in / work-in-progress versions (e.g.
 		// moq-lite-06-wip) that are deliberately absent from `moq_net::ALPNS` still work.
 		alpn if alpns.contains(&alpn) => {
-			// Raw QUIC carries no request URL; the path rides the SETUP.
+			// Raw QUIC carries no request URL; the path rides the SETUP. The TLS SNI is the
+			// only authority the client can offer here, and it is optional.
+			let authority = conn.server_name().filter(|h| !h.is_empty());
 			let session = web_transport_quiche::Connection::raw(conn);
-			Ok((session, None, identity))
+			Ok(crate::server::Accepted {
+				session,
+				url: None,
+				identity,
+				authority,
+			})
 		}
 		_ => Err(Error::UnsupportedAlpn(alpn.to_string())),
 	}

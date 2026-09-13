@@ -15,14 +15,14 @@ For each quest, interactively prompt the user if:
 
 1. /start-quest
 2. /plan-quests
-3. deprioritize it
+3. skip it
 4. delete it
 
 Include a recommended option.
 
 For each quest to work on, spawn a background sub-agent to /start-quest.
 Determine the base branch for the quest and create a fresh worktree.
-Limit the concurrency to at most N agents in parallel, where N is half the number of CPU cores.
+Limit the concurrency to at most N agents in parallel, where N is half the number of physical CPU cores.
 
 Monitor the sub-agents and report their final status, but do not monitor their PRs.
 Prompt the user if they want to /plan-quests for any suggested follow-ups.

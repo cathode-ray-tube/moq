@@ -85,20 +85,23 @@ impl Publish {
 		Ok(id)
 	}
 
-	/// Set whether the broadcast's exact path is announced as a route. The
-	/// broadcast itself stays reachable by exact path either way.
-	pub fn set_announce(&mut self, broadcast: Id, announce: bool) -> Result<(), Error> {
+	/// Advertise the broadcast's exact path as a route. Announcing again re-prices
+	/// in place. The broadcast itself stays reachable by exact path either way.
+	pub fn announce(&mut self, broadcast: Id, route: moq_net::origin::Route) -> Result<(), Error> {
 		let broadcast = self.broadcasts.get_mut(broadcast).ok_or(Error::BroadcastNotFound)?;
-		if announce {
-			broadcast.producer.announce(moq_net::origin::Route::default())?;
-		} else {
-			broadcast.producer.unannounce();
-		}
+		broadcast.producer.announce(route)?;
+		Ok(())
+	}
+
+	/// Retract the broadcast's exact-path advertisement, if any.
+	pub fn unannounce(&mut self, broadcast: Id) -> Result<(), Error> {
+		let broadcast = self.broadcasts.get_mut(broadcast).ok_or(Error::BroadcastNotFound)?;
+		broadcast.producer.unannounce();
 		Ok(())
 	}
 
 	/// The broadcast's track producer.
-	fn producer(&mut self, id: Id) -> Result<&mut moq_net::broadcast::Producer, Error> {
+	pub(crate) fn producer(&mut self, id: Id) -> Result<&mut moq_net::broadcast::Producer, Error> {
 		Ok(&mut self.broadcasts.get_mut(id).ok_or(Error::BroadcastNotFound)?.producer)
 	}
 
@@ -315,6 +318,11 @@ impl Publish {
 		let catalog = self.catalog(broadcast)?;
 		catalog.lock().remove_section(name);
 		Ok(())
+	}
+
+	/// A watch-only handle to a raw track's subscriber demand.
+	pub fn track_demand(&self, track: Id) -> Result<moq_net::track::Demand, Error> {
+		Ok(self.tracks.get(track).ok_or(Error::TrackNotFound)?.demand())
 	}
 
 	/// Create a raw track on a broadcast for arbitrary byte payloads.

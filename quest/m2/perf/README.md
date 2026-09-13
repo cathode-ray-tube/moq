@@ -50,6 +50,8 @@ default backend.
 ## Quests
 
 - [Ingest batch](/quest/m2/perf/ingest-batch.md) - relay ingest pays one lock, wake, and clock read per chunk burst instead of per chunk
+- [Egress cache refresh](/quest/m2/perf/egress-keepalive.md) - measure refresh costs while preserving slow-reader retention
+- [Owned decoding copies](/quest/m2/perf/coding-decode.md) - measure and reduce owned decode allocations and copies
 - [#3122](/quest/m2/perf/3122-moq-uring-2-5-of-relay-cpu-is-vdso-clock-reads-the-drive.md) - moq-uring: ~2.5% of relay CPU is vdso clock reads; the drive loop and its callers each re-read Instant::now()
 - [Cache shard](/quest/m2/perf/cache-shard.md) - stop hammering one process-global cache line from every worker
 - [#3199](/quest/m2/perf/3199-moq-uring-remove-sq-indirection-and-per-enter-ring-fd.md) - moq-uring: remove SQ indirection and per-enter ring fd lookup
@@ -68,3 +70,4 @@ default backend.
 
 - [noq parity gate](/quest/m2/quic/noq-parity.md) - the benchmark that
   decides whether quiche can go, run on these worker primitives
+- [Origin lookup CPU](/quest/m2/origin-cpu/README.md) - announce/subscribe table, not uring

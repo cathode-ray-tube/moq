@@ -9,6 +9,8 @@
 //! [`request_broadcast`](moq_net::origin::Consumer::request_broadcast) deduplicates
 //! shared subscriptions.
 
+use std::task::{Poll, ready};
+
 use moq_net::AsPath;
 
 /// The subscription side of an export: an origin and the path of the broadcast
@@ -229,14 +231,21 @@ impl Binding {
 		Self(Bound::Ready(broadcast))
 	}
 
+	/// Poll for the bound broadcast without blocking.
+	///
+	/// Concurrent polls and cancelled waits retain the same request and result.
+	pub fn poll_broadcast(&self, waiter: &kio::Waiter) -> Poll<crate::Result<moq_net::broadcast::Consumer>> {
+		match &self.0 {
+			Bound::Ready(broadcast) => Poll::Ready(Ok(broadcast.clone())),
+			Bound::Requested(request) => Poll::Ready(Ok(ready!(request.poll_ok(waiter))?)),
+		}
+	}
+
 	/// The bound broadcast, awaiting the origin's answer when it hasn't arrived yet.
 	///
 	/// Concurrent reads and cancelled waits retain the same request and result.
 	pub async fn broadcast(&self) -> crate::Result<moq_net::broadcast::Consumer> {
-		match &self.0 {
-			Bound::Ready(broadcast) => Ok(broadcast.clone()),
-			Bound::Requested(request) => Ok(kio::wait(|waiter| request.poll_ok(waiter)).await?),
-		}
+		kio::wait(|waiter| self.poll_broadcast(waiter)).await
 	}
 }
 
@@ -295,7 +304,7 @@ pub(crate) fn produce_origin() -> moq_net::origin::Producer {
 #[cfg(test)]
 pub(crate) fn announced(broadcast: &moq_net::broadcast::Consumer) -> Source {
 	let origin = produce_origin();
-	let dynamic = origin.dynamic("", Default::default()).unwrap();
+	let dynamic = origin.dynamic(moq_net::Pattern::all(), Default::default()).unwrap();
 	let served = broadcast.clone();
 	tokio::spawn(async move {
 		while let Ok(request) = dynamic.requested_broadcast().await {
@@ -324,10 +333,15 @@ mod tests {
 	#[tokio::test]
 	async fn binding_retains_a_pending_request_across_cancelled_and_repeated_reads() {
 		let origin = produce_origin();
-		let dynamic = origin.dynamic("", Default::default()).unwrap();
+		let dynamic = origin.dynamic(moq_net::Pattern::all(), Default::default()).unwrap();
 		let source = Source::new(origin.consume(), "live");
 		let binding = source.bind(None).unwrap();
 		let request = dynamic.requested_broadcast().await.unwrap();
+
+		assert!(
+			binding.poll_broadcast(&kio::Waiter::noop()).is_pending(),
+			"the handler has not answered"
+		);
 
 		tokio::select! {
 			biased;

@@ -6,10 +6,9 @@ Real-time pub/sub with built-in caching, fan-out, and prioritization.
 from moq_ffi import MoqError as Error
 
 from .client import Client, connect
-from .errors import is_auth, is_shutdown
+from .errors import is_auth, is_shutdown, protocol_error
 from .log import log_level
 from .origin import (
-    Announce,
     Announced,
     AnnouncedBroadcast,
     Announcement,
@@ -36,7 +35,7 @@ from .publish import (
     VideoProducer,
 )
 from .server import Request, Server, Transport
-from .session import Session
+from .session import Bandwidth, Reservation, Session
 from .subscribe import (
     AudioConsumer,
     BroadcastConsumer,
@@ -66,9 +65,12 @@ from .types import (
     ContainerFormat,
     Datagram,
     Dimensions,
+    ErrorScope,
     FetchGroupOptions,
     Frame,
     MediaFrame,
+    ProtocolError,
+    ProtocolKind,
     Route,
     Subscription,
     TrackInfo,
@@ -87,7 +89,6 @@ from .types import (
 )
 
 __all__ = [
-    "Announce",
     "Announced",
     "AnnouncedBroadcast",
     "Announcement",
@@ -106,6 +107,7 @@ __all__ = [
     "AudioFrame",
     "AudioProducer",
     "Backoff",
+    "Bandwidth",
     "BroadcastConsumer",
     "BroadcastDynamic",
     "BroadcastProducer",
@@ -119,7 +121,10 @@ __all__ = [
     "Datagram",
     "Dimensions",
     "Error",
+    "ErrorScope",
     "Frame",
+    "ProtocolError",
+    "ProtocolKind",
     "MediaFrame",
     "FetchGroupOptions",
     "GroupConsumer",
@@ -137,6 +142,7 @@ __all__ = [
     "OriginDynamic",
     "OriginProducer",
     "Request",
+    "Reservation",
     "Route",
     "Server",
     "Session",
@@ -164,4 +170,5 @@ __all__ = [
     "is_auth",
     "is_shutdown",
     "log_level",
+    "protocol_error",
 ]

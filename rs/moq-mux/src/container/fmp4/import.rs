@@ -143,6 +143,19 @@ struct Fmp4Track<E: crate::catalog::hang::CatalogExt> {
 	// Measures the track's catalog jitter and bitrate from the fragments; the descriptor's own
 	// bitrate, when it declares one, still wins over what this measures.
 	estimator: Estimator,
+
+	/// Peak-hold claim on the connection allocator. Passthrough writes groups by
+	/// hand, so this sits beside the estimator the same way it does on a
+	/// [`container::Producer`](crate::container::Producer).
+	claim: crate::catalog::Claim,
+}
+
+impl<E: crate::catalog::hang::CatalogExt> Fmp4Track<E> {
+	fn publish_estimate(&mut self) -> crate::Result<()> {
+		let estimate = self.estimator.estimate();
+		self.claim.update(&self.track.demand(), estimate.bitrate);
+		self.rendition.estimate(estimate)
+	}
 }
 
 impl<E: crate::catalog::hang::CatalogExt> Import<E> {
@@ -285,8 +298,8 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 		// rather than publishing a second snapshot for it.
 		{
 			let mut catalog = self.catalog.lock();
-			if catalog.timeline.is_none() && !moov.trak.is_empty() {
-				catalog.timeline = Some(timeline.section());
+			if catalog.archive.is_none() && !moov.trak.is_empty() {
+				catalog.archive = Some(timeline.section());
 			}
 		}
 
@@ -326,7 +339,7 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 
 			// Enroll every track in the broadcast's timeline: passthrough writes groups by hand
 			// (no `container::Producer`), so the recorder is fed directly at each group open.
-			// The root timeline section is advertised before any rendition releases its reservation.
+			// The root archive entry is advertised before any rendition releases its reservation.
 			let recorder = timeline.pacing_track(track.name())?;
 
 			// Whatever the descriptor declared (a bitrate) is authoritative; the rest is filled by
@@ -359,6 +372,7 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 					sample_duration: None,
 					pending_sequence: None,
 					estimator: Estimator::new(),
+					claim: crate::catalog::Claim::new(self.catalog.bandwidth()),
 				},
 			);
 		}
@@ -994,7 +1008,7 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			}
 			let span = end.checked_sub(timestamp)?;
 			track.estimator.burst(span.into());
-			track.rendition.estimate(track.estimator.estimate())?;
+			track.publish_estimate()?;
 		}
 
 		Ok(())
@@ -1006,7 +1020,7 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	pub fn finish(&mut self) -> Result<()> {
 		for track in self.tracks.values_mut() {
 			track.estimator.cut(None);
-			track.rendition.estimate(track.estimator.estimate())?;
+			track.publish_estimate()?;
 			if let Some(mut g) = track.group.take() {
 				g.finish()?;
 			}
@@ -1034,7 +1048,7 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	pub fn seek(&mut self, sequence: u64) -> Result<()> {
 		for track in self.tracks.values_mut() {
 			track.estimator.cut(None);
-			track.rendition.estimate(track.estimator.estimate())?;
+			track.publish_estimate()?;
 			if let Some(mut g) = track.group.take() {
 				g.finish()?;
 			}

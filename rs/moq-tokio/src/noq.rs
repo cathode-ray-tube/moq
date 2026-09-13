@@ -10,7 +10,6 @@ use crate::tls::{FingerprintVerifier, ServeCerts};
 use std::net;
 use std::sync::Arc;
 use std::time::Duration;
-use url::Url;
 use web_transport_noq::noq;
 
 pub use web_transport_noq;
@@ -645,17 +644,14 @@ impl NoqServer {
 
 /// A raw QUIC connection request without WebTransport framing (noq backend).
 /// Accept a QUIC connection, negotiate WebTransport or raw moq, and complete the
-/// handshake (a `200 OK` for WebTransport). Returns the established session plus the
-/// request URL and validated mTLS identity, both captured before the response consumes
-/// the request. Raw QUIC carries no request URL (the path rides the SETUP instead).
+/// handshake (a `200 OK` for WebTransport). Returns the established session, the request
+/// URL and validated mTLS identity (both captured before the response consumes the
+/// request), and the dialed authority (the CONNECT authority on WebTransport, the TLS
+/// SNI on raw QUIC). Raw QUIC carries no request URL (the path rides the SETUP instead).
 pub(crate) async fn accept(
 	conn: noq::Incoming,
 	alpns: Vec<&'static str>,
-) -> Result<(
-	web_transport_noq::Session,
-	Option<Url>,
-	Option<crate::tls::PeerIdentity>,
-)> {
+) -> Result<crate::server::Accepted<web_transport_noq::Session>> {
 	let mut conn = conn.accept()?;
 
 	let handshake = conn
@@ -689,6 +685,8 @@ pub(crate) async fn accept(
 				.map_err(|err| Error::RecvRequest(crate::error::message(err)))?;
 			let url = Some(request.url.clone());
 			let identity = crate::tls::PeerIdentity::from_any(request.conn().peer_identity());
+			// The authority the client put in its CONNECT URL.
+			let authority = request.url.host_str().filter(|h| !h.is_empty()).map(str::to_owned);
 
 			let mut response = web_transport_noq::proto::ConnectResponse::OK;
 			if let Some(protocol) = request.protocols.iter().find(|p| alpns.contains(&p.as_str())) {
@@ -698,7 +696,12 @@ pub(crate) async fn accept(
 				.respond(response)
 				.await
 				.map_err(|err| Error::Server(crate::error::message(err)))?;
-			Ok((session, url, identity))
+			Ok(crate::server::Accepted {
+				session,
+				url,
+				identity,
+				authority,
+			})
 		}
 		// Recognize any moq ALPN this server actually offered (its configured versions),
 		// not the global default set. rustls only negotiates an ALPN the server offered, so
@@ -706,9 +709,16 @@ pub(crate) async fn accept(
 		// deliberately absent from `moq_net::ALPNS`.
 		alpn if alpns.contains(&alpn) => {
 			let identity = crate::tls::PeerIdentity::from_any(conn.peer_identity());
-			// Raw QUIC carries no request URL; the path rides the SETUP.
+			// Raw QUIC carries no request URL; the path rides the SETUP. The TLS SNI is the
+			// only authority the client can offer here, and it is optional.
+			let authority = (!host.is_empty()).then_some(host);
 			let session = web_transport_noq::Session::raw(conn);
-			Ok((session, None, identity))
+			Ok(crate::server::Accepted {
+				session,
+				url: None,
+				identity,
+				authority,
+			})
 		}
 		_ => Err(Error::UnsupportedAlpn(alpn)),
 	}
@@ -786,6 +796,7 @@ impl noq::ConnectionIdGenerator for ServerIdGenerator {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use url::Url;
 
 	/// noq exposes no getters for the flow-control windows, but its `Debug` prints
 	/// them, which is enough to prove each one reached the transport config and that

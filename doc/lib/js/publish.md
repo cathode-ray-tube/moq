@@ -31,15 +31,17 @@ WebCodecs, writes the catalog, and publishes a hang broadcast.
 | `source` | `camera`, `screen`, or `file`. |
 | `muted`, `invisible` | Disable audio or video capture. |
 | `preview` | What the nested element shows: the raw `source` (default), a decoded copy of the `encoded` stream to see what viewers get, or `none`. |
-| `announce` | When to announce: once a `source` is live (default), `always`, or `never`. |
+| `announce` | When to advertise: once a `source` is live (default), `always`, or `never`. The broadcast is created while connected either way; this only flips discoverability. |
 
 A nested `<video>` gets the raw capture stream; a `<canvas>` is drawn by the
 element. `<moq-publish-support>` shows what the browser can encode.
 
 ## Encoding
 
-The video encoder's bitrate cap follows the connection's bandwidth estimate,
-so a tightening uplink costs quality instead of stalling. Codec, resolution,
+The video encoder follows its share of the connection's send-rate estimate
+(via `Bandwidth.Allocator`), so several publishers on one connection do not
+each target the whole uplink. Audio reserves its configured bitrate so
+video's share is honest, and keeps encoding at that rate. Codec, resolution,
 framerate, and bitrate are tunable through `el.video.config`; the audio
 encoder exposes its codec and volume. For simulcast or several renditions,
 drop the element and register your own encoders on a `Publish.Broadcast`.
@@ -85,7 +87,7 @@ import * as Publish from "@moq/publish";
 
 // Shared with every other component pointed at the same relay; its origin holds
 // the broadcasts, so they survive a reconnect.
-const connection = new Moq.Connection.Shared({ url: new URL("https://relay.example.com/anon") });
+const connection = new Moq.Connection({ url: new URL("https://relay.example.com/anon") });
 
 const broadcast = new Publish.Broadcast({
     origin: connection.origin,

@@ -24,6 +24,7 @@ final class Moq {
     String? tlsCert,
     String? tlsKey,
     String? bind,
+    int? maxStreams,
     MoqOriginProducer? publish,
     MoqOriginProducer? subscribe,
   }) async {
@@ -40,6 +41,7 @@ final class Moq {
       if (tlsCert != null) client.setTlsCert(path: tlsCert);
       if (tlsKey != null) client.setTlsKey(path: tlsKey);
       if (bind != null) client.setBind(addr: bind);
+      if (maxStreams != null) client.setQuicMaxStreams(maxStreams: maxStreams);
       if (publish != null) client.setPublish(origin: publish);
       if (subscribe != null) client.setConsume(origin: subscribe);
 
@@ -51,7 +53,10 @@ final class Moq {
     }
   }
 
-  /// Create and announce a broadcast at [path].
+  /// Create an unadvertised broadcast at [path].
+  ///
+  /// Advertise it with `announce` after populating tracks. Create, `dynamic`
+  /// if tracks are served on demand, populate, then announce.
   MoqBroadcastProducer createBroadcast(String path) =>
       session.publisher().createBroadcast(path: path);
 
@@ -81,6 +86,17 @@ final class Moq {
   /// Resolve an existing broadcast at [path].
   Future<MoqBroadcastConsumer> requestBroadcast(String path) =>
       session.consumer().requestBroadcast(path: path);
+
+  /// The connection epoch: 1 for the connect that built this session, one more
+  /// on each reconnect. A server-accepted session stays at 1.
+  int get epoch => session.epoch();
+
+  /// The session's bandwidth allocator.
+  ///
+  /// Every call returns a handle to the same registry. [MoqBandwidth.reserve]
+  /// a share for an app-owned encoder; dropping the [MoqReservation] hands
+  /// the room back.
+  MoqBandwidth bandwidth() => session.bandwidth();
 
   /// Gracefully close the session and stop the client.
   void close() {

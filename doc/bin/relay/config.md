@@ -7,6 +7,9 @@ description: TOML reference for moq-relay
 
 `moq-relay relay.toml`. Every key is also a CLI flag and environment variable
 (`--listen-backend`, `MOQ_LISTEN_BACKEND`), named by joining the section and key.
+Precedence is CLI > env > file > defaults: a flag or environment variable that
+was actually supplied overrides the file, and a file key that was actually
+written (an empty list, a `false` boolean) overrides the built-in default.
 
 ## \[listen]
 
@@ -142,6 +145,7 @@ id = 12345                                            # Stable Hop ID across res
 [cluster.lan]                                         # Find peers on the LAN over mDNS.
 enabled = true
 secret = "/etc/moq/cluster.key"                       # Required: 64 hex chars, or a file holding them.
+# app = "default"                                     # DNS-SD subtype; moq-cli shares this name.
 ```
 
 See [Clustering](/bin/relay/cluster).
@@ -190,7 +194,7 @@ waiting forever).
 seconds and resizes the pool. Embedders calling `CacheConfig::init` directly
 should know that the task is owned by the `cache::Pool` it resizes, not by the
 `Cache` struct or the `Relay`: it stops on its next tick once the last `Pool`
-clone drops. Handing the `Cache` to `Cluster::with_cache` therefore moves the
+clone drops. Handing the `Cache` to `Cluster::new` therefore moves the
 task's lifetime onto the cluster, and keeping a `Pool` clone of your own keeps
 the task running for as long as you hold it.
 

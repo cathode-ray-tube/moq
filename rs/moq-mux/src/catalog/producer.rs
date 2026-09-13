@@ -153,6 +153,9 @@ pub struct Producer<E: CatalogExt = ()> {
 	/// [`Reserved`](super::Reserved) mints tracks under one policy. See
 	/// [`Config::with_max_age`].
 	max_age: Option<std::time::Duration>,
+	/// Connection allocator passthrough tracks claim their peak-hold bitrate on.
+	/// See [`Config::with_bandwidth`].
+	bandwidth: moq_net::bandwidth::Allocator,
 }
 
 // Manual Clone so a producer is cheaply clonable regardless of whether `E` is.
@@ -164,6 +167,7 @@ impl<E: CatalogExt> Clone for Producer<E> {
 			clock: self.clock,
 			timeline: self.timeline.clone(),
 			max_age: self.max_age,
+			bandwidth: self.bandwidth.clone(),
 		}
 	}
 }
@@ -179,6 +183,7 @@ impl<E: CatalogExt> Clone for Producer<E> {
 pub struct Config<E: CatalogExt = ()> {
 	catalog: Catalog<E>,
 	max_age: Option<std::time::Duration>,
+	bandwidth: moq_net::bandwidth::Allocator,
 }
 
 impl Default for Config<()> {
@@ -186,6 +191,7 @@ impl Default for Config<()> {
 		Self {
 			catalog: Catalog::default(),
 			max_age: None,
+			bandwidth: moq_net::bandwidth::Allocator::unlimited(),
 		}
 	}
 }
@@ -198,6 +204,7 @@ impl<E: CatalogExt> Config<E> {
 		Config {
 			catalog,
 			max_age: self.max_age,
+			bandwidth: self.bandwidth,
 		}
 	}
 
@@ -214,6 +221,18 @@ impl<E: CatalogExt> Config<E> {
 	/// moq-net's default: both are read at the live edge, which is retained unconditionally.
 	pub fn with_max_age(mut self, max_age: impl Into<Option<std::time::Duration>>) -> Self {
 		self.max_age = max_age.into();
+		self
+	}
+
+	/// Claim each media track's peak-hold catalog bitrate on `bandwidth`.
+	///
+	/// A passthrough import has no configured ceiling, so it reserves the
+	/// measured maximum instead: taken on the first 1 s window, raised when a
+	/// later window exceeds it, never walked back. A co-resident encoder then
+	/// targets what is left of the uplink. `unlimited` (the default) claims
+	/// nothing a sender can follow.
+	pub fn with_bandwidth(mut self, bandwidth: moq_net::bandwidth::Allocator) -> Self {
+		self.bandwidth = bandwidth;
 		self
 	}
 }
@@ -288,6 +307,7 @@ impl<E: CatalogExt> Producer<E> {
 			clock: crate::Clock::new(),
 			timeline,
 			max_age: config.max_age,
+			bandwidth: config.bandwidth,
 		})
 	}
 
@@ -430,21 +450,31 @@ impl<E: CatalogExt> Producer<E> {
 		}
 	}
 
-	/// Build the media [`container::Producer`](crate::container::Producer) for `track`,
-	/// enrolling it in the broadcast's timeline so its groups are indexed into the aligned
-	/// segments.
-	///
-	/// The broadcast's one timeline track is created (and advertised in the catalog's root
-	/// `timeline` section) on first use; see [`timeline`](crate::timeline) for the whole model.
-	pub fn media_producer<C: crate::container::Container<Error = crate::error::Error>>(
-		&mut self,
-		track: moq_net::track::Producer,
-		container: C,
-	) -> crate::Result<crate::container::Producer<C>> {
-		let recorder = self.enroll(track.name())?;
+			/// Build the media [`container::Producer`](crate::container::Producer) for `track`,
+		/// enrolling it in the broadcast's timeline so its groups are indexed into the aligned
+		/// segments.
+		///
+		/// The broadcast's one timeline track is created (and advertised in the catalog's root
+		/// `timeline` section) on first use; see [`timeline`](crate::timeline) for the whole model.
+		pub fn media_producer<C: crate::container::Container<Error = crate::error::Error>>(
+			&mut self,
+			track: moq_net::track::Producer,
+			container: C,
+		) -> crate::Result<crate::container::Producer<C>> {
+			let recorder = self.enroll(track.name())?;
 
-		Ok(crate::container::Producer::new(track, container).with_recorder(recorder))
-	}
+			Ok(crate::container::Producer::new(track, container)
+				.with_recorder(recorder)
+				.with_bandwidth(self.bandwidth.clone()))
+		}
+
+		/// The allocator passthrough tracks claim on.
+		/// fMP4 writes groups by hand (no [`media_producer`](Self::media_producer)),
+		/// so it reads this itself.
+		pub(crate) fn bandwidth(&self) -> moq_net::bandwidth::Allocator {
+			self.bandwidth.clone()
+		}
+
 
 	/// Enroll `track` in the broadcast's timeline, advertising the timeline in the catalog's
 	/// root section the first time.
@@ -457,8 +487,8 @@ impl<E: CatalogExt> Producer<E> {
 
 		let section = self.timeline.section();
 		let mut catalog = self.lock();
-		if catalog.timeline.is_none() {
-			catalog.timeline = Some(section);
+		if catalog.archive.is_none() {
+			catalog.archive = Some(section);
 		}
 
 		Ok(recorder)
@@ -466,8 +496,8 @@ impl<E: CatalogExt> Producer<E> {
 
 	/// The broadcast's [`timeline::Producer`](crate::timeline::Producer): its segment index.
 	///
-	/// The MoQ track behind it is created (and advertised in the catalog's root `timeline`
-	/// section) when the first media track enrolls, so reading this costs nothing on a
+	/// The MoQ track behind it is created (and advertised in the catalog's root `archive`
+	/// entry) when the first media track enrolls, so reading this costs nothing on a
 	/// broadcast that never segments. Use it to declare boundaries
 	/// ([`cut`](crate::timeline::Producer::cut)) or to hold publishing back while tracks
 	/// enroll ([`reserve`](crate::timeline::Producer::reserve), the timeline's counterpart to
@@ -932,14 +962,14 @@ mod test {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let mut catalog = Producer::new(&mut broadcast).unwrap();
 
-		// A broadcast that never segments never advertises a timeline.
-		assert_eq!(catalog.snapshot().timeline, None);
+		// A broadcast that never segments never advertises an archive.
+		assert_eq!(catalog.snapshot().archive, None);
 
 		let _recorder = catalog.enroll("video0").unwrap();
 		assert_eq!(
-			catalog.snapshot().timeline,
+			catalog.snapshot().archive,
 			Some(catalog.timeline().section()),
-			"the root section should advertise the timeline track"
+			"the root archive should advertise the timeline track"
 		);
 	}
 

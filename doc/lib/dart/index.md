@@ -38,12 +38,24 @@ final broadcast = await moq.requestBroadcast('live/camera');
 final mine = moq.createBroadcast('live/camera');
 final track = mine.publishTrack(name: 'video', info: null);
 track.appendGroup().writeFrame(frame: MoqFrame(payload: bytes));
+mine.announce(route: MoqRoute());
 
 moq.close();
 ```
 
+Sessions reconnect with backoff when the transport drops and re-announce local
+broadcasts. `moq.epoch` counts the connections, 1 on the first, pairing with
+`session.status()` to log each reconnect; `maxStreams` raises the peer's
+inbound stream cap for a subscriber to many tracks.
+
 Cancelling a stream releases the native cursor. The package re-exports
 `moq_ffi`, so the full generated API is available without a second import.
+`ProtocolMoqException` carries a `MoqProtocolException` as `details` (scope, verbatim
+code, kind) when the peer sent a session or stream code.
+
+`moq.bandwidth()` divides the connection's send estimate; `reserve` a share
+for an app-owned encoder so several publishers on one session split the
+uplink instead of each targeting the whole thing.
 
 Unlike the other bindings, the published Dart binaries carry **no codecs**:
 catalog and container types are there, so already-encoded frames flow through

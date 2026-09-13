@@ -1231,7 +1231,8 @@ where
 			}
 			Entry::Vacant(entry) => {
 				// Propagates Error::Unauthorized if the namespace is out of scope.
-				let dynamic = self.origin.dynamic(&path, route.clone())?;
+				let pattern = crate::Pattern::subtree(path.as_str()).map_err(|_| Error::Unsupported)?;
+				let dynamic = self.origin.dynamic(pattern, route.clone())?;
 
 				entry.insert(BroadcastState {
 					route,
@@ -1874,8 +1875,8 @@ where
 		};
 
 		match res {
-			Err(Error::Cancel) => {
-				let _ = producer.abort(Error::Cancel);
+			Err(err @ (Error::Cancel | Error::Stream(crate::StreamError::Cancel))) => {
+				let _ = producer.abort(err);
 			}
 			Err(err) => {
 				tracing::debug!(%err, group = %producer.sequence, "group error");
@@ -4339,14 +4340,15 @@ struct Join {
 /// Object subscription plus a `StartGroup=1` fill, which is the only form a publisher has
 /// to honor. It splits the group across two streams, the fill carrying the head and the
 /// subscription the tail, which `claim_fill` stitches back into one group producer.
-/// Earlier drafts cannot name a fill at all, so they keep asking for the next Object and
-/// joining mid-group, exactly as they always did.
+/// Earlier drafts have no fill parameter. Request unfiltered delivery so our publisher
+/// supplies the current group from its start without a separate joining FETCH.
+///
 /// A start group we already know is absolute and needs no fill: the subscription's own
 /// range covers it, which is what our publisher serves from its cache.
 fn subscribe_join(start: Option<track::Position>, end: Option<track::Position>, version: Version) -> Join {
 	if !Filter::is_draft20(version) {
 		return Join {
-			filter: Filter::NextObject,
+			filter: Filter::Unfiltered,
 			fill: None,
 		};
 	}
@@ -4523,10 +4525,9 @@ mod filter_tests {
 		);
 	}
 
-	/// Earlier drafts have no fill and no way to name a group relative to a live edge they
-	/// have not learned, so they keep asking for exactly what they always did.
+	/// Without joining FETCH support, older-draft clients must not exclude the cached prefix.
 	#[test]
-	fn older_drafts_ask_for_the_next_object() {
+	fn older_drafts_ask_for_unfiltered_delivery() {
 		for version in [Version::Draft14, Version::Draft16, Version::Draft19] {
 			assert_eq!(
 				subscribe_join(
@@ -4535,7 +4536,7 @@ mod filter_tests {
 					version
 				),
 				Join {
-					filter: Filter::NextObject,
+					filter: Filter::Unfiltered,
 					fill: None,
 				},
 				"{version}"

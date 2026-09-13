@@ -28,11 +28,17 @@ int32_t moq_log_level(const char *level, uintptr_t level_len);
 int32_t moq_session_connect(const char *url, uintptr_t url_len, const moq_client_config *config, uint32_t origin_publish, uint32_t origin_consume, void (*on_status)(void *user_data, int32_t code), void *user_data);
 moq_client_config moq_client_defaults(void);
 int32_t moq_session_close(uint32_t session);
+int32_t moq_session_bandwidth(uint32_t session);
+int32_t moq_bandwidth_reserve(uint32_t bandwidth, uint32_t track, uint64_t max_bps);
+int32_t moq_bandwidth_close(uint32_t bandwidth);
+int32_t moq_reservation_grant(uint32_t reservation, uint64_t *bps, bool *present);
+int32_t moq_reservation_update(uint32_t reservation, uint64_t max_bps);
+int32_t moq_reservation_close(uint32_t reservation);
 
 // Origin
 int32_t moq_origin_create(void);
 int32_t moq_origin_close(uint32_t origin);
-int32_t moq_origin_publish(uint32_t origin, const char *path, uintptr_t path_len);
+int32_t moq_origin_create_broadcast(uint32_t origin, const char *path, uintptr_t path_len);
 int32_t moq_origin_request(uint32_t origin, const char *path, uintptr_t path_len, void (*on_broadcast)(void *user_data, int32_t broadcast), void *user_data);
 int32_t moq_origin_request_close(uint32_t task);
 int32_t moq_origin_consume_announced(uint32_t origin, const char *path, uintptr_t path_len, void (*on_broadcast)(void *user_data, int32_t broadcast), void *user_data);
@@ -43,7 +49,8 @@ int32_t moq_origin_announced_free(uint32_t announced);
 int32_t moq_origin_announced_close(uint32_t announced);
 
 // Publishing
-int32_t moq_publish_set_announce(uint32_t broadcast, bool announce);
+int32_t moq_publish_announce(uint32_t broadcast, const moq_route *route);
+int32_t moq_publish_unannounce(uint32_t broadcast);
 int32_t moq_publish_finish(uint32_t broadcast);
 int32_t moq_publish_audio(uint32_t broadcast, const moq_audio_init *config);
 int32_t moq_publish_video(uint32_t broadcast, const moq_video_init *config);
