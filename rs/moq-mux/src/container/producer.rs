@@ -79,7 +79,7 @@ pub struct Producer<C: Container> {
 	/// two counters, and a caller who doesn't publish a rendition simply never reads it.
 	estimator: crate::catalog::Estimator,
 
-	/// Optional encrypter
+    	/// Optional encrypter.
 	/// Persistent across immediate writes and flushes.
 	encrypter: Option<Box<dyn FrameEncrypter>>,
 
@@ -109,8 +109,8 @@ impl<C: Container<Error = crate::error::Error>> Producer<C> {
 			cadence: None,
 			reordered: false,
 			estimator: crate::catalog::Estimator::new(),
-<<<<<<< HEAD
 			encrypter: None,
+			bandwidth: None,
 		}
 	}
 
@@ -122,9 +122,9 @@ impl<C: Container<Error = crate::error::Error>> Producer<C> {
 	///
 	/// Usage:
 	/// let encrypter = MoqSecureEncrypter::new(
-	/// &key_store,
-	/// &signing_key,
-	/// key_id...
+	///     &key_store,
+	///     &signing_key,
+	///     key_id...
 	///
 	/// TODO: tear-down behavior will zero-ize credentials.
 	/// Key management will generally be left to the application,
@@ -155,7 +155,8 @@ impl<C: Container<Error = crate::error::Error>> Producer<C> {
 
 		match encrypter.as_mut() {
 			Some(encrypter) => {
-				let mut protected = crate::container::ProtectedFrame::new(output, encrypter.as_mut());
+				let mut protected =
+					crate::container::ProtectedFrame::new(output, encrypter.as_mut());
 
 				container.write(&mut protected, frames)?;
 			}
@@ -168,16 +169,13 @@ impl<C: Container<Error = crate::error::Error>> Producer<C> {
 		}
 
 		Ok(())
-
-			bandwidth: None,
-		}
 	}
 
 	#[cfg(test)]
 	fn bandwidth_ceiling(&self) -> Option<moq_net::bandwidth::Rate> {
 		self.bandwidth.as_ref().and_then(|claim| claim.ceiling())
-
 	}
+
 
 	/// The jitter and bitrate measured from the frames written so far.
 	///
