@@ -3,7 +3,10 @@ import * as Path from "../path.ts";
 import { Reader, Writer } from "../stream.ts";
 import {
 	decodeSubscribeResponse,
+	emptyRange,
 	encodeSubscribeResponse,
+	exclusiveGroupEnd,
+	inclusiveGroupEnd,
 	Subscribe,
 	SubscribeDrop,
 	SubscribeEnd,
@@ -187,4 +190,23 @@ test("frame bounds without their group bounds are rejected before encoding", asy
 	await expect(encodeSubscribe(new Subscribe({ ...base, endFrame: 7 }))).rejects.toThrow(
 		"frame bound without a group bound",
 	);
+});
+
+test("model and wire group ends convert without an off-by-one", () => {
+	expect(exclusiveGroupEnd(undefined)).toBeUndefined();
+	expect(exclusiveGroupEnd(0)).toBe(1);
+	expect(exclusiveGroupEnd(9)).toBe(10);
+	expect(inclusiveGroupEnd(undefined)).toBeUndefined();
+	expect(inclusiveGroupEnd(1)).toBe(0);
+	expect(inclusiveGroupEnd(10)).toBe(9);
+	expect(() => inclusiveGroupEnd(0)).toThrow("empty subscription range cannot be encoded");
+});
+
+test("a requested range is empty when its bounds meet anywhere", () => {
+	expect(emptyRange({})).toBe(false);
+	expect(emptyRange({ endGroup: 0 })).toBe(true);
+	expect(emptyRange({ startGroup: 5, endGroup: 5 })).toBe(true);
+	expect(emptyRange({ startGroup: 6, endGroup: 5 })).toBe(true);
+	expect(emptyRange({ startGroup: 5, endGroup: 6 })).toBe(false);
+	expect(emptyRange({ startGroup: 5 })).toBe(false);
 });

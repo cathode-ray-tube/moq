@@ -1,6 +1,7 @@
 use crate::{frame, group, origin, track};
 use std::{
 	collections::HashMap,
+	ops::Bound,
 	task::{Poll, ready},
 	time::Duration,
 };
@@ -1310,6 +1311,7 @@ where
 								request_id: request.request_id,
 								track_namespace: request.path.as_path(),
 								cluster: advert.params(),
+								pattern: None,
 							})
 							.await?;
 					}
@@ -1398,6 +1400,7 @@ where
 				request_id,
 				track_namespace: path.as_path(),
 				cluster,
+				pattern: None,
 			})
 			.await?;
 
@@ -1757,7 +1760,12 @@ where
 					return stream.writer.closed().await;
 				}
 				NamespaceEvent::Update(Some(update)) => {
-					let path = update.prefix.as_path().to_owned();
+					let Some(path) = update.pattern.as_prefix() else {
+						// Decode-first: do not emit NAMESPACE_PATTERN until receivers
+						// that negotiated it also land it, and never as a literal prefix.
+						continue;
+					};
+					let path = crate::Path::new(path).to_owned();
 					let suffix = path
 						.strip_prefix(&prefix)
 						.expect("origin returned invalid prefix")
@@ -1823,7 +1831,7 @@ impl<S: crate::transport::poll::Session> TrackServe<S> {
 				}
 			}
 		}
-		track.end_at(range.end.map(|end| end.group));
+		track.end_at(range.end.map_or(Bound::Unbounded, |end| Bound::Included(end.group)));
 
 		Self {
 			session,
@@ -1961,7 +1969,7 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 		slice: GroupSlice,
 	) -> Self {
 		group.skip_to(slice.skip);
-		group.end_at(slice.until.and_then(|until| until.checked_sub(1)));
+		group.end_at(slice.until.map_or(Bound::Unbounded, Bound::Excluded));
 		let object_delta = group.index();
 		Self {
 			session,

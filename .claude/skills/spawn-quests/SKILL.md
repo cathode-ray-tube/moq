@@ -6,10 +6,11 @@ description: Spawn background agents work on quests in parallel.
 Before you begin, read `quest/CLAUDE.md` completely.
 
 Your goal is to execute and/or plan quests in parallel.
+If you or a sub-agent are unsure or unclear, ask the user for clarification before proceeding.
 
 The scope consists of all unblocked quests that are not claimed and have no blockers.
 Use the argument (if provided) to filter to specific quests/questlines.
-Report which quests are not ready to be worked on and why.
+Inspect any blocked quests, and determine if they can be unblocked.
 
 For each quest, interactively prompt the user if:
 

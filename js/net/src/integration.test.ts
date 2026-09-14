@@ -73,14 +73,14 @@ async function runPublishSubscribeFlow(protocol: string, version?: number) {
 	const announced = client.announced();
 	const entry = await announced.next();
 	if (!entry) throw new Error("expected entry");
-	expect(entry.prefix).toBe("test" as Path.Valid);
+	expect(entry.pattern.asPrefix()).toBe("test" as Path.Valid);
 	expect(entry.active).toBe(true);
 
 	// Prefix-scoped discovery returns paths relative to the requested prefix.
 	const prefixed = client.announced(Path.from("root"));
 	const prefixedEntry = await prefixed.next();
 	if (!prefixedEntry) throw new Error("expected prefixed entry");
-	expect(prefixedEntry.prefix).toBe("child" as Path.Valid);
+	expect(prefixedEntry.pattern.asPrefix()).toBe("child" as Path.Valid);
 	expect(prefixedEntry.active).toBe(true);
 
 	// Client consumes the broadcast and subscribes to a track
@@ -232,8 +232,9 @@ test("integration: lite carries a fractional maxAge as a whole millisecond", asy
 test("integration: lite applies initial and updated group bounds", async () => {
 	const GROUP_COUNT = 6;
 	const INITIAL_START_GROUP = 1;
-	const INITIAL_END_GROUP = 2;
+	const INITIAL_END_GROUP = 3; // exclusive: groups 1 and 2
 	const UPDATED_GROUP = 4;
+	const UPDATED_END_GROUP = 5; // exclusive: group 4
 	const REPLAY_LATENCY_MS = 5000;
 	const PENDING_ASSERT_MS = 20;
 	const UPDATE_TIMEOUT_MS = 1000;
@@ -260,7 +261,7 @@ test("integration: lite applies initial and updated group bounds", async () => {
 		.ordered();
 	try {
 		expect((await subscriber.nextGroup())?.sequence).toBe(INITIAL_START_GROUP);
-		expect((await subscriber.nextGroup())?.sequence).toBe(INITIAL_END_GROUP);
+		expect((await subscriber.nextGroup())?.sequence).toBe(INITIAL_END_GROUP - 1);
 
 		const pending = subscriber.nextGroup();
 		expect(await Promise.race([pending, sleep(PENDING_ASSERT_MS).then(() => "pending")])).toBe("pending");
@@ -268,7 +269,7 @@ test("integration: lite applies initial and updated group bounds", async () => {
 		subscriber.update({
 			maxAge: REPLAY_LATENCY_MS,
 			startGroup: UPDATED_GROUP,
-			endGroup: UPDATED_GROUP,
+			endGroup: UPDATED_END_GROUP,
 		});
 		expect((await withTimeout(pending, UPDATE_TIMEOUT_MS, "updated group bound timed out"))?.sequence).toBe(
 			UPDATED_GROUP,
@@ -278,6 +279,48 @@ test("integration: lite applies initial and updated group bounds", async () => {
 		expect(await Promise.race([capped, sleep(PENDING_ASSERT_MS).then(() => "pending")])).toBe("pending");
 	} finally {
 		subscriber.close();
+		remote.close();
+		broadcast.close();
+		client.close();
+		server.close();
+	}
+});
+
+test("integration: lite refuses an empty requested range on open and on update", async () => {
+	const GROUP_COUNT = 4;
+	const REPLAY_LATENCY_MS = 5000;
+	const TIMEOUT_MS = 1000;
+
+	const pair = createMockTransportPair(Lite.ALPN_05);
+	const origin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	const broadcast = publish(origin, Path.from("test"));
+	const producer = broadcast.createTrack("video");
+	for (let sequence = 0; sequence < GROUP_COUNT; sequence++) producer.appendGroup().close();
+
+	const remote = client.consume(Path.from("test"));
+	const video = remote.track("video");
+	try {
+		// Bounds that meet cannot go on the wire: the nearest encoding inverts the range.
+		const empty = video.subscribe({ maxAge: REPLAY_LATENCY_MS, startGroup: 2, endGroup: 2 });
+		await expect(withTimeout(empty.recvGroup(), TIMEOUT_MS, "empty open never settled")).rejects.toThrow(
+			"empty subscription range cannot be encoded",
+		);
+		empty.close();
+
+		// A live subscription whose demand later collapses to nothing fails the same way.
+		const live = video.subscribe({ maxAge: REPLAY_LATENCY_MS, startGroup: 1, endGroup: 2 }).ordered();
+		expect((await live.nextGroup())?.sequence).toBe(1);
+		live.update({ maxAge: REPLAY_LATENCY_MS, startGroup: 3, endGroup: 3 });
+		await expect(withTimeout(live.nextGroup(), TIMEOUT_MS, "empty update never settled")).rejects.toThrow(
+			"empty subscription range cannot be encoded",
+		);
+		live.close();
+	} finally {
 		remote.close();
 		broadcast.close();
 		client.close();
@@ -304,28 +347,28 @@ test("integration: lite draft-06 announce lifecycle", async () => {
 	const announced = client.announced();
 	let entry = await announced.next();
 	if (!entry) throw new Error("expected announce");
-	expect(entry.prefix).toBe("first" as Path.Valid);
+	expect(entry.pattern.asPrefix()).toBe("first" as Path.Valid);
 	expect(entry.active).toBe(true);
 
 	// A live announce.
 	const second = publish(origin, Path.from("second"));
 	entry = await announced.next();
 	if (!entry) throw new Error("expected announce");
-	expect(entry.prefix).toBe("second" as Path.Valid);
+	expect(entry.pattern.asPrefix()).toBe("second" as Path.Valid);
 	expect(entry.active).toBe(true);
 
 	// Unannounce: retracted by announce id on the wire.
 	second.close();
 	entry = await announced.next();
 	if (!entry) throw new Error("expected unannounce");
-	expect(entry.prefix).toBe("second" as Path.Valid);
+	expect(entry.pattern.asPrefix()).toBe("second" as Path.Valid);
 	expect(entry.active).toBe(false);
 
 	// Re-announce the same path: a fresh announce assigning a fresh id.
 	const secondAgain = publish(origin, Path.from("second"));
 	entry = await announced.next();
 	if (!entry) throw new Error("expected re-announce");
-	expect(entry.prefix).toBe("second" as Path.Valid);
+	expect(entry.pattern.asPrefix()).toBe("second" as Path.Valid);
 	expect(entry.active).toBe(true);
 
 	// Cleanup
@@ -486,6 +529,39 @@ test("integration: lite draft-05 missing datagram writer does not close streams"
 	producer.writeString("group");
 
 	expect(await track.readString()).toBe("group");
+
+	broadcast.close();
+	remote.close();
+	client.close();
+	server.close();
+});
+
+test("integration: ietf does not deliver datagrams", async () => {
+	const enc = new TextEncoder();
+	const pair = createMockTransportPair(Ietf.ALPN.DRAFT_19);
+	const origin = new OriginProducer();
+
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	const broadcast = publish(origin, Path.from("test"));
+	const producer = broadcast.createTrack("video", { timescale: Timescale.MILLI });
+
+	const remote = client.consume(Path.from("test"));
+	const track = remote.track("video").subscribe().ordered();
+	const datagrams = remote.track("video").subscribe();
+
+	producer.insertDatagram(7, Timestamp.fromMillis(0), enc.encode("dgram"));
+	producer.writeString("group");
+
+	expect(await track.readString()).toBe("group");
+
+	const datagram = datagrams.recvDatagram();
+	datagram.catch(() => {});
+	const outcome = await Promise.race([datagram, sleep(50).then(() => "timeout" as const)]);
+	expect(outcome).toBe("timeout");
 
 	broadcast.close();
 	remote.close();
@@ -1613,7 +1689,7 @@ async function runOriginFlow(protocol: string, version?: number) {
 	// The announcement lands in the client's origin.
 	const reader = clientOrigin.consume();
 	const announced = reader.announced();
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("test"), active: true });
+	expect(await announced.next()).toMatchObject({ pattern: Path.Pattern.subtree(Path.from("test")), active: true });
 
 	// Consuming through the origin reaches the wire.
 	const remote = await routed(reader, Path.from("test"));
@@ -1623,7 +1699,7 @@ async function runOriginFlow(protocol: string, version?: number) {
 
 	// Unpublishing retracts the entry over the wire and out of the origin.
 	broadcast.close();
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("test"), active: false });
+	expect(await announced.next()).toMatchObject({ pattern: Path.Pattern.subtree(Path.from("test")), active: false });
 	await until(() => !reader.routes(Path.from("test")));
 
 	await serving;
@@ -1973,7 +2049,7 @@ test("create then announce is discoverable on the wire", async () => {
 	const pending = announced.next();
 	broadcast.announce();
 	const entry = await pending;
-	expect(entry?.prefix).toBe("later" as Path.Valid);
+	expect(entry?.pattern.asPrefix()).toBe("later" as Path.Valid);
 	expect(entry?.active).toBe(true);
 
 	announced.close();
@@ -2003,7 +2079,7 @@ test("a handle serves a request under live/** over the wire", async () => {
 
 	const announced = client.announced();
 	const entry = await announced.next();
-	expect(entry?.prefix).toBe("live" as Path.Valid);
+	expect(entry?.pattern.asPrefix()).toBe("live" as Path.Valid);
 	expect(entry?.active).toBe(true);
 
 	const remote = client.consume(Path.from("live/cam"));

@@ -18,6 +18,7 @@ import { Priority, sendOrder } from "./priority.ts";
 import { Probe } from "./probe.ts";
 import {
 	encodeSubscribeResponse,
+	exclusiveGroupEnd,
 	type Subscribe,
 	SubscribeEnd,
 	SubscribeOk,
@@ -26,6 +27,22 @@ import {
 } from "./subscribe.ts";
 import { TrackInfo as TrackInfoMessage, type Track as TrackMessage } from "./track.ts";
 import { hasAnnounceId, hasAnnounceOk, hasDatagrams, hasProbeRtt, resolvesStart, Version } from "./version.ts";
+
+function presented(
+	prefix: Path.Valid,
+	table: ReadonlyMap<Path.Valid, Advertised>,
+	version: Version,
+): Map<Path.Valid, Advertised> {
+	const out = new Map<Path.Valid, Advertised>();
+	for (const [name, snap] of table) {
+		const advertised = Path.Pattern.parse(name);
+		for (const residual of advertised.rebase(prefix)) {
+			if (!hasAnnounceId(version) && residual.asPrefix() === undefined) continue;
+			out.set(Path.from(residual.text), snap);
+		}
+	}
+	return out;
+}
 
 const PROBE_INTERVAL = 100; // ms
 const PROBE_MAX_AGE = 10_000; // ms
@@ -97,7 +114,7 @@ type FrameBounds = {
  * The frames of `sequence` a subscription asked for, as a start index and an inclusive end.
  *
  * The frame bounds qualify the start and end group only; every other group is served whole.
- * Which groups are served at all is the subscriber's read cursor (`startAt` / `endAt`),
+ * Which groups are served at all is the subscriber's read cursor (`replaceGroups`),
  * applied when a group is popped rather than re-checked here.
  *
  * The serving loop calls this synchronously after the pop, before any SUBSCRIBE_UPDATE can
@@ -294,7 +311,7 @@ function positionCursor(track: track.Subscriber, version: Version, startGroup: n
 	if (resolvesStart(version) || startGroup !== undefined) return;
 
 	const latest = track.latest();
-	if (latest !== undefined) track.startAt(latest);
+	if (latest !== undefined) hooks.replaceGroups(track, { start: { included: latest } });
 }
 
 /**
@@ -388,13 +405,19 @@ export class Publisher {
 		};
 
 		const announce = async (suffix: Path.Valid, route: Route) => {
+			const pattern = Path.Pattern.parse(suffix);
+			const prefix = pattern.asPrefix();
+			const hops = wireHops(route);
+			let msg: Parameters<typeof encodeAnnounceBroadcast>[1];
+			if (prefix !== undefined) {
+				msg = { status: "active", suffix: Path.from(prefix), hops, cost: route.cost };
+			} else {
+				if (!hasAnnounceId(this.version)) return;
+				msg = { status: "pattern", pattern, hops, cost: route.cost.warm };
+			}
 			console.debug(`announce: broadcast=${suffix} active=true`);
 			if (hasAnnounceId(this.version)) announceIds.set(suffix, nextAnnounceId++);
-			await encodeAnnounceBroadcast(
-				stream.writer,
-				{ status: "active", suffix, hops: wireHops(route), cost: route.cost },
-				this.version,
-			);
+			await encodeAnnounceBroadcast(stream.writer, msg, this.version);
 		};
 
 		const restart = async (suffix: Path.Valid, route: Route) => {
@@ -421,7 +444,11 @@ export class Publisher {
 		const retract = async (suffix: Path.Valid) => {
 			console.debug(`announce: broadcast=${suffix} active=false`);
 			if (!hasAnnounceId(this.version)) {
-				await encodeAnnounceBroadcast(stream.writer, { status: "ended", suffix }, this.version);
+				await encodeAnnounceBroadcast(
+					stream.writer,
+					{ status: "ended", suffix: Path.from(Path.Pattern.parse(suffix).asPrefix()!) },
+					this.version,
+				);
 				return;
 			}
 
@@ -445,10 +472,8 @@ export class Publisher {
 			const initial = this.#advertised.peek();
 			if (!initial) return; // closed
 
-			for (const [name, snap] of initial) {
-				const suffix = Path.stripPrefix(msg.prefix, name);
-				if (suffix === null) continue;
-				active.set(suffix, snap);
+			for (const [name, snap] of presented(msg.prefix, initial, this.version)) {
+				active.set(name, snap);
 			}
 
 			switch (this.version) {
@@ -457,7 +482,9 @@ export class Publisher {
 					for (const suffix of active.keys()) {
 						console.debug(`announce: broadcast=${suffix} active=true`);
 					}
-					const init = new AnnounceInit([...active.keys()]);
+					const init = new AnnounceInit(
+						[...active.keys()].map((key) => Path.from(Path.Pattern.parse(key).asPrefix()!)),
+					);
 					await init.encode(stream.writer, this.version);
 					break;
 				}
@@ -492,10 +519,8 @@ export class Publisher {
 				if (!latest) break;
 
 				const updated = new Map<Path.Valid, Advertised>();
-				for (const [name, snap] of latest) {
-					const suffix = Path.stripPrefix(msg.prefix, name);
-					if (suffix === null) continue;
-					updated.set(suffix, snap);
+				for (const [name, snap] of presented(msg.prefix, latest, this.version)) {
+					updated.set(name, snap);
 				}
 
 				for (const [suffix, snap] of active) {
@@ -539,14 +564,15 @@ export class Publisher {
 			return;
 		}
 
+		const endGroup = exclusiveGroupEnd(msg.endGroup);
 		const track = front.subscribe(msg.track, {
 			priority: msg.priority,
 			maxAge: servingMaxAge(this.version, msg.maxAge),
 			startGroup: msg.startGroup,
-			endGroup: msg.endGroup,
+			endGroup,
 		});
 		positionCursor(track, this.version, msg.startGroup);
-		track.endAt(msg.endGroup);
+		hooks.replaceGroups(track, { end: endGroup === undefined ? undefined : { excluded: endGroup } });
 
 		// The best-effort datagram loop, started once serving begins. It parks when the
 		// track finishes (recvDatagram returns undefined), so #runTrack alone ends the
@@ -597,7 +623,7 @@ export class Publisher {
 						priority: update.priority,
 						maxAge: servingMaxAge(this.version, update.maxAge),
 						startGroup: update.startGroup,
-						endGroup: update.endGroup,
+						endGroup: exclusiveGroupEnd(update.endGroup),
 					});
 				},
 			});
@@ -750,8 +776,10 @@ export class Publisher {
 						case "update": {
 							const update = control.update;
 							console.debug(`subscribe update: broadcast=${broadcast} track=${track.name}`);
-							if (update.startGroup !== undefined) track.startAt(update.startGroup);
-							track.endAt(update.endGroup);
+							hooks.replaceGroups(track, {
+								start: update.startGroup === undefined ? undefined : { included: update.startGroup },
+								end: update.endGroup === undefined ? undefined : { included: update.endGroup },
+							});
 							bounds.startGroup = update.startGroup;
 							bounds.startFrame = update.startFrame;
 							bounds.endGroup = update.endGroup;
@@ -797,7 +825,10 @@ export class Publisher {
 					// SUBSCRIBE_START promises nothing below this sequence will be delivered.
 					// Arrival-order serving could later surface a straggler below the first
 					// group, so pin the floor to what was announced.
-					track.startAt(group.sequence);
+					hooks.replaceGroups(track, {
+						start: { included: group.sequence },
+						end: bounds.endGroup === undefined ? undefined : { included: bounds.endGroup },
+					});
 					if (
 						!(await controls.response(
 							encodeSubscribeResponse(

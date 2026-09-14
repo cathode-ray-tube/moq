@@ -11,11 +11,11 @@ burst sizes.
 Boundaries: no packet loss concealment; an underrun still renders a ramped
 gap. The target estimator and the ring's slack and re-stall are #3517 on
 dev; the clock the stretch converges toward is
-[Plan: A/V clock](/quest/m1/plan-av-clock.md).
+[Plan: A/V clock](/quest/m2/plan-av-clock.md).
 
 ## Plan
 
-Branch from dev.
+Branch from main after the dev merge.
 
 - Implement WSOLA-style stretch and compress in `render-worklet.ts` on the
   PCM the ring hands out, bounded to a few percent per quantum, driven by the
@@ -29,6 +29,6 @@ Branch from dev.
 
 ## Required
 
-- [Plan: A/V clock](/quest/m1/plan-av-clock.md) - stretching against a free-running ring only moves the drift
-
+- [Merge dev](/quest/m1/merge-dev.md) - the required M1 APIs must be available on main before this implementation starts
+- [Plan: A/V clock](/quest/m2/plan-av-clock.md) - stretching against a free-running ring only moves the drift
 - [Watch](/quest/m2/audio-jitter-target/watch.md) - the recorded traces this replays, and the JS target it converges toward

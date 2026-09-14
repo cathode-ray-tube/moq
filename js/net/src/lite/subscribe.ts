@@ -108,6 +108,43 @@ async function padGroupOrder(w: Writer, version: Version) {
 	if (hasGroupOrder(version)) await w.bool(false);
 }
 
+/**
+ * Exclusive model/local cap from a decoded inclusive last group.
+ *
+ * The wire's `Group End` is inclusive once decoded; the track model and `setGroups` are
+ * exclusive. `undefined` stays unbounded.
+ */
+export function exclusiveGroupEnd(inclusive?: number): number | undefined {
+	return inclusive === undefined ? undefined : inclusive + 1;
+}
+
+/** The error for a requested range the wire cannot carry; see {@link emptyRange}. */
+export const EMPTY_RANGE = "empty subscription range cannot be encoded";
+
+/**
+ * Inclusive last group a Subscribe message carries, from an exclusive model end.
+ *
+ * Empty (`0`) cannot be encoded: the wire's 0 means unbounded. Callers refuse an empty
+ * requested range with {@link emptyRange} before reaching here.
+ */
+export function inclusiveGroupEnd(exclusive?: number): number | undefined {
+	if (exclusive === undefined) return undefined;
+	if (exclusive === 0) throw new Error(EMPTY_RANGE);
+	return exclusive - 1;
+}
+
+/**
+ * Whether a requested range asks for nothing.
+ *
+ * The wire has no encoding for one: its bounds are inclusive, so flooring the end would
+ * either hand back the group the caller excluded (0 means unbounded) or invert the
+ * range once the two bounds meet. An absent start is the live edge, so it only empties
+ * the range when the end is 0.
+ */
+export function emptyRange({ startGroup, endGroup }: { startGroup?: number; endGroup?: number }): boolean {
+	return endGroup !== undefined && (startGroup ?? 0) >= endGroup;
+}
+
 export class SubscribeUpdate {
 	priority: number;
 	/** Subscriber max latency in milliseconds; zero skips once a newer group is available. */

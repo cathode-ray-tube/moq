@@ -79,18 +79,18 @@ CAT cannot represent `pid/*/chat`.
 
 - [Origin scopes](/quest/m2/path-patterns/origin.md) - literal origin roots
   carry arbitrary pattern unions without widening authorization
-- [Claims](/quest/m2/path-patterns/claims.md) - versioned token and JWK scopes
-  preserve v0 and enforce exact v1 grants
 - [Token SDKs](/quest/m2/path-patterns/token-sdk.md) - published libraries and
-  CLIs default new minting to v1
+  CLIs default new minting to v1 in a subsequent breaking dev cycle
 - [Relay auth](/quest/m2/path-patterns/relay-auth.md) - relay token, public,
   static, and revalidation paths enforce patterns
 - [Pattern interest](/quest/m2/path-patterns/interest.md) - moq-lite-06 carries
-  a full pattern in ANNOUNCE_REQUEST
+  pattern grants in AUTH and full-pattern interest in ANNOUNCE_REQUEST
 
 ## Related
 
+- [Versioned token claims API](/quest/m1/api-token-claims.md) - owns the working v0/v1 library contract before release
+
 - [Wildcard advertisements](/quest/m2/wildcard/README.md) - routing adopts the
   matcher while retaining its own cost, pool, refusal, and resolution work
-- [mTLS explicit scope](/quest/m2/auth-api/mtls-scope.md) - an mTLS grant
+- [mTLS explicit scope](/quest/m1/auth-api/mtls-scope.md) - an mTLS grant
   uses the same versioned publish and subscribe pattern sets

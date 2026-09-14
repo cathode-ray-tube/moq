@@ -27,6 +27,7 @@ pub(crate) use requests::Requests;
 pub(crate) use weak_cache::{WeakCache, WeakEntry};
 
 pub use bytes::*;
+pub(crate) use subscription::Cap;
 // Datagram stays flat at the crate root (a small track-adjacent wire type),
 // not under a role module.
 pub use datagram::*;
@@ -35,7 +36,7 @@ pub use time::*;
 /// Publishing broadcasts, announcing routes, and consuming both through an origin.
 pub mod origin {
 	pub use super::origin_impl::{
-		Consumer, Cost, DRAIN_COST, Driver, Dynamic, Info, MAX_COST, Prefix, Producer, Request, Requesting, Route, Run,
+		Consumer, Cost, DRAIN_COST, Driver, Dynamic, Info, MAX_COST, Producer, Request, Requesting, Route, Run,
 	};
 }
 

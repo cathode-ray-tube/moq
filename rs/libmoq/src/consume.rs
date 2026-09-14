@@ -1,6 +1,7 @@
 use std::{
 	ffi::c_char,
 	future::Future,
+	ops::Bound,
 	pin::Pin,
 	task::{Poll, ready},
 };
@@ -627,14 +628,13 @@ impl Consume {
 
 	fn apply_raw_subscription(track: &mut moq_net::track::Ordered, subscription: Option<moq_net::track::Subscription>) {
 		let subscription = subscription.unwrap_or_default();
-		if let Some(start) = subscription.start.map(|start| start.group).or_else(|| track.latest()) {
-			track.start_at(start);
-		}
-		// The read cursor is a group sequence, and its cap is inclusive. An end at the
-		// very first position is the empty range, which no inclusive group can express;
-		// leaving it uncapped would serve everything, so cap at the first group and let
-		// the empty demand stop delivery upstream.
-		track.end_at(subscription.end.map(|end| end.before().map_or(0, |end| end.group)));
+		let start = subscription.start.map(|start| start.group).or_else(|| track.latest());
+		track.set_groups((
+			start.map_or(Bound::Unbounded, Bound::Included),
+			subscription
+				.end
+				.map_or(Bound::Unbounded, moq_net::track::Position::group_end),
+		));
 		// A closed track makes the update meaningless; the reader already sees the close.
 		let _ = track.update(subscription);
 	}

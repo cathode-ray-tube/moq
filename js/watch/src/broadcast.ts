@@ -192,8 +192,10 @@ export class Broadcast {
 				if (!entry) break;
 				this.#announced.mutate((active) => {
 					if (!active) return;
-					if (entry.active) active.add(entry.prefix);
-					else active.delete(entry.prefix);
+					const prefix = entry.pattern.asPrefix();
+					if (prefix === undefined) return;
+					if (entry.active) active.add(Path.from(prefix));
+					else active.delete(Path.from(prefix));
 				});
 			}
 		});
@@ -306,7 +308,8 @@ export class Broadcast {
 		// "hangz" decompressing the `.z` track; MSF stays on its own one-blob-per-group fetch.
 		let fetchNext: () => Promise<Catalog.Root | undefined>;
 		if (format === "hang" || format === "hangz") {
-			const consumer = new Json.Snapshot.Consumer<Catalog.Root>(track, {
+			const consumer = new Json.Snapshot.Consumer<Catalog.Root>({
+				track,
 				schema: Catalog.RootSchema,
 				compression: format === "hangz",
 			});

@@ -281,15 +281,16 @@ export class Publisher {
 			// The wire request tells an upstream what we need; the cursor is what actually
 			// trims this subscriber, since the producer fans every cached group out to every
 			// sink regardless. An absent start joins at the latest group, which is what
-			// moq-lite means by joining a live track.
+			// moq-lite means by joining a live track. The range's end is the inclusive last
+			// group; the model's `endGroup` is exclusive.
 			track.update({
 				priority,
 				maxAge: Varint.MAX_U53,
 				startGroup: range.start && Number(range.start.group),
-				endGroup: range.end && Number(range.end.group),
+				endGroup: range.end && Number(range.end.group) + 1,
 			});
 			const startGroup = range.start ? Number(range.start.group) : track.latest();
-			if (startGroup !== undefined) track.startAt(startGroup);
+			if (startGroup !== undefined) track.setGroups({ start: { included: startGroup } });
 
 			// A fill reads the group cache through its own consumer, independent of the
 			// subscription's cursor. Forked from this subscriber rather than resolved through
@@ -352,7 +353,7 @@ export class Publisher {
 					const group = await track.recvGroup();
 					if (!group) return;
 
-					// Past the filter's end. Dropped here rather than through `endAt`, which
+					// Past the filter's end. Dropped here rather than through `setGroups`, which
 					// parks a capped group instead: this range is fixed for the life of the
 					// subscription, so a group above it is never coming back in, and holding
 					// one keeps the loop from ever ending. A producer that publishes beyond
@@ -714,7 +715,9 @@ export class Publisher {
 
 				const updated = new Map<Path.Valid, Advertised>();
 				for (const [name, snap] of advertised) {
-					const suffix = Path.stripPrefix(prefix, name);
+					const claim = Path.Pattern.parse(name).asPrefix();
+					if (claim === undefined) continue;
+					const suffix = Path.stripPrefix(prefix, Path.from(claim));
 					if (suffix === null) continue;
 					updated.set(suffix, snap);
 				}
@@ -842,7 +845,11 @@ export class Publisher {
 					break;
 				}
 
-				const updated = new Map<Path.Valid, Advertised>(advertised);
+				const updated = new Map<Path.Valid, Advertised>();
+				for (const [name, snap] of advertised) {
+					const claim = Path.Pattern.parse(name).asPrefix();
+					if (claim !== undefined) updated.set(Path.from(claim), snap);
+				}
 
 				// A namespace that is gone, or that a republish replaced, takes its refusal with
 				// it: the peer refused a broadcast, not a path forever, so a different one at

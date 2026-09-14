@@ -41,10 +41,17 @@ a full mesh trades that for one fewer hop. Mix shapes as your traffic demands.
 Add `?cost=N` to a peer URL to route by price instead of hop count. An unpriced
 link costs 1, which reproduces plain hop counting. Each relay adds the price of
 the link an announcement arrived on before forwarding it, so a route's cost is
-the sum of what it crossed. Routing prefers the most specific announced prefix,
-then the lowest cost, then the shortest hop list, breaking any remaining tie
-toward the newest announcement so a reconnecting publisher isn't outranked by
-the session it replaced.
+the sum of what it crossed.
+
+Wildcard advertisements are forwarded and costed the same way as an exact-path
+route: each hop appends its identity, adds the link price, and passes the
+claim on. An advertisement must be contained by one of the publisher's granted
+prefixes (`grant/**`); an over-wide pattern is refused rather than clamped.
+
+Routing prefers the most specific pattern, then the lowest cost, then the
+shortest hop list, breaking any remaining tie toward the newest announcement
+so a reconnecting publisher isn't outranked by the session it replaced.
+Resolving a non-prefix pattern into a subscription is not implemented yet.
 
 ```toml
 [cluster]
@@ -82,27 +89,35 @@ A relay with `node` and `mesh` but no `connect` is a passive rendezvous.
 
 On a LAN there may be no seed peer to gossip through. `[cluster.lan]` advertises
 this relay over mDNS and dials the peers that advertise back, so a rack or a
-home lab meshes with no seed list:
+home lab meshes with no seed list. A `moq --cluster-lan` process on the same
+network joins the same mesh:
 
 ```toml
 [cluster]
+# Optional. Without it the relay advertises its listen port and fingerprint,
+# the way `moq --cluster-lan` does.
 node = "us-west.local:4443"
 
 [cluster.lan]
 enabled = true
-secret = "/etc/moq/cluster.key"       # 64 hex chars, or a file holding them.
+# secret = "/etc/moq/cluster.key"     # Optional. 64 hex chars, or a file holding them.
 # app = "default"                     # DNS-SD subtype; moq-cli shares this name.
 ```
 
-mDNS only replaces how peers find each other; they are still dialed at their
-`node` URL and authenticate as usual. `secret` is required rather than optional
-and must match across peers: mDNS is an open channel, so without a proof of key
-possession an attacker could advertise a URL it controls and collect
-`cluster.token`. `app` names the DNS-SD application this relay advertises under;
-peers using a different name never discover it. It defaults to `default`, which
-moq-cli shares so the two find each other with no configuration. An application
-built on the library picks its own name. Startup waits for at least one
-interface to announce before the relay reports itself ready.
+A LAN peer authenticates with its mDNS credential on `/.cluster/<credential>`
+and is never handed `cluster.token`; that token is for static and gossip peers
+only. The advertisement carries the listener fingerprint when the certificate
+was generated or supplied in-memory, the `node` URL when one is configured,
+and at least one of them. `secret` is optional. Without it, anyone who can
+reach the listener joins, so leave it unset only on networks you trust. With
+it, only peers that prove they hold the same key are discovered or accepted.
+mDNS is still an open channel: the secret authenticates the record, it does
+not hide the credential or the node URL. `app` names the DNS-SD application
+this relay advertises under; peers using a different name never discover it.
+It defaults to `default`, which moq-cli shares so the two find each other
+with no configuration. An application built on the library picks its own
+name. Startup waits for at least one interface to announce before the relay
+reports itself ready.
 
 ## Dynamic peer lists
 
@@ -129,9 +144,11 @@ clients decode it.
 
 Peers authenticate with **mTLS** (recommended: `listen.tls.root` on the
 listener, `connect.tls.cert`/`key` on the dialer) or a **JWT** (inline
-`?jwt=` on a peer URL, or a shared `cluster.token` file for gossip). Dials
-retry forever with capped backoff, so a rejected token is loud in the logs
-rather than fatal. See [Authentication](/bin/relay/auth#mtls).
+`?jwt=` on a peer URL, or a shared `cluster.token` file for static and gossip
+peers). LAN peers authenticate with the mDNS credential on
+`/.cluster/<credential>` and never receive `cluster.token`. Dials retry
+forever with capped backoff, so a rejected token is loud in the logs rather
+than fatal. See [Authentication](/bin/relay/auth#mtls).
 
 The `/nodes` [internal endpoint](/bin/relay/http#get-nodes) shows the cluster
 as this relay sees it.

@@ -27,3 +27,12 @@ against the Kotlin and Swift artifacts that already pay it, and update
 
 Deployment floors stay as they are (Android API 24, iOS 16); a codec addition
 that raises either is a separate decision.
+
+This quest owns Dart integration of the already-landed `MoqVideoConsumer`:
+expose it through the Dart wrapper, ship codec-enabled artifacts, and test
+subscribed video decoding from Dart in CI. Update the capability docs in the
+same change. Do not finish with codecs enabled but the consumer unexposed.
+
+## Required
+
+- [FFI video consumer](/quest/m2/mobile/ffi-video-consumer.md) - land the shared decoder API before integrating it into Dart

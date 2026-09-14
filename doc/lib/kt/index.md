@@ -50,6 +50,15 @@ Moq.connect("https://relay.example.com").use { moq ->
 }
 ```
 
+The three advertising operations: `moq.createBroadcast(path)` (or
+`origin.createBroadcast`) returns an unadvertised producer;
+`broadcast.announce(route)` / `broadcast.unannounce()` own that exact-path
+advertisement; `origin.dynamic(pattern, route)` claims every matching path
+(`foo/**` for a prefix). Hold the returned `OriginDynamic` while the claim
+should stay advertised. A wildcard is a capability, not an inventory;
+`announcement.path()` is the covered prefix for a prefix-shaped claim and
+the pattern text otherwise.
+
 Sessions reconnect with backoff when the transport drops and re-announce local
 broadcasts. `moq.epoch()` counts the connections, 1 on the first, pairing with
 `MoqSession.status` to log each reconnect; the `backoff` argument tunes the
@@ -57,7 +66,9 @@ pacing (`timeoutMs = 0` retries forever); and `maxStreams` raises the peer's
 inbound stream cap.
 
 `Server.listen(bind, tlsGenerate = ...)` accepts sessions with per-request
-`accept()`/`reject()`. JSON tracks take `@Serializable` types
+`accept()`/`reject()`. Generated configuration setters, including
+`MoqRequest.setPublish`/`setConsume`, throw if a connect, listen, or accept is
+in flight, or after cancel. JSON tracks take `@Serializable` types
 (`publishJsonSnapshot`, `publishJsonStream`, `valuesAs<T>()`), and the rest of
 the [shared feature list](/lib/#what-every-binding-can-do) maps one to one:
 `fetchGroup`/`fetchMediaGroup`, `dynamic()` for tracks and `dynamic(pattern)` for broadcasts, `appendDatagram`/`datagrams()`,

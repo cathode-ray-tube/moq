@@ -9,6 +9,7 @@ members = [
     "rs/moq-binary",
     "rs/moq-boy",
     "rs/moq-cli",
+    "rs/moq-e2ee",
     "rs/moq-ffi",
     "rs/moq-flate",
     "rs/moq-gst",
@@ -23,6 +24,7 @@ members = [
     "rs/moq-nvenc",
     "rs/moq-pattern",
     "rs/moq-relay",
+    "rs/moq-room",
     "rs/moq-rtc",
     "rs/moq-rtmp",
     "rs/moq-sock",
@@ -47,6 +49,7 @@ default-members = [
     "rs/moq-bench",
     "rs/moq-binary",
     "rs/moq-cli",
+    "rs/moq-e2ee",
     # "rs/moq-ffi",   # requires Python/maturin
     # "rs/moq-gst",   # requires GStreamer
     "rs/moq-flate",
@@ -60,6 +63,7 @@ default-members = [
     "rs/moq-nvenc",
     "rs/moq-pattern",
     "rs/moq-relay",
+    "rs/moq-room",
     "rs/moq-rtc",
     "rs/moq-rtmp",
     "rs/moq-sock",
@@ -83,12 +87,12 @@ ignored = ["getrandom"]
 [workspace.package]
 # Floor for the library surface: iroh 1.0 (via moq-tokio) needs 1.91. This is
 # what consumers of moq-net / hang / moq-tokio / etc. see. moq-relay overrides
-# it to 1.95 (sysinfo 0.39). moq-relay is lib+bin, so 1.95 does apply to its
-# own library target, but that crate is an application with no external
-# consumers; the point of the override is to keep the bump off the libraries
-# others actually build on. The nix flake / rust-toolchain.toml pin the build
-# toolchain to 1.95 (so the whole workspace including the relay compiles) rather
-# than latest stable, which keeps the relay's ceiling from creeping up unnoticed.
+# it to 1.95 (sysinfo 0.39), and moq-cli does too because it depends on that
+# library. Those crates are applications; the point of the per-crate override
+# is to keep the bump off the libraries others actually build on. The nix flake
+# / rust-toolchain.toml pin the build toolchain to 1.95 (so the whole workspace
+# including the relay compiles) rather than latest stable, which keeps the
+# relay's ceiling from creeping up unnoticed.
 rust-version = "1.91"
 
 [workspace.dependencies]
@@ -140,6 +144,7 @@ moq-net = { version = "0.2.20", path = "rs/moq-net" }
 # used by moq-video on Linux.
 moq-nvenc = { version = "0.0.4", path = "rs/moq-nvenc" }
 moq-pattern = { version = "0.1.0", path = "rs/moq-pattern" }
+moq-relay = { version = "0.14.16", path = "rs/moq-relay", default-features = false }
 moq-rtc = { version = "0.2.9", path = "rs/moq-rtc" }
 moq-rtmp = { version = "0.2.9", path = "rs/moq-rtmp" }
 moq-sock = { version = "0.0.1", path = "rs/moq-sock" }
@@ -219,6 +224,7 @@ web-transport-quinn = { version = "0.12", default-features = false }
 web-transport-trait = "0.4"
 web-transport-wasm = "0.6"
 x11rb = { version = "0.14.0", features = ["randr", "xfixes"] }
+zeroize = { version = "1", features = ["derive"] }
 
 [patch.crates-io]
 # web-transport-quinn and web-transport-iroh depend on kio from crates.io. Without

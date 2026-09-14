@@ -54,8 +54,18 @@ try broadcast.announce()
 session.shutdown()
 ```
 
-For a self-signed relay on your own test network, `client.setTlsVerify(false)`
+The three advertising operations: `session.publisher.createBroadcast(path:)`
+returns an unadvertised producer; `broadcast.announce(route:)` /
+`broadcast.unannounce()` own that exact-path advertisement;
+`session.publisher.dynamic(pattern:route:)` claims every matching path
+(`foo/**` for a prefix). Hold the returned `OriginDynamic` while the claim
+should stay advertised. A wildcard is a capability, not an inventory;
+`announcement.path` is the covered prefix for a prefix-shaped claim and the
+pattern text otherwise.
+
+For a self-signed relay on your own test network, `try client.setTlsVerify(false)`
 accepts any certificate; prefer `setTlsRoots` or a fingerprint anywhere else.
+Setters throw if a connect is in flight or after `cancel()`.
 
 Sessions reconnect with backoff when the transport drops and re-announce local
 broadcasts. `session.epoch()` counts the connections, 1 on the first, pairing

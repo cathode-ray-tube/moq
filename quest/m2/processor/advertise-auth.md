@@ -28,8 +28,8 @@ publish grant.
 
 ## Required
 
-- [Advertise](/quest/m1/wildcard-advertise.md) - supplies the wildcard message
-  and authorization point this capability separates
+- [Merge dev](/quest/m1/merge-dev.md) - the required M1 APIs must be available on main before this implementation starts
+
 - [Token SDKs](/quest/m2/path-patterns/token-sdk.md) - supplies the published
   v1 claim writers this extension changes
 - [Relay auth](/quest/m2/path-patterns/relay-auth.md) - supplies the v1 origin
