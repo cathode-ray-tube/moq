@@ -160,7 +160,7 @@ impl<C: Container<Error = crate::error::Error>> Producer<C> {
 		match encrypter.as_mut() {
 			Some(encrypter) => {
 				let mut protected =
-					crate::container::ProtectedWriteFrame::new(output, encrypter.as_mut());
+					ProtectedWriteFrame::new(output, encrypter.as_mut());
 
 				container.write(&mut protected, frames)?;
 			}
