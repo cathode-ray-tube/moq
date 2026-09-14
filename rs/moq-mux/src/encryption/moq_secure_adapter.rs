@@ -1,13 +1,11 @@
-// src/encryption/moq_secure_adapter.rs
-
 use std::sync::Arc;
 
 use bytes::Bytes;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use moq_secure::key_store::KeyStore;
 
 use super::EncryptionError;
-use crate::container::FrameEncrypter;
+use crate::container::{FrameDecrypter, FrameEncrypter};
 
 impl From<moq_secure::error::MoqSecureError> for EncryptionError {
 	fn from(error: moq_secure::error::MoqSecureError) -> Self {
@@ -16,7 +14,9 @@ impl From<moq_secure::error::MoqSecureError> for EncryptionError {
 		match error {
 			MoqSecureError::InvalidMagic => Self::InvalidFrame,
 
-			MoqSecureError::UnsupportedVersion(version) => Self::UnsupportedVersion(version),
+			MoqSecureError::UnsupportedVersion(version) => {
+				Self::UnsupportedVersion(version)
+			}
 
 			MoqSecureError::TruncatedFrame => Self::TruncatedFrame,
 
@@ -24,7 +24,9 @@ impl From<moq_secure::error::MoqSecureError> for EncryptionError {
 
 			MoqSecureError::InvalidPadLength => Self::InvalidPadLength,
 
-			MoqSecureError::InvalidEncryptedFlag(flag) => Self::InvalidEncryptedFlag(flag),
+			MoqSecureError::InvalidEncryptedFlag(flag) => {
+				Self::InvalidEncryptedFlag(flag)
+			}
 
 			MoqSecureError::InvalidSigFlag(flag) => Self::InvalidSigFlag(flag),
 
@@ -36,7 +38,9 @@ impl From<moq_secure::error::MoqSecureError> for EncryptionError {
 
 			MoqSecureError::MissingSigSlot => Self::MissingSigSlot,
 
-			MoqSecureError::SignatureNotAllowedByNSigned => Self::SignatureNotAllowedByNSigned,
+			MoqSecureError::SignatureNotAllowedByNSigned => {
+				Self::SignatureNotAllowedByNSigned
+			}
 
 			MoqSecureError::DecryptFailed => Self::DecryptionFailed,
 
@@ -46,10 +50,6 @@ impl From<moq_secure::error::MoqSecureError> for EncryptionError {
 }
 
 /// Encrypts each frame using moq-secure.
-///
-/// `sequence_number` supplied to `encrypt()` is the frame number within
-/// the current group. The independent `ctr` field is incremented by this
-/// encrypter once for every frame.
 pub struct MoqSecureEncrypter {
 	pub key_store: Arc<dyn KeyStore>,
 	pub signing_key: SigningKey,
@@ -58,7 +58,7 @@ pub struct MoqSecureEncrypter {
 	pub maybe_sign: bool,
 	pub pad_len: u32,
 
-	/// Independent encryption counter.
+	/// Independent moq-secure encryption counter.
 	ctr: u64,
 }
 
@@ -83,26 +83,28 @@ impl MoqSecureEncrypter {
 		}
 	}
 
-	/// Returns the counter that will be assigned to the next frame.
 	pub fn next_counter(&self) -> u64 {
 		self.ctr
 	}
 
-	/// Returns the counter that will be assigned to the next frame and
-	/// advances it by one.
 	fn take_counter(&mut self) -> Result<u64, EncryptionError> {
 		let ctr = self.ctr;
 
-		self.ctr = self.ctr.checked_add(1).ok_or(EncryptionError::CounterExhausted)?;
+		self.ctr = self
+			.ctr
+			.checked_add(1)
+			.ok_or(EncryptionError::CounterExhausted)?;
 
 		Ok(ctr)
 	}
 }
 
 impl FrameEncrypter for MoqSecureEncrypter {
-	fn encrypt(&mut self, _sequence_number: u64, plaintext: &[u8]) -> Result<Bytes, EncryptionError> {
-		// This counter is intentionally independent of the group frame
-		// sequence number passed by ProtectedFrame.
+	fn encrypt(
+		&mut self,
+		_sequence_number: u64,
+		plaintext: &[u8],
+	) -> Result<Bytes, EncryptionError> {
 		let ctr = self.take_counter()?;
 
 		let frame = moq_secure::wire::encrypt_frame(
@@ -112,11 +114,70 @@ impl FrameEncrypter for MoqSecureEncrypter {
 			ctr,
 			self.n_signed,
 			self.maybe_sign,
-			1, // encrypted
+			1,
 			self.pad_len,
 			plaintext,
 		)?;
 
 		Ok(Bytes::from(frame.serialize()))
+	}
+}
+
+/// Decrypts and verifies each frame using moq-secure.
+pub struct MoqSecureDecrypter {
+	pub key_store: Arc<dyn KeyStore>,
+	pub broadcaster_public_key: VerifyingKey,
+
+	/// Number of unsigned frames remaining in the current signature lease.
+	pub lease_remaining: u8,
+}
+
+impl MoqSecureDecrypter {
+	pub fn new(
+		key_store: Arc<dyn KeyStore>,
+		broadcaster_public_key: VerifyingKey,
+	) -> Self {
+		Self {
+			key_store,
+			broadcaster_public_key,
+			lease_remaining: 0,
+		}
+	}
+
+	pub fn with_lease(
+		key_store: Arc<dyn KeyStore>,
+		broadcaster_public_key: VerifyingKey,
+		lease_remaining: u8,
+	) -> Self {
+		Self {
+			key_store,
+			broadcaster_public_key,
+			lease_remaining,
+		}
+	}
+
+	pub fn lease_remaining(&self) -> u8 {
+		self.lease_remaining
+	}
+
+	pub fn reset_lease(&mut self) {
+		self.lease_remaining = 0;
+	}
+}
+
+impl FrameDecrypter for MoqSecureDecrypter {
+	fn decrypt(
+		&mut self,
+		_sequence_number: u64,
+		ciphertext: &[u8],
+	) -> Result<Bytes, EncryptionError> {
+		let plaintext = moq_secure::wire::decrypt_frame(
+			self.key_store.as_ref(),
+			&self.broadcaster_public_key,
+			&mut self.lease_remaining,
+			ciphertext,
+		)?;
+
+		Ok(Bytes::from(plaintext))
 	}
 }

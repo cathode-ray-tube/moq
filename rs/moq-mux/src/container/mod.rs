@@ -21,8 +21,8 @@ mod source;
 #[cfg(test)]
 pub(crate) mod test_util;
 
+pub mod reader;
 pub mod writer;
-
 pub mod flv;
 pub mod fmp4;
 pub mod legacy;
@@ -37,7 +37,18 @@ pub(crate) use source::ExportSource;
 
 pub use crate::error::Error;
 
-pub use writer::{FrameEncrypter, FrameWriter, MoqFrameWriter, ProtectedFrame};
+pub use reader::{
+	FrameDecrypter,
+	FrameReader,
+	ProtectedFrame as ProtectedReadFrame,
+	ReadFrame,
+};
+
+pub use writer::{
+	FrameEncrypter,
+	FrameWriter,
+	ProtectedFrame as ProtectedWriteFrame,
+};
 
 /// The media role that determines how a container represents frame durations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
