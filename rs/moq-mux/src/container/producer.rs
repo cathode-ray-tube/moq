@@ -2,7 +2,11 @@
 use bytes::Bytes;
 
 use super::{Container, Frame};
-use crate::container::FrameEncrypter;
+use crate::container::{
+    FrameEncrypter,
+    MoqFrameWriter,
+    ProtectedWriteFrame,
+};
 
 fn add_micros(timestamp: moq_net::Timestamp, extra: moq_net::Timestamp) -> Option<moq_net::Timestamp> {
 	let micros = timestamp.as_micros().saturating_add(extra.as_micros());
@@ -151,12 +155,12 @@ impl<C: Container<Error = crate::error::Error>> Producer<C> {
 		let container = &mut self.container;
 		let encrypter = &mut self.encrypter;
 
-		let output = crate::container::MoqFrameWriter { group };
+		let output = MoqFrameWriter { group };
 
 		match encrypter.as_mut() {
 			Some(encrypter) => {
 				let mut protected =
-					crate::container::ProtectedFrame::new(output, encrypter.as_mut());
+					crate::container::ProtectedWriteFrame::new(output, encrypter.as_mut());
 
 				container.write(&mut protected, frames)?;
 			}
