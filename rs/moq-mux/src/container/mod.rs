@@ -38,16 +38,17 @@ pub(crate) use source::ExportSource;
 pub use crate::error::Error;
 
 pub use reader::{
-	FrameDecrypter,
-	FrameReader,
-	ProtectedFrame as ProtectedReadFrame,
-	ReadFrame,
+    FrameDecrypter,
+    FrameReader,
+    ProtectedFrame as ProtectedReadFrame,
+    ReadFrame,
 };
 
 pub use writer::{
-	FrameEncrypter,
-	FrameWriter,
-	ProtectedFrame as ProtectedWriteFrame,
+    FrameEncrypter,
+    FrameWriter,
+    MoqFrameWriter,
+    ProtectedFrame as ProtectedWriteFrame,
 };
 
 /// The media role that determines how a container represents frame durations.
