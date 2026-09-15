@@ -98,27 +98,30 @@ impl Reset {
 
 impl<F: Container<Error = crate::error::Error>> Consumer<F> {
     /// Create a consumer wrapping the given subscriber and container.
-    pub fn new(
-        track: moq_net::track::Subscriber,
-        format: F,
-        decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,
-    ) -> Self {
-        let subscription = track.subscription();
-        let start = subscription.start.map(|position| position.group);
-        let max_age = subscription.max_age.min(track.info().max_age);
-
-        Self {
-            track,
-            format,
-            current: start.unwrap_or(0),
-            pending: VecDeque::new(),
-            startup: start.is_none(),
-            max_age,
-            rewind: Rewind::default(),
-            end: None,
-            decrypter,
-        }
-    }
+	    pub fn new(track: moq_net::track::Subscriber, format: F) -> Self {
+		let subscription = track.subscription();
+		let start = subscription.start.map(|position| position.group);
+		let max_age = subscription.max_age.min(track.info().max_age);
+	
+		Self {
+			track,
+			format,
+			current: start.unwrap_or(0),
+			pending: VecDeque::new(),
+			startup: start.is_none(),
+			max_age,
+			rewind: Rewind::default(),
+			end: None,
+			decrypter: None,
+		}
+	}
+	pub fn with_decrypter<D>(mut self, decrypter: D) -> Self
+	where
+		D: FrameDecrypter + Send + Sync + 'static,
+	{
+		self.decrypter = Some(Box::new(decrypter));
+		self
+	}
 
     /// A counter that increments each time the consumer reaches a declared
     /// discontinuity or detects a timeline rewind.
