@@ -84,6 +84,30 @@ impl Container for Wire {
 		Ok(())
 	}
 
+	fn poll_read_frames<R>(
+    &self,
+    reader: &mut R,
+    waiter: &kio::Waiter,
+	) -> Poll<Result<Option<Vec<Frame>>, Self::Error>>
+	where
+	    R: FrameReader,
+	{
+	    let Some(data) = ready!(reader.poll_read_frame(waiter)?) else {
+	        return Poll::Ready(Ok(None));
+	    };
+	
+	    let hang_frame = hang::container::Frame::decode(data.payload)?;
+	
+	    Poll::Ready(Ok(Some(vec![Frame {
+	        // Prefer the timestamp from the wire frame if it is available
+	        // outside the encrypted payload.
+	        timestamp: data.timestamp,
+	        payload: hang_frame.payload,
+	        keyframe: false,
+	        duration: None,
+	    }])))
+	}
+
 	fn poll_read(
 		&self,
 		group: &mut moq_net::group::Consumer,
