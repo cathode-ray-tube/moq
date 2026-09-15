@@ -375,8 +375,17 @@ impl<C: Container<Error = crate::error::Error>> Producer<C> {
 		let tail_end = marker_at.filter(|_| !self.reordered);
 		self.flush(tail_end)?;
 		if let Some(group) = self.group.as_mut() {
-			self.container.finish_group(group, tail_end)?;
+		    let writer = MoqFrameWriter { group };
+		
+		    if let Some(encrypter) = self.encrypter.as_mut() {
+		        let mut protected = ProtectedWriteFrame::new(writer, &mut **encrypter);
+		        self.container.finish_group(&mut protected, tail_end)?;
+		    } else {
+		        let mut writer = writer;
+		        self.container.finish_group(&mut writer, tail_end)?;
+		    }
 		}
+
 		if let Some(mut group) = self.group.take() {
 			group.finish()?;
 		}
