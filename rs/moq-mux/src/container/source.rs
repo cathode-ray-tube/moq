@@ -327,14 +327,20 @@ impl ExportSource {
 				.take()
 				.expect("media present until the subscription resolves");
 
-			// The decryptor is moved into Consumer exactly once. It remains
+					// The decryptor is moved into Consumer exactly once. It remains
 			// alive for the lifetime of the active consumer, preserving any
 			// counters, replay windows, key epochs, or nonce state.
 			let decrypter = self.decrypter.take();
+			
+			let consumer = Consumer::new(track, media);
+			
+			let consumer = match decrypter {
+			    Some(decrypter) => consumer.with_decrypter(decrypter),
+			    None => consumer,
+			};
+			
+			self.state = SourceState::Active(Box::new(consumer));
 
-			self.state = SourceState::Active(Box::new(
-    Consumer::new(track, media).with_decrypter(decrypter),
-));
 		}
 
 		loop {
