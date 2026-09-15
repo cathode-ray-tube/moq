@@ -835,7 +835,7 @@ impl<E: catalog::Catalog> Export<E> {
 					self.tracks.insert(name.clone(), track);
 				}
 				None => {
-					let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age)? else {
+					let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age, None)? else {
 						continue;
 					};
 					self.insert_track(name, source, pid, kind, descriptors, reserve);
@@ -854,7 +854,7 @@ impl<E: catalog::Catalog> Export<E> {
 					self.tracks.insert(name.clone(), track);
 				}
 				None => {
-					let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age)? else {
+					let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, None)? else {
 						continue;
 					};
 					self.insert_track(name, source, pid, kind, descriptors, DEFAULT_DTS_RESERVE);
@@ -880,7 +880,7 @@ impl<E: catalog::Catalog> Export<E> {
 					self.tracks.insert(name.clone(), existing);
 				}
 				None => {
-					let source = ExportSource::for_stream(&self.source, name, self.max_age)?;
+					let source = ExportSource::for_stream(&self.source, name, self.max_age, None)?;
 					self.insert_track(name, source, pid, kind, descriptors, DEFAULT_DTS_RESERVE);
 				}
 			}
