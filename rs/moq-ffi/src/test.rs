@@ -5,6 +5,7 @@ use super::session::{MoqClient, MoqSession};
 use crate::consumer::MoqBroadcastConsumer;
 use crate::consumer::MoqFetchGroupOptions;
 use crate::consumer::MoqSubscription;
+use crate::consumer::MoqTrackConsumer;
 use crate::error::MoqError;
 use crate::json::{MoqJsonSnapshotConfig, MoqJsonStreamConfig};
 use crate::media::{MoqAudio, MoqAudioFormat, MoqAudioInit, MoqContainer, MoqFrame, MoqVideoFormat, MoqVideoInit};
@@ -73,6 +74,39 @@ async fn wait_for_config_error(
 	})
 	.await
 	.expect("timed out waiting for the expected configuration error")
+}
+
+/// Wait until `read_frame` has taken `group` off the ordered cursor.
+async fn wait_group_acquired(group: &MoqGroupProducer) {
+	tokio::time::timeout(TIMEOUT, group.used())
+		.await
+		.expect("timed out waiting for the group to be acquired")
+		.unwrap();
+}
+
+/// Run `read_frame` until it has taken `group`, proving it did not treat the
+/// current group as EOF, then abort that call. The group stays in the reader.
+async fn cancel_parked_read_frame(consumer: &Arc<MoqTrackConsumer>, group: &MoqGroupProducer) {
+	let mut read = {
+		let consumer = consumer.clone();
+		spawn_parked(async move { consumer.read_frame().await }).await
+	};
+	tokio::select! {
+		result = &mut read => match result {
+			Ok(Ok(Some(_))) => panic!("read_frame returned a frame before one was written"),
+			Ok(Ok(None)) => panic!("read_frame returned EOF before a frame was written"),
+			Ok(Err(err)) => panic!("read_frame errored before a frame was written: {err:?}"),
+			Err(err) => panic!("read task failed: {err:?}"),
+		},
+		_ = wait_group_acquired(group) => {}
+	}
+	read.abort();
+	match read.await {
+		Err(err) => assert!(err.is_cancelled()),
+		Ok(Ok(Some(_))) => panic!("aborted read returned a frame"),
+		Ok(Ok(None)) => panic!("aborted read returned EOF"),
+		Ok(Err(err)) => panic!("aborted read errored: {err:?}"),
+	}
 }
 
 fn assert_protocol(err: &MoqError, scope: crate::error::MoqErrorScope, kind: crate::error::MoqProtocolKind) {
@@ -223,6 +257,68 @@ fn origin_options_set_cache_capacity() {
 		origin.inner().info().pool.expiry(),
 		Some(moq_net::cache::DEFAULT_EXPIRY)
 	);
+}
+
+#[test]
+fn route_cold_cost_conversions_are_lossless() {
+	// An explicit cold half survives the round trip in both directions.
+	let route = moq_net::origin::Route::default().with_cost((0u64, 9u64));
+	let ffi = MoqRoute::from(route.clone());
+	assert_eq!(ffi.cost, 0);
+	assert_eq!(ffi.cold, Some(9));
+	let back = moq_net::origin::Route::try_from(ffi).unwrap();
+	assert_eq!(back.cost, route.cost);
+
+	// An omitted cold means the same as the warm cost: a publisher seeding
+	// only its production cost sets one number.
+	let seeded = moq_net::origin::Route::try_from(MoqRoute {
+		hops: vec![],
+		cost: 5,
+		cold: None,
+	})
+	.unwrap();
+	assert_eq!(seeded.cost, moq_net::origin::Cost::from((5u64, 5u64)));
+}
+
+#[tokio::test]
+async fn announced_route_keeps_cold_cost_on_reannounce() {
+	let origin = MoqOriginProducer::new(MoqOriginOptions::default());
+	let consumer = origin.consume();
+	let broadcast = origin.create_broadcast("cold-route".into()).unwrap();
+	broadcast
+		.announce(MoqRoute {
+			hops: vec![],
+			cost: 0,
+			cold: Some(9),
+		})
+		.unwrap();
+
+	// The route observed through the announcement stream carries both halves:
+	// a truthful `{warm: 0, cold: 9}` is never rewritten to the publisher's
+	// own `{warm: 0, cold: 0}`.
+	let announced = consumer.announced("".into()).unwrap();
+	let route = loop {
+		let announcement = tokio::time::timeout(TIMEOUT, announced.next())
+			.await
+			.expect("timed out waiting for an announce update")
+			.unwrap()
+			.expect("origin ended while waiting for an announce update");
+		if announcement.path() == "cold-route" && announcement.active() {
+			break announcement.route();
+		}
+	};
+	assert_eq!(route.cost, 0);
+	assert_eq!(route.cold, Some(9));
+
+	// Announcing the observed route again reproduces it exactly, cold half
+	// included. (An identical re-announce is not redelivered, so this checks
+	// the conversion rather than waiting for a second update.)
+	broadcast.announce(route.clone()).unwrap();
+	let back = moq_net::origin::Route::try_from(route.clone()).unwrap();
+	assert_eq!(back.cost, moq_net::origin::Cost::from((0u64, 9u64)));
+	assert_eq!(MoqRoute::from(back), route);
+
+	broadcast.finish().unwrap();
 }
 
 #[test]
@@ -2452,6 +2548,245 @@ async fn raw_track_handle_cancel_aborts_both_pending_lanes() {
 		Err(err) => panic!("handle cancel should fail the datagram read, got {err:?}"),
 		Ok(_) => panic!("handle cancel should fail the datagram read"),
 	}
+}
+
+/// An empty completed group is not track EOF: `read_frame` waits for a later
+/// group on a still-open track.
+#[tokio::test]
+async fn raw_read_frame_skips_empty_group_on_open_track() {
+	let broadcast = MoqBroadcastProducer::new().unwrap();
+	let track = broadcast.publish_track("status".into(), None).unwrap();
+	let consumer = track.consume(None).unwrap();
+
+	let empty = track.append_group().unwrap();
+	empty.finish().unwrap();
+
+	let read = {
+		let consumer = consumer.clone();
+		spawn_parked(async move { consumer.read_frame().await }).await
+	};
+	if read.is_finished() {
+		match read.await {
+			Ok(Ok(Some(_))) => panic!("empty group returned a frame"),
+			Ok(Ok(None)) => panic!("empty group must not end an open track"),
+			Ok(Err(err)) => panic!("read_frame errored on an empty group: {err:?}"),
+			Err(err) => panic!("read task failed: {err:?}"),
+		}
+	}
+
+	let payload = b"after-empty".to_vec();
+	track
+		.write_frame(MoqFrame {
+			payload: payload.clone(),
+			timestamp_us: 1_000,
+		})
+		.unwrap();
+
+	let frame = tokio::time::timeout(TIMEOUT, read)
+		.await
+		.expect("timed out waiting for the frame after an empty group")
+		.expect("read task panicked")
+		.unwrap()
+		.expect("expected a frame");
+	assert_eq!(frame.payload, payload);
+	assert_eq!(frame.timestamp_us, 1_000);
+}
+
+/// Empty groups already in the cursor are skipped, then the next populated
+/// group's first frame is returned.
+#[tokio::test]
+async fn raw_read_frame_skips_empty_then_populated_groups() {
+	let broadcast = MoqBroadcastProducer::new().unwrap();
+	let track = broadcast.publish_track("status".into(), None).unwrap();
+	let consumer = track.consume(None).unwrap();
+
+	track.append_group().unwrap().finish().unwrap();
+	track.append_group().unwrap().finish().unwrap();
+
+	let payload = b"populated".to_vec();
+	track
+		.write_frame(MoqFrame {
+			payload: payload.clone(),
+			timestamp_us: 2_000,
+		})
+		.unwrap();
+
+	let frame = tokio::time::timeout(TIMEOUT, consumer.read_frame())
+		.await
+		.expect("timed out skipping empty groups")
+		.unwrap()
+		.expect("expected the populated group's first frame");
+	assert_eq!(frame.payload, payload);
+	assert_eq!(frame.timestamp_us, 2_000);
+}
+
+/// Cancelling `read_frame` after it has taken the next group must not drop that
+/// group: the next read still returns its first frame.
+#[tokio::test]
+async fn raw_read_frame_keeps_group_across_cancelled_call() {
+	let broadcast = MoqBroadcastProducer::new().unwrap();
+	let track = broadcast.publish_track("status".into(), None).unwrap();
+	let consumer = track.consume(None).unwrap();
+
+	let group = track.append_group().unwrap();
+	cancel_parked_read_frame(&consumer, &group).await;
+
+	let payload = b"kept".to_vec();
+	group
+		.write_frame(MoqFrame {
+			payload: payload.clone(),
+			timestamp_us: 3_000,
+		})
+		.unwrap();
+	group.finish().unwrap();
+	track.finish().unwrap();
+
+	let frame = tokio::time::timeout(TIMEOUT, consumer.read_frame())
+		.await
+		.expect("timed out reading the preserved group")
+		.unwrap()
+		.expect("cancelled read_frame must not lose the group's first frame");
+	assert_eq!(frame.payload, payload);
+	assert_eq!(frame.timestamp_us, 3_000);
+
+	assert!(
+		tokio::time::timeout(TIMEOUT, consumer.read_frame())
+			.await
+			.expect("timed out waiting for track EOF")
+			.unwrap()
+			.is_none()
+	);
+}
+
+/// An error on a pending group's first frame is terminal for that group: the
+/// next `read_frame` moves on rather than retrying the dead group.
+#[tokio::test]
+async fn raw_read_frame_drops_aborted_pending_group() {
+	let broadcast = MoqBroadcastProducer::new().unwrap();
+	let track = broadcast.publish_track("status".into(), None).unwrap();
+	let consumer = track.consume(None).unwrap();
+
+	let first = track.append_group().unwrap();
+	let read = {
+		let consumer = consumer.clone();
+		tokio::spawn(async move { consumer.read_frame().await })
+	};
+	wait_group_acquired(&first).await;
+	first.abort(409).unwrap();
+
+	let err = tokio::time::timeout(TIMEOUT, read)
+		.await
+		.expect("timed out waiting for the aborted group")
+		.expect("read task panicked");
+	match err {
+		Err(MoqError::Protocol { details: protocol }) => {
+			assert_eq!(protocol.scope, crate::error::MoqErrorScope::Stream);
+			assert_eq!(protocol.code, 64 + 409);
+			assert_eq!(protocol.kind, crate::error::MoqProtocolKind::App);
+		}
+		Err(other) => panic!("expected Protocol App(409), got {other:?}"),
+		Ok(Some(_)) => panic!("aborted group returned a frame"),
+		Ok(None) => panic!("aborted group returned EOF"),
+	}
+
+	let payload = b"next".to_vec();
+	track
+		.write_frame(MoqFrame {
+			payload: payload.clone(),
+			timestamp_us: 4_000,
+		})
+		.unwrap();
+	let frame = tokio::time::timeout(TIMEOUT, consumer.read_frame())
+		.await
+		.expect("timed out reading the group after an aborted pending group")
+		.unwrap()
+		.expect("an aborted pending group must not block later groups");
+	assert_eq!(frame.payload, payload);
+	assert_eq!(frame.timestamp_us, 4_000);
+}
+
+/// `next_group` and `read_frame` share one ordered cursor. A cancelled
+/// `read_frame` leaves its group for `next_group`; a group `next_group` has
+/// already returned is not also read as a first frame.
+#[tokio::test]
+async fn raw_read_frame_and_next_group_share_the_cursor() {
+	let broadcast = MoqBroadcastProducer::new().unwrap();
+	let track = broadcast.publish_track("status".into(), None).unwrap();
+	let consumer = track.consume(None).unwrap();
+
+	let first = track.append_group().unwrap();
+	cancel_parked_read_frame(&consumer, &first).await;
+	first
+		.write_frame(MoqFrame {
+			payload: b"first".to_vec(),
+			timestamp_us: 0,
+		})
+		.unwrap();
+	first.finish().unwrap();
+
+	let group = tokio::time::timeout(TIMEOUT, consumer.next_group())
+		.await
+		.expect("timed out taking the pending group")
+		.unwrap()
+		.expect("next_group should return the group read_frame acquired");
+	let frame = tokio::time::timeout(TIMEOUT, group.read_frame())
+		.await
+		.expect("timed out reading the handed-off group")
+		.unwrap()
+		.expect("expected the first group's frame");
+	assert_eq!(frame.payload, b"first".to_vec());
+
+	track
+		.write_frame(MoqFrame {
+			payload: b"second".to_vec(),
+			timestamp_us: 0,
+		})
+		.unwrap();
+	let frame = tokio::time::timeout(TIMEOUT, consumer.read_frame())
+		.await
+		.expect("timed out reading the next group")
+		.unwrap()
+		.expect("read_frame should skip the group next_group already returned");
+	assert_eq!(frame.payload, b"second".to_vec());
+}
+
+/// Terminal cancel drops the pending group and releases subscription demand.
+#[tokio::test]
+async fn raw_read_frame_terminal_cancel_releases_demand() {
+	let broadcast = MoqBroadcastProducer::new().unwrap();
+	let track = broadcast.publish_track("status".into(), None).unwrap();
+	let consumer = track.consume(None).unwrap();
+
+	tokio::time::timeout(TIMEOUT, track.used(None))
+		.await
+		.expect("timed out waiting for the subscriber")
+		.unwrap();
+
+	let open = track.append_group().unwrap();
+	let read = {
+		let consumer = consumer.clone();
+		spawn_parked(async move { consumer.read_frame().await }).await
+	};
+	wait_group_acquired(&open).await;
+
+	consumer.cancel();
+	let err = tokio::time::timeout(TIMEOUT, read)
+		.await
+		.expect("timed out waiting for the cancelled read")
+		.expect("read task panicked");
+	match err {
+		Err(MoqError::Cancelled) => {}
+		Err(other) => panic!("unexpected error: {other:?}"),
+		Ok(Some(_)) => panic!("cancelled read returned a frame"),
+		Ok(None) => panic!("cancelled read returned EOF"),
+	}
+
+	tokio::time::timeout(TIMEOUT, track.unused(None))
+		.await
+		.expect("timed out waiting for demand to drop")
+		.unwrap();
+
+	assert!(matches!(consumer.read_frame().await, Err(MoqError::Cancelled)));
 }
 
 #[tokio::test]

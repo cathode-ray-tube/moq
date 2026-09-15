@@ -561,6 +561,78 @@ audit:
 relay-minimal:
     cargo nextest run --locked -p moq-relay --no-default-features --lib -E 'test(workers_require_a_quic_backend)'
 
+# libmoq's C fixtures (`rs/libmoq/c-tests/*.c`) link `libmoq.a` the way an
+# embedder does: an external `cc` against the generated `moq.h`, plus the native
+# libraries from `rs/libmoq/native-libs` that cargo can't inject into a link it
+# doesn't drive. Each fixture pins part of the C ABI at compile time and
+# exercises it at runtime, so it has to run, not just compile.
+#
+# Outside nextest on purpose. The staticlib link alone takes ~2 minutes, past the
+# hang budget in `.config/nextest.toml` once the rest of the workspace builds
+# beside it, and `rs/CLAUDE.md` says to make a slow test fast, not to raise the
+# ceiling. obs.yml runs this on every PR that touches rs/libmoq, right after it
+# has built the same debug libmoq.a for the plugin, and nightly.yml covers the
+# paths that filter misses.
+#
+# Unix only: linking a Rust staticlib from MSVC spells the flags and the
+# archive (`moq.lib`) differently, and this recipe doesn't model that.
+
+# Compile and run libmoq's C fixtures against libmoq.a. Must run on Unix.
+c-tests:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cc="${CC:-cc}"
+    if ! command -v "$cc" >/dev/null; then
+        echo "no C compiler at '$cc'" >&2
+        exit 1
+    fi
+
+    cargo build --locked -p libmoq
+
+    # Ask cargo where it put the staticlib rather than assuming target/debug:
+    # CARGO_TARGET_DIR and a configured build target (`target/<triple>/debug`)
+    # both move it, and guessing wrong would link a stale copy or nothing.
+    # Replays the build above from cache, so it costs a process, not a compile.
+    lib=$(cargo build --locked -p libmoq --message-format=json |
+        jq -r 'select(.reason == "compiler-artifact") | .filenames[] | select(endswith("/libmoq.a"))' |
+        tail -1)
+    if [ -z "$lib" ]; then
+        echo "cargo reported no libmoq.a for libmoq" >&2
+        exit 1
+    fi
+    # The header sits beside the profile directory: rs/libmoq/build.rs writes it
+    # to `<target>/include`, one level above `<target>/<profile>/libmoq.a`.
+    profile=$(dirname "$lib")
+    include="$(dirname "$profile")/include"
+    if [ ! -f "$include/moq.h" ]; then
+        echo "$include/moq.h missing after 'cargo build --locked -p libmoq'" >&2
+        exit 1
+    fi
+
+    # Same list build.rs (moq.pc), CMakeLists.txt, and test/smoke/smoke.sh read:
+    # `framework:Foo` is a linker framework flag, anything else a plain library.
+    case "$(uname -s)" in
+        Darwin) native_libs=rs/libmoq/native-libs/apple.txt ;;
+        *) native_libs=rs/libmoq/native-libs/linux.txt ;;
+    esac
+    libs=()
+    while read -r entry; do
+        case "$entry" in
+            '' | '#'*) continue ;;
+            framework:*) libs+=(-framework "${entry#framework:}") ;;
+            *) libs+=("-l$entry") ;;
+        esac
+    done <"$native_libs"
+
+    out=$(mktemp -d)
+    trap 'rm -rf "$out"' EXIT
+    for source in rs/libmoq/c-tests/*.c; do
+        bin="$out/$(basename "$source" .c)"
+        "$cc" "$source" -I"$include" -L"$profile" -lmoq "${libs[@]}" -o "$bin"
+        echo "running $source"
+        "$bin"
+    done
+
 # The feature permutations `check` leaves out. Each is a full workspace compile
 # at a feature set that shares almost no artifacts with the default one (~6min
 # for the all-features clippy alone), which is why this is nightly rather than
@@ -788,8 +860,7 @@ package crate packager:
     case "{{ crate }}" in
     	moq-relay)      bin=moq-relay  ;;
     	moq-cli)        bin=moq        ;;
-        moq-token-cli)  bin=moq-token  ;;
-    	*) echo "Unknown crate: {{ crate }} (use moq-relay, moq-cli, or moq-token-cli)" >&2; exit 1 ;;
+    	*) echo "Unknown crate: {{ crate }} (use moq-relay or moq-cli)" >&2; exit 1 ;;
     esac
     case "{{ packager }}" in
     	deb)

@@ -88,7 +88,7 @@ pub struct Invocation {
 	/// Only [`MoqSide::reject`] reads it. A local verb refuses a MoQ side the user
 	/// asked for, and an exported `MOQ_CONNECT` is not an ask: it is a standing
 	/// setting for the publishing this shell usually does, and it would otherwise
-	/// make `moq token` and `moq completion` fail for everyone who has one.
+	/// make `moq auth` and `moq completion` fail for everyone who has one.
 	pub typed: MoqSide,
 
 	/// The stages, in the order given. Never empty.
@@ -466,7 +466,7 @@ impl MoqSide {
 
 	/// Reject the MoQ flags on a verb that never touches the network, rather than
 	/// silently ignoring them. `--broadcast` counts: a local verb has no content, and
-	/// next to `token generate` it reads like it scopes the key, which `--root` does.
+	/// next to `auth generate` it reads like it scopes the key, which `--root` does.
 	///
 	/// Private, and reached only through [`Invocation::reject`], so it cannot be asked
 	/// of the resolved side: every one of these flags has a `MOQ_*` variable, and a
@@ -549,7 +549,7 @@ pub enum Command {
 	#[cfg(feature = "transcode")]
 	Transcode(crate::transcode::Args),
 	/// Generate, sign, and verify the JWT tokens a relay authenticates with.
-	Token(moq_token_cli::Args),
+	Auth(crate::auth::Args),
 	/// Write the shell script that completes this command line.
 	Completion(crate::complete::Args),
 	/// List the capture devices `import capture` can name.
@@ -584,7 +584,7 @@ impl Command {
 			Self::Play(_) => "play",
 			#[cfg(feature = "transcode")]
 			Self::Transcode(_) => "transcode",
-			Self::Token(_) => "token",
+			Self::Auth(_) => "auth",
 			Self::Completion(_) => "completion",
 			#[cfg(feature = "capture")]
 			Self::Devices => "devices",
@@ -1033,7 +1033,7 @@ mod tests {
 			"import",
 			"ts",
 			"--",
-			"token",
+			"auth",
 			"generate",
 			"--algorithm",
 			"ES256",
@@ -1041,7 +1041,7 @@ mod tests {
 		.unwrap();
 
 		let err = cli.validate().unwrap_err().to_string();
-		assert!(err.contains("token"), "{err}");
+		assert!(err.contains("auth"), "{err}");
 	}
 
 	/// Each stage is parsed by a real Usage parser, so a typo past the first `--` is
@@ -1222,12 +1222,12 @@ mod tests {
 	}
 
 	#[test]
-	fn token_verb() {
-		let cli = Invocation::try_parse_from(["moq", "token", "generate", "--algorithm", "ES256"]).unwrap();
-		assert!(matches!(cli.stages[0], Command::Token(_)));
+	fn auth_verb() {
+		let cli = Invocation::try_parse_from(["moq", "auth", "generate", "--algorithm", "ES256"]).unwrap();
+		assert!(matches!(cli.stages[0], Command::Auth(_)));
 		// Local verb: it needs no MoQ side, so what every other verb demands...
 		assert!(cli.moq.validate().is_err());
-		assert!(cli.moq.reject("token").is_ok());
+		assert!(cli.moq.reject("auth").is_ok());
 
 		// ...these it refuses, rather than accepting the flag and ignoring it.
 		for (flag, value, reported) in [
@@ -1245,13 +1245,13 @@ mod tests {
 			("--cluster-id", "1", "--cluster-id"),
 			("--cluster-tier", "internal", "--cluster-tier"),
 		] {
-			let cli = Invocation::try_parse_from(["moq", flag, value, "token", "generate"]).unwrap();
-			let err = cli.moq.reject("token").unwrap_err().to_string();
+			let cli = Invocation::try_parse_from(["moq", flag, value, "auth", "generate"]).unwrap();
+			let err = cli.moq.reject("auth").unwrap_err().to_string();
 			assert!(err.contains(reported), "{err}");
 		}
 
-		let cli = Invocation::try_parse_from(["moq", "--cluster-mesh", "token", "generate"]).unwrap();
-		let err = cli.moq.reject("token").unwrap_err().to_string();
+		let cli = Invocation::try_parse_from(["moq", "--cluster-mesh", "auth", "generate"]).unwrap();
+		let err = cli.moq.reject("auth").unwrap_err().to_string();
 		assert!(err.contains("--cluster-mesh"), "{err}");
 
 		#[cfg(unix)]
@@ -1262,16 +1262,16 @@ mod tests {
 				("--listen-unix-allow-gid", "1000", "--listen-unix-allow-gid"),
 				("--listen-unix-allow-pid", "1000", "--listen-unix-allow-pid"),
 			] {
-				let cli = Invocation::try_parse_from(["moq", flag, value, "token", "generate"]).unwrap();
-				let err = cli.moq.reject("token").unwrap_err().to_string();
+				let cli = Invocation::try_parse_from(["moq", flag, value, "auth", "generate"]).unwrap();
+				let err = cli.moq.reject("auth").unwrap_err().to_string();
 				assert!(err.contains(reported), "{err}");
 			}
 		}
 
 		#[cfg(feature = "cluster-lan")]
 		{
-			let cli = Invocation::try_parse_from(["moq", "--cluster-lan", "token", "generate"]).unwrap();
-			let err = cli.moq.reject("token").unwrap_err().to_string();
+			let cli = Invocation::try_parse_from(["moq", "--cluster-lan", "auth", "generate"]).unwrap();
+			let err = cli.moq.reject("auth").unwrap_err().to_string();
 			assert!(err.contains("--cluster-lan"), "{err}");
 
 			// The parser considers the secret's `requires` satisfied when the boolean flag
@@ -1282,11 +1282,11 @@ mod tests {
 				"--cluster-lan=false",
 				"--cluster-lan-secret",
 				"cluster.key",
-				"token",
+				"auth",
 				"generate",
 			])
 			.unwrap();
-			let err = cli.moq.reject("token").unwrap_err().to_string();
+			let err = cli.moq.reject("auth").unwrap_err().to_string();
 			assert!(err.contains("--cluster-lan-secret"), "{err}");
 
 			let cli = Invocation::try_parse_from([
@@ -1294,11 +1294,11 @@ mod tests {
 				"--cluster-lan=false",
 				"--cluster-lan-app",
 				"custom",
-				"token",
+				"auth",
 				"generate",
 			])
 			.unwrap();
-			let err = cli.moq.reject("token").unwrap_err().to_string();
+			let err = cli.moq.reject("auth").unwrap_err().to_string();
 			assert!(err.contains("--cluster-lan-app"), "{err}");
 		}
 	}
