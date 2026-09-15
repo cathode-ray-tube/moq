@@ -2,85 +2,141 @@ use std::collections::VecDeque;
 use std::task::{Poll, ready};
 
 use super::{Container, Frame};
+use crate::encryption::FrameDecrypter;
+use crate::reader::{FrameReader, GroupReader, ProtectedFrame};
 
-/// Decode a single [`moq_net::group::Consumer`] into a finite stream of media [`Frame`]s.
+/// Decode a single [`moq_net::group::Consumer`] into a finite stream of media
+/// [`Frame`]s.
 ///
-/// This is the group-scoped counterpart to [`Consumer`](super::Consumer). Where that one
-/// subscribes to a track and juggles group ordering, age skipping, and rewinds, this one
-/// reads exactly the group it was handed, in arrival order, and ends. That is what a caller
-/// wants after a FETCH: a group already chosen by sequence, with no live subscription and no
-/// max age budget that could skip the very group being asked for.
-///
-/// A batch of frames decoded from one wire frame (a CMAF fragment carrying several samples) is
-/// handed back one frame at a time.
+/// The optional decrypter persists for the lifetime of this group consumer and
+/// is reused across all calls to [`Self::poll_read`].
 pub struct GroupConsumer<F: Container> {
-	group: moq_net::group::Consumer,
-	format: F,
+    group: moq_net::group::Consumer,
+    format: F,
 
-	// Frames decoded from the last wire frame but not yet returned.
-	pending: VecDeque<Frame>,
+    /// Optional decrypter.
+    ///
+    /// Persistent across reads and group transitions.
+    decrypter: Option<Box<dyn FrameDecrypter>>,
 
-	// How many media frames we have returned, so the first one can be marked a keyframe.
-	index: u64,
+    // Frames decoded from the last wire frame but not yet returned.
+    pending: VecDeque<Frame>,
+
+    // How many media frames we have returned, so the first one can be marked
+    // as a keyframe.
+    index: u64,
 }
 
 impl<F: Container> GroupConsumer<F> {
-	/// Decode `group` with the given container format.
-	pub fn new(group: moq_net::group::Consumer, format: F) -> Self {
-		Self {
-			group,
-			format,
-			pending: VecDeque::new(),
-			index: 0,
-		}
-	}
+    /// Decode `group` with the given container format.
+    pub fn new(
+        group: moq_net::group::Consumer,
+        format: F,
+        decrypter: Option<Box<dyn FrameDecrypter>>,
+    ) -> Self {
+        Self {
+            group,
+            format,
+            decrypter,
+            pending: VecDeque::new(),
+            index: 0,
+        }
+    }
 
-	/// The sequence number of this group within its track.
-	pub fn sequence(&self) -> u64 {
-		self.group.sequence
-	}
+    /// The sequence number of this group within its track.
+    pub fn sequence(&self) -> u64 {
+        self.group.sequence
+    }
 
-	/// Read the next frame, or `None` once the group ends.
-	pub async fn read(&mut self) -> Result<Option<Frame>, F::Error> {
-		kio::wait(|waiter| self.poll_read(waiter)).await
-	}
+    /// Read the next frame, or `None` once the group ends.
+    pub async fn read(&mut self) -> Result<Option<Frame>, F::Error> {
+        kio::wait(|waiter| self.poll_read(waiter)).await
+    }
 
-	/// Poll for the next frame, without blocking.
-	pub fn poll_read(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<Frame>, F::Error>> {
-		// Hold the latest media frame until a marker or FIN times it. FETCH groups are
-		// already finished, so this look-ahead does not add latency there.
-		while self.pending.front().is_none_or(|frame| {
-			self.format.kind() == super::Kind::Video && frame.duration.is_none() && self.pending.len() < 2
-		}) {
-			match ready!(self.format.poll_read(&mut self.group, waiter)?) {
-				Some(frames) => {
-					for frame in frames {
-						if let Some(bound) = self.format.end(&frame) {
-							if self.format.kind() == super::Kind::Video
-								&& let Some(last) = self.pending.back_mut()
-							{
-								super::close_duration(last, bound);
-							}
-						} else {
-							self.pending.push_back(frame);
-						}
-					}
-				}
-				None => return Poll::Ready(Ok(self.pop_media())),
-			}
-		}
-		Poll::Ready(Ok(self.pop_media()))
-	}
+    /// Poll for the next frame, without blocking.
+    pub fn poll_read(
+        &mut self,
+        waiter: &kio::Waiter,
+    ) -> Poll<Result<Option<Frame>, F::Error>> {
+        // Hold the latest media frame until a marker or FIN times it.
+        // FETCH groups are already finished, so this look-ahead does not add
+        // latency there.
+        while self.pending.front().is_none_or(|frame| {
+            self.format.kind() == super::Kind::Video
+                && frame.duration.is_none()
+                && self.pending.len() < 2
+        }) {
+            let decoded = match self.poll_read_frames(waiter) {
+                Poll::Pending => return Poll::Pending,
 
-	fn pop_media(&mut self) -> Option<Frame> {
-		let mut frame = self.pending.pop_front()?;
-		// First frame of a group is always a keyframe by protocol invariant; trust
-		// the container's flag otherwise so CMAF mid-group keyframes survive.
-		frame.keyframe = frame.keyframe || self.index == 0;
-		self.index += 1;
-		Some(frame)
-	}
+                Poll::Ready(Err(error)) => {
+                    return Poll::Ready(Err(error));
+                }
+
+                Poll::Ready(Ok(frames)) => frames,
+            };
+
+            match decoded {
+                Some(frames) => {
+                    for frame in frames {
+                        if let Some(bound) = self.format.end(&frame) {
+                            if self.format.kind() == super::Kind::Video
+                                && let Some(last) = self.pending.back_mut()
+                            {
+                                super::close_duration(last, bound);
+                            }
+                        } else {
+                            self.pending.push_back(frame);
+                        }
+                    }
+                }
+
+                None => {
+                    return Poll::Ready(Ok(self.pop_media()));
+                }
+            }
+        }
+
+        Poll::Ready(Ok(self.pop_media()))
+    }
+
+    fn poll_read_frames(
+        &mut self,
+        waiter: &kio::Waiter,
+    ) -> Poll<Result<Option<Vec<Frame>>, F::Error>> {
+        let raw_reader = GroupReader::new(&mut self.group);
+
+        match self.decrypter.as_mut() {
+            Some(decrypter) => {
+                let mut reader = ProtectedFrame::new(
+                    raw_reader,
+                    decrypter.as_mut(),
+                );
+
+                self.format.poll_read_frames(&mut reader, waiter)
+            }
+
+            None => {
+                let mut reader = raw_reader;
+
+                self.format.poll_read_frames(&mut reader, waiter)
+            }
+        }
+    }
+
+    fn pop_media(&mut self) -> Option<Frame> {
+        let mut frame = self.pending.pop_front()?;
+
+        // The first frame of a group is always a keyframe by protocol
+        // invariant; trust the container's flag otherwise so CMAF mid-group
+        // keyframes survive.
+        frame.keyframe = frame.keyframe || self.index == 0;
+        self.index += 1;
+
+        Some(frame)
+    }
 }
+
 
 #[cfg(test)]
 mod tests {
