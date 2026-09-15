@@ -14,6 +14,7 @@ use hang::catalog::{VideoCodecKind, VideoConfig};
 use crate::catalog::Stream;
 use crate::codec::annexb;
 use crate::container::ExportSource;
+use crate::container::FrameDecrypter;
 
 /// Single-rendition H.265 Annex-B exporter.
 pub struct Export<S: Stream> {
