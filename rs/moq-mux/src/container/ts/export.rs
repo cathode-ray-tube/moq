@@ -41,7 +41,7 @@ use crate::container::{ExportSource, Frame};
 
 use super::adts;
 use super::catalog;
-use crate::container::FrameDecrytper;
+use crate::container::FrameDecrypter;
 
 /// PID of the single program's PMT.
 const PMT_PID: u16 = 0x1000;
