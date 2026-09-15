@@ -174,12 +174,12 @@ pub trait Container {
     /// The reader may be a `ProtectedFrame`, in which case each payload has
     /// already been decrypted before the container parses it.
     fn poll_read_frames<R>(
-        &self,
-        reader: &mut R,
-        waiter: &kio::Waiter,
-    ) -> Poll<Result<Option<Vec<Frame>>, Self::Error>>
-    where
-    R: FrameReader<Error = crate::error::Error>,
+    &self,
+    reader: &mut R,
+    waiter: &kio::Waiter,
+) -> Poll<Result<Option<Vec<Frame>>, Self::Error>>
+where
+    R: FrameReader<Error = Self::Error>;
 
     fn end(&self, _frame: &Frame) -> Option<moq_net::Timestamp> {
         None
