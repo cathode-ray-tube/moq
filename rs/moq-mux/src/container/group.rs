@@ -4,7 +4,7 @@ use std::task::{Poll, ready};
 use super::{Container, Frame};
 use super::FrameDecrypter;
 use super::reader::{FrameReader, GroupReader, ProtectedReadFrame};
-
+use crate::container::reader::ProtectedFrame;
 
 /// Decode a single [`moq_net::group::Consumer`] into a finite stream of media
 /// [`Frame`]s.
