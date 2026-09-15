@@ -498,7 +498,9 @@ impl<E: catalog::Catalog> Export<E> {
 		// 1. Drain catalog updates, discovering the track layout.
 		while let Some(catalog) = self.catalog.as_mut() {
 			match catalog.poll_next(waiter)? {
-				Poll::Ready(Some(snapshot)) => self.update_catalog(snapshot, decrypter_factory())?,
+				Poll::Ready(Some(snapshot)) => {
+				   self.update_catalog(snapshot, decrypter_factory)?
+					 }
 				Poll::Ready(None) => {
 					self.catalog = None;
 					break;
@@ -881,7 +883,13 @@ impl<E: catalog::Catalog> Export<E> {
 					self.tracks.insert(name.clone(), existing);
 				}
 				None => {
-					let source = ExportSource::for_stream(&self.source, name, self.max_age, None, decrypter_factory(),)?;
+					let source = ExportSource::for_stream(
+						    &self.source,
+						    name,
+						    self.max_age,
+						    None,
+						    decrypter_factory,
+						)?;
 					self.insert_track(name, source, pid, kind, descriptors, DEFAULT_DTS_RESERVE);
 				}
 			}
