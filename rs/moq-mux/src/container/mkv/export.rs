@@ -13,6 +13,7 @@ use crate::catalog::Stream;
 use crate::container::ExportSource;
 use crate::container::Frame;
 use crate::container::mkv::Error;
+use crate::container::FrameDecryper;
 
 /// Matroska TimestampScale: 1 ms (in nanoseconds).
 const TIMESTAMP_SCALE_NS: u64 = 1_000_000;
@@ -305,7 +306,7 @@ impl<S: Stream> Export<S> {
 		Poll::Pending
 	}
 
-	fn update_catalog(&mut self, mut catalog: Catalog) -> Result<()> {
+	fn update_catalog(&mut self, mut catalog: Catalog, decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,) -> Result<()> {
 		self.source.retain_valid_media(&mut catalog);
 
 		let mut active: HashMap<String, ()> = HashMap::new();
