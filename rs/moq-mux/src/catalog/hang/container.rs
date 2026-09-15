@@ -83,17 +83,20 @@ impl ContainerTrait for Container {
 		}
 	}
 
-	fn finish_group(
-		&self,
-		group: &mut moq_net::group::Producer,
-		end: Option<moq_net::Timestamp>,
-	) -> Result<(), Self::Error> {
-		match self {
-			Self::Legacy(kind) => legacy::Wire(*kind).finish_group(group, end),
-			Self::Cmaf(wire) => wire.finish_group(group, end).map_err(Into::into),
-			Self::Loc(kind) => loc::Wire(*kind).finish_group(group, end),
-		}
-	}
+	fn finish_group<W>(
+    &self,
+    group: &mut W,
+    end: Option<moq_net::Timestamp>,
+) -> Result<(), Self::Error>
+where
+    W: FrameWriter<Error = Self::Error>,
+{
+    match self {
+        Self::Legacy(kind) => legacy::Wire(*kind).finish_group(group, end),
+        Self::Cmaf(wire) => wire.finish_group(group, end).map_err(Into::into),
+        Self::Loc(kind) => loc::Wire(*kind).finish_group(group, end),
+    }
+}
 
 	fn write<W>(&self, output: &mut W, frames: &[Frame]) -> Result<(), Self::Error>
 	where
