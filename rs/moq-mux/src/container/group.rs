@@ -2,8 +2,9 @@ use std::collections::VecDeque;
 use std::task::{Poll, ready};
 
 use super::{Container, Frame};
-use crate::encryption::FrameDecrypter;
-use crate::reader::{FrameReader, GroupReader, ProtectedFrame};
+use super::FrameDecrypter;
+use super::reader::{FrameReader, GroupReader, ProtectedReadFrame};
+
 
 /// Decode a single [`moq_net::group::Consumer`] into a finite stream of media
 /// [`Frame`]s.
