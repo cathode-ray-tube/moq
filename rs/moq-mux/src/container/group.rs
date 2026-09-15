@@ -9,16 +9,20 @@ use crate::error::Error;
 
 pub struct GroupReader<'a> {
     group: &'a mut moq_net::group::Consumer,
+    next_sequence_number: u32,
 }
 
 impl<'a> GroupReader<'a> {
     pub fn new(group: &'a mut moq_net::group::Consumer) -> Self {
-        Self { group }
+        Self {
+            group,
+            next_sequence_number: 0,
+        }
     }
 }
 
 impl FrameReader for GroupReader<'_> {
-    type Error = Error;
+    type Error = crate::Error;
 
     fn poll_read_frame(
         &mut self,
@@ -26,17 +30,25 @@ impl FrameReader for GroupReader<'_> {
     ) -> Poll<Result<Option<ReadFrame>, Self::Error>> {
         let frame = ready!(self.group.poll_read_frame(waiter)?);
 
-        Poll::Ready(Ok(frame.map(|frame| ReadFrame {
-            sequence_number: frame.sequence_number,
+        let Some(frame) = frame else {
+            return Poll::Ready(Ok(None));
+        };
+
+        let sequence_number = self.next_sequence_number;
+        self.next_sequence_number += 1;
+
+        Poll::Ready(Ok(Some(ReadFrame {
+            sequence_number,
             timestamp: frame.timestamp,
             payload: frame.payload,
         })))
     }
 
     fn next_sequence_number(&self) -> u32 {
-        self.group.next_sequence_number()
+        self.next_sequence_number
     }
 }
+
 
 
 /// Decode a single [`moq_net::group::Consumer`] into a finite stream of media
