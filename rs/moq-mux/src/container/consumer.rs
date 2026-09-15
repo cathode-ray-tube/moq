@@ -703,199 +703,199 @@ impl GroupBuffer {
         }
     }
 
-    /// Poll for the next frame or boundary event from this group.
-    fn poll_read<F: Container<Error = crate::error::Error>>(
-        &mut self,
-        waiter: &kio::Waiter,
-        format: &F,
-        mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync)>,
-    ) -> Poll<Result<Option<Event>, F::Error>> {
-        loop {
-            if self
-                .markers
-                .front()
-                .is_some_and(|(index, _)| *index <= self.delivered)
-            {
-                let (_, end) = self.markers.pop_front().unwrap();
+   /// Poll for the next frame or boundary event from this group.
+fn poll_read<F: Container<Error = crate::error::Error>>(
+    &mut self,
+    waiter: &kio::Waiter,
+    format: &F,
+    mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync + '_)>,
+) -> Poll<Result<Option<Event>, F::Error>> {
+    loop {
+        if self
+            .markers
+            .front()
+            .is_some_and(|(index, _)| *index <= self.delivered)
+        {
+            let (_, end) = self.markers.pop_front().unwrap();
 
-                return Poll::Ready(Ok(Some(Event::FrameEnd(end))));
-            }
-
-            if let Some(frame) = self.buffered.pop_front() {
-                self.delivered += 1;
-
-                return Poll::Ready(Ok(Some(Event::Frame(frame))));
-            }
-
-            if !ready!(self.buffer_once(waiter, format, decrypter.as_deref_mut())?) {
-                return Poll::Ready(Ok(None));
-            }
-        }
-    }
-
-    /// Add one more wire frame to the buffer if possible.
-    ///
-    /// Returns `false` if the group is finished.
-   fn buffer_once<F: Container<Error = crate::error::Error>>(
-        &mut self,
-        waiter: &kio::Waiter,
-        format: &F,
-       mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync + '_)>
-    ) -> Poll<Result<bool, F::Error>> {
-        let frames = if let Some(decrypter) = decrypter.as_deref_mut() {
-            let raw_reader = GroupReader::new(&mut self.group);
-            let mut reader = ProtectedFrame::new(raw_reader, decrypter);
-
-            ready!(format.poll_read_frames(&mut reader, waiter))?
-        } else {
-            let mut reader = GroupReader::new(&mut self.group);
-
-            ready!(format.poll_read_frames(&mut reader, waiter))?
-        };
-
-        let Some(frames) = frames else {
-            return Poll::Ready(Ok(false));
-        };
-
-        self.empty = false;
-
-        for mut frame in frames {
-            if let Some(bound) = format.end(&frame) {
-                self.note_end(bound);
-                self.markers.push_back((self.index, bound));
-                continue;
-            }
-
-            self.min_timestamp = Some(match self.min_timestamp {
-                Some(existing) => existing.min(frame.timestamp),
-                None => frame.timestamp,
-            });
-
-            self.max_timestamp = Some(match self.max_timestamp {
-                Some(existing) => existing.max(frame.timestamp),
-                None => frame.timestamp,
-            });
-
-            // A frame with no duration contributes only its timestamp.
-            self.note_end(frame.timestamp);
-
-            if let Some(duration) = frame.duration {
-                let end = std::time::Duration::from(frame.timestamp)
-                    + std::time::Duration::from(duration);
-
-                self.max_end = Some(
-                    self.max_end
-                        .map_or(end, |existing| existing.max(end)),
-                );
-            }
-
-            // The first frame of a group is always a keyframe by protocol
-            // invariant. Preserve container-provided keyframe flags thereafter.
-            frame.keyframe = frame.keyframe || self.index == 0;
-            self.index += 1;
-
-            self.buffered.push_back(frame);
+            return Poll::Ready(Ok(Some(Event::FrameEnd(end))));
         }
 
-        Poll::Ready(Ok(true))
-    }
+        if let Some(frame) = self.buffered.pop_front() {
+            self.delivered += 1;
 
-    /// Ensure at least one media frame is buffered.
-   fn buffer_one<F: Container<Error = crate::error::Error>>(
-        &mut self,
-        waiter: &kio::Waiter,
-        format: &F,
-        mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync + '_)>
-    ) -> Poll<Result<bool, F::Error>> {
-        loop {
-            if !self.buffered.is_empty() {
-                return Poll::Ready(Ok(true));
-            }
+            return Poll::Ready(Ok(Some(Event::Frame(frame))));
+        }
 
-            if !ready!(
-                self.buffer_once(
-                    waiter,
-                    format,
-                    decrypter.as_deref_mut(),
-                )?
-            ) {
-                return Poll::Ready(Ok(false));
-            }
-
-            // The wire frame decoded to no media frames. Continue reading.
+        if !ready!(self.buffer_once(waiter, format, decrypter.as_deref_mut())?) {
+            return Poll::Ready(Ok(None));
         }
     }
+}
 
-    /// Read all remaining wire frames.
-   fn buffer_all<F: Container<Error = crate::error::Error>>(
-        &mut self,
-        waiter: &kio::Waiter,
-        format: &F,
-        mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync + '_)>
-    ) -> Poll<Result<(), F::Error>> {
-        while ready!(
+/// Add one more wire frame to the buffer if possible.
+///
+/// Returns `false` if the group is finished.
+fn buffer_once<F: Container<Error = crate::error::Error>>(
+    &mut self,
+    waiter: &kio::Waiter,
+    format: &F,
+    mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync + '_)>,
+) -> Poll<Result<bool, F::Error>> {
+    let frames = if let Some(decrypter) = decrypter.as_deref_mut() {
+        let raw_reader = GroupReader::new(&mut self.group);
+        let mut reader = ProtectedFrame::new(raw_reader, decrypter);
+
+        ready!(format.poll_read_frames(&mut reader, waiter))?
+    } else {
+        let mut reader = GroupReader::new(&mut self.group);
+
+        ready!(format.poll_read_frames(&mut reader, waiter))?
+    };
+
+    let Some(frames) = frames else {
+        return Poll::Ready(Ok(false));
+    };
+
+    self.empty = false;
+
+    for mut frame in frames {
+        if let Some(bound) = format.end(&frame) {
+            self.note_end(bound);
+            self.markers.push_back((self.index, bound));
+            continue;
+        }
+
+        self.min_timestamp = Some(match self.min_timestamp {
+            Some(existing) => existing.min(frame.timestamp),
+            None => frame.timestamp,
+        });
+
+        self.max_timestamp = Some(match self.max_timestamp {
+            Some(existing) => existing.max(frame.timestamp),
+            None => frame.timestamp,
+        });
+
+        // A frame with no duration contributes only its timestamp.
+        self.note_end(frame.timestamp);
+
+        if let Some(duration) = frame.duration {
+            let end = std::time::Duration::from(frame.timestamp)
+                + std::time::Duration::from(duration);
+
+            self.max_end = Some(
+                self.max_end
+                    .map_or(end, |existing| existing.max(end)),
+            );
+        }
+
+        // The first frame of a group is always a keyframe by protocol
+        // invariant. Preserve container-provided keyframe flags thereafter.
+        frame.keyframe = frame.keyframe || self.index == 0;
+        self.index += 1;
+
+        self.buffered.push_back(frame);
+    }
+
+    Poll::Ready(Ok(true))
+}
+
+/// Ensure at least one media frame is buffered.
+fn buffer_one<F: Container<Error = crate::error::Error>>(
+    &mut self,
+    waiter: &kio::Waiter,
+    format: &F,
+    mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync + '_)>,
+) -> Poll<Result<bool, F::Error>> {
+    loop {
+        if !self.buffered.is_empty() {
+            return Poll::Ready(Ok(true));
+        }
+
+        if !ready!(
             self.buffer_once(
                 waiter,
                 format,
                 decrypter.as_deref_mut(),
             )?
-        ) {}
+        ) {
+            return Poll::Ready(Ok(false));
+        }
 
-        Poll::Ready(Ok(()))
+        // The wire frame decoded to no media frames. Continue reading.
     }
+}
 
-    /// Poll for the maximum timestamp in this group.
-    fn poll_max_timestamp<F: Container>(
-        &mut self,
-        waiter: &kio::Waiter,
-        format: &F,
-        mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync)>,
-    ) -> Poll<Result<Timestamp, F::Error>> {
-        // Continue reading to advance the maximum timestamp.
-        let _ = self.buffer_all(
+/// Read all remaining wire frames.
+fn buffer_all<F: Container<Error = crate::error::Error>>(
+    &mut self,
+    waiter: &kio::Waiter,
+    format: &F,
+    mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync + '_)>,
+) -> Poll<Result<(), F::Error>> {
+    while ready!(
+        self.buffer_once(
             waiter,
             format,
             decrypter.as_deref_mut(),
-        )?;
+        )?
+    ) {}
 
-        if let Some(max) = self.max_timestamp {
-            return Poll::Ready(Ok(max));
-        }
+    Poll::Ready(Ok(()))
+}
 
-        if let Poll::Ready(_frames) = self.group.poll_finished(waiter)? {
-            return Poll::Ready(Err(
-                moq_net::Error::Decode(moq_net::DecodeError::Short).into()
-            ));
-        }
+/// Poll for the maximum timestamp in this group.
+fn poll_max_timestamp<F: Container<Error = crate::error::Error>>(
+    &mut self,
+    waiter: &kio::Waiter,
+    format: &F,
+    mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync + '_)>,
+) -> Poll<Result<Timestamp, F::Error>> {
+    // Continue reading to advance the maximum timestamp.
+    let _ = self.buffer_all(
+        waiter,
+        format,
+        decrypter.as_deref_mut(),
+    )?;
 
-        Poll::Pending
+    if let Some(max) = self.max_timestamp {
+        return Poll::Ready(Ok(max));
     }
 
-    /// Poll for the minimum timestamp in this group.
-    fn poll_min_timestamp<F: Container>(
-        &mut self,
-        waiter: &kio::Waiter,
-        format: &F,
-        mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync + '_)>
-    ) -> Poll<Result<Timestamp, F::Error>> {
-        let _ = self.buffer_one(
-            waiter,
-            format,
-            decrypter.as_deref_mut(),
-        )?;
-
-        if let Some(min) = self.min_timestamp {
-            return Poll::Ready(Ok(min));
-        }
-
-        if let Poll::Ready(_frames) = self.group.poll_finished(waiter)? {
-            return Poll::Ready(Err(
-                moq_net::Error::Decode(moq_net::DecodeError::Short).into()
-            ));
-        }
-
-        Poll::Pending
+    if let Poll::Ready(_frames) = self.group.poll_finished(waiter)? {
+        return Poll::Ready(Err(
+            moq_net::Error::Decode(moq_net::DecodeError::Short).into()
+        ));
     }
+
+    Poll::Pending
+}
+
+/// Poll for the minimum timestamp in this group.
+fn poll_min_timestamp<F: Container<Error = crate::error::Error>>(
+    &mut self,
+    waiter: &kio::Waiter,
+    format: &F,
+    mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync + '_)>,
+) -> Poll<Result<Timestamp, F::Error>> {
+    let _ = self.buffer_one(
+        waiter,
+        format,
+        decrypter.as_deref_mut(),
+    )?;
+
+    if let Some(min) = self.min_timestamp {
+        return Poll::Ready(Ok(min));
+    }
+
+    if let Poll::Ready(_frames) = self.group.poll_finished(waiter)? {
+        return Poll::Ready(Err(
+            moq_net::Error::Decode(moq_net::DecodeError::Short).into()
+        ));
+    }
+
+    Poll::Pending
+}
 
     /// True if the transport can no longer deliver the frame at which this
     /// group stopped.
