@@ -6,7 +6,8 @@ use moq_net::Timestamp;
 use super::{Container, Frame};
 
 use crate::container::{FrameDecrypter, ProtectedReadFrame};
-use crate::container::reader::GroupReader;
+use crate::container::group::GroupReader;
+use crate::container::reader::ProtectedFrame;
 
 /// Media and clean group boundaries in delivery order.
 pub(crate) enum Event {
