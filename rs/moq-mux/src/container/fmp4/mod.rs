@@ -49,6 +49,9 @@ use crate::error::Error as MuxError;
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+	 #[error("HANG decode error: {0}")]
+    Hang(#[from] hang::Error),
+	
 	#[error("mp4: {0}")]
 	Mp4(std::sync::Arc<mp4_atom::Error>),
 
