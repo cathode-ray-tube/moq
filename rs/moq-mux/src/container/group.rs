@@ -5,6 +5,41 @@ use super::{Container, Frame};
 use crate::container::{FrameDecrypter, ProtectedReadFrame};
 use crate::container::reader::FrameReader;
 
+use crate::container::{FrameDecrypter, ProtectedReadFrame, ReadFrame};
+use crate::error::Error;
+
+struct GroupReader<'a> {
+    group: &'a mut moq_net::group::Consumer,
+}
+
+impl<'a> GroupReader<'a> {
+    fn new(group: &'a mut moq_net::group::Consumer) -> Self {
+        Self { group }
+    }
+}
+
+impl FrameReader for GroupReader<'_> {
+    type Error = Error;
+
+    fn poll_read_frame(
+        &mut self,
+        waiter: &kio::Waiter,
+    ) -> Poll<Result<Option<ReadFrame>, Self::Error>> {
+        let frame = ready!(self.group.poll_read_frame(waiter)?);
+
+        Poll::Ready(Ok(frame.map(|frame| ReadFrame {
+            sequence_number: frame.sequence_number,
+            timestamp: frame.timestamp,
+            payload: frame.payload,
+        })))
+    }
+
+    fn next_sequence_number(&self) -> u32 {
+        self.group.next_sequence_number()
+    }
+}
+
+
 /// Decode a single [`moq_net::group::Consumer`] into a finite stream of media
 /// [`Frame`]s.
 ///
