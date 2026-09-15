@@ -15,8 +15,6 @@ use std::task::ready;
 
 use crate::Error;
 
-use crate::container::FrameReader;
-
 /// LOC's catalog convention: timestamps are in microseconds when no per-frame
 /// 0x08 timescale property is present.
 const DEFAULT_TIMESCALE: Timescale = Timescale::MICRO;
