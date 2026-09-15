@@ -1,6 +1,6 @@
 use std::task::{Poll, ready};
 
-use crate::container::{Container as ContainerTrait, Frame, FrameWriter, Kind, fmp4, legacy, loc};
+use crate::container::{Container as ContainerTrait, Frame, FrameWriter, FrameReader, Kind, fmp4, legacy, loc};
 
 /// Runtime-dispatched wire format for a track described by a hang catalog.
 ///
@@ -107,6 +107,30 @@ where
 			Self::Cmaf(cmaf) => cmaf.write(output, frames).map_err(Into::into),
 			Self::Loc(kind) => loc::Wire(*kind).write(output, frames),
 		}
+	}
+
+	fn poll_read_frames<R>(
+    &self,
+    reader: &mut R,
+    waiter: &kio::Waiter,
+	) -> Poll<Result<Option<Vec<Frame>>, Self::Error>>
+	where
+	    R: FrameReader<Error = Error>,
+	{
+	    let Some(data) = ready!(reader.poll_read_frame(waiter)?) else {
+	        return Poll::Ready(Ok(None));
+	    };
+	
+	    let hang_frame = hang::container::Frame::decode(data.payload)?;
+	
+	    Poll::Ready(Ok(Some(vec![Frame {
+	        // Prefer the timestamp from the wire frame if it is available
+	        // outside the encrypted payload.
+	        timestamp: data.timestamp,
+	        payload: hang_frame.payload,
+	        keyframe: false,
+	        duration: None,
+	    }])))
 	}
 
 	fn poll_read(
