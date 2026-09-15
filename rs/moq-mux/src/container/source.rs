@@ -23,6 +23,7 @@ use crate::catalog::hang::Container as HangContainer;
 use crate::codec::h264::Avc1;
 use crate::codec::h265::Hvc1;
 use crate::container::{Consumer, Frame};
+use crate::container::FrameDecrypter;
 
 /// Per-track video transform that bridges between codec shapes.
 pub(crate) enum VideoTransform {
@@ -267,7 +268,7 @@ impl ExportSource {
 				.media
 				.take()
 				.expect("media present until the subscription resolves");
-			self.state = SourceState::Active(Box::new(Consumer::new(track, media, None)));
+			self.state = SourceState::Active(Box::new(Consumer::new(track, media, None::<Box<dyn FrameDecrypter + Send + Sync>>,)));
 		}
 
 		loop {
