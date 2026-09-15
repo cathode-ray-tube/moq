@@ -801,7 +801,7 @@ impl GroupBuffer {
     }
 
     /// Ensure at least one media frame is buffered.
-    fn buffer_one<F: Container>(
+   fn buffer_one<F: Container<Error = crate::error::Error>>(
         &mut self,
         waiter: &kio::Waiter,
         format: &F,
