@@ -4,7 +4,9 @@ use std::task::{ready, Poll};
 use moq_net::Timestamp;
 
 use super::{Container, Frame};
-use crate::encryption::FrameDecrypter;
+
+use crate::container::{FrameDecrypter, ProtectedReadFrame};
+use crate::container::reader::GroupReader;
 
 /// Media and clean group boundaries in delivery order.
 pub(crate) enum Event {
