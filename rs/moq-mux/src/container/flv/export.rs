@@ -372,7 +372,7 @@ impl Export {
 		Ok(())
 	}
 
-	fn bind_audio(&mut self, catalog: &Catalog, decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,) -> anyhow::Result<()> {
+	fn bind_audio(&mut self, catalog: &Catalog, decrypter_factory: impl Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,) -> anyhow::Result<()> {
 		for (name, config) in &catalog.audio.renditions {
 			if !self.multitrack && !self.audio.is_empty() {
 				tracing::warn!("FLV export only supports one audio track; ignoring the rest (enable multitrack)");
