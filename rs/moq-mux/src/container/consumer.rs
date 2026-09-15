@@ -80,6 +80,11 @@ pub struct Consumer<F: Container> {
 
 	// Exclusive audio endpoint delivered before terminal codec packets.
 	end: Option<Timestamp>,
+
+	/// Optional decrypter.
+	///
+	/// Persistent across reads and group transitions.
+	decrypter: Option<Box<dyn FrameDecrypter>>,
 }
 
 /// Live state for detecting timeline rewinds and classifying out-of-order groups.
