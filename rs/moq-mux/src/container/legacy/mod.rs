@@ -9,6 +9,7 @@ use std::task::Poll;
 use std::task::ready;
 use crate::container::{Container, Frame, FrameWriter, FrameReader, Kind};
 use crate::container::FrameReader;
+use crate::Error;
 
 /// Hang Legacy wire format configured for the track's media role.
 pub struct Wire(
