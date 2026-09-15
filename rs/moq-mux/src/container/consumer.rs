@@ -43,7 +43,7 @@ pub struct Consumer<F: Container> {
     end: Option<Timestamp>,
 
     /// Optional decrypter, persistent across reads and group transitions.
-    mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync)>
+    decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,
 
 }
 
