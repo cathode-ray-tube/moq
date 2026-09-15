@@ -827,7 +827,7 @@ impl GroupBuffer {
     }
 
     /// Read all remaining wire frames.
-    fn buffer_all<F: Container>(
+   fn buffer_all<F: Container<Error = crate::error::Error>>(
         &mut self,
         waiter: &kio::Waiter,
         format: &F,
