@@ -73,7 +73,7 @@ pub struct GroupConsumer<F: Container> {
     index: u64,
 }
 
-impl<F: Container> GroupConsumer<F> {
+impl<F: Container<Error = crate::error::Error>> GroupConsumer<F> {
     /// Decode `group` with the given container format.
     pub fn new(
         group: moq_net::group::Consumer,
