@@ -10,7 +10,16 @@ pub(crate) enum Event {
 	Frame(Frame),
 	FrameEnd(Timestamp),
 	GroupEnd,
-}
+};
+
+use::encryption::FrameDecrypter;
+
+use crate::reader::{
+    FrameReader,
+    ProtectedReadFrame,
+};
+
+
 
 /// Decode a moq-lite track into a stream of media [`Frame`]s in age-bounded
 /// presentation order.
@@ -84,7 +93,7 @@ pub struct Consumer<F: Container> {
 	/// Optional decrypter.
 	///
 	/// Persistent across reads and group transitions.
-	decrypter: Option<Box<dyn FrameDecrypter>>,
+	decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,
 }
 
 /// Live state for detecting timeline rewinds and classifying out-of-order groups.
