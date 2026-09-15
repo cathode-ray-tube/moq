@@ -736,7 +736,7 @@ impl GroupBuffer {
     /// Add one more wire frame to the buffer if possible.
     ///
     /// Returns `false` if the group is finished.
-    fn buffer_once<F: Container>(
+   fn buffer_once<F: Container<Error = crate::error::Error>>(
         &mut self,
         waiter: &kio::Waiter,
         format: &F,
