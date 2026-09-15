@@ -633,37 +633,6 @@ impl<F: Container> Consumer<F> {
 
 /// Internal reader for a group of frames.
 ///
-/// Handles two-phase frame reading (get FrameConsumer, then read all data),
-/// timestamp parsing, and min/max timestamp tracking for age decisions.
-struct GroupBuffer {
-	group: moq_net::group::Consumer,
-
-	// The current frame index within the group.
-	index: usize,
-
-	// Whether the group has carried any wire frame. A cleanly finished group with
-	// none is an explicit discontinuity marker.
-	empty: bool,
-
-	// Read frames that haven't been consumed yet.
-	buffered: VecDeque<Frame>,
-	markers: VecDeque<(usize, Timestamp)>,
-	delivered: usize,
-
-	// The minimum timestamp in the group.
-	min_timestamp: Option<Timestamp>,
-
-	// The maximum timestamp in the group.
-	max_timestamp: Option<Timestamp>,
-
-	// The furthest presentation point reached so far, i.e. max(timestamp + duration).
-	// Equals the max timestamp when the container carries no per-frame duration.
-	// Stored as a wall-clock duration so cross-scale comparisons are cheap.
-	max_end: Option<std::time::Duration>,
-}
-
-/// Internal reader for a group of frames.
-///
 /// Handles two-phase frame reading, timestamp parsing, and min/max timestamp
 /// tracking for age decisions.
 struct GroupBuffer {
