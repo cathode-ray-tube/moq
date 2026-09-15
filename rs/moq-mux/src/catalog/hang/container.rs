@@ -1,5 +1,7 @@
 use std::task::{Poll, ready};
 
+use crate::Error;
+
 use crate::container::{Container as ContainerTrait, Frame, FrameWriter, FrameReader, Kind, fmp4, legacy, loc};
 
 /// Runtime-dispatched wire format for a track described by a hang catalog.
