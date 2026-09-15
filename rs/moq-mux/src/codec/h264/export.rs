@@ -122,7 +122,7 @@ impl<S: Stream> Export<S> {
 		}
 	}
 
-	fn update_catalog(&mut self, catalog: &Catalog, decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,) -> crate::Result<()> {
+	fn update_catalog(&mut self, catalog: &Catalog, decrypter_factory: impl Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,) -> crate::Result<()> {
 		let mut catalog = catalog.clone();
 		self.source.retain_valid_media(&mut catalog);
 
@@ -154,7 +154,7 @@ impl<S: Stream> Export<S> {
 			return Ok(());
 		}
 
-		let Some(source) = ExportSource::for_video_raw(&self.source, name, config, self.max_age, decrypter)? else {
+		let Some(source) = ExportSource::for_video_raw(&self.source, name, config, self.max_age, decrypter_factory())? else {
 			unreachable!("invalid broadcast references were removed above");
 		};
 		let convert = match config.description.as_ref().filter(|d| !d.is_empty()) {
