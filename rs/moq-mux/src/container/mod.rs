@@ -16,7 +16,6 @@ use std::task::Poll;
 mod consumer;
 mod group;
 mod producer;
-mod source;
 
 #[cfg(test)]
 pub(crate) mod test_util;
