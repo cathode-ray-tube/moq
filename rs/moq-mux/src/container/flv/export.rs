@@ -353,7 +353,14 @@ impl Export {
 				(VideoCodec::AV1(av1), None) => Some(Bytes::copy_from_slice(&av1c_bytes(av1))),
 				_ => None,
 			};
-			let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age, None, decrypter_factory())? else {
+			let Some(source) = ExportSource::for_video(
+				    &self.source,
+				    name,
+				    config,
+				    self.max_age,
+				    None,
+				    decrypter_factory,
+				)? else {
 				continue;
 			};
 			let track_id = u8::try_from(self.video.len()).context("too many FLV video tracks")?;
@@ -372,7 +379,7 @@ impl Export {
 		Ok(())
 	}
 
-	fn bind_audio(&mut self, catalog: &Catalog, decrypter_factory: impl Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,) -> anyhow::Result<()> {
+	fn bind_audio(&mut self, catalog: &Catalog, decrypter_factory: &dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,) -> anyhow::Result<()> {
 		for (name, config) in &catalog.audio.renditions {
 			if !self.multitrack && !self.audio.is_empty() {
 				tracing::warn!("FLV export only supports one audio track; ignoring the rest (enable multitrack)");
@@ -383,7 +390,15 @@ impl Export {
 			}
 			let flavor = audio_flavor(config)?;
 			ensure_legacy(&config.container, "audio", name)?;
-			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, None, decrypter_factory())? else {
+			let Some(source) = ExportSource::for_audio(
+			    &self.source,
+			    name,
+			    config,
+			    self.max_age,
+			    None,
+			    decrypter_factory,
+			)?
+			 else {
 				continue;
 			};
 			let track_id = u8::try_from(self.audio.len()).context("too many FLV audio tracks")?;
