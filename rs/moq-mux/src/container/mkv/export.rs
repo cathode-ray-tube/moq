@@ -340,7 +340,7 @@ impl<S: Stream> Export<S> {
 				continue;
 			}
 			ensure_legacy(&config.container, "video", name)?;
-			let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age, None)? else {
+			let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age, decrypter)? else {
 				continue;
 			};
 			self.tracks.insert(
@@ -361,7 +361,7 @@ impl<S: Stream> Export<S> {
 				continue;
 			}
 			ensure_legacy(&config.container, "audio", name)?;
-			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, None)? else {
+			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, None, decrypter)? else {
 				continue;
 			};
 			self.tracks.insert(
