@@ -6,8 +6,8 @@
 //! to pull normalized frames. For Annex-B sources (catalog codec marked
 //! `inline: true` / `in_band: true`, empty `description`) the source attaches
 //! an [`Avc1`] / [`Hvc1`] transform that caches parameter sets, synthesizes
-//! the codec config record, and length-prefixes slice NALs. Frame emission
-//! is deferred until the transform has produced its config record.
+//! the codec config record, and length-prefixes slice NALs. Frame emission is
+//! deferred until the transform has produced its config record.
 //!
 //! `description()` returns the resolved codec config: either the catalog's
 //! existing `description` (for already-out-of-band sources) or the synthesized
@@ -34,79 +34,102 @@ pub(crate) enum VideoTransform {
 impl VideoTransform {
 	pub(crate) fn codec_private(&self) -> Option<&Bytes> {
 		match self {
-			VideoTransform::Avc1(t) => t.avcc(),
-			VideoTransform::Hvc1(t) => t.hvcc(),
+			Self::Avc1(transform) => transform.avcc(),
+			Self::Hvc1(transform) => transform.hvcc(),
 		}
 	}
 
 	pub(crate) fn transform(&mut self, payload: Bytes) -> crate::Result<Option<Bytes>> {
 		match self {
-			VideoTransform::Avc1(t) => Ok(t.transform(payload)?),
-			VideoTransform::Hvc1(t) => Ok(t.transform(payload)?),
+			Self::Avc1(transform) => Ok(transform.transform(payload)?),
+			Self::Hvc1(transform) => Ok(transform.transform(payload)?),
 		}
 	}
 }
 
 /// A subscription that resolves on first poll, then the live consumer.
 enum SourceState {
-	/// Waiting for the target broadcast (the catalog broadcast, or a cross-broadcast
-	/// reference) to resolve; the track (by name) is subscribed once it does.
+	/// Waiting for the target broadcast (the catalog broadcast, or a
+	/// cross-broadcast reference) to resolve; the track is subscribed once it
+	/// does.
 	Requesting(kio::Pending<moq_net::origin::Requesting>, String),
-	/// Waiting for the subscription to resolve (blocks on the publisher's SUBSCRIBE_OK).
+
+	/// Waiting for the subscription to resolve. This blocks on the publisher's
+	/// SUBSCRIBE_OK.
 	Subscribing(kio::Pending<moq_net::track::Subscribing>),
-	/// The resolved consumer, reading frames. Boxed because it's much larger than
-	/// the `Subscribing` variant (clippy `large_enum_variant`).
+
+	/// The resolved consumer, reading frames.
+	///
+	/// Boxed because it is much larger than the `Subscribing` variant.
 	Active(Box<Consumer<HangContainer>>),
 }
 
-/// A per-rendition source that normalizes frame shape (Annex-B →
-/// length-prefixed for H.264/H.265) and exposes the resolved codec config
-/// record alongside the frame stream.
+/// A per-rendition source that normalizes frame shape and exposes the
+/// resolved codec configuration record alongside the frame stream.
 pub(crate) struct ExportSource {
 	state: SourceState,
+
 	/// Wire format, consumed when the subscription resolves into a consumer.
 	media: Option<HangContainer>,
+
 	max_age: std::time::Duration,
+
+	/// Decryptor retained while the source is resolving and consumed when the
+	/// subscription becomes active.
+	decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,
+
 	transform: Option<VideoTransform>,
-	/// Resolved codec configuration record (avcC / hvcC / AudioSpecificConfig /
-	/// OpusHead). Some once the codec config is available — from the catalog
-	/// `description`, or synthesized by the transform.
+
+	/// Resolved codec configuration record (avcC / hvcC /
+	/// AudioSpecificConfig / OpusHead).
+	///
+	/// This is populated from the catalog description or synthesized by the
+	/// video transform.
 	description: Option<Bytes>,
+
 	/// Video codec used to derive geometry from its configuration or keyframes.
 	video_codec: Option<VideoCodec>,
-	/// Geometry resolved from the initial catalog or codec data received afterward.
+
+	/// Geometry resolved from the initial catalog or codec data received
+	/// afterward.
 	video_dimensions: Option<(u32, u32)>,
 }
 
 impl ExportSource {
 	/// Subscribe to a video rendition and build an `ExportSource`.
 	///
-	/// Fails with [`Error::EscapingBroadcast`](crate::Error::EscapingBroadcast) if the catalog
-	/// `broadcast` reference escapes above the root, naming no broadcast to subscribe on. The
-	/// catalog stream rejects such a reference first, so this is a backstop for a caller that
-	/// built the config itself.
+	/// Fails with [`Error::EscapingBroadcast`](crate::Error::EscapingBroadcast)
+	/// if the catalog `broadcast` reference escapes above the root.
 	pub fn for_video(
 		source: &crate::Source,
 		name: &str,
 		config: &VideoConfig,
 		max_age: std::time::Duration,
+		decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,
 	) -> Result<Option<Self>, crate::Error> {
-		Self::video(source, name, config, max_age, build_video_transform(config))
+		Self::video(
+			source,
+			name,
+			config,
+			max_age,
+			build_video_transform(config),
+			decrypter,
+		)
 	}
 
 	/// Subscribe to a video rendition without attaching any codec-shape
-	/// transform. Payloads pass through untouched (Annex-B stays Annex-B,
-	/// avc1 length-prefixed stays length-prefixed). The Annex-B exporter
-	/// uses this to keep parameter sets in-band.
+	/// transform.
 	///
-	/// Rejects an escaping `broadcast` reference like [`Self::for_video`].
+	/// Payloads pass through untouched. Annex-B remains Annex-B and avc1
+	/// length-prefixed payloads remain length-prefixed.
 	pub fn for_video_raw(
 		source: &crate::Source,
 		name: &str,
 		config: &VideoConfig,
 		max_age: std::time::Duration,
+		decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,
 	) -> Result<Option<Self>, crate::Error> {
-		Self::video(source, name, config, max_age, None)
+		Self::video(source, name, config, max_age, None, decrypter)
 	}
 
 	fn video(
@@ -115,9 +138,16 @@ impl ExportSource {
 		config: &VideoConfig,
 		max_age: std::time::Duration,
 		transform: Option<VideoTransform>,
+		decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,
 	) -> Result<Option<Self>, crate::Error> {
 		let media: HangContainer = config.try_into()?;
-		let description = config.description.as_ref().filter(|b| !b.is_empty()).cloned();
+
+		let description = config
+			.description
+			.as_ref()
+			.filter(|description| !description.is_empty())
+			.cloned();
+
 		let Some(request) = source.try_request(config.broadcast.as_ref()) else {
 			return Ok(None);
 		};
@@ -126,27 +156,36 @@ impl ExportSource {
 			state: SourceState::Requesting(request, name.to_string()),
 			media: Some(media),
 			max_age,
+			decrypter,
 			transform,
 			description,
 			video_codec: Some(config.codec.clone()),
 			video_dimensions: catalog_dimensions(config),
 		};
+
 		source.resolve_video_dimensions(&[])?;
 		Ok(Some(source))
 	}
 
-	/// Subscribe to an audio rendition. Audio has no codec-shape transform;
-	/// `description` is taken straight from the catalog.
+	/// Subscribe to an audio rendition.
 	///
-	/// Rejects an escaping `broadcast` reference like [`Self::for_video`].
+	/// Audio has no codec-shape transform; `description` is taken directly
+	/// from the catalog.
 	pub fn for_audio(
 		source: &crate::Source,
 		name: &str,
 		config: &AudioConfig,
 		max_age: std::time::Duration,
+		decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,
 	) -> Result<Option<Self>, crate::Error> {
 		let media: HangContainer = config.try_into()?;
-		let description = config.description.as_ref().filter(|b| !b.is_empty()).cloned();
+
+		let description = config
+			.description
+			.as_ref()
+			.filter(|description| !description.is_empty())
+			.cloned();
+
 		let Some(request) = source.try_request(config.broadcast.as_ref()) else {
 			return Ok(None);
 		};
@@ -155,6 +194,7 @@ impl ExportSource {
 			state: SourceState::Requesting(request, name.to_string()),
 			media: Some(media),
 			max_age,
+			decrypter,
 			transform: None,
 			description,
 			video_codec: None,
@@ -162,17 +202,21 @@ impl ExportSource {
 		}))
 	}
 
-	/// Subscribe to a verbatim `mpegts` stream rendition (SCTE-35, private PES, ...).
-	/// No codec-shape transform and no description: the frames are Legacy-framed
-	/// verbatim bytes the muxer writes back out as PES or private sections.
+	/// Subscribe to a verbatim `mpegts` stream rendition.
 	///
-	/// Such a rendition has no catalog `broadcast` field, so it always lives on the
-	/// catalog broadcast and can never carry an escaping reference.
-	pub fn for_stream(source: &crate::Source, name: &str, max_age: std::time::Duration) -> Result<Self, crate::Error> {
+	/// Such a rendition has no catalog `broadcast` field, so it always lives on
+	/// the catalog broadcast and can never carry an escaping reference.
+	pub fn for_stream(
+		source: &crate::Source,
+		name: &str,
+		max_age: std::time::Duration,
+		decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,
+	) -> Result<Self, crate::Error> {
 		Ok(Self {
 			state: SourceState::Requesting(source.request_catalog(), name.to_string()),
 			media: Some(HangContainer::Legacy(crate::container::Kind::Data)),
 			max_age,
+			decrypter,
 			transform: None,
 			description: None,
 			video_codec: None,
@@ -185,13 +229,8 @@ impl ExportSource {
 		self.description.as_ref()
 	}
 
-	/// The underlying consumer's timeline-discontinuity counter, or 0 until the
-	/// subscription resolves.
-	///
-	/// See [`Consumer::discontinuity`]. Sample it alongside each frame returned by
-	/// [`poll_read`](Self::poll_read): the frame read while the counter changes is
-	/// the first of a new timeline, so anything anchored on the media clock (a
-	/// repetition cadence, a clock grid, a pacer) has to re-anchor to it.
+	/// The underlying consumer's timeline-discontinuity counter, or 0 until
+	/// the subscription resolves.
 	pub fn discontinuity(&self) -> u64 {
 		match &self.state {
 			SourceState::Active(consumer) => consumer.discontinuity(),
@@ -199,8 +238,7 @@ impl ExportSource {
 		}
 	}
 
-	/// True if the codec config is resolved (either present in the catalog,
-	/// no transform attached, or the transform has built its record).
+	/// True if the codec config is resolved.
 	pub fn header_ready(&self) -> bool {
 		self.transform.is_none() || self.description.is_some()
 	}
@@ -212,26 +250,35 @@ impl ExportSource {
 		}
 
 		let (width, height) = self.video_dimensions?;
+
 		let mut config = config.clone();
 		config.coded_width = Some(width);
 		config.coded_height = Some(height);
+
 		Some(config)
 	}
 
-	/// True when this codec is unsupported or has enough geometry to build a video header.
+	/// True when this codec is unsupported or has enough geometry to build a
+	/// video header.
 	pub fn video_geometry_ready(&self, config: &VideoConfig) -> bool {
 		!matches!(
 			config.codec,
-			VideoCodec::H264(_) | VideoCodec::H265(_) | VideoCodec::VP8 | VideoCodec::VP9(_) | VideoCodec::AV1(_)
+			VideoCodec::H264(_)
+				| VideoCodec::H265(_)
+				| VideoCodec::VP8
+				| VideoCodec::VP9(_)
+				| VideoCodec::AV1(_)
 		) || self.video_config(config).is_some()
 	}
 
 	/// Pull the next normalized frame.
 	///
-	/// Parameter-only frames (SPS/PPS-only inputs to the Avc3 transform) are
-	/// absorbed and the next frame is polled. Returns `Ready(None)` at
-	/// end-of-track.
-	pub fn poll_read(&mut self, waiter: &kio::Waiter) -> Poll<crate::Result<Option<Frame>>> {
+	/// Parameter-only frames are absorbed and the next frame is polled.
+	/// Returns `Ready(None)` at end-of-track.
+	pub fn poll_read(
+		&mut self,
+		waiter: &kio::Waiter,
+	) -> Poll<crate::Result<Option<Frame>>> {
 		loop {
 			match ready!(self.poll_event(waiter))? {
 				Some(Event::Frame(frame)) => return Poll::Ready(Ok(Some(frame))),
@@ -242,42 +289,64 @@ impl ExportSource {
 	}
 
 	/// Read normalized media or a clean group boundary.
-	pub fn poll_event(&mut self, waiter: &kio::Waiter) -> Poll<crate::Result<Option<Event>>> {
-		// Resolve a cross-broadcast reference into a broadcast before subscribing.
+	pub fn poll_event(
+		&mut self,
+		waiter: &kio::Waiter,
+	) -> Poll<crate::Result<Option<Event>>> {
+		// Resolve a cross-broadcast reference into a broadcast before
+		// subscribing.
 		if matches!(self.state, SourceState::Requesting(..)) {
 			let (broadcast, name) = {
 				let SourceState::Requesting(pending, name) = &self.state else {
 					unreachable!("just matched Requesting");
 				};
+
 				(ready!(pending.poll_ok(waiter))?, name.clone())
 			};
-			let subscription = moq_net::track::Subscription::default().with_max_age(self.max_age);
-			self.state = SourceState::Subscribing(broadcast.track(&name)?.subscribe(subscription));
+
+			let subscription = moq_net::track::Subscription::default()
+				.with_max_age(self.max_age);
+
+			self.state = SourceState::Subscribing(
+				broadcast.track(&name)?.subscribe(subscription),
+			);
 		}
 
 		// Resolve the subscription before reading any frames.
 		if matches!(self.state, SourceState::Subscribing(_)) {
-			// Scope the `pending` borrow so it ends before we touch `self.media`/`self.state`.
 			let track = {
 				let SourceState::Subscribing(pending) = &self.state else {
 					unreachable!("just matched Subscribing");
 				};
+
 				ready!(pending.poll_ok(waiter))?
 			};
+
 			let media = self
 				.media
 				.take()
 				.expect("media present until the subscription resolves");
-			self.state = SourceState::Active(Box::new(Consumer::new(track, media, None::<Box<dyn FrameDecrypter + Send + Sync>>,)));
+
+			// The decryptor is moved into Consumer exactly once. It remains
+			// alive for the lifetime of the active consumer, preserving any
+			// counters, replay windows, key epochs, or nonce state.
+			let decrypter = self.decrypter.take();
+
+			self.state = SourceState::Active(Box::new(Consumer::new(
+				track,
+				media,
+				decrypter,
+			)));
 		}
 
 		loop {
-			// Scope the consumer borrow to the poll so `self.transform` /
-			// `self.refresh_description` can borrow `self` afterwards.
+			// Scope the consumer borrow to the poll so `self.transform` and
+			// `self.refresh_description` can borrow `self` afterward.
 			let frame = {
 				let SourceState::Active(consumer) = &mut self.state else {
 					unreachable!("subscription resolved into an Active consumer");
 				};
+
 				match ready!(consumer.poll_event(waiter))? {
 					Some(Event::Frame(frame)) => frame,
 					event => return Poll::Ready(Ok(event)),
@@ -292,31 +361,34 @@ impl ExportSource {
 			match transform.transform(frame.payload.clone())? {
 				None => {
 					// Parameter set absorbed by the transform. Refresh the
-					// resolved description (it may have just become available)
-					// and pull the next frame.
+					// resolved description and pull the next frame.
 					self.refresh_description();
 					self.resolve_video_dimensions(&frame.payload)?;
 					continue;
 				}
+
 				Some(payload) => {
 					self.refresh_description();
 					self.resolve_video_dimensions(&payload)?;
-					return Poll::Ready(Ok(Some(Event::Frame(Frame { payload, ..frame }))));
+
+					return Poll::Ready(Ok(Some(Event::Frame(Frame {
+						payload,
+						..frame
+					}))));
 				}
 			}
 		}
 	}
 
 	fn refresh_description(&mut self) {
-		// Track the transform's record even after it is first set: a mid-stream
-		// reconfiguration rebuilds the avcC/hvcC with a new parameter set, and the
-		// muxer re-injects from this on every keyframe, so a stale record would
-		// carry superseded SPS/PPS.
+		// Track the transform's record even after it is first set. A
+		// mid-stream reconfiguration can rebuild avcC/hvcC with a new
+		// parameter set.
 		if let Some(transform) = self.transform.as_ref()
-			&& let Some(d) = transform.codec_private()
-			&& self.description.as_ref() != Some(d)
+			&& let Some(description) = transform.codec_private()
+			&& self.description.as_ref() != Some(description)
 		{
-			self.description = Some(d.clone());
+			self.description = Some(description.clone());
 		}
 	}
 
@@ -324,20 +396,28 @@ impl ExportSource {
 		if self.video_dimensions.is_some() {
 			return Ok(());
 		}
+
 		let Some(codec) = self.video_codec.as_ref() else {
 			return Ok(());
 		};
-		self.video_dimensions = codec_dimensions(codec, self.description.as_deref(), payload)?;
+
+		self.video_dimensions =
+			codec_dimensions(codec, self.description.as_deref(), payload)?;
+
 		Ok(())
 	}
 }
 
-pub(crate) fn catalog_dimensions(config: &VideoConfig) -> Option<(u32, u32)> {
+pub(crate) fn catalog_dimensions(
+	config: &VideoConfig,
+) -> Option<(u32, u32)> {
 	let dimensions = (config.coded_width?, config.coded_height?);
+
 	(dimensions.0 > 0 && dimensions.1 > 0).then_some(dimensions)
 }
 
-/// Resolve encoded dimensions from codec configuration or an in-band keyframe.
+/// Resolve encoded dimensions from codec configuration or an in-band
+/// keyframe.
 pub(crate) fn codec_dimensions(
 	codec: &VideoCodec,
 	description: Option<&[u8]>,
@@ -345,20 +425,35 @@ pub(crate) fn codec_dimensions(
 ) -> crate::Result<Option<(u32, u32)>> {
 	let dimensions = match codec {
 		VideoCodec::H264(_) => match description {
-			Some(description) => catalog_dimensions(&crate::codec::h264::config(description)?),
+			Some(description) => {
+				catalog_dimensions(&crate::codec::h264::config(description)?)
+			}
 			None => None,
 		},
+
 		VideoCodec::H265(_) => match description {
-			Some(description) => catalog_dimensions(&crate::codec::h265::config(description)?),
+			Some(description) => {
+				catalog_dimensions(&crate::codec::h265::config(description)?)
+			}
 			None => None,
 		},
-		VideoCodec::VP8 if !payload.is_empty() => crate::codec::vp8::FrameHeader::parse(payload)?
-			.dimensions
-			.map(|(width, height)| (u32::from(width), u32::from(height))),
-		VideoCodec::VP9(_) if !payload.is_empty() => crate::codec::vp9::config_from_keyframe(payload)?
-			.as_ref()
-			.and_then(catalog_dimensions),
-		VideoCodec::AV1(_) if !payload.is_empty() => crate::codec::av1::dimensions(payload)?,
+
+		VideoCodec::VP8 if !payload.is_empty() => {
+			crate::codec::vp8::FrameHeader::parse(payload)?
+				.dimensions
+				.map(|(width, height)| (u32::from(width), u32::from(height)))
+		}
+
+		VideoCodec::VP9(_) if !payload.is_empty() => {
+			crate::codec::vp9::config_from_keyframe(payload)?
+				.as_ref()
+				.and_then(catalog_dimensions)
+		}
+
+		VideoCodec::AV1(_) if !payload.is_empty() => {
+			crate::codec::av1::dimensions(payload)?
+		}
+
 		_ => None,
 	};
 
@@ -367,17 +462,26 @@ pub(crate) fn codec_dimensions(
 
 /// Build a video transform for an Annex-B source, or `None` if the catalog
 /// already provides an out-of-band description.
-pub(crate) fn build_video_transform(config: &VideoConfig) -> Option<VideoTransform> {
-	let needs_transform = config.description.as_ref().map(|d| d.is_empty()).unwrap_or(true);
+pub(crate) fn build_video_transform(
+	config: &VideoConfig,
+) -> Option<VideoTransform> {
+	let needs_transform = config
+		.description
+		.as_ref()
+		.map(|description| description.is_empty())
+		.unwrap_or(true);
+
 	if !needs_transform {
 		return None;
 	}
+
 	match &config.codec {
 		VideoCodec::H264(_) => Some(VideoTransform::Avc1(Avc1::new())),
 		VideoCodec::H265(_) => Some(VideoTransform::Hvc1(Hvc1::new())),
 		_ => None,
 	}
 }
+
 
 #[cfg(test)]
 mod tests {
