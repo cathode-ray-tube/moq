@@ -5,7 +5,7 @@ use moq_net::Timestamp;
 
 use super::{Container, Frame};
 
-use crate::container::{FrameDecrypter, ProtectedReadFrame};
+use crate::container::FrameDecrypter;
 use crate::container::group::GroupReader;
 use crate::container::reader::ProtectedFrame;
 
@@ -96,7 +96,7 @@ impl Reset {
     }
 }
 
-impl<F: Container> Consumer<F> {
+impl<F: Container<Error = crate::error::Error>> Consumer<F> {
     /// Create a consumer wrapping the given subscriber and container.
     pub fn new(
         track: moq_net::track::Subscriber,
