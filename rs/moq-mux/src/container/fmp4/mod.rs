@@ -31,7 +31,7 @@ mod export_test;
 mod import_test;
 
 use std::{task::Poll, time::Duration};
-
+use crate::Error;
 use bytes::Bytes;
 use hang::catalog::{AudioCodec, AudioConfig, VideoCodec, VideoConfig};
 use mp4_atom::Atom;
