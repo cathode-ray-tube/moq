@@ -267,7 +267,7 @@ impl ExportSource {
 				.media
 				.take()
 				.expect("media present until the subscription resolves");
-			self.state = SourceState::Active(Box::new(Consumer::new(track, media)));
+			self.state = SourceState::Active(Box::new(Consumer::new(track, media, None)));
 		}
 
 		loop {
