@@ -60,6 +60,21 @@ where
     }
 }
 
+/// Allows a boxed decrypter to be used as a decrypter.
+impl<T> FrameDecrypter for Box<T>
+where
+    T: FrameDecrypter + ?Sized,
+{
+    fn decrypt(
+        &mut self,
+        sequence_number: u64,
+        ciphertext: &[u8],
+    ) -> Result<Bytes, EncryptionError> {
+        (**self).decrypt(sequence_number, ciphertext)
+    }
+}
+
+
 /// A [`FrameReader`] decorator that decrypts each payload before returning it.
 pub struct ProtectedFrame<R, D> {
     pub inner: R,
