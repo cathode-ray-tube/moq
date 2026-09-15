@@ -2,9 +2,8 @@ use std::collections::VecDeque;
 use std::task::{Poll, ready};
 
 use super::{Container, Frame};
-use super::FrameDecrypter;
-use super::reader::{FrameReader, GroupReader, ProtectedReadFrame};
-use crate::container::reader::ProtectedFrame;
+use crate::container::{FrameDecrypter, ProtectedReadFrame};
+use crate::container::reader::FrameReader;
 
 /// Decode a single [`moq_net::group::Consumer`] into a finite stream of media
 /// [`Frame`]s.
@@ -109,7 +108,7 @@ impl<F: Container> GroupConsumer<F> {
 
         match self.decrypter.as_mut() {
             Some(decrypter) => {
-                let mut reader = ProtectedFrame::new(
+                let mut reader = ProtectedReadFrame::new(
                     raw_reader,
                     decrypter.as_mut(),
                 );
