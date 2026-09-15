@@ -83,7 +83,9 @@ impl<S: Stream> Export<S> {
 	pub fn poll_next(&mut self, waiter: &kio::Waiter) -> Poll<crate::Result<Option<Bytes>>> {
 		while let Some(catalog) = self.catalog.as_mut() {
 			match catalog.poll_next(waiter)? {
-				Poll::Ready(Some(snapshot)) => self.update_catalog(&snapshot.media())?,
+				Poll::Ready(Some(snapshot)) => {
+    self.update_catalog(&snapshot.media(), &decrypter_factory)?
+}
 				Poll::Ready(None) => {
 					self.catalog = None;
 					break;
