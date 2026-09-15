@@ -113,7 +113,7 @@ impl<S: Stream> Export<S> {
 		}
 	}
 
-	fn update_catalog(&mut self, catalog: &Catalog) -> crate::Result<()> {
+	fn update_catalog(&mut self, catalog: &Catalog, decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,) -> crate::Result<()> {
 		let mut catalog = catalog.clone();
 		self.source.retain_valid_media(&mut catalog);
 
