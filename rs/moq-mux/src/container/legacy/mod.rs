@@ -1,3 +1,4 @@
+
 //! The original hang wire format.
 //!
 //! Each moq frame holds one media frame: a VarInt-encoded timestamp
@@ -18,32 +19,50 @@ impl Container for Wire {
 	type Error = crate::Error;
 
 	fn end(&self, frame: &Frame) -> Option<moq_net::Timestamp> {
-		(self.0 != Kind::Data && frame.payload.is_empty()).then_some(frame.timestamp)
+		// This check happens after decryption on the read side. The encrypted
+		// group-finishing frame decrypts back to an empty Legacy payload.
+		(self.0 != Kind::Data && frame.payload.is_empty())
+			.then_some(frame.timestamp)
 	}
 
 	fn kind(&self) -> Kind {
 		self.0
 	}
 
-	fn finish_group(
+	fn finish_group<W>(
 		&self,
-		group: &mut moq_net::group::Producer,
+		output: &mut W,
 		end: Option<moq_net::Timestamp>,
-	) -> Result<(), Self::Error> {
+	) -> Result<(), Self::Error>
+	where
+		W: FrameWriter<Error = Self::Error>,
+	{
 		if self.0 == Kind::Video
 			&& let Some(timestamp) = end
 		{
-			hang::container::Frame {
+			let mut payload = bytes::BytesMut::new();
+
+			let frame = hang::container::Frame {
 				timestamp,
 				payload: bytes::Bytes::new(),
-			}
-			.write_to(group)?;
+			};
+
+			// Encode the empty Legacy boundary frame exactly as an ordinary
+			// Legacy frame. Writing through `output` ensures that
+			// ProtectedFrame encrypts it when encryption is enabled.
+			frame.encode(&mut payload)?;
+
+			output.write_frame(timestamp, payload.freeze())?;
 		}
 
 		Ok(())
 	}
 
-	fn write<W>(&self, output: &mut W, frames: &[Frame]) -> Result<(), Self::Error>
+	fn write<W>(
+		&self,
+		output: &mut W,
+		frames: &[Frame],
+	) -> Result<(), Self::Error>
 	where
 		W: FrameWriter<Error = Self::Error>,
 	{
@@ -57,6 +76,8 @@ impl Container for Wire {
 
 			hang_frame.encode(&mut payload)?;
 
+			// Producer supplies either MoqFrameWriter or
+			// ProtectedFrame<MoqFrameWriter, Encrypter> here.
 			output.write_frame(frame.timestamp, payload.freeze())?;
 		}
 
@@ -70,7 +91,11 @@ impl Container for Wire {
 	) -> Poll<Result<Option<Vec<Frame>>, Self::Error>> {
 		use std::task::ready;
 
-		let Some(data) = ready!(group.poll_read_frame(waiter).map_err(hang::Error::from)?) else {
+		let Some(data) = ready!(
+			group
+				.poll_read_frame(waiter)
+				.map_err(hang::Error::from)?
+		) else {
 			return Poll::Ready(Ok(None));
 		};
 
