@@ -306,7 +306,7 @@ impl<S: Stream> Export<S> {
 		Poll::Pending
 	}
 
-	fn update_catalog(&mut self, mut catalog: Catalog, decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,) -> Result<()> {
+	fn update_catalog(&mut self, mut catalog: Catalog, decrypter_factory: impl Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,) -> Result<()> {
 		self.source.retain_valid_media(&mut catalog);
 
 		let mut active: HashMap<String, ()> = HashMap::new();
@@ -341,7 +341,7 @@ impl<S: Stream> Export<S> {
 				continue;
 			}
 			ensure_legacy(&config.container, "video", name)?;
-			let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age, decrypter)? else {
+			let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age, decrypter_factory())? else {
 				continue;
 			};
 			self.tracks.insert(
@@ -362,7 +362,7 @@ impl<S: Stream> Export<S> {
 				continue;
 			}
 			ensure_legacy(&config.container, "audio", name)?;
-			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, None, decrypter)? else {
+			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, None, decrypter_factory())? else {
 				continue;
 			};
 			self.tracks.insert(
