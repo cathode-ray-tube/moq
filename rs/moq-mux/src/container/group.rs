@@ -7,12 +7,12 @@ use crate::container::reader::FrameReader;
 use crate::container::{FrameDecrypter, ProtectedReadFrame, ReadFrame};
 use crate::error::Error;
 
-struct GroupReader<'a> {
+pub struct GroupReader<'a> {
     group: &'a mut moq_net::group::Consumer,
 }
 
 impl<'a> GroupReader<'a> {
-    fn new(group: &'a mut moq_net::group::Consumer) -> Self {
+    pub fn new(group: &'a mut moq_net::group::Consumer) -> Self {
         Self { group }
     }
 }
