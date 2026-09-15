@@ -162,238 +162,254 @@ impl<F: Container> Consumer<F> {
         }
     }
 
-    /// Read media or a clean group boundary without waiting for a successor group.
-    pub(crate) fn poll_event(
-        &mut self,
-        waiter: &kio::Waiter,
-    ) -> Poll<Result<Option<Event>, F::Error>> {
-        let finished = self.poll_read_finish(waiter)?.is_ready();
+   
+/// Read media or a clean group boundary without waiting for a successor group.
+pub(crate) fn poll_event(
+    &mut self,
+    waiter: &kio::Waiter,
+) -> Poll<Result<Option<Event>, F::Error>> {
+    let finished = self.poll_read_finish(waiter)?.is_ready();
 
-        if self.startup {
-            let mut found = None;
+    if self.startup {
+        let mut found = None;
 
-            for index in 0..self.pending.len() {
-                if matches!(
-                    self.poll_min_timestamp(index, waiter),
-                    Poll::Ready(Ok(_))
-                ) {
-                    found = Some(index);
-                    break;
-                }
-            }
-
-            if found.is_some() {
-                self.current = self
-                    .pending
-                    .front()
-                    .expect("a group has a frame")
-                    .sequence;
-
-                self.startup = false;
+        for index in 0..self.pending.len() {
+            if matches!(
+                self.poll_min_timestamp(index, waiter),
+                Poll::Ready(Ok(_))
+            ) {
+                found = Some(index);
+                break;
             }
         }
 
-        let current = self.current;
+        if found.is_some() {
+            self.current = self
+                .pending
+                .front()
+                .expect("a group has a frame")
+                .sequence;
 
-        self.pending.retain_mut(|group| {
-            group.sequence <= current
-                || !group.buffered.is_empty()
-                || !group.poll_aborted(waiter)
-        });
-
-        'read: loop {
-            if self.poll_reset(waiter)? {
-                continue;
-            }
-
-            self.poll_classify(waiter)?;
-
-            if let Some(group) = self.pending.front()
-                && group.sequence <= self.current
-            {
-                match self.poll_read_group(0, waiter) {
-                    Poll::Ready(Ok(Some(Event::Frame(frame)))) => {
-                        let sequence = self.pending[0].group.sequence;
-                        let timestamp = frame.timestamp;
-
-                        if self
-                            .rewind
-                            .live_edge
-                            .is_none_or(|(_, high)| timestamp > high)
-                        {
-                            self.rewind.live_edge = Some((sequence, timestamp));
-                        }
-
-                        return Poll::Ready(Ok(Some(Event::Frame(frame))));
-                    }
-
-                    Poll::Ready(Ok(Some(event))) => {
-                        return Poll::Ready(Ok(Some(event)));
-                    }
-
-                    Poll::Pending => {}
-
-                    Poll::Ready(Err(error)) => {
-                        let aborted = self.pending[0].poll_aborted(waiter);
-
-                        if !aborted {
-                            return Poll::Ready(Err(error));
-                        }
-
-                        tracing::warn!(
-                            error = ?error,
-                            "current group evicted; skipping to next buffered group"
-                        );
-
-                        self.pending.pop_front();
-
-                        self.current = self
-                            .pending
-                            .front()
-                            .map_or(self.current + 1, |group| group.sequence);
-
-                        continue 'read;
-                    }
-                }
-            }
-
-            let (oldest_timestamp, current_end) =
-                if let Some(index) = self.pending.iter().position(|group| {
-                    group.sequence <= self.current
-                }) {
-                    match self.poll_min_timestamp(index, waiter) {
-                        Poll::Ready(Ok(timestamp)) => {
-                            let end = self.pending[index].max_end;
-                            (
-                                Some(std::time::Duration::from(timestamp)),
-                                end,
-                            )
-                        }
-
-                        _ => (None, None),
-                    }
-                } else {
-                    (None, None)
-                };
-
-            let mut next_group = None;
-
-            for index in 0..self.pending.len() {
-                if self.pending[index].sequence <= self.current {
-                    continue;
-                }
-
-                if let Poll::Ready(Ok(timestamp)) =
-                    self.poll_min_timestamp(index, waiter)
-                {
-                    next_group = Some((
-                        index,
-                        std::time::Duration::from(timestamp),
-                    ));
-                    break;
-                }
-            }
-
-            let mut max_timestamp = std::time::Duration::ZERO;
-
-            for index in (0..self.pending.len()).rev() {
-                if self.pending[index].sequence <= self.current {
-                    break;
-                }
-
-                if let Poll::Ready(Ok(timestamp)) =
-                    self.poll_max_timestamp(index, waiter)
-                {
-                    max_timestamp = max_timestamp.max(timestamp.into());
-                    break;
-                }
-            }
-
-            if let Some(front_sequence) =
-                self.pending.front().map(|group| group.sequence)
-                && front_sequence > self.current
-                && let Some((_, next_start)) = next_group
-                && (finished
-                    || max_timestamp.saturating_sub(next_start)
-                        >= self.max_age)
-            {
-                self.current = front_sequence;
-                continue;
-            }
-
-            let should_skip = if let Some((_, next_start)) = next_group {
-                if let Some(oldest) = oldest_timestamp {
-                    let over_max_age =
-                        max_timestamp.saturating_sub(oldest) >= self.max_age;
-
-                    let covered =
-                        current_end.is_some_and(|end| end >= next_start);
-
-                    over_max_age || covered
-                } else {
-                    max_timestamp.saturating_sub(next_start) >= self.max_age
-                }
-            } else {
-                false
-            };
-
-            if let Some((new_index, _)) = next_group
-                && should_skip
-            {
-                let mut discontinuities = 0;
-
-                if self.rewind.live_edge.is_some() {
-                    for index in 0..new_index {
-                        match self.poll_empty(index, waiter) {
-                            Poll::Ready(true) => {
-                                discontinuities += 1;
-                            }
-
-                            Poll::Ready(false) => {}
-
-                            Poll::Pending => {
-                                return Poll::Pending;
-                            }
-                        }
-                    }
-                }
-
-                self.pending.drain(0..new_index);
-                self.mark_discontinuities(discontinuities);
-
-                let new_current = self
-                    .pending
-                    .front()
-                    .expect("skip target exists")
-                    .sequence;
-
-                tracing::debug!(
-                    old = self.current,
-                    new = new_current,
-                    "skipping slow groups"
-                );
-
-                self.current = new_current;
-                continue;
-            }
-
-            if finished
-                && let Some(index) = self.pending.iter().position(|group| {
-                    group.sequence > self.current
-                })
-                && matches!(self.poll_empty(index, waiter), Poll::Ready(true))
-            {
-                self.current = self.pending[index].sequence;
-                continue;
-            }
-
-            if finished && self.pending.is_empty() {
-                return Poll::Ready(Ok(None));
-            }
-
-            return Poll::Pending;
+            self.startup = false;
         }
     }
+
+    let current = self.current;
+
+    self.pending.retain_mut(|group| {
+        group.sequence <= current
+            || !group.buffered.is_empty()
+            || !group.poll_aborted(waiter)
+    });
+
+    'read: loop {
+        if self.poll_reset(waiter)? {
+            continue;
+        }
+
+        self.poll_classify(waiter)?;
+
+        if let Some(group) = self.pending.front()
+            && group.sequence <= self.current
+        {
+            match self.poll_read_group(0, waiter) {
+                Poll::Ready(Ok(Some(Event::Frame(frame)))) => {
+                    let sequence = self.pending[0].group.sequence;
+                    let timestamp = frame.timestamp;
+
+                    if self
+                        .rewind
+                        .live_edge
+                        .is_none_or(|(_, high)| timestamp > high)
+                    {
+                        self.rewind.live_edge = Some((sequence, timestamp));
+                    }
+
+                    return Poll::Ready(Ok(Some(Event::Frame(frame))));
+                }
+
+                Poll::Ready(Ok(Some(event))) => {
+                    return Poll::Ready(Ok(Some(event)));
+                }
+
+                Poll::Ready(Ok(None)) => {
+                    self.pending.pop_front();
+
+                    self.current = self
+                        .pending
+                        .front()
+                        .map_or(self.current + 1, |group| group.sequence);
+
+                    continue 'read;
+                }
+
+                Poll::Pending => {}
+
+                Poll::Ready(Err(error)) => {
+                    let aborted = self.pending[0].poll_aborted(waiter);
+
+                    if !aborted {
+                        return Poll::Ready(Err(error));
+                    }
+
+                    tracing::warn!(
+                        error = ?error,
+                        "current group evicted; skipping to next buffered group"
+                    );
+
+                    self.pending.pop_front();
+
+                    self.current = self
+                        .pending
+                        .front()
+                        .map_or(self.current + 1, |group| group.sequence);
+
+                    continue 'read;
+                }
+            }
+        }
+
+        let (oldest_timestamp, current_end) =
+            if let Some(index) = self
+                .pending
+                .iter()
+                .position(|group| group.sequence <= self.current)
+            {
+                match self.poll_min_timestamp(index, waiter) {
+                    Poll::Ready(Ok(timestamp)) => {
+                        let end = self.pending[index].max_end;
+
+                        (
+                            Some(std::time::Duration::from(timestamp)),
+                            end,
+                        )
+                    }
+
+                    _ => (None, None),
+                }
+            } else {
+                (None, None)
+            };
+
+        let mut next_group = None;
+
+        for index in 0..self.pending.len() {
+            if self.pending[index].sequence <= self.current {
+                continue;
+            }
+
+            if let Poll::Ready(Ok(timestamp)) =
+                self.poll_min_timestamp(index, waiter)
+            {
+                next_group = Some((
+                    index,
+                    std::time::Duration::from(timestamp),
+                ));
+                break;
+            }
+        }
+
+        let mut max_timestamp = std::time::Duration::ZERO;
+
+        for index in (0..self.pending.len()).rev() {
+            if self.pending[index].sequence <= self.current {
+                break;
+            }
+
+            if let Poll::Ready(Ok(timestamp)) =
+                self.poll_max_timestamp(index, waiter)
+            {
+                max_timestamp = max_timestamp.max(timestamp.into());
+                break;
+            }
+        }
+
+        if let Some(front_sequence) =
+            self.pending.front().map(|group| group.sequence)
+            && front_sequence > self.current
+            && let Some((_, next_start)) = next_group
+            && (finished
+                || max_timestamp.saturating_sub(next_start)
+                    >= self.max_age)
+        {
+            self.current = front_sequence;
+            continue;
+        }
+
+        let should_skip = if let Some((_, next_start)) = next_group {
+            if let Some(oldest) = oldest_timestamp {
+                let over_max_age =
+                    max_timestamp.saturating_sub(oldest) >= self.max_age;
+
+                let covered =
+                    current_end.is_some_and(|end| end >= next_start);
+
+                over_max_age || covered
+            } else {
+                max_timestamp.saturating_sub(next_start) >= self.max_age
+            }
+        } else {
+            false
+        };
+
+        if let Some((new_index, _)) = next_group
+            && should_skip
+        {
+            let mut discontinuities = 0;
+
+            if self.rewind.live_edge.is_some() {
+                for index in 0..new_index {
+                    match self.poll_empty(index, waiter) {
+                        Poll::Ready(true) => {
+                            discontinuities += 1;
+                        }
+
+                        Poll::Ready(false) => {}
+
+                        Poll::Pending => {
+                            return Poll::Pending;
+                        }
+                    }
+                }
+            }
+
+            self.pending.drain(0..new_index);
+            self.mark_discontinuities(discontinuities);
+
+            let new_current = self
+                .pending
+                .front()
+                .expect("skip target exists")
+                .sequence;
+
+            tracing::debug!(
+                old = self.current,
+                new = new_current,
+                "skipping slow groups"
+            );
+
+            self.current = new_current;
+            continue;
+        }
+
+        if finished
+            && let Some(index) = self
+                .pending
+                .iter()
+                .position(|group| group.sequence > self.current)
+            && matches!(self.poll_empty(index, waiter), Poll::Ready(true))
+        {
+            self.current = self.pending[index].sequence;
+            continue;
+        }
+
+        if finished && self.pending.is_empty() {
+            return Poll::Ready(Ok(None));
+        }
+
+        return Poll::Pending;
+    }
+}
 
     fn mark_discontinuities(&mut self, count: u64) {
         if count == 0 {
