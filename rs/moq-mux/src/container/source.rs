@@ -332,11 +332,9 @@ impl ExportSource {
 			// counters, replay windows, key epochs, or nonce state.
 			let decrypter = self.decrypter.take();
 
-			self.state = SourceState::Active(Box::new(Consumer::new(
-				track,
-				media,
-				decrypter,
-			)));
+			self.state = SourceState::Active(Box::new(
+    Consumer::new(track, media).with_decrypter(decrypter),
+));
 		}
 
 		loop {
@@ -529,13 +527,13 @@ mod tests {
 		// single-segment path, so its parent is the root and any `..` walks above it.
 		for reference in ["..", "../source", "../../elsewhere"] {
 			let config = video(Some(reference));
-			escaping(ExportSource::for_video(&source, "video", &config, max_age), reference);
+			escaping(ExportSource::for_video(&source, "video", &config, max_age, video_decrypter), reference);
 			escaping(
-				ExportSource::for_video_raw(&source, "video", &config, max_age),
+				ExportSource::for_video_raw(&source, "video", &config, max_age, video_decrypter),
 				reference,
 			);
 			escaping(
-				ExportSource::for_audio(&source, "audio", &audio(Some(reference)), max_age),
+				ExportSource::for_audio(&source, "audio", &audio(Some(reference)), max_age, audio_decrypter),
 				reference,
 			);
 		}
@@ -550,10 +548,10 @@ mod tests {
 		let max_age = std::time::Duration::ZERO;
 
 		for reference in [None, Some(""), Some("./source"), Some("sub"), Some(".")] {
-			ExportSource::for_video(&source, "video", &video(reference), max_age)
+			ExportSource::for_video(&source, "video", &video(reference), max_age, video_decrypter)
 				.unwrap_or_else(|err| panic!("{reference:?} should keep the rendition: {err:?}"))
 				.unwrap_or_else(|| panic!("{reference:?} should keep the rendition"));
-			ExportSource::for_audio(&source, "audio", &audio(reference), max_age)
+			ExportSource::for_audio(&source, "audio", &audio(reference), max_age, audio_decrypter)
 				.unwrap_or_else(|err| panic!("{reference:?} should keep the rendition: {err:?}"))
 				.unwrap_or_else(|| panic!("{reference:?} should keep the rendition"));
 		}
@@ -565,7 +563,7 @@ mod tests {
 	async fn latency_is_sent_with_the_initial_subscription() {
 		let live = Live::avc3();
 		let max_age = std::time::Duration::from_secs(10);
-		let mut export = ExportSource::for_video(&live.source(), live.track.name(), &video(None), max_age)
+		let mut export = ExportSource::for_video(&live.source(), live.track.name(), &video(None), max_age, video_decrypter)
 			.unwrap()
 			.expect("fixture should produce a video rendition");
 
