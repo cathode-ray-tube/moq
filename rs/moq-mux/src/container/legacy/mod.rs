@@ -7,7 +7,7 @@
 
 use std::task::Poll;
 
-use crate::container::{Container, Frame, FrameWriter, Kind};
+use crate::container::{Container, Frame, FrameWriter, FrameReader, Kind};
 
 /// Hang Legacy wire format configured for the track's media role.
 pub struct Wire(
