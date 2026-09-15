@@ -43,7 +43,8 @@ pub struct Consumer<F: Container> {
     end: Option<Timestamp>,
 
     /// Optional decrypter, persistent across reads and group transitions.
-    decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,
+    mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync)>
+
 }
 
 /// Live state for detecting timeline rewinds and classifying out-of-order groups.
@@ -691,7 +692,7 @@ impl GroupBuffer {
         &mut self,
         waiter: &kio::Waiter,
         format: &F,
-        decrypter: Option<&mut dyn FrameDecrypter>,
+        mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync)>,
     ) -> Poll<Result<Option<Event>, F::Error>> {
         loop {
             if self
@@ -832,7 +833,7 @@ impl GroupBuffer {
         &mut self,
         waiter: &kio::Waiter,
         format: &F,
-        mut decrypter: Option<&mut dyn FrameDecrypter>,
+        mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync)>,
     ) -> Poll<Result<Timestamp, F::Error>> {
         // Continue reading to advance the maximum timestamp.
         let _ = self.buffer_all(
@@ -859,7 +860,7 @@ impl GroupBuffer {
         &mut self,
         waiter: &kio::Waiter,
         format: &F,
-        mut decrypter: Option<&mut dyn FrameDecrypter>,
+        mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync)>,
     ) -> Poll<Result<Timestamp, F::Error>> {
         let _ = self.buffer_one(
             waiter,
