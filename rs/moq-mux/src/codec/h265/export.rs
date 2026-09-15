@@ -145,7 +145,7 @@ impl<S: Stream> Export<S> {
 			return Ok(());
 		}
 
-		let Some(source) = ExportSource::for_video_raw(&self.source, name, config, self.max_age)? else {
+		let Some(source) = ExportSource::for_video_raw(&self.source, name, config, self.max_age, decrypter)? else {
 			unreachable!("invalid broadcast references were removed above");
 		};
 		let convert = match config.description.as_ref().filter(|d| !d.is_empty()) {
