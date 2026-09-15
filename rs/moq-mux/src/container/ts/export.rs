@@ -835,7 +835,7 @@ impl<E: catalog::Catalog> Export<E> {
 					self.tracks.insert(name.clone(), track);
 				}
 				None => {
-					let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age, None)? else {
+					let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age, None, decrypter)? else {
 						continue;
 					};
 					self.insert_track(name, source, pid, kind, descriptors, reserve);
