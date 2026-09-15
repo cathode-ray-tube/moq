@@ -146,8 +146,6 @@ pub struct InvalidEnd;
 
 /// Encode and decode media frames over a moq-lite group.
 pub trait Container {
-    /// Container-specific error. Must be convertible from [`moq_net::Error`]
-    /// so I/O errors propagate, [`MissingKeyframe`], and [`InvalidEnd`].
     type Error: std::error::Error
         + Send
         + Sync
@@ -156,43 +154,41 @@ pub trait Container {
         + From<MissingKeyframe>
         + From<InvalidEnd>;
 
-    /// Encode one or more frames and send them through `output`.
-    ///
-    /// The writer may be protected, so container implementations must write
-    /// encoded payloads through this abstraction rather than directly through
-    /// a group producer.
-    fn write<W>(&self, output: &mut W, frames: &[Frame]) -> Result<(), Self::Error>
+    fn write<W>(
+        &self,
+        output: &mut W,
+        frames: &[Frame],
+    ) -> Result<(), Self::Error>
     where
         W: FrameWriter<Error = Self::Error>;
 
-     /// Poll the next MoQ frame from `group` and decode it into media frames.
-    ///
-    /// Container implementations should obtain their `FrameReader` and call
-    /// `poll_read_frame(waiter)`. If the reader is a `ProtectedReadFrame`,
-    /// its returned payload has already been decrypted.
+    /// Existing unprotected compatibility path.
     fn poll_read(
         &self,
         group: &mut moq_net::group::Consumer,
         waiter: &kio::Waiter,
     ) -> Poll<Result<Option<Vec<Frame>>, Self::Error>>;
 
-    /// Return the endpoint timestamp when `frame` carries empty-payload metadata.
+    /// Read through an already-created frame reader.
+    ///
+    /// The reader may be a `ProtectedFrame`, in which case each payload has
+    /// already been decrypted before the container parses it.
+    fn poll_read_frames<R>(
+        &self,
+        reader: &mut R,
+        waiter: &kio::Waiter,
+    ) -> Poll<Result<Option<Vec<Frame>>, Self::Error>>
+    where
+        R: FrameReader<Error = Self::Error>;
+
     fn end(&self, _frame: &Frame) -> Option<moq_net::Timestamp> {
         None
     }
 
-    /// The media role, when this format represents an audio or video track.
     fn kind(&self) -> Kind {
         Kind::Data
     }
 
-    /// Write any format-specific endpoint before the producer closes the
-    /// group.
-    ///
-    /// The endpoint, when present, is emitted after the media frames and
-    /// before the producer writes the group's final boundary. The endpoint is
-    /// sent through the same [`FrameWriter`] as ordinary media frames, so it
-    /// receives the same protection, including encryption.
     fn finish_group<W>(
         &self,
         _output: &mut W,
@@ -204,7 +200,6 @@ pub trait Container {
         Ok(())
     }
 
-    /// Async wrapper around [`Self::poll_read`].
     fn read(
         &self,
         group: &mut moq_net::group::Consumer,
@@ -215,3 +210,4 @@ pub trait Container {
         async { kio::wait(|waiter| self.poll_read(group, waiter)).await }
     }
 }
+
