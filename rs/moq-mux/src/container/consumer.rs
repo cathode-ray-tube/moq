@@ -860,7 +860,7 @@ impl GroupBuffer {
         &mut self,
         waiter: &kio::Waiter,
         format: &F,
-        mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync)>,
+        mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync + '_)>
     ) -> Poll<Result<Timestamp, F::Error>> {
         let _ = self.buffer_one(
             waiter,
