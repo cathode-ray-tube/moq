@@ -105,7 +105,7 @@ impl ExportSource {
 		name: &str,
 		config: &VideoConfig,
 		max_age: std::time::Duration,
-		decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,
+		decrypter_factory: &dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,
 	) -> Result<Option<Self>, crate::Error> {
 		Self::video(
 			source,
@@ -127,7 +127,7 @@ impl ExportSource {
 		name: &str,
 		config: &VideoConfig,
 		max_age: std::time::Duration,
-		decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,
+		decrypter_factory: &dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,
 	) -> Result<Option<Self>, crate::Error> {
 		Self::video(source, name, config, max_age, None, decrypter)
 	}
@@ -138,7 +138,7 @@ impl ExportSource {
 		config: &VideoConfig,
 		max_age: std::time::Duration,
 		transform: Option<VideoTransform>,
-		decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,
+		decrypter_factory: &dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,
 	) -> Result<Option<Self>, crate::Error> {
 		let media: HangContainer = config.try_into()?;
 
@@ -176,7 +176,7 @@ impl ExportSource {
 		name: &str,
 		config: &AudioConfig,
 		max_age: std::time::Duration,
-		decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,
+		decrypter_factory: &dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,
 	) -> Result<Option<Self>, crate::Error> {
 		let media: HangContainer = config.try_into()?;
 
@@ -210,7 +210,7 @@ impl ExportSource {
 		source: &crate::Source,
 		name: &str,
 		max_age: std::time::Duration,
-		decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,
+		decrypter_factory: &dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,
 	) -> Result<Self, crate::Error> {
 		Ok(Self {
 			state: SourceState::Requesting(source.request_catalog(), name.to_string()),
@@ -334,11 +334,11 @@ impl ExportSource {
 			
 			let consumer = Consumer::new(track, media);
 			
-			let consumer = match decrypter {
+			let consumer = match decrypter_factory() {
 			    Some(decrypter) => consumer.with_decrypter(decrypter),
 			    None => consumer,
 			};
-			
+						
 			self.state = SourceState::Active(Box::new(consumer));
 
 		}
