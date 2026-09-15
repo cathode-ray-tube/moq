@@ -29,6 +29,7 @@ use super::{
 };
 use crate::catalog::{CatalogFormat, Stream};
 use crate::container::{ExportSource, Frame};
+use crate::container::FrameDecrypter;
 
 /// Which FLV payload shape a bound track is muxed as: a legacy CodecID
 /// (`Avc`/`Aac`) or an enhanced-RTMP FourCC codec.
@@ -335,7 +336,7 @@ impl Export {
 		Ok(())
 	}
 
-	fn bind_video(&mut self, catalog: &Catalog) -> anyhow::Result<()> {
+	fn bind_video(&mut self, catalog: &Catalog, decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,) -> anyhow::Result<()> {
 		for (name, config) in &catalog.video.renditions {
 			if !self.multitrack && !self.video.is_empty() {
 				tracing::warn!("FLV export only supports one video track; ignoring the rest (enable multitrack)");
@@ -371,7 +372,7 @@ impl Export {
 		Ok(())
 	}
 
-	fn bind_audio(&mut self, catalog: &Catalog) -> anyhow::Result<()> {
+	fn bind_audio(&mut self, catalog: &Catalog, decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,) -> anyhow::Result<()> {
 		for (name, config) in &catalog.audio.renditions {
 			if !self.multitrack && !self.audio.is_empty() {
 				tracing::warn!("FLV export only supports one audio track; ignoring the rest (enable multitrack)");
