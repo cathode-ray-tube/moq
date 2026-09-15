@@ -331,7 +331,7 @@ impl Container for Wire {
     &self,
     reader: &mut R,
     waiter: &kio::Waiter,
-	) -> Poll<Result<Option<Vec<Frame>>, Self::Error>>
+	) -> Poll<std::result::Result<Option<Vec<Frame>>, crate::error::Error>>
 	where
 	    R: FrameReader<Error = Error>,
 	{
