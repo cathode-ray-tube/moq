@@ -1,621 +1,634 @@
 use std::collections::VecDeque;
-use std::task::{Poll, ready};
+use std::task::{ready, Poll};
 
 use moq_net::Timestamp;
 
 use super::{Container, Frame};
+use crate::encryption::FrameDecrypter;
 
 /// Media and clean group boundaries in delivery order.
 pub(crate) enum Event {
-	Frame(Frame),
-	FrameEnd(Timestamp),
-	GroupEnd,
-};
-
-use::encryption::FrameDecrypter;
-
-use crate::reader::{
-    FrameReader,
-    ProtectedReadFrame,
-};
-
-
+    Frame(Frame),
+    FrameEnd(Timestamp),
+    GroupEnd,
+}
 
 /// Decode a moq-lite track into a stream of media [`Frame`]s in age-bounded
 /// presentation order.
-///
-/// `Consumer` wraps a [`moq_net::track::Subscriber`] and a [`Container`]
-/// format implementation, typically
-/// [`catalog::hang::Container`](crate::catalog::hang::Container). Yields
-/// decoded frames via [`read`](Self::read).
-///
-/// ## Ordering & age skipping
-///
-/// Groups can arrive on the wire out of order. The consumer always reads frames *within*
-/// a group in arrival order, but across groups it advances by sequence number, skipping
-/// stalled or missing groups when the difference between the oldest pending timestamp
-/// and the newest available timestamp exceeds the configured max age. With the default
-/// max age of zero, the consumer skips aggressively. Any group that has a newer
-/// alternative is dropped. With a non-zero max age, slow groups are tolerated up to that
-/// budget before being skipped. A missing sequence gets the same tolerance: there is no
-/// way to tell a stream that lost the delivery race from one the cache evicted, so the
-/// consumer waits for it until everything it could still present (bounded by where the
-/// next group begins) falls a full budget behind the newest content.
-///
-/// Delivery starts at the [`Subscription::start`](moq_net::track::Subscription::start)
-/// floor when one is named, waiting for that group under the budget; without one it
-/// starts wherever the publisher does, adopted from the first served groups. From there
-/// the same budget is the one rule that catches the consumer up to the live edge, and
-/// history the publisher no longer serves expires like any other gap, since its reach
-/// sits a full budget behind the newest content.
-///
-/// A stalled group is also skipped early, regardless of the max age budget, once it has
-/// presented up to where the next group begins. CMAF frames carry a per-sample duration,
-/// so a group whose most recent frame ends (timestamp + duration) at or past the next
-/// group's first timestamp has nothing left worth waiting for. Containers without a
-/// duration report zero, which disables this check and falls back to the max age budget.
-///
-/// Put the initial max age on the [`moq_net::track::Subscription`] before
-/// subscribing. [`new`](Self::new) inherits that budget, and
-/// [`set_max_age`](Self::set_max_age) changes it mid-stream.
-///
-/// ## Timeline discontinuities
-///
-/// An empty group declares a codec boundary. A newer group whose timestamps jump backwards
-/// past the live edge also reneges the buffered tail (e.g. a voice agent interrupted
-/// mid-utterance). The consumer bumps [`discontinuity`](Self::discontinuity) for either,
-/// dropping reneged groups when needed so downstream consumers can reset codec and render
-/// buffers. This is always on.
 pub struct Consumer<F: Container> {
-	track: moq_net::track::Subscriber,
+    track: moq_net::track::Subscriber,
 
-	format: F,
+    format: F,
 
-	// The current group that we want to read from
-	current: u64,
+    /// The current group that we want to read from.
+    current: u64,
 
-	// Groups that we are monitoring, sorted by sequence ascending.
-	pending: VecDeque<GroupBuffer>,
+    /// Groups that we are monitoring, sorted by sequence ascending.
+    pending: VecDeque<GroupBuffer>,
 
-	// Latches the cursor onto the publisher's first served group when the
-	// subscription names no start. Cleared once a first group is chosen.
-	startup: bool,
+    /// Latches the cursor onto the publisher's first served group when the
+    /// subscription names no start.
+    startup: bool,
 
-	// How far we may drift from the live edge before skipping a group.
-	max_age: std::time::Duration,
+    /// How far we may drift from the live edge before skipping a group.
+    max_age: std::time::Duration,
 
-	// Timeline-discontinuity tracking: the live edge, rewind boundary, and event count.
-	rewind: Rewind,
+    /// Timeline-discontinuity tracking.
+    rewind: Rewind,
 
-	// Exclusive audio endpoint delivered before terminal codec packets.
-	end: Option<Timestamp>,
+    /// Exclusive audio endpoint delivered before terminal codec packets.
+    end: Option<Timestamp>,
 
-	/// Optional decrypter.
-	///
-	/// Persistent across reads and group transitions.
-	decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,
+    /// Optional decrypter, persistent across reads and group transitions.
+    decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,
 }
 
 /// Live state for detecting timeline rewinds and classifying out-of-order groups.
-///
-/// Tracks the live edge and [`Reset`] boundary used to classify a timestamp rewind, plus the
-/// counter shared by rewinds and explicit empty-group discontinuities.
 #[derive(Default)]
 struct Rewind {
-	// The live edge of playback: the largest timestamp delivered so far and the group that
-	// carried it. `None` until the first frame is delivered.
-	live_edge: Option<(u64, Timestamp)>,
+    /// Largest timestamp delivered so far and the group that carried it.
+    live_edge: Option<(u64, Timestamp)>,
 
-	// The active rewind boundary, if any. Out-of-order groups are classified against it so a
-	// late new-epoch group is kept while a reneged old-epoch straggler is dropped.
-	boundary: Option<Reset>,
+    /// Active rewind boundary.
+    boundary: Option<Reset>,
 
-	// Increments on every declared discontinuity or rewind. Downstream consumers compare it
-	// across reads and reset codec and render buffers when it changes.
-	discontinuity: u64,
+    /// Number of discontinuities observed.
+    discontinuity: u64,
 }
 
 /// A recorded rewind boundary.
-///
-/// After a backwards timestamp jump, groups can still arrive out of order, so a single
-/// sequence floor is not enough: a late new-epoch group can have a *lower* sequence than
-/// the group that triggered detection. We keep just enough state to classify any group by
-/// `(sequence, timestamp)`.
 #[derive(Clone, Copy)]
 struct Reset {
-	// Highest-sequence old-epoch group seen at detection (it held the old live edge).
-	// Sequences at or below this are old: drop.
-	prev_max: u64,
+    /// Highest-sequence old-epoch group seen at detection.
+    prev_max: u64,
 
-	// The group whose backwards timestamp triggered detection. Sequences at or above this
-	// are new: keep.
-	group: u64,
+    /// Group whose backwards timestamp triggered detection.
+    group: u64,
 
-	// That group's timestamp. Within the ambiguous span `(prev_max, group)` a group is a
-	// new-epoch gap-filler if its timestamp is below this, else an old straggler whose
-	// higher timestamp simply hadn't arrived yet.
-	timestamp: Timestamp,
+    /// Timestamp that triggered detection.
+    timestamp: Timestamp,
 }
 
 impl Reset {
-	// Classify by sequence alone. `Some(true)` = old/drop, `Some(false)` = new/keep,
-	// `None` = ambiguous (the caller must resolve it with the group's timestamp).
-	fn by_sequence(&self, sequence: u64) -> Option<bool> {
-		if sequence <= self.prev_max {
-			Some(true)
-		} else if sequence >= self.group {
-			Some(false)
-		} else {
-			None
-		}
-	}
+    /// `Some(true)` means old/drop.
+    ///
+    /// `Some(false)` means new/keep.
+    ///
+    /// `None` means ambiguous and requires timestamp classification.
+    fn by_sequence(&self, sequence: u64) -> Option<bool> {
+        if sequence <= self.prev_max {
+            Some(true)
+        } else if sequence >= self.group {
+            Some(false)
+        } else {
+            None
+        }
+    }
 
-	// Whether a group belongs to the reneged old epoch and should be dropped. In the
-	// ambiguous span, old stragglers sit at or above the reset timestamp; new gap-fillers
-	// fall below it.
-	fn is_stale(&self, sequence: u64, timestamp: Timestamp) -> bool {
-		self.by_sequence(sequence).unwrap_or(timestamp >= self.timestamp)
-	}
+    /// Returns whether a group belongs to the reneged old epoch.
+    fn is_stale(&self, sequence: u64, timestamp: Timestamp) -> bool {
+        self.by_sequence(sequence)
+            .unwrap_or(timestamp >= self.timestamp)
+    }
 }
 
 impl<F: Container> Consumer<F> {
-	/// Create a Consumer wrapping the given moq-lite consumer, decoding `format`.
-	///
-	/// The ordering window inherits the subscriber's current max age budget, clamped
-	/// to the track's retention window. Put that budget on the
-	/// [`moq_net::track::Subscription`] before awaiting the subscription, so the
-	/// publisher preserves the same replay window.
-	pub fn new(track: moq_net::track::Subscriber, format: F) -> Self {
-		let subscription = track.subscription();
-		// Delivery starts at the subscription floor; without one it starts wherever
-		// the publisher does, adopted from the first arrivals (see poll_read). Either
-		// way the age budget is the one rule that catches the cursor up to the live
-		// edge from there. The budget is clamped to the track's retention window,
-		// since history the publisher no longer keeps can't be waited for and would
-		// otherwise stall the catch-up by the excess.
-		let start = subscription.start.map(|position| position.group);
-		let max_age = subscription.max_age.min(track.info().max_age);
-		Self {
-			track,
-			format,
-			current: start.unwrap_or(0),
-			pending: VecDeque::new(),
-			startup: start.is_none(),
-			max_age,
-			rewind: Rewind::default(),
-			end: None,
-			decrypter,
-		}
-	}
+    /// Create a consumer wrapping the given subscriber and container.
+    pub fn new(
+        track: moq_net::track::Subscriber,
+        format: F,
+        decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,
+    ) -> Self {
+        let subscription = track.subscription();
+        let start = subscription.start.map(|position| position.group);
+        let max_age = subscription.max_age.min(track.info().max_age);
 
-	/// A counter that increments each time the consumer reaches a declared discontinuity or
-	/// detects a timeline rewind and drops the reneged buffer.
-	///
-	/// A publisher declares a discontinuity with an empty group. A newer group whose timestamps
-	/// jump backwards past the live edge also reneges everything buffered after that point.
-	/// Downstream consumers should compare this across reads and, when it changes, reset codec
-	/// state and flush media still queued in decoder or render buffers. The frame returned by
-	/// the read that bumps it is the first of the new timeline.
-	pub fn discontinuity(&self) -> u64 {
-		self.rewind.discontinuity
-	}
+        Self {
+            track,
+            format,
+            current: start.unwrap_or(0),
+            pending: VecDeque::new(),
+            startup: start.is_none(),
+            max_age,
+            rewind: Rewind::default(),
+            end: None,
+            decrypter,
+        }
+    }
 
-	/// The exclusive audio endpoint delivered before terminal codec packets.
-	pub fn end(&self) -> Option<Timestamp> {
-		self.end
-	}
+    /// A counter that increments each time the consumer reaches a declared
+    /// discontinuity or detects a timeline rewind.
+    pub fn discontinuity(&self) -> u64 {
+        self.rewind.discontinuity
+    }
 
-	/// Read the next frame from the track.
-	///
-	/// This method handles timestamp decoding, group ordering, and age management
-	/// automatically. It will skip groups that are too far behind to maintain the
-	/// configured max age.
-	///
-	/// Returns `None` when the track has ended.
-	pub async fn read(&mut self) -> Result<Option<Frame>, F::Error> {
-		kio::wait(|waiter| self.poll_read(waiter)).await
-	}
+    /// The exclusive audio endpoint delivered before terminal codec packets.
+    pub fn end(&self) -> Option<Timestamp> {
+        self.end
+    }
 
-	/// Poll-based implementation of the read loop.
-	///
-	/// Uses a single waiter that gets registered on all relevant kio channels,
-	/// avoiding the need for `tokio::select!` or `FuturesUnordered`.
-	pub fn poll_read(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<Frame>, F::Error>> {
-		loop {
-			match ready!(self.poll_event(waiter))? {
-				Some(Event::Frame(frame)) => return Poll::Ready(Ok(Some(frame))),
-				Some(Event::FrameEnd(end)) => {
-					if self.format.kind() == super::Kind::Audio {
-						self.end = Some(end);
-					}
-				}
-				Some(Event::GroupEnd) => continue,
-				None => return Poll::Ready(Ok(None)),
-			}
-		}
-	}
+    /// Read the next frame from the track.
+    pub async fn read(&mut self) -> Result<Option<Frame>, F::Error> {
+        kio::wait(|waiter| self.poll_read(waiter)).await
+    }
 
-	/// Read media or a clean group boundary without waiting for a successor group.
-	pub(crate) fn poll_event(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<Event>, F::Error>> {
-		// Grab any new groups from the track, recording whether the track is finished.
-		let finished = self.poll_read_finish(waiter)?.is_ready();
+    /// Poll-based implementation of the read loop.
+    pub fn poll_read(
+        &mut self,
+        waiter: &kio::Waiter,
+    ) -> Poll<Result<Option<Frame>, F::Error>> {
+        loop {
+            match ready!(self.poll_event(waiter))? {
+                Some(Event::Frame(frame)) => {
+                    return Poll::Ready(Ok(Some(frame)));
+                }
 
-		// A subscription with no explicit start begins wherever the publisher does:
-		// the lowest sequence it actually serves. Timestamps can't reveal that point
-		// (a gap below the served window looks like in-flight groups until the budget
-		// expires, or forever on a quiet track), so the cursor adopts it from the
-		// first arrivals instead of assuming group 0. Skipping stays the budget's job.
-		if self.startup {
-			// NOTE: poll_min_timestamp buffers at least one frame per group and
-			// registers the waiter on the ones still empty.
-			let any_frame = self
-				.pending
-				.iter_mut()
-				.any(|group| matches!(group.poll_min_timestamp(waiter, &self.format), Poll::Ready(Ok(_))));
-			if any_frame {
-				self.current = self.pending.front().expect("a group has a frame").sequence;
-				self.startup = false;
-			}
-		}
+                Some(Event::FrameEnd(end)) => {
+                    if self.format.kind() == super::Kind::Audio {
+                        self.end = Some(end);
+                    }
+                }
 
-		// Reap aborted groups the cursor hasn't reached: nothing below settles them
-		// (the read arm only handles the front at the cursor, and neither the skip
-		// target scan nor the empty-group check counts an abort), so one left ahead
-		// of a sequence gap would park the consumer forever. Buffered frames read
-		// before the abort stay deliverable, so such a group is kept; the front at
-		// the cursor keeps the eviction fast path in the read arm below.
-		// poll_aborted registers the waiter on live groups, so a later abort re-polls.
-		let current = self.current;
-		self.pending
-			.retain_mut(|group| group.sequence <= current || !group.buffered.is_empty() || !group.poll_aborted(waiter));
+                Some(Event::GroupEnd) => {}
 
-		'read: loop {
-			// A newer group whose timestamps jumped backwards means the publisher reneged
-			// the buffered tail. Record the boundary and resume from the new epoch, then restart.
-			if self.poll_reset(waiter)? {
-				continue;
-			}
+                None => {
+                    return Poll::Ready(Ok(None));
+                }
+            }
+        }
+    }
 
-			// Drop any reneged stragglers whose timestamps have since resolved them as old.
-			self.poll_classify(waiter)?;
+    /// Read media or a clean group boundary without waiting for a successor group.
+    pub(crate) fn poll_event(
+        &mut self,
+        waiter: &kio::Waiter,
+    ) -> Poll<Result<Option<Event>, F::Error>> {
+        let finished = self.poll_read_finish(waiter)?.is_ready();
 
-			// Return the next frame from the current group if possible.
-			// If the current group is finished or errored, advance to the next group.
-			if let Some(group) = self.pending.front_mut()
-				&& group.sequence <= self.current
-			{
-				match group.poll_read(waiter, &self.format) {
-					Poll::Ready(Ok(Some(Event::Frame(frame)))) => {
-						// Track the live edge (the max timestamp and the group that carries it) so a
-						// later backwards jump is detectable and the old epoch's tail is anchored.
-						let seq = group.group.sequence;
-						let ts = frame.timestamp;
-						if self.rewind.live_edge.is_none_or(|(_, high)| ts > high) {
-							self.rewind.live_edge = Some((seq, ts));
-						}
-						return Poll::Ready(Ok(Some(Event::Frame(frame))));
-					}
-					Poll::Ready(Ok(Some(event))) => return Poll::Ready(Ok(Some(event))),
-					// Still blocked on this group, don't skip it yet.
-					Poll::Pending => {}
-					Poll::Ready(Err(e)) => {
-						// Tell a relay group eviction/abort (skip) from a payload decode error
-						// (propagate). The moq_net group's own state at the read cursor is the
-						// source of truth: a cursor the transport can no longer serve reports
-						// the error from poll_finished, while a malformed payload leaves the
-						// group live or cleanly finished. A decode error is real and the caller
-						// must see it, not have the group silently dropped.
-						if !group.poll_aborted(waiter) {
-							return Poll::Ready(Err(e));
-						}
-						// The group aged out of the relay cache (`Error::Old`) or was otherwise
-						// aborted. Any sequences between it and the next buffered group were
-						// evicted alongside it, so jump straight to that group instead of
-						// stepping one-by-one and then blocking on a sequence gap of groups
-						// that will never arrive.
-						tracing::warn!(error = ?e, "current group evicted; skipping to next buffered group");
-						self.pending.pop_front();
-						self.current = self.pending.front().map_or(self.current + 1, |g| g.sequence);
-						continue 'read;
-					}
-					// Cleanly finished group: advance to the next sequence.
-					Poll::Ready(Ok(None)) => {
-						let empty = group.empty;
-						self.pending.pop_front();
-						self.current += 1;
-						if empty {
-							self.mark_discontinuities(1);
-						}
-						return Poll::Ready(Ok(Some(Event::GroupEnd)));
-					}
-				}
-			}
+        if self.startup {
+            let mut found = None;
 
-			// Get the current group's min timestamp (the reference for age
-			// comparison) and its furthest presentation point (timestamp + duration).
-			let (oldest_timestamp, current_end) = if let Some(current) = self.pending.front_mut()
-				&& current.sequence <= self.current
-			{
-				match current.poll_min_timestamp(waiter, &self.format) {
-					Poll::Ready(Ok(ts)) => (Some(std::time::Duration::from(ts)), current.max_end),
-					_ => (None, None),
-				}
-			} else {
-				(None, None)
-			};
+            for index in 0..self.pending.len() {
+                if matches!(
+                    self.poll_min_timestamp(index, waiter),
+                    Poll::Ready(Ok(_))
+                ) {
+                    found = Some(index);
+                    break;
+                }
+            }
 
-			// Find the first newer group with data (our skip target) and where it starts.
-			let mut next_group = None;
-			for (i, group) in self.pending.iter_mut().enumerate() {
-				if group.sequence <= self.current {
-					continue;
-				}
+            if found.is_some() {
+                self.current = self
+                    .pending
+                    .front()
+                    .expect("a group has a frame")
+                    .sequence;
 
-				if let Poll::Ready(Ok(ts)) = group.poll_min_timestamp(waiter, &self.format) {
-					next_group = Some((i, std::time::Duration::from(ts)));
-					break;
-				}
-			}
+                self.startup = false;
+            }
+        }
 
-			// Find the max timestamp across all newer groups.
-			let mut max_timestamp = std::time::Duration::ZERO;
-			for group in self.pending.iter_mut().rev() {
-				if group.sequence <= self.current {
-					break;
-				}
+        let current = self.current;
 
-				if let Poll::Ready(Ok(ts)) = group.poll_max_timestamp(waiter, &self.format) {
-					max_timestamp = max_timestamp.max(ts.into());
-					break; // We know older groups won't be newer than this.
-				}
-			}
+        self.pending.retain_mut(|group| {
+            group.sequence <= current
+                || !group.buffered.is_empty()
+                || !group.poll_aborted(waiter)
+        });
 
-			// Walk the cursor over missing sequences below the first arrived group.
-			// Groups race on independent QUIC streams (newer ones at higher priority),
-			// so a buffered higher sequence proves nothing: the missing one may be
-			// merely late, and there is no way to tell that from an eviction. The age
-			// budget is the gate: everything a missing group could still present is
-			// bounded by where the next stamped group begins. A finished track closes
-			// the gap outright, since no new group can arrive. That proof covers only
-			// sequences that never arrived: finishing the track ends new groups, not
-			// the frames still flowing on ones already open, so arrived groups are
-			// settled below by their own FIN, abort, or the budget.
-			if let Some(front_sequence) = self.pending.front().map(|g| g.sequence)
-				&& front_sequence > self.current
-				&& let Some((_, next_start)) = next_group
-				&& (finished || max_timestamp.saturating_sub(next_start) >= self.max_age)
-			{
-				self.current = front_sequence;
-				continue;
-			}
+        'read: loop {
+            if self.poll_reset(waiter)? {
+                continue;
+            }
 
-			let should_skip = if let Some((_, next_start)) = next_group {
-				if let Some(oldest) = oldest_timestamp {
-					// Current group is blocking. Skip if newer groups have pulled past
-					// the max age budget, or if the current group has already presented
-					// up to where the next group begins (duration coverage) so there's
-					// nothing left worth waiting for.
-					let over_max_age = max_timestamp.saturating_sub(oldest) >= self.max_age;
-					let covered = current_end.is_some_and(|end| end >= next_start);
-					over_max_age || covered
-				} else {
-					// The current group has arrived but has no frame yet. Its content
-					// is bounded by where the next stamped group begins the same way a
-					// missing one's is, so give it the same budget before giving up.
-					max_timestamp.saturating_sub(next_start) >= self.max_age
-				}
-			} else {
-				false
-			};
+            self.poll_classify(waiter)?;
 
-			if let Some((new_idx, _)) = next_group
-				&& should_skip
-			{
-				// A zero-frame group is ambiguous until its FIN arrives. Keep it in order so a
-				// delayed empty-group boundary cannot be discarded before it is recognized.
-				// With nothing delivered since the last boundary there is no codec state to
-				// reset, so a would-be discontinuity is redundant and the wait is skipped.
-				let mut discontinuities = 0;
-				if self.rewind.live_edge.is_some() {
-					for group in self.pending.iter_mut().take(new_idx) {
-						match group.poll_empty(waiter) {
-							Poll::Ready(true) => discontinuities += 1,
-							Poll::Ready(false) => {}
-							Poll::Pending => return Poll::Pending,
-						}
-					}
-				}
-				self.pending.drain(0..new_idx);
-				self.mark_discontinuities(discontinuities);
-				let new_current = self.pending.front().map(|g| g.sequence).unwrap();
+            if let Some(group) = self.pending.front()
+                && group.sequence <= self.current
+            {
+                match self.poll_read_group(0, waiter) {
+                    Poll::Ready(Ok(Some(Event::Frame(frame)))) => {
+                        let sequence = self.pending[0].group.sequence;
+                        let timestamp = frame.timestamp;
 
-				tracing::debug!(old = self.current, new = new_current, "skipping slow groups");
+                        if self
+                            .rewind
+                            .live_edge
+                            .is_none_or(|(_, high)| timestamp > high)
+                        {
+                            self.rewind.live_edge = Some((sequence, timestamp));
+                        }
 
-				self.current = new_current;
-				continue;
-			}
+                        return Poll::Ready(Ok(Some(Event::Frame(frame))));
+                    }
 
-			if finished
-				&& let Some(group) = self.pending.front_mut()
-				&& group.sequence > self.current
-				&& matches!(group.poll_empty(waiter), Poll::Ready(true))
-			{
-				self.current = group.sequence;
-				continue;
-			}
+                    Poll::Ready(Ok(Some(event))) => {
+                        return Poll::Ready(Ok(Some(event)));
+                    }
 
-			if finished && self.pending.is_empty() {
-				return Poll::Ready(Ok(None));
-			}
+                    Poll::Pending => {}
 
-			return Poll::Pending;
-		}
-	}
+                    Poll::Ready(Err(error)) => {
+                        let aborted = self.pending[0].poll_aborted(waiter);
 
-	fn mark_discontinuities(&mut self, count: u64) {
-		if count == 0 {
-			return;
-		}
+                        if !aborted {
+                            return Poll::Ready(Err(error));
+                        }
 
-		self.rewind.discontinuity += count;
-		self.end = None;
-		self.rewind.live_edge = None;
-		self.rewind.boundary = None;
-	}
+                        tracing::warn!(
+                            error = ?error,
+                            "current group evicted; skipping to next buffered group"
+                        );
 
-	// Reads any new groups from the track until we're completely finished.
-	//
-	// Returns Pending until all groups have been consumed.
-	fn poll_read_finish(&mut self, waiter: &kio::Waiter) -> Poll<Result<(), F::Error>> {
-		loop {
-			let Some(group) = ready!(self.track.poll_recv_group(waiter)?) else {
-				// Track is finished.
-				return Poll::Ready(Ok(()));
-			};
+                        self.pending.pop_front();
 
-			let reader = GroupBuffer::new(group);
-			let sequence = reader.group.sequence;
+                        self.current = self
+                            .pending
+                            .front()
+                            .map_or(self.current + 1, |group| group.sequence);
 
-			// Normally we drop anything behind the playback cursor. With an active reset the
-			// cursor isn't a valid floor: a late new-epoch group can sit below it. Defer to
-			// the boundary, admitting ambiguous groups so poll_classify can rule on them once
-			// their timestamps arrive.
-			let drop = match &self.rewind.boundary {
-				Some(reset) => match reset.by_sequence(sequence) {
-					Some(true) => true,                     // old epoch: reneged
-					Some(false) => sequence < self.current, // new epoch, but already played past
-					None => false,                          // ambiguous: admit, classify later
-				},
-				None => sequence < self.current,
-			};
-			if drop {
-				tracing::debug!(old = ?sequence, current = ?self.current, "skipping old group");
-				continue;
-			}
+                        continue 'read;
+                    }
+                }
+            }
 
-			let idx = self
-				.pending
-				.partition_point(|g| g.group.sequence < reader.group.sequence);
-			self.pending.insert(idx, reader);
-		}
-	}
+            let (oldest_timestamp, current_end) =
+                if let Some(index) = self.pending.iter().position(|group| {
+                    group.sequence <= self.current
+                }) {
+                    match self.poll_min_timestamp(index, waiter) {
+                        Poll::Ready(Ok(timestamp)) => {
+                            let end = self.pending[index].max_end;
+                            (
+                                Some(std::time::Duration::from(timestamp)),
+                                end,
+                            )
+                        }
 
-	// Detect a publisher "rewind" and record the reneged boundary.
-	//
-	// A newer group (sequence climbs) whose first frame lands before the live edge (timestamp
-	// goes backwards) can only be an explicit reneg of the buffered tail. We record a [`Reset`]
-	// from `(live-edge group, rewound group, rewound timestamp)`, drop the buffered groups it
-	// can already prove stale, bump the discontinuity counter, and resume playback from the
-	// earliest survivor. Groups still ambiguous (a late new-epoch group vs. an old straggler)
-	// are kept and resolved by [`poll_classify`](Self::poll_classify) once their timestamps
-	// arrive.
-	//
-	// Returns true if a reset happened, signalling the caller to restart the read loop.
-	fn poll_reset(&mut self, waiter: &kio::Waiter) -> Result<bool, F::Error> {
-		let Some((prev_max, live_edge)) = self.rewind.live_edge else {
-			return Ok(false);
-		};
+                        _ => (None, None),
+                    }
+                } else {
+                    (None, None)
+                };
 
-		// Scan newer groups from the back (highest sequence first) for a rewind: a group whose
-		// timestamp went strictly backwards past the live edge. Checking only `back()` would
-		// miss a rewind that a higher-sequence group masks by having already caught back up
-		// (timestamp >= live edge) or by having no frame yet. Pending is sequence-sorted, so we
-		// take the highest-sequence group that actually rewound.
-		let reset = {
-			let mut found = None;
-			for group in self.pending.iter_mut().rev() {
-				// The cursor may already point at an unread group. Only groups that
-				// supplied the old live edge (or preceded it) are ruled out.
-				if group.group.sequence <= prev_max {
-					break;
-				}
+            let mut next_group = None;
 
-				// Skip groups with no frame yet; a lower-sequence one may still have rewound.
-				let Poll::Ready(Ok(min)) = group.poll_min_timestamp(waiter, &self.format) else {
-					continue;
-				};
+            for index in 0..self.pending.len() {
+                if self.pending[index].sequence <= self.current {
+                    continue;
+                }
 
-				if min < live_edge {
-					found = Some(Reset {
-						prev_max,
-						group: group.group.sequence,
-						timestamp: min,
-					});
-					break;
-				}
-			}
+                if let Poll::Ready(Ok(timestamp)) =
+                    self.poll_min_timestamp(index, waiter)
+                {
+                    next_group = Some((
+                        index,
+                        std::time::Duration::from(timestamp),
+                    ));
+                    break;
+                }
+            }
 
-			let Some(reset) = found else {
-				return Ok(false);
-			};
-			reset
-		};
+            let mut max_timestamp = std::time::Duration::ZERO;
 
-		// Drop buffered groups the boundary can already prove are old-epoch. Ambiguous ones
-		// (no verdict by sequence, or timestamp not read yet) are kept for poll_classify.
-		self.pending.retain(|g| match reset.by_sequence(g.group.sequence) {
-			Some(stale) => !stale,
-			None => g.min_timestamp.is_none_or(|ts| !reset.is_stale(g.group.sequence, ts)),
-		});
+            for index in (0..self.pending.len()).rev() {
+                if self.pending[index].sequence <= self.current {
+                    break;
+                }
 
-		self.rewind.discontinuity += 1;
-		self.end = None;
-		tracing::debug!(
-			prev_max = reset.prev_max,
-			group = reset.group,
-			discontinuity = self.rewind.discontinuity,
-			"buffer reset: group timestamps rewound"
-		);
-		self.rewind.boundary = Some(reset);
-		// Resume from the earliest survivor; if none buffered yet, from the rewound group.
-		self.current = self.pending.front().map_or(reset.group, |g| g.group.sequence);
-		self.rewind.live_edge = Some((reset.group, reset.timestamp));
+                if let Poll::Ready(Ok(timestamp)) =
+                    self.poll_max_timestamp(index, waiter)
+                {
+                    max_timestamp = max_timestamp.max(timestamp.into());
+                    break;
+                }
+            }
 
-		Ok(true)
-	}
+            if let Some(front_sequence) =
+                self.pending.front().map(|group| group.sequence)
+                && front_sequence > self.current
+                && let Some((_, next_start)) = next_group
+                && (finished
+                    || max_timestamp.saturating_sub(next_start)
+                        >= self.max_age)
+            {
+                self.current = front_sequence;
+                continue;
+            }
 
-	// Resolve groups left ambiguous by a reset once their timestamps arrive.
-	//
-	// A group whose sequence falls in the reset's ambiguous span could be a late new-epoch
-	// group (keep) or an old straggler whose higher timestamp simply hadn't been seen at
-	// detection time (drop). We can only tell once it has a frame, so we re-check each loop
-	// iteration and drop the ones that resolve to stale.
-	fn poll_classify(&mut self, waiter: &kio::Waiter) -> Result<(), F::Error> {
-		let Some(reset) = self.rewind.boundary else {
-			return Ok(());
-		};
+            let should_skip = if let Some((_, next_start)) = next_group {
+                if let Some(oldest) = oldest_timestamp {
+                    let over_max_age =
+                        max_timestamp.saturating_sub(oldest) >= self.max_age;
 
-		let mut i = 0;
-		while i < self.pending.len() {
-			let group = &mut self.pending[i];
-			// Only ambiguous-by-sequence groups need a timestamp verdict.
-			if reset.by_sequence(group.group.sequence).is_some() {
-				i += 1;
-				continue;
-			}
+                    let covered =
+                        current_end.is_some_and(|end| end >= next_start);
 
-			match group.poll_min_timestamp(waiter, &self.format) {
-				Poll::Ready(Ok(min)) if reset.is_stale(group.group.sequence, min) => {
-					self.pending.remove(i);
-				}
-				_ => i += 1,
-			}
-		}
+                    over_max_age || covered
+                } else {
+                    max_timestamp.saturating_sub(next_start) >= self.max_age
+                }
+            } else {
+                false
+            };
 
-		Ok(())
-	}
+            if let Some((new_index, _)) = next_group
+                && should_skip
+            {
+                let mut discontinuities = 0;
 
-	/// Set the max age mid-stream, clamped to the track's retention window like
-	/// [`new`](Self::new). The subscription keeps the requested value verbatim,
-	/// matching [`moq_net::track::Subscription::max_age`].
-	pub fn set_max_age(&mut self, max_age: std::time::Duration) {
-		self.max_age = max_age.min(self.track.info().max_age);
-		// The transport enforces the same budget on the subscription itself, so a
-		// tolerance set here has to reach it: otherwise moq-net skips the very groups
-		// this consumer was told to wait for, before they ever get here.
-		let subscription = self.track.subscription().with_max_age(max_age);
-		let _ = self.track.update(subscription);
-	}
+                if self.rewind.live_edge.is_some() {
+                    for index in 0..new_index {
+                        match self.poll_empty(index, waiter) {
+                            Poll::Ready(true) => {
+                                discontinuities += 1;
+                            }
+
+                            Poll::Ready(false) => {}
+
+                            Poll::Pending => {
+                                return Poll::Pending;
+                            }
+                        }
+                    }
+                }
+
+                self.pending.drain(0..new_index);
+                self.mark_discontinuities(discontinuities);
+
+                let new_current = self
+                    .pending
+                    .front()
+                    .expect("skip target exists")
+                    .sequence;
+
+                tracing::debug!(
+                    old = self.current,
+                    new = new_current,
+                    "skipping slow groups"
+                );
+
+                self.current = new_current;
+                continue;
+            }
+
+            if finished
+                && let Some(index) = self.pending.iter().position(|group| {
+                    group.sequence > self.current
+                })
+                && matches!(self.poll_empty(index, waiter), Poll::Ready(true))
+            {
+                self.current = self.pending[index].sequence;
+                continue;
+            }
+
+            if finished && self.pending.is_empty() {
+                return Poll::Ready(Ok(None));
+            }
+
+            return Poll::Pending;
+        }
+    }
+
+    fn mark_discontinuities(&mut self, count: u64) {
+        if count == 0 {
+            return;
+        }
+
+        self.rewind.discontinuity += count;
+        self.end = None;
+        self.rewind.live_edge = None;
+        self.rewind.boundary = None;
+    }
+
+    /// Read newly available groups from the track.
+    fn poll_read_finish(
+        &mut self,
+        waiter: &kio::Waiter,
+    ) -> Poll<Result<(), F::Error>> {
+        loop {
+            let Some(group) = ready!(self.track.poll_recv_group(waiter)?) else {
+                return Poll::Ready(Ok(()));
+            };
+
+            let reader = GroupBuffer::new(group);
+            let sequence = reader.group.sequence;
+
+            let drop = match &self.rewind.boundary {
+                Some(reset) => match reset.by_sequence(sequence) {
+                    Some(true) => true,
+                    Some(false) => sequence < self.current,
+                    None => false,
+                },
+
+                None => sequence < self.current,
+            };
+
+            if drop {
+                tracing::debug!(
+                    old = ?sequence,
+                    current = ?self.current,
+                    "skipping old group"
+                );
+
+                continue;
+            }
+
+            let index = self
+                .pending
+                .partition_point(|group| group.sequence < sequence);
+
+            self.pending.insert(index, reader);
+        }
+    }
+
+    /// Detect a publisher rewind.
+    fn poll_reset(
+        &mut self,
+        waiter: &kio::Waiter,
+    ) -> Result<bool, F::Error> {
+        let Some((previous_max, live_edge)) = self.rewind.live_edge else {
+            return Ok(false);
+        };
+
+        let reset = {
+            let mut found = None;
+
+            for index in (0..self.pending.len()).rev() {
+                if self.pending[index].sequence <= previous_max {
+                    break;
+                }
+
+                let timestamp = match self.poll_min_timestamp(index, waiter) {
+                    Poll::Ready(Ok(timestamp)) => timestamp,
+                    _ => continue,
+                };
+
+                if timestamp < live_edge {
+                    found = Some(Reset {
+                        prev_max: previous_max,
+                        group: self.pending[index].sequence,
+                        timestamp,
+                    });
+
+                    break;
+                }
+            }
+
+            let Some(reset) = found else {
+                return Ok(false);
+            };
+
+            reset
+        };
+
+        self.pending.retain(|group| {
+            match reset.by_sequence(group.sequence) {
+                Some(stale) => !stale,
+
+                None => group
+                    .min_timestamp
+                    .is_none_or(|timestamp| {
+                        !reset.is_stale(group.sequence, timestamp)
+                    }),
+            }
+        });
+
+        self.rewind.discontinuity += 1;
+        self.end = None;
+
+        tracing::debug!(
+            prev_max = reset.prev_max,
+            group = reset.group,
+            discontinuity = self.rewind.discontinuity,
+            "buffer reset: group timestamps rewound"
+        );
+
+        self.rewind.boundary = Some(reset);
+
+        self.current = self
+            .pending
+            .front()
+            .map_or(reset.group, |group| group.sequence);
+
+        self.rewind.live_edge = Some((reset.group, reset.timestamp));
+
+        Ok(true)
+    }
+
+    /// Resolve groups left ambiguous by a reset.
+    fn poll_classify(
+        &mut self,
+        waiter: &kio::Waiter,
+    ) -> Result<(), F::Error> {
+        let Some(reset) = self.rewind.boundary else {
+            return Ok(());
+        };
+
+        let mut index = 0;
+
+        while index < self.pending.len() {
+            let sequence = self.pending[index].sequence;
+
+            if reset.by_sequence(sequence).is_some() {
+                index += 1;
+                continue;
+            }
+
+            match self.poll_min_timestamp(index, waiter) {
+                Poll::Ready(Ok(timestamp))
+                    if reset.is_stale(sequence, timestamp) =>
+                {
+                    self.pending.remove(index);
+                }
+
+                _ => {
+                    index += 1;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Set the maximum age mid-stream.
+    pub fn set_max_age(&mut self, max_age: std::time::Duration) {
+        self.max_age = max_age.min(self.track.info().max_age);
+
+        let subscription = self
+            .track
+            .subscription()
+            .with_max_age(max_age);
+
+        let _ = self.track.update(subscription);
+    }
+
+    /*
+     * GroupBuffer adapter methods.
+     *
+     * The decrypter is temporarily moved out of `self` so it can be mutably
+     * borrowed at the same time as an individual GroupBuffer.
+     */
+
+    fn poll_read_group(
+        &mut self,
+        index: usize,
+        waiter: &kio::Waiter,
+    ) -> Poll<Result<Option<Event>, F::Error>> {
+        let mut decrypter = self.decrypter.take();
+
+        let result = self.pending[index].poll_read(
+            waiter,
+            &self.format,
+            decrypter.as_deref_mut(),
+        );
+
+        self.decrypter = decrypter;
+        result
+    }
+
+    fn poll_min_timestamp(
+        &mut self,
+        index: usize,
+        waiter: &kio::Waiter,
+    ) -> Poll<Result<Timestamp, F::Error>> {
+        let mut decrypter = self.decrypter.take();
+
+        let result = self.pending[index].poll_min_timestamp(
+            waiter,
+            &self.format,
+            decrypter.as_deref_mut(),
+        );
+
+        self.decrypter = decrypter;
+        result
+    }
+
+    fn poll_max_timestamp(
+        &mut self,
+        index: usize,
+        waiter: &kio::Waiter,
+    ) -> Poll<Result<Timestamp, F::Error>> {
+        let mut decrypter = self.decrypter.take();
+
+        let result = self.pending[index].poll_max_timestamp(
+            waiter,
+            &self.format,
+            decrypter.as_deref_mut(),
+        );
+
+        self.decrypter = decrypter;
+        result
+    }
+
+    fn poll_empty(
+        &mut self,
+        index: usize,
+        waiter: &kio::Waiter,
+    ) -> Poll<bool> {
+        self.pending[index].poll_empty(waiter)
+    }
 }
 
 /// Internal reader for a group of frames.
