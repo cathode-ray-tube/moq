@@ -718,7 +718,7 @@ impl<E: catalog::Catalog> Export<E> {
 		}
 		Ok(())
 	}
-	fn update_catalog(&mut self, mut catalog: Catalog<E>) -> anyhow::Result<()> {
+	fn update_catalog(&mut self, mut catalog: Catalog<E>, decrypter_factory: impl Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,) -> anyhow::Result<()> {
 		self.source.retain_valid(&mut catalog);
 
 		// The MPEG-TS section lives in the extension. The trait only exposes
@@ -835,7 +835,7 @@ impl<E: catalog::Catalog> Export<E> {
 					self.tracks.insert(name.clone(), track);
 				}
 				None => {
-					let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age, None, decrypter)? else {
+					let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age, None, decrypter_factory(),)? else {
 						continue;
 					};
 					self.insert_track(name, source, pid, kind, descriptors, reserve);
@@ -854,7 +854,7 @@ impl<E: catalog::Catalog> Export<E> {
 					self.tracks.insert(name.clone(), track);
 				}
 				None => {
-					let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, None, decrypter)? else {
+					let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, None, decrypter_factory(),)? else {
 						continue;
 					};
 					self.insert_track(name, source, pid, kind, descriptors, DEFAULT_DTS_RESERVE);
@@ -880,7 +880,7 @@ impl<E: catalog::Catalog> Export<E> {
 					self.tracks.insert(name.clone(), existing);
 				}
 				None => {
-					let source = ExportSource::for_stream(&self.source, name, self.max_age, None, decrypter)?;
+					let source = ExportSource::for_stream(&self.source, name, self.max_age, None, decrypter_factory(),)?;
 					self.insert_track(name, source, pid, kind, descriptors, DEFAULT_DTS_RESERVE);
 				}
 			}
