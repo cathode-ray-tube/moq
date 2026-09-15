@@ -336,7 +336,7 @@ impl Container for Wire {
     waiter: &kio::Waiter,
 	) -> Poll<std::result::Result<Option<Vec<Frame>>, crate::error::Error>>
 	where
-	    R: FrameReader<Error = Error>,
+	   R: FrameReader<Error = crate::error::Error>,
 	{
 	    let Some(data) = ready!(reader.poll_read_frame(waiter)?) else {
 	        return Poll::Ready(Ok(None));
