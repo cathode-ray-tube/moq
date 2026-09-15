@@ -316,8 +316,8 @@ impl Export {
 		// unmuxed rather than emitted as undecodable config-less frames. (This
 		// mirrors the single-track path ignoring extra renditions.)
 		if !self.header_emitted {
-			self.bind_video(&catalog)?;
-			self.bind_audio(&catalog)?;
+			self.bind_video(&catalog, &decrypter_factory)?;
+            self.bind_audio(&catalog, &decrypter_factory)?;
 		} else if catalog.video.renditions.len() > self.video.len() || catalog.audio.renditions.len() > self.audio.len()
 		{
 			tracing::warn!("ignoring FLV rendition that appeared after the stream header");
@@ -336,7 +336,7 @@ impl Export {
 		Ok(())
 	}
 
-	fn bind_video(&mut self, catalog: &Catalog, decrypter_factory: impl Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,) -> anyhow::Result<()> {
+	fn bind_video(&mut self, catalog: &Catalog, decrypter_factory: &dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,) -> anyhow::Result<()> {
 		for (name, config) in &catalog.video.renditions {
 			if !self.multitrack && !self.video.is_empty() {
 				tracing::warn!("FLV export only supports one video track; ignoring the rest (enable multitrack)");
