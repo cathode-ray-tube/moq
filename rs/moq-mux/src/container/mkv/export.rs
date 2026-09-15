@@ -13,7 +13,7 @@ use crate::catalog::Stream;
 use crate::container::ExportSource;
 use crate::container::Frame;
 use crate::container::mkv::Error;
-use crate::container::FrameDecrytper;
+use crate::container::FrameDecrypter;
 
 /// Matroska TimestampScale: 1 ms (in nanoseconds).
 const TIMESTAMP_SCALE_NS: u64 = 1_000_000;
