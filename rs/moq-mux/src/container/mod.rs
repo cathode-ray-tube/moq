@@ -179,7 +179,8 @@ pub trait Container {
         waiter: &kio::Waiter,
     ) -> Poll<Result<Option<Vec<Frame>>, Self::Error>>
     where
-        R: FrameReader<Error = Self::Error>;
+        where
+    R: FrameReader<Error = crate::error::Error>,
 
     fn end(&self, _frame: &Frame) -> Option<moq_net::Timestamp> {
         None
