@@ -501,7 +501,7 @@ impl<S: Stream> Export<S> {
 			if self.tracks.contains_key(name) {
 				continue;
 			}
-			let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age)? else {
+			let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age, None)? else {
 				continue;
 			};
 			let timescale = catalog_timescale_video(config)?;
@@ -529,7 +529,7 @@ impl<S: Stream> Export<S> {
 			if self.tracks.contains_key(name) {
 				continue;
 			}
-			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age)? else {
+			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, None)? else {
 				continue;
 			};
 			let timescale = catalog_timescale_audio(config)?;
