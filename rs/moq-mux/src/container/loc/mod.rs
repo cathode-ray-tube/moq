@@ -1,89 +1,227 @@
-//! Low Overhead Container.
+//! Container formats.
 //!
-//! The IETF draft replacement for hang's Legacy format. Each moq frame
-//! holds a small property block (timestamp, optional per-frame
-//! timescale) followed by the codec bitstream. Defaults to microsecond
-//! timestamps. See [draft-ietf-moq-loc-04](https://www.ietf.org/archive/id/draft-ietf-moq-loc-04.html).
+//! A container decides how one or more media samples are laid out inside a
+//! moq-lite frame, including framing overhead and optional file-format
+//! compatibility.
+//!
+//! Each submodule implements one format. Wire-level formats implement the
+//! [`Container`] trait, so [`Producer<C>`] and [`Consumer<C>`] can be generic
+//! over the choice. The catalog announces a container per track;
+//! [`catalog::hang::Container`](crate::catalog::hang::Container) dispatches
+//! the appropriate implementation at runtime.
 
+use bytes::Bytes;
 use std::task::Poll;
 
-use moq_net::{Timescale, Timestamp};
+mod consumer;
+mod group;
+mod producer;
+mod source;
 
-use crate::container::{Container, Frame, FrameWriter, Kind};
+#[cfg(test)]
+pub(crate) mod test_util;
 
-/// LOC's catalog convention: timestamps are in microseconds when no per-frame
-/// 0x08 timescale property is present.
-const DEFAULT_TIMESCALE: Timescale = Timescale::MICRO;
+pub mod flv;
+pub mod fmp4;
+pub mod legacy;
+pub mod loc;
+pub mod mkv;
+pub mod reader;
+pub mod source;
+pub mod ts;
+pub mod writer;
 
-/// LOC wire format configured for the track's media role.
-pub struct Wire(
-	/// The kind of content carried by the track.
-	pub Kind,
-);
+pub use consumer::Consumer;
+pub use group::GroupConsumer;
+pub use producer::Producer;
+pub(crate) use source::ExportSource;
 
-impl Container for Wire {
-	type Error = crate::Error;
+pub use crate::error::Error;
 
-	fn write<W>(&self, output: &mut W, frames: &[Frame]) -> Result<(), Self::Error>
-	where
-		W: FrameWriter<Error = Self::Error>,
-	{
-		for frame in frames {
-			// LOC uses microsecond timestamps by convention when no per-frame
-			// timescale property is present.
-			let timestamp = frame.timestamp.convert(DEFAULT_TIMESCALE).map_err(hang::Error::from)?;
+pub use reader::{
+    FrameDecrypter,
+    FrameReader,
+    ProtectedFrame as ProtectedReadFrame,
+    ReadFrame,
+};
 
-			let payload = moq_loc::encode(timestamp.value(), &frame.payload)?;
+pub use writer::{
+    FrameEncrypter,
+    FrameWriter,
+    MoqFrameWriter,
+    ProtectedFrame as ProtectedWriteFrame,
+};
 
-			// The LOC timestamp is encoded inside the payload using the
-			// default timescale. The outer MoQ frame keeps the original
-			// track timestamp.
-			output.write_frame(frame.timestamp, payload)?;
-		}
+/// The media role that determines how a container represents frame durations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// Audio packets carry codec-defined durations.
+    Audio,
 
-		Ok(())
-	}
+    /// Video frames can need a duration marker at group end.
+    Video,
 
-	fn poll_read(
-		&self,
-		group: &mut moq_net::group::Consumer,
-		waiter: &kio::Waiter,
-	) -> Poll<Result<Option<Vec<Frame>>, Self::Error>> {
-		use std::task::ready;
+    /// Opaque data has no sample-duration semantics.
+    Data,
+}
 
-		let Some(frame) = ready!(group.poll_read_frame(waiter)?) else {
-			return Poll::Ready(Ok(None));
-		};
+/// A decoded media frame: timestamp, payload bytes, keyframe flag.
+#[derive(Clone, Debug)]
+pub struct Frame {
+    /// Presentation timestamp.
+    ///
+    /// Each container picks its own native scale: fMP4 uses the source
+    /// `mdhd.timescale`, Matroska uses nanoseconds, Legacy is fixed at
+    /// microseconds, and LOC defaults to microseconds while preserving any
+    /// per-frame timescale carried on the wire.
+    pub timestamp: moq_net::Timestamp,
 
-		let loc = moq_loc::decode(frame.payload)?;
+    /// Sample duration, normalized to microseconds, when the container reports
+    /// one.
+    ///
+    /// CMAF carries a per-sample duration. Legacy and LOC can fill this from
+    /// a duration marker when reading a fetched group. Streaming muxers
+    /// receive the later endpoint separately, so media remains immediately
+    /// available.
+    ///
+    /// The [`Consumer`] adds this duration to `timestamp` to learn how far a
+    /// group has been presented. It can then advance to a newer group as soon
+    /// as the gap is covered instead of waiting out the maximum-age budget.
+    pub duration: Option<moq_net::Timestamp>,
 
-		// `loc.timescale == Some(0)` is malformed and is rejected by
-		// `moq_loc::decode`. Any remaining Some(_) value is non-zero.
-		let scale = loc
-			.timescale
-			.and_then(|s| Timescale::new(s).ok())
-			.unwrap_or(DEFAULT_TIMESCALE);
+    /// Encoded codec payload.
+    pub payload: Bytes,
 
-		let timestamp = Timestamp::new(loc.timestamp, scale).map_err(hang::Error::from)?;
+    /// Whether this frame opens a group, or is a video keyframe.
+    ///
+    /// Containers that carry the bit on the wire, such as CMAF, set it from
+    /// the container metadata. Containers without keyframe metadata, such as
+    /// Legacy and LOC, return `false`; the wrapping [`Consumer`] promotes the
+    /// first decoded frame in each group to a keyframe and validates the group
+    /// boundary.
+    ///
+    /// For audio, whose samples are independently decodable, the group
+    /// boundary is the only source of this information.
+    pub keyframe: bool,
+}
 
-		Poll::Ready(Ok(Some(vec![Frame {
-			timestamp,
-			payload: loc.payload,
+/// Stamp `frame` with the duration ending at `bound`, unless it already has
+/// one.
+///
+/// Durations are normalized to microseconds, matching the historical behavior
+/// of this module. The timestamp itself may use a different native timescale.
+pub(crate) fn close_duration(frame: &mut Frame, bound: moq_net::Timestamp) {
+    if frame.duration.is_some() {
+        return;
+    }
 
-			// LOC does not carry the keyframe bit on the wire; the wrapping
-			// Consumer fills it in from group position.
-			keyframe: false,
+    let Some(delta) = bound
+        .as_micros()
+        .checked_sub(frame.timestamp.as_micros())
+    else {
+        return;
+    };
 
-			// LOC carries no per-frame duration.
-			duration: None,
-		}])))
-	}
+    if delta == 0 {
+        return;
+    }
 
-	fn kind(&self) -> Kind {
-		self.0
-	}
+    let Ok(delta) = u64::try_from(delta) else {
+        return;
+    };
 
-	fn end(&self, frame: &Frame) -> Option<moq_net::Timestamp> {
-		(self.0 != Kind::Data && frame.payload.is_empty()).then_some(frame.timestamp)
-	}
+    if let Ok(duration) = moq_net::Timestamp::from_micros(delta) {
+        frame.duration = Some(duration);
+    }
+}
+
+/// A non-keyframe frame arrived with no open group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("missing keyframe: a group must open on a keyframe")]
+pub struct MissingKeyframe;
+
+/// An explicit endpoint precedes the last frame of an ordered video group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("video group endpoint precedes its last frame")]
+pub struct InvalidEnd;
+
+/// Encode and decode media frames over a moq-lite group.
+pub trait Container {
+    /// Container-specific error. Must be convertible from [`moq_net::Error`]
+    /// so I/O errors propagate, [`MissingKeyframe`], and [`InvalidEnd`].
+    type Error: std::error::Error
+        + Send
+        + Sync
+        + Unpin
+        + From<moq_net::Error>
+        + From<MissingKeyframe>
+        + From<InvalidEnd>;
+
+    /// Encode one or more frames and send them through `output`.
+    ///
+    /// The writer may be protected, so container implementations must write
+    /// encoded payloads through this abstraction rather than directly through
+    /// a group producer.
+    fn write<W>(&self, output: &mut W, frames: &[Frame]) -> Result<(), Self::Error>
+    where
+        W: FrameWriter<Error = Self::Error>;
+
+    /// Poll the next moq-lite frame from `group` and decode it into media
+    /// frames.
+    fn poll_read(
+        &self,
+        group: &mut moq_net::group::Consumer,
+        waiter: &kio::Waiter,
+    ) -> Poll<Result<Option<Vec<Frame>>, Self::Error>>;
+
+    /// Return the endpoint timestamp when `frame` is a format-specific
+    /// endpoint marker.
+    ///
+    /// For video, this bounds the preceding frame. For audio, it bounds
+    /// source samples before terminal codec packets. A consumer never submits
+    /// the marker to a decoder. Formats without endpoint metadata return
+    /// `None`.
+    ///
+    /// Implementations must ensure that ordinary empty media payloads cannot
+    /// be mistaken for endpoint metadata.
+    fn end(&self, _frame: &Frame) -> Option<moq_net::Timestamp> {
+        None
+    }
+
+    /// The media role, when this format represents an audio or video track.
+    fn kind(&self) -> Kind {
+        Kind::Data
+    }
+
+    /// Write any format-specific endpoint before the producer closes the
+    /// group.
+    ///
+    /// The endpoint, when present, is emitted after the media frames and
+    /// before the producer writes the group's final boundary. The endpoint is
+    /// sent through the same [`FrameWriter`] as ordinary media frames, so it
+    /// receives the same protection, including encryption.
+    fn finish_group<W>(
+        &self,
+        _output: &mut W,
+        _end: Option<moq_net::Timestamp>,
+    ) -> Result<(), Self::Error>
+    where
+        W: FrameWriter<Error = Self::Error>,
+    {
+        Ok(())
+    }
+
+    /// Async wrapper around [`Self::poll_read`].
+    ///
+    /// Only `Ok(None)` ends the group. `Ok(Some(batch))` may return an empty
+    /// batch, in which case the caller must poll again.
+    fn read(
+        &self,
+        group: &mut moq_net::group::Consumer,
+    ) -> impl std::future::Future<Output = Result<Option<Vec<Frame>>, Self::Error>>
+    where
+        Self: Sync,
+    {
+        async { kio::wait(|waiter| self.poll_read(group, waiter)).await }
+    }
 }
