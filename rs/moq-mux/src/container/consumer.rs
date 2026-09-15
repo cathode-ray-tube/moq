@@ -704,7 +704,7 @@ impl GroupBuffer {
     }
 
     /// Poll for the next frame or boundary event from this group.
-    fn poll_read<F: Container>(
+    fn poll_read<F: Container<Error = crate::error::Error>>(
         &mut self,
         waiter: &kio::Waiter,
         format: &F,
