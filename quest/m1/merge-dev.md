@@ -39,17 +39,26 @@ broadcast that has been up for days must get a playlist promptly. The bounded
 `moq_json::window` timeline (#3240) is what makes that hold, and only a long
 run proves it.
 
-The breaking-change targeting rules in CONTRIBUTING.md govern the release
-that follows. Dart already has that surface, so nothing waits on this
+[Release](/quest/m1/release.md) cuts the release that follows and holds
+what gates it but not the merge. Dart already has that surface, so nothing waits on this
 merge for it. The rest of the archive line, wildcard resolution, and every
 additive quest that builds on dev-only code start on main afterwards from
 [m2](/quest/m2/README.md).
 
 ## Required
 
+- [Reserved codes](/quest/m1/lite-reserved-codes.md) - nothing provisional ships on the released wire
+- [Reconnect stats handle](/quest/m1/api-reconnect-stats-handle.md) - `ConnectionStatsReader` does not ship
+- [Rate estimate names](/quest/m1/api-rate-estimate-names.md) - the estimates carry one name on the C ABI and every binding
+- [Counter edge names](/quest/m1/api-counter-edge-names.md) - the stats counters name both edges before the wire ossifies
+- [Announce names](/quest/m1/api-announce-names.md) - the announce and request surface releases under one name per concept
+- [moq-tokio names](/quest/m1/api-tokio-names.md) - moq-tokio's first release under this name has settled names
+- [JSON config names](/quest/m1/api-json-binary-config-names.md) - the json and binary packages agree on Config
+- [JS names](/quest/m1/api-js-net-names.md) - the npm packages mirror Rust
+- [FFI units](/quest/m1/api-ffi-units-verbs.md) - the binding records release with one duration unit
+- [Deprecated sweep](/quest/m1/deprecated-sweep.md) - the breaking release removes what it deprecates
 - [Worker ownership](/quest/m1/api-worker-ownership.md) - consuming split ownership retains sockets and joins the group before release
 - [Origin scope API](/quest/m1/api-origin-pattern-scopes.md) - typed scope grants preserve current prefixes and refuse unsupported patterns
-- [Auth server](/quest/m1/auth/README.md) - the breaking auth contract, flags, claims, and package names the release moq.pro adopts must carry
 - [Cluster peer API](/quest/m1/api-cluster-peer-config.md) - typed peer configuration supports current symmetric policy
 - [Broadcast clock](/quest/m1/broadcast-clock.md) - the root clock replaces the published archive wall field on dev before release
 - [m0](/quest/m0/README.md) - every release blocker lands or is punted before the merge

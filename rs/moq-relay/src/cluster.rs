@@ -1036,12 +1036,16 @@ impl Cluster {
 		None
 	}
 
-	/// Grant the cluster-peer scope a `cluster.token` would: unscoped publish
-	/// and subscribe, billed under `--cluster-tier`.
-	pub(crate) fn lan_peer_token(&self) -> AuthToken {
-		let mut token = AuthToken::unrestricted(Path::new("").to_owned());
-		token.tier = self.cluster_tier();
-		token
+	/// The grant a LAN peer gets once its membership proof checks out: everything,
+	/// billed under `--cluster-tier`. The proof is a secret this relay minted for
+	/// itself, so no auth server is asked.
+	pub(crate) fn lan_peer_grant(&self) -> moq_auth::Grant {
+		let mut grant = moq_auth::Grant::new(
+			[moq_auth::Pattern::all()].into_iter().collect(),
+			[moq_auth::Pattern::all()].into_iter().collect(),
+		);
+		grant.tier = self.config.tier.clone().filter(|tier| !tier.is_empty());
+		grant
 	}
 
 	/// Whether a protocol version carries the request path used to mark a mesh dial.
@@ -1445,7 +1449,7 @@ impl Cluster {
 					.client_tls
 					.as_ref()
 					.expect("http(s) connect_api source requires client TLS");
-				let http = match crate::http_client::build(tls, crate::http_client::CacheScope::Shared) {
+				let http = match crate::http_client::build(tls) {
 					Ok(http) => http,
 					Err(err) => {
 						tracing::error!(%err, "cluster.connect_api: failed to build HTTP client");
@@ -1591,7 +1595,7 @@ impl Cluster {
 		// Apply the shared cluster token unless the URL already carries its own
 		// non-empty `?jwt=` (a per-peer inline token wins; the shared token still
 		// covers peers that have none). An empty
-		// `?jwt=` counts as absent, matching `AuthParams::from_url`.
+		// `?jwt=` counts as absent, as `moq auth serve` reads it.
 		// LAN dials never get the token: they authenticate with the mDNS credential.
 		if !target.lan && !token.is_empty() {
 			for url in &mut urls {
@@ -3087,7 +3091,7 @@ mod tests {
 		tokio::spawn(async move {
 			let mut listener = listener;
 			while let Some(request) = listener.accept().await {
-				let conn = crate::Connection::new(request, accept.clone(), crate::Auth::default());
+				let conn = crate::Connection::new(request, accept.clone(), crate::Auth::refuse("test"));
 				tokio::spawn(async move {
 					let _ = conn.run().await;
 				});

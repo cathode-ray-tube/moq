@@ -439,6 +439,9 @@ struct State {
 	/// Advanced by `Shared::connected` with the same write that publishes `status`,
 	/// so a reader can't see `Connected` without its epoch.
 	epoch: u64,
+	/// Cumulative connects and disconnects, bumped by the reconnect loop itself so a session that
+	/// connects and drops before a consumer polls still counts.
+	presence: moq_net::stats::Presence,
 	/// The negotiated MoQ version of the live session, or `None` when disconnected.
 	version: Option<Version>,
 	/// Set when the reconnect loop permanently gives up (reconnect timeout exceeded).
@@ -475,6 +478,7 @@ impl Shared {
 		if let Ok(mut state) = self.state.write() {
 			state.status = Some(Status::Connected);
 			state.epoch += 1;
+			state.presence.sessions += 1;
 			state.version = Some(session.version());
 			state.session = Some(session.clone());
 		}
@@ -492,6 +496,12 @@ impl Shared {
 	/// and drops the estimates that belonged to it.
 	fn disconnected(&self) {
 		if let Ok(mut state) = self.state.write() {
+			// Count one close per live session; a second call without an
+			// intervening connect (e.g. Drop after the loop already reported
+			// the close) must not move the counter again.
+			if state.session.is_some() {
+				state.presence.sessions_closed += 1;
+			}
 			state.status = Some(Status::Disconnected);
 			state.version = None;
 			state.session = None;
@@ -527,9 +537,40 @@ impl Drop for Shared {
 #[derive(Clone)]
 pub struct ConnectionStatsReader {
 	state: kio::Consumer<State>,
+	last_presence: moq_net::stats::Presence,
 }
 
 impl ConnectionStatsReader {
+	/// Cumulative connects and disconnects of this reconnect loop, the same shape as a relay's
+	/// sessions track: `sessions - sessions_closed` is 1 while connected, and a rate is a delta over
+	/// any window.
+	pub fn presence(&self) -> moq_net::stats::Presence {
+		self.state.read().presence
+	}
+
+	/// Poll until either presence counter moves past what this handle last reported.
+	pub fn poll_presence(&mut self, waiter: &kio::Waiter) -> Poll<crate::Result<moq_net::stats::Presence>> {
+		let last = self.last_presence;
+		let presence = match ready!(self.state.poll(waiter, |state| match state.presence {
+			presence if presence != last => Poll::Ready(presence),
+			_ => Poll::Pending,
+		})) {
+			Ok(presence) => presence,
+			Err(state) => return Poll::Ready(Err(terminal(&state))),
+		};
+
+		self.last_presence = presence;
+		Poll::Ready(Ok(presence))
+	}
+
+	/// Wait until either presence counter moves past what this handle last reported.
+	///
+	/// Unlike [`Connection::status`], a connect and disconnect that both land before the caller polls
+	/// are not coalesced away: the counters still moved.
+	pub async fn presence_changed(&mut self) -> crate::Result<moq_net::stats::Presence> {
+		kio::wait(|waiter| self.poll_presence(waiter)).await
+	}
+
 	/// Snapshot the current connection's stats, or `None` if not currently connected.
 	pub fn stats(&self) -> Option<moq_net::ConnectionStats> {
 		self.state.read().session.as_ref().map(moq_net::Session::stats)
@@ -1086,6 +1127,7 @@ impl Connection {
 	pub fn stats(&self) -> ConnectionStatsReader {
 		ConnectionStatsReader {
 			state: self.state.clone(),
+			last_presence: moq_net::stats::Presence::default(),
 		}
 	}
 }
