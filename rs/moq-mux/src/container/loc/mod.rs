@@ -13,6 +13,8 @@ use crate::container::{Container, Frame, FrameWriter, FrameReader, Kind};
 
 use std::task::ready;
 
+use crate::Error;
+
 use crate::container::FrameReader;
 
 /// LOC's catalog convention: timestamps are in microseconds when no per-frame
