@@ -2,7 +2,6 @@ use std::collections::VecDeque;
 use std::task::{Poll, ready};
 
 use super::{Container, Frame};
-use crate::container::{FrameDecrypter, ProtectedReadFrame};
 use crate::container::reader::FrameReader;
 
 use crate::container::{FrameDecrypter, ProtectedReadFrame, ReadFrame};
