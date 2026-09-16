@@ -3,7 +3,7 @@ use std::task::{Poll, ready};
 
 use super::{Container, Frame};
 use crate::container::reader::FrameReader;
-use crate::container::{FrameDecrypter, ProtectedReadFrame, ReadFrame};
+use crate::container::{Decrypter, FrameDecrypter, ProtectedReadFrame, ReadFrame};
 
 pub struct GroupReader<'a> {
     group: &'a mut moq_net::group::Consumer,
@@ -47,27 +47,19 @@ impl FrameReader for GroupReader<'_> {
     }
 }
 
-
-
 /// Decode a single [`moq_net::group::Consumer`] into a finite stream of media
 /// [`Frame`]s.
-///
-/// The optional decrypter persists for the lifetime of this group consumer and
-/// is reused across all calls to [`Self::poll_read`].
 pub struct GroupConsumer<F: Container> {
     group: moq_net::group::Consumer,
     format: F,
 
-    /// Optional decrypter.
-    ///
-    /// Persistent across reads and group transitions.
-    decrypter: Option<Box<dyn FrameDecrypter>>,
+    /// Persistent across all reads and group transitions.
+    decrypter: Option<Decrypter>,
 
     // Frames decoded from the last wire frame but not yet returned.
     pending: VecDeque<Frame>,
 
-    // How many media frames we have returned, so the first one can be marked
-    // as a keyframe.
+    // Number of media frames returned. The first one is marked as a keyframe.
     index: u64,
 }
 
@@ -76,7 +68,7 @@ impl<F: Container<Error = crate::error::Error>> GroupConsumer<F> {
     pub fn new(
         group: moq_net::group::Consumer,
         format: F,
-        decrypter: Option<Box<dyn FrameDecrypter>>,
+        decrypter: Option<Decrypter>,
     ) -> Self {
         Self {
             group,
@@ -113,9 +105,7 @@ impl<F: Container<Error = crate::error::Error>> GroupConsumer<F> {
             let decoded = match self.poll_read_frames(waiter) {
                 Poll::Pending => return Poll::Pending,
 
-                Poll::Ready(Err(error)) => {
-                    return Poll::Ready(Err(error));
-                }
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
 
                 Poll::Ready(Ok(frames)) => frames,
             };
@@ -135,9 +125,7 @@ impl<F: Container<Error = crate::error::Error>> GroupConsumer<F> {
                     }
                 }
 
-                None => {
-                    return Poll::Ready(Ok(self.pop_media()));
-                }
+                None => return Poll::Ready(Ok(self.pop_media())),
             }
         }
 
@@ -152,10 +140,7 @@ impl<F: Container<Error = crate::error::Error>> GroupConsumer<F> {
 
         match self.decrypter.as_mut() {
             Some(decrypter) => {
-                let mut reader = ProtectedReadFrame::new(
-                    raw_reader,
-                    decrypter.as_mut(),
-                );
+                let mut reader = ProtectedReadFrame::new(raw_reader, decrypter);
 
                 self.format.poll_read_frames(&mut reader, waiter)
             }
@@ -180,7 +165,6 @@ impl<F: Container<Error = crate::error::Error>> GroupConsumer<F> {
         Some(frame)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
