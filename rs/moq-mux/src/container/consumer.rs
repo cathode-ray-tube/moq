@@ -115,13 +115,10 @@ impl<F: Container<Error = crate::error::Error>> Consumer<F> {
 			decrypter: None,
 		}
 	}
-	pub fn with_decrypter<D>(mut self, decrypter: D) -> Self
-	where
-		D: Decrypter,
-	{
-		self.decrypter = Some(Box::new(decrypter));
-		self
-	}
+	pub fn with_decrypter(mut self, decrypter: Decrypter) -> Self {
+    self.decrypter = Some(decrypter);
+    self
+}
 
     /// A counter that increments each time the consumer reaches a declared
     /// discontinuity or detects a timeline rewind.
