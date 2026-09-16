@@ -30,7 +30,7 @@ use super::{
 use crate::catalog::{CatalogFormat, Stream};
 use crate::container::FrameDecrypter;
 use crate::container::{ExportSource, Frame};
-use crate::container::{Decrypter, DecrypterFactor};
+use crate::container::{Decrypter, DecrypterFactory};
 
 /// Which FLV payload shape a bound track is muxed as: a legacy CodecID
 /// (`Avc`/`Aac`) or an enhanced-RTMP FourCC codec.
