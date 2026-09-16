@@ -28,7 +28,6 @@ use super::{
 	VIDEO_EX_HEADER, VIDEO_PACKET_CODED_FRAMES, VIDEO_PACKET_MULTITRACK, VIDEO_PACKET_SEQUENCE_START,
 };
 use crate::catalog::{CatalogFormat, Stream};
-use crate::container::FrameDecrypter;
 use crate::container::{ExportSource, Frame};
 use crate::container::{Decrypter, DecrypterFactory};
 
