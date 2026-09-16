@@ -3,6 +3,12 @@ use std::task::Poll;
 
 use crate::{encryption::EncryptionError, error::Error};
 
+type Decrypter =
+    Box<dyn FrameDecrypter + Send + Sync>;
+
+type DecrypterFactory =
+    Box<dyn Fn() -> Option<Decrypter> + Send + Sync>;
+
 /// A frame returned by an underlying MoQ frame reader.
 #[derive(Debug, Clone)]
 pub struct ReadFrame {
