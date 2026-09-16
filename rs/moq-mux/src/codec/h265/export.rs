@@ -14,7 +14,7 @@ use hang::catalog::{VideoCodecKind, VideoConfig};
 use crate::catalog::Stream;
 use crate::codec::annexb;
 use crate::container::ExportSource;
-use crate::container::FrameDecrypter;
+use crate::container::{Decrypter, DecrypterFactory};
 
 /// Single-rendition H.265 Annex-B exporter.
 pub struct Export<S: Stream> {
@@ -22,7 +22,7 @@ pub struct Export<S: Stream> {
 	catalog: Option<S>,
 	max_age: std::time::Duration,
 	track: Option<H265Track>,
-	decrypter_factory: Box<dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>> + Send + Sync>,
+	decrypter_factory: Option<Decrypter>,
 }
 
 struct H265Track {
@@ -67,6 +67,33 @@ impl<S: Stream> Export<S> {
 			decrypter_factory,
 		}
 	}
+
+	//  instantiates decrypter_factory, making it ready to produce any number of decrypters with the given config
+	pub fn with_decryption<C, F>(
+        mut self,
+        config: C,
+        factory: F,
+    ) -> Self
+    where
+        C: Send + Sync + 'static,
+        F: Fn(&C) -> Option<Decrypter>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.decrypter_factory = Some(Box::new(move || {
+            factory(&config)
+        }));
+
+        self
+    }
+
+	// no need for decryption-related config args in methods creating a decrypter, simply call: self.new_decrypter()
+    fn new_decrypter(&self) -> Option<Decrypter> {
+        let factory = self.decrypter_factory.as_ref()?;
+
+        factory()
+    }
 
 	/// Set the max age for the per-track source.
 	///
@@ -160,7 +187,7 @@ impl<S: Stream> Export<S> {
 			return Ok(());
 		}
 
-		let Some(source) = ExportSource::for_video_raw(&self.source, name, config, self.max_age, &self.decrypter_factory)?
+		let Some(source) = ExportSource::for_video_raw(&self.source, name, config, self.max_age, self.new_decrypter())?
 		else {
 			unreachable!("invalid broadcast references were removed above");
 		};
