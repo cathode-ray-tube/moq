@@ -42,6 +42,8 @@ pub use reader::{
     FrameReader,
     ProtectedFrame as ProtectedReadFrame,
     ReadFrame,
+	Decrypter,
+	DecrypterFactory,
 };
 
 pub use writer::{
