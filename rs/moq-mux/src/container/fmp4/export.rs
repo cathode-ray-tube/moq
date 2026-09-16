@@ -10,7 +10,6 @@ use crate::Result;
 use crate::catalog::Stream;
 use crate::container::ExportSource;
 use crate::container::Frame;
-use crate::container::FrameDecrypter;
 use crate::container::{Decrypter, DecrypterFactory};
 use crate::container::consumer::Event;
 use crate::container::fmp4::Error;
