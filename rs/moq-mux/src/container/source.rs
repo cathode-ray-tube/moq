@@ -89,7 +89,7 @@ pub(crate) struct ExportSource {
 	/// afterward.
 	video_dimensions: Option<(u32, u32)>,
 	
-	decrypter: Decrypter,
+	decrypter: Option<Decrypter>,
 }
 
 impl ExportSource {
@@ -102,7 +102,7 @@ impl ExportSource {
 		name: &str,
 		config: &VideoConfig,
 		max_age: std::time::Duration,
-		decrypter: Decrypter,
+		decrypter: Option<Decrypter>,
 	) -> Result<Option<Self>, crate::Error> {
 		Self::video(
 			source,
@@ -124,7 +124,7 @@ impl ExportSource {
 		name: &str,
 		config: &VideoConfig,
 		max_age: std::time::Duration,
-		decrypter: Decrypter,
+		decrypter: Option<Decrypter>,
 	) -> Result<Option<Self>, crate::Error> {
 		Self::video(source, name, config, max_age, None, decrypter)
 	}
@@ -135,7 +135,7 @@ impl ExportSource {
 		config: &VideoConfig,
 		max_age: std::time::Duration,
 		transform: Option<VideoTransform>,
-		decrypter: Decrypter,
+		decrypter: Option<Decrypter>,
 	) -> Result<Option<Self>, crate::Error> {
 		let media: HangContainer = config.try_into()?;
 
@@ -173,7 +173,7 @@ impl ExportSource {
 		name: &str,
 		config: &AudioConfig,
 		max_age: std::time::Duration,
-		decrypter: Decrypter,
+		decrypter: Option<Decrypter>,
 	) -> Result<Option<Self>, crate::Error> {
 		let media: HangContainer = config.try_into()?;
 
@@ -207,7 +207,7 @@ impl ExportSource {
 		source: &crate::Source,
 		name: &str,
 		max_age: std::time::Duration,
-		decrypter: Decrypter,
+		decrypter: Option<Decrypter>,
 	) -> Result<Self, crate::Error> {
 		Ok(Self {
 			state: SourceState::Requesting(source.request_catalog(), name.to_string()),
