@@ -22,7 +22,7 @@ use super::consumer::Event;
 use crate::catalog::hang::Container as HangContainer;
 use crate::codec::h264::Avc1;
 use crate::codec::h265::Hvc1;
-use crate::container::{Consumer, Frame, Decrypter, FrameDecrypter};
+use crate::container::{Consumer, Frame, Decrypter};
 
 /// Per-track video transform that bridges between codec shapes.
 pub(crate) enum VideoTransform {
