@@ -528,7 +528,7 @@ impl<E: catalog::Catalog> Export<E> {
 		// 1. Drain catalog updates, discovering the track layout.
 		while let Some(catalog) = self.catalog.as_mut() {
 			match catalog.poll_next(waiter)? {
-				Poll::Ready(Some(snapshot)) => self.update_catalog(snapshot, decrypter_factory)?,
+				Poll::Ready(Some(snapshot)) => self.update_catalog(snapshot)?,
 				Poll::Ready(None) => {
 					self.catalog = None;
 					break;
