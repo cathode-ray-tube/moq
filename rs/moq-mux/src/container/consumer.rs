@@ -849,7 +849,7 @@ fn poll_max_timestamp<F: Container<Error = crate::error::Error>>(
     &mut self,
     waiter: &kio::Waiter,
     format: &F,
-    mut decrypter: Option<Decrypter>,
+    decrypter: Option<Decrypter>,
 ) -> Poll<Result<Timestamp, F::Error>> {
     // Continue reading to advance the maximum timestamp.
     let _ = self.buffer_all(
@@ -876,7 +876,7 @@ fn poll_min_timestamp<F: Container<Error = crate::error::Error>>(
     &mut self,
     waiter: &kio::Waiter,
     format: &F,
-    mut decrypter: Option<Decrypter>,
+    decrypter: Option<Decrypter>,
 ) -> Poll<Result<Timestamp, F::Error>> {
     let _ = self.buffer_one(
         waiter,
