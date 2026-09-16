@@ -742,7 +742,7 @@ fn buffer_once<F: Container<Error = crate::error::Error>>(
     format: &F,
     decrypter: Option<Decrypter>,
 ) -> Poll<Result<bool, F::Error>> {
-    let frames = if let Some(decrypter) = decrypter.as_deref_mut() {
+    let frames = if let Some(decrypter) = decrypter {
         let raw_reader = GroupReader::new(&mut self.group);
         let mut reader = ProtectedFrame::new(raw_reader, decrypter);
 
