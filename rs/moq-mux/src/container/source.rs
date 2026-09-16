@@ -22,8 +22,7 @@ use super::consumer::Event;
 use crate::catalog::hang::Container as HangContainer;
 use crate::codec::h264::Avc1;
 use crate::codec::h265::Hvc1;
-use crate::container::{Consumer, Frame};
-use crate::container::FrameDecrypter;
+use crate::container::{Consumer, Frame, Decrypter, FrameDecrypter};
 
 /// Per-track video transform that bridges between codec shapes.
 pub(crate) enum VideoTransform {
@@ -74,12 +73,8 @@ pub(crate) struct ExportSource {
 
 	max_age: std::time::Duration,
 
-	/// Decryptor retained while the source is resolving and consumed when the
-	/// subscription becomes active.
-	decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,
-
 	transform: Option<VideoTransform>,
-
+	
 	/// Resolved codec configuration record (avcC / hvcC /
 	/// AudioSpecificConfig / OpusHead).
 	///
@@ -93,6 +88,8 @@ pub(crate) struct ExportSource {
 	/// Geometry resolved from the initial catalog or codec data received
 	/// afterward.
 	video_dimensions: Option<(u32, u32)>,
+	
+	decrypter: Decrypter,
 }
 
 impl ExportSource {
@@ -105,7 +102,7 @@ impl ExportSource {
 		name: &str,
 		config: &VideoConfig,
 		max_age: std::time::Duration,
-		decrypter_factory: &dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,
+		decrypter: Decrypter,
 	) -> Result<Option<Self>, crate::Error> {
 		Self::video(
 			source,
@@ -127,7 +124,7 @@ impl ExportSource {
 		name: &str,
 		config: &VideoConfig,
 		max_age: std::time::Duration,
-		decrypter_factory: &dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,
+		decrypter: Decrypter,
 	) -> Result<Option<Self>, crate::Error> {
 		Self::video(source, name, config, max_age, None, decrypter)
 	}
@@ -138,7 +135,7 @@ impl ExportSource {
 		config: &VideoConfig,
 		max_age: std::time::Duration,
 		transform: Option<VideoTransform>,
-		decrypter_factory: &dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,
+		decrypter: Decrypter,
 	) -> Result<Option<Self>, crate::Error> {
 		let media: HangContainer = config.try_into()?;
 
@@ -176,7 +173,7 @@ impl ExportSource {
 		name: &str,
 		config: &AudioConfig,
 		max_age: std::time::Duration,
-		decrypter_factory: &dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,
+		decrypter: Decrypter,
 	) -> Result<Option<Self>, crate::Error> {
 		let media: HangContainer = config.try_into()?;
 
@@ -210,7 +207,7 @@ impl ExportSource {
 		source: &crate::Source,
 		name: &str,
 		max_age: std::time::Duration,
-		decrypter_factory: &dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,
+		decrypter: Decrypter,
 	) -> Result<Self, crate::Error> {
 		Ok(Self {
 			state: SourceState::Requesting(source.request_catalog(), name.to_string()),
@@ -334,7 +331,7 @@ impl ExportSource {
 			
 			let consumer = Consumer::new(track, media);
 			
-			let consumer = match decrypter_factory() {
+			let consumer = match decrypter {
 			    Some(decrypter) => consumer.with_decrypter(decrypter),
 			    None => consumer,
 			};
