@@ -613,7 +613,7 @@ pub(crate) fn poll_event(
         index: usize,
         waiter: &kio::Waiter,
     ) -> Poll<Result<Timestamp, F::Error>> {
-        let mut decrypter = self.decrypter.take();
+        let decrypter = self.decrypter.take();
 
         let result = self.pending[index].poll_min_timestamp(
             waiter,
@@ -630,7 +630,7 @@ pub(crate) fn poll_event(
         index: usize,
         waiter: &kio::Waiter,
     ) -> Poll<Result<Timestamp, F::Error>> {
-        let mut decrypter = self.decrypter.take();
+        let decrypter = self.decrypter.take();
 
         let result = self.pending[index].poll_max_timestamp(
             waiter,
@@ -805,7 +805,7 @@ fn buffer_one<F: Container<Error = crate::error::Error>>(
     &mut self,
     waiter: &kio::Waiter,
     format: &F,
-    mut decrypter: Option<Decrypter>,
+    decrypter: Option<Decrypter>,
 ) -> Poll<Result<bool, F::Error>> {
     loop {
         if !self.buffered.is_empty() {
@@ -831,7 +831,7 @@ fn buffer_all<F: Container<Error = crate::error::Error>>(
     &mut self,
     waiter: &kio::Waiter,
     format: &F,
-    mut decrypter: Option<Decrypter>,
+    decrypter: Option<Decrypter>,
 ) -> Poll<Result<(), F::Error>> {
     while ready!(
         self.buffer_once(
