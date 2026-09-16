@@ -708,7 +708,7 @@ impl GroupBuffer {
         &mut self,
         waiter: &kio::Waiter,
         format: &F,
-        mut decrypter: Option<&mut dyn FrameDecrypter>,
+        decrypter: &mut Option<Decrypter>,
     ) -> Poll<Result<Option<Event>, F::Error>> {
         loop {
             if self
@@ -746,7 +746,7 @@ impl GroupBuffer {
         &mut self,
         waiter: &kio::Waiter,
         format: &F,
-        decrypter: Option<&mut dyn FrameDecrypter>,
+        decrypter: &mut Option<Decrypter>,
     ) -> Poll<Result<bool, F::Error>> {
         let frames = if let Some(decrypter) = decrypter {
             let raw_reader = GroupReader::new(&mut self.group);
@@ -810,7 +810,7 @@ impl GroupBuffer {
         &mut self,
         waiter: &kio::Waiter,
         format: &F,
-        mut decrypter: Option<&mut dyn FrameDecrypter>,
+        decrypter: &mut Option<Decrypter>,
     ) -> Poll<Result<bool, F::Error>> {
         loop {
             if !self.buffered.is_empty() {
@@ -836,7 +836,7 @@ impl GroupBuffer {
         &mut self,
         waiter: &kio::Waiter,
         format: &F,
-        mut decrypter: Option<&mut dyn FrameDecrypter>,
+        decrypter: &mut Option<Decrypter>,
     ) -> Poll<Result<(), F::Error>> {
         while ready!(
             self.buffer_once(
@@ -854,7 +854,7 @@ impl GroupBuffer {
         &mut self,
         waiter: &kio::Waiter,
         format: &F,
-        mut decrypter: Option<&mut dyn FrameDecrypter>,
+        decrypter: &mut Option<Decrypter>,
     ) -> Poll<Result<Timestamp, F::Error>> {
         let _ = self.buffer_all(
             waiter,
@@ -880,7 +880,7 @@ impl GroupBuffer {
         &mut self,
         waiter: &kio::Waiter,
         format: &F,
-        mut decrypter: Option<&mut dyn FrameDecrypter>,
+        decrypter: &mut Option<Decrypter>,
     ) -> Poll<Result<Timestamp, F::Error>> {
         let _ = self.buffer_one(
             waiter,
