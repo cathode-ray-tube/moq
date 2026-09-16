@@ -418,33 +418,6 @@ impl Export {
 		Self::with_catalog_format(source, CatalogFormat::default()).await
 	}
 
-	//  instantiates decrypter_factory, making it ready to produce any number of decrypters with the given config
-	pub fn with_decryption<C, F>(
-        mut self,
-        config: C,
-        factory: F,
-    ) -> Self
-    where
-        C: Send + Sync + 'static,
-        F: Fn(&C) -> Option<Decrypter>
-            + Send
-            + Sync
-            + 'static,
-    {
-        self.decrypter_factory = Some(Box::new(move || {
-            factory(&config)
-        }));
-
-        self
-    }
-
-	// no need for decryption-related config args in methods creating a decrypter, simply call: self.new_decrypter()
-    fn new_decrypter(&self) -> Option<Decrypter> {
-        let factory = self.decrypter_factory.as_ref()?;
-
-        factory()
-    }
-
 	/// Subscribe to `source`, selecting an explicit catalog format. Media only;
 	/// any catalog extension (e.g. the `mpegts` verbatim streams) is ignored.
 	pub async fn with_catalog_format(
@@ -499,6 +472,34 @@ impl<E: catalog::Catalog> Export<E> {
 			decrypter_factory: None,
 		})
 	}
+
+	//  instantiates decrypter_factory, making it ready to produce any number of decrypters with the given config
+	pub fn with_decryption<C, F>(
+        mut self,
+        config: C,
+        factory: F,
+    ) -> Self
+    where
+        C: Send + Sync + 'static,
+        F: Fn(&C) -> Option<Decrypter>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.decrypter_factory = Some(Box::new(move || {
+            factory(&config)
+        }));
+
+        self
+    }
+
+	// no need for decryption-related config args in methods creating a decrypter, simply call: self.new_decrypter()
+    fn new_decrypter(&self) -> Option<Decrypter> {
+        let factory = self.decrypter_factory.as_ref()?;
+
+        factory()
+    }
+
 
 	/// Set the max age for each per-track source.
 	///
