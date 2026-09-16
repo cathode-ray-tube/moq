@@ -743,7 +743,7 @@ fn buffer_once<F: Container<Error = crate::error::Error>>(
     &mut self,
     waiter: &kio::Waiter,
     format: &F,
-    mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync + '_)>,
+    mut decrypter: Option<Decrypter>,
 ) -> Poll<Result<bool, F::Error>> {
     let frames = if let Some(decrypter) = decrypter.as_deref_mut() {
         let raw_reader = GroupReader::new(&mut self.group);
@@ -808,7 +808,7 @@ fn buffer_one<F: Container<Error = crate::error::Error>>(
     &mut self,
     waiter: &kio::Waiter,
     format: &F,
-    mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync + '_)>,
+    mut decrypter: Option<Decrypter>,
 ) -> Poll<Result<bool, F::Error>> {
     loop {
         if !self.buffered.is_empty() {
@@ -834,7 +834,7 @@ fn buffer_all<F: Container<Error = crate::error::Error>>(
     &mut self,
     waiter: &kio::Waiter,
     format: &F,
-    mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync + '_)>,
+    mut decrypter: Option<Decrypter>,
 ) -> Poll<Result<(), F::Error>> {
     while ready!(
         self.buffer_once(
@@ -852,7 +852,7 @@ fn poll_max_timestamp<F: Container<Error = crate::error::Error>>(
     &mut self,
     waiter: &kio::Waiter,
     format: &F,
-    mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync + '_)>,
+    mut decrypter: Option<Decrypter>,
 ) -> Poll<Result<Timestamp, F::Error>> {
     // Continue reading to advance the maximum timestamp.
     let _ = self.buffer_all(
@@ -879,7 +879,7 @@ fn poll_min_timestamp<F: Container<Error = crate::error::Error>>(
     &mut self,
     waiter: &kio::Waiter,
     format: &F,
-    mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync + '_)>,
+    mut decrypter: Option<Decrypter>,
 ) -> Poll<Result<Timestamp, F::Error>> {
     let _ = self.buffer_one(
         waiter,
