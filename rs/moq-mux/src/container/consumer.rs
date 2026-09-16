@@ -5,7 +5,7 @@ use moq_net::Timestamp;
 
 use super::{Container, Frame};
 
-use crate::container::{Decrypter, FrameDecrypter};
+use crate::container::Decrypter;
 use crate::container::group::GroupReader;
 use crate::container::reader::ProtectedFrame;
 
