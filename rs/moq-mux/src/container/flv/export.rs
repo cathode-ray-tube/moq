@@ -211,7 +211,7 @@ impl Export {
         self
     }
 
-	// no need for decryption-related config args in methods creating a decrypter, simply call self.new_decrypter
+	// no need for decryption-related config args in methods creating a decrypter, simply call: self.new_decrypter()
     fn new_decrypter(&self) -> Option<Decrypter> {
         let factory = self.decrypter_factory.as_ref()?;
 
@@ -427,7 +427,6 @@ impl Export {
 	fn bind_audio(
 		&mut self,
 		catalog: &Catalog,
-		decrypter_factory: &dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,
 	) -> anyhow::Result<()> {
 		for (name, config) in &catalog.audio.renditions {
 			if !self.multitrack && !self.audio.is_empty() {
@@ -439,7 +438,8 @@ impl Export {
 			}
 			let flavor = audio_flavor(config)?;
 			ensure_legacy(&config.container, "audio", name)?;
-			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, decrypter_factory)?
+			let decrypter = self.new_decrypter();
+			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, decrypter)?
 			else {
 				continue;
 			};
