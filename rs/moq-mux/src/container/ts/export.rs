@@ -498,9 +498,7 @@ impl<E: catalog::Catalog> Export<E> {
 		// 1. Drain catalog updates, discovering the track layout.
 		while let Some(catalog) = self.catalog.as_mut() {
 			match catalog.poll_next(waiter)? {
-				Poll::Ready(Some(snapshot)) => {
-				   self.update_catalog(snapshot, decrypter_factory)?
-					 }
+				Poll::Ready(Some(snapshot)) => self.update_catalog(snapshot, decrypter_factory)?,
 				Poll::Ready(None) => {
 					self.catalog = None;
 					break;
@@ -721,7 +719,11 @@ impl<E: catalog::Catalog> Export<E> {
 		}
 		Ok(())
 	}
-	fn update_catalog(&mut self, mut catalog: Catalog<E>, decrypter_factory: impl Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,) -> anyhow::Result<()> {
+	fn update_catalog(
+		&mut self,
+		mut catalog: Catalog<E>,
+		decrypter_factory: impl Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,
+	) -> anyhow::Result<()> {
 		self.source.retain_valid(&mut catalog);
 
 		// The MPEG-TS section lives in the extension. The trait only exposes
@@ -838,7 +840,9 @@ impl<E: catalog::Catalog> Export<E> {
 					self.tracks.insert(name.clone(), track);
 				}
 				None => {
-					let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age, decrypter_factory(),)? else {
+					let Some(source) =
+						ExportSource::for_video(&self.source, name, config, self.max_age, &decrypter_factory)?
+					else {
 						continue;
 					};
 					self.insert_track(name, source, pid, kind, descriptors, reserve);
@@ -857,7 +861,9 @@ impl<E: catalog::Catalog> Export<E> {
 					self.tracks.insert(name.clone(), track);
 				}
 				None => {
-					let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, decrypter_factory(),)? else {
+					let Some(source) =
+						ExportSource::for_audio(&self.source, name, config, self.max_age, &decrypter_factory)?
+					else {
 						continue;
 					};
 					self.insert_track(name, source, pid, kind, descriptors, DEFAULT_DTS_RESERVE);
@@ -883,13 +889,7 @@ impl<E: catalog::Catalog> Export<E> {
 					self.tracks.insert(name.clone(), existing);
 				}
 				None => {
-					let source = ExportSource::for_stream(
-						    &self.source,
-						    name,
-						    self.max_age,
-						    None,
-						    decrypter_factory,
-						)?;
+					let source = ExportSource::for_stream(&self.source, name, self.max_age, &decrypter_factory)?;
 					self.insert_track(name, source, pid, kind, descriptors, DEFAULT_DTS_RESERVE);
 				}
 			}

@@ -83,9 +83,7 @@ impl<S: Stream> Export<S> {
 	pub fn poll_next(&mut self, waiter: &kio::Waiter) -> Poll<crate::Result<Option<Bytes>>> {
 		while let Some(catalog) = self.catalog.as_mut() {
 			match catalog.poll_next(waiter)? {
-				Poll::Ready(Some(snapshot)) => {
-    self.update_catalog(&snapshot.media(), &decrypter_factory)?
-}
+				Poll::Ready(Some(snapshot)) => self.update_catalog(&snapshot.media(), decrypter_factory)?,
 				Poll::Ready(None) => {
 					self.catalog = None;
 					break;
@@ -124,7 +122,11 @@ impl<S: Stream> Export<S> {
 		}
 	}
 
-	fn update_catalog(&mut self, catalog: &Catalog, decrypter_factory: impl Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,) -> crate::Result<()> {
+	fn update_catalog(
+		&mut self,
+		catalog: &Catalog,
+		decrypter_factory: impl Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,
+	) -> crate::Result<()> {
 		let mut catalog = catalog.clone();
 		self.source.retain_valid_media(&mut catalog);
 
@@ -156,7 +158,8 @@ impl<S: Stream> Export<S> {
 			return Ok(());
 		}
 
-		let Some(source) = ExportSource::for_video_raw(&self.source, name, config, self.max_age, decrypter_factory())? else {
+		let Some(source) = ExportSource::for_video_raw(&self.source, name, config, self.max_age, &decrypter_factory)?
+		else {
 			unreachable!("invalid broadcast references were removed above");
 		};
 		let convert = match config.description.as_ref().filter(|d| !d.is_empty()) {

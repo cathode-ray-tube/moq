@@ -10,9 +10,9 @@ use crate::Result;
 use crate::catalog::Stream;
 use crate::container::ExportSource;
 use crate::container::Frame;
+use crate::container::FrameDecrypter;
 use crate::container::consumer::Event;
 use crate::container::fmp4::Error;
-use crate::container::FrameDecrypter;
 use moq_net::Timestamp;
 
 /// Subscribe to a moq broadcast and produce a single fMP4 / CMAF byte stream.
@@ -265,9 +265,7 @@ impl<S: Stream> Export<S> {
 			// 1. Drain catalog updates and (un)subscribe tracks accordingly.
 			while let Some(catalog) = self.catalog.as_mut() {
 				match catalog.poll_next(waiter)? {
-					Poll::Ready(Some(snapshot)) => {
-					    self.update_catalog(&snapshot.media(), &decrypter_factory)?
-					}
+					Poll::Ready(Some(snapshot)) => self.update_catalog(&snapshot.media(), decrypter_factory)?,
 					Poll::Ready(None) => {
 						self.catalog = None;
 						break;
@@ -471,7 +469,11 @@ impl<S: Stream> Export<S> {
 			.map(|(_, _, name)| name.clone())
 	}
 
-	fn update_catalog(&mut self, catalog: &Catalog, decrypter_factory: &dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,) -> Result<()> {
+	fn update_catalog(
+		&mut self,
+		catalog: &Catalog,
+		decrypter_factory: &dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,
+	) -> Result<()> {
 		// A rendition we can't parse is ignored rather than failing the whole export. Drop it
 		// before the snapshot is cached, since the init segment expects a track for every
 		// rendition in it. (An escaping `broadcast` reference is already gone: the catalog
@@ -504,7 +506,8 @@ impl<S: Stream> Export<S> {
 			if self.tracks.contains_key(name) {
 				continue;
 			}
-			let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age, None, decrypter_factory)? else {
+			let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age, decrypter_factory)?
+			else {
 				continue;
 			};
 			let timescale = catalog_timescale_video(config)?;
@@ -532,7 +535,8 @@ impl<S: Stream> Export<S> {
 			if self.tracks.contains_key(name) {
 				continue;
 			}
-			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, None, decrypter_factory)? else {
+			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, decrypter_factory)?
+			else {
 				continue;
 			};
 			let timescale = catalog_timescale_audio(config)?;
