@@ -123,6 +123,13 @@ impl FrameEncrypter for MoqSecureEncrypter {
 	}
 }
 
+
+#[derive(Clone)]
+pub struct MoqSecureDecryptionConfig {
+    pub key_store: Arc<dyn KeyStore>,
+    pub broadcaster_public_key: VerifyingKey,
+}
+
 /// Decrypts and verifies each frame using moq-secure.
 pub struct MoqSecureDecrypter {
 	pub key_store: Arc<dyn KeyStore>,
@@ -133,16 +140,13 @@ pub struct MoqSecureDecrypter {
 }
 
 impl MoqSecureDecrypter {
-	pub fn new(
-		key_store: Arc<dyn KeyStore>,
-		broadcaster_public_key: VerifyingKey,
-	) -> Self {
-		Self {
-			key_store,
-			broadcaster_public_key,
+	pub fn new(config: &MoqSecureDecryptionConfig) -> Self {
+        Self {
+            key_store: Arc::clone(&config.key_store),
+            broadcaster_public_key: config.broadcaster_public_key.clone(),
 			lease_remaining: 0,
-		}
-	}
+        }
+    }
 
 	pub fn with_lease(
 		key_store: Arc<dyn KeyStore>,
