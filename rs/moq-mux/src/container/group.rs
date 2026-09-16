@@ -3,7 +3,7 @@ use std::task::{Poll, ready};
 
 use super::{Container, Frame};
 use crate::container::reader::FrameReader;
-use crate::container::{Decrypter, FrameDecrypter, ProtectedReadFrame, ReadFrame};
+use crate::container::{Decrypter, ProtectedReadFrame, ReadFrame};
 
 pub struct GroupReader<'a> {
     group: &'a mut moq_net::group::Consumer,
