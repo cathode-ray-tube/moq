@@ -601,7 +601,7 @@ pub(crate) fn poll_event(
         let result = self.pending[index].poll_read(
             waiter,
             &self.format,
-            decrypter.as_deref_mut(),
+            decrypter,
         );
 
         self.decrypter = decrypter;
@@ -618,7 +618,7 @@ pub(crate) fn poll_event(
         let result = self.pending[index].poll_min_timestamp(
             waiter,
             &self.format,
-            decrypter.as_deref_mut(),
+            decrypter,
         );
 
         self.decrypter = decrypter;
@@ -635,7 +635,7 @@ pub(crate) fn poll_event(
         let result = self.pending[index].poll_max_timestamp(
             waiter,
             &self.format,
-            decrypter.as_deref_mut(),
+            decrypter,
         );
 
         self.decrypter = decrypter;
@@ -727,7 +727,7 @@ fn poll_read<F: Container<Error = crate::error::Error>>(
             return Poll::Ready(Ok(Some(Event::Frame(frame))));
         }
 
-        if !ready!(self.buffer_once(waiter, format, decrypter.as_deref_mut())?) {
+        if !ready!(self.buffer_once(waiter, format, decrypter)?) {
             return Poll::Ready(Ok(None));
         }
     }
@@ -816,7 +816,7 @@ fn buffer_one<F: Container<Error = crate::error::Error>>(
             self.buffer_once(
                 waiter,
                 format,
-                decrypter.as_deref_mut(),
+                decrypter,
             )?
         ) {
             return Poll::Ready(Ok(false));
@@ -837,7 +837,7 @@ fn buffer_all<F: Container<Error = crate::error::Error>>(
         self.buffer_once(
             waiter,
             format,
-            decrypter.as_deref_mut(),
+            decrypter,
         )?
     ) {}
 
@@ -855,7 +855,7 @@ fn poll_max_timestamp<F: Container<Error = crate::error::Error>>(
     let _ = self.buffer_all(
         waiter,
         format,
-        decrypter.as_deref_mut(),
+        decrypter,
     )?;
 
     if let Some(max) = self.max_timestamp {
@@ -881,7 +881,7 @@ fn poll_min_timestamp<F: Container<Error = crate::error::Error>>(
     let _ = self.buffer_one(
         waiter,
         format,
-        decrypter.as_deref_mut(),
+        decrypter,
     )?;
 
     if let Some(min) = self.min_timestamp {
