@@ -12,7 +12,7 @@ use crate::Result;
 use crate::catalog::Stream;
 use crate::container::ExportSource;
 use crate::container::Frame;
-use crate::container::{Decrypter, DecrypterFactory},
+use crate::container::{Decrypter, DecrypterFactory};
 use crate::container::mkv::Error;
 
 /// Matroska TimestampScale: 1 ms (in nanoseconds).
