@@ -11,7 +11,7 @@ use crate::catalog::Stream;
 use crate::container::ExportSource;
 use crate::container::Frame;
 use crate::container::FrameDecrypter;
-use crate::container::Decrypter;
+use crate::container::{Decrypter, DecrypterFactory};
 use crate::container::consumer::Event;
 use crate::container::fmp4::Error;
 use moq_net::Timestamp;
@@ -63,7 +63,7 @@ pub struct Export<S: Stream> {
 	/// is what CMAF asks for.
 	sequence_number: u32,
 
-	decrypter: Option<Decrypter>,
+	decrypter_factory: Option<DecrypterFactory>,
 }
 
 /// One emitted CMAF chunk: the init segment, then media fragments.
@@ -195,7 +195,7 @@ impl<S: Stream> Export<S> {
 			catalog_snapshot: None,
 			init_emitted: false,
 			sequence_number: 1,
-			decrypter: None,
+			decrypter_factory: None,
 		}
 	}
 
@@ -536,7 +536,7 @@ impl<S: Stream> Export<S> {
 			if self.tracks.contains_key(name) {
 				continue;
 			}
-			let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age, decrypter_factory)?
+			let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age, self.new_decrypter())?
 			else {
 				continue;
 			};
@@ -565,7 +565,7 @@ impl<S: Stream> Export<S> {
 			if self.tracks.contains_key(name) {
 				continue;
 			}
-			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, decrypter)?
+			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, self.new_decrypter)?
 			else {
 				continue;
 			};
