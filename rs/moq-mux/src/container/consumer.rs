@@ -729,7 +729,7 @@ impl GroupBuffer {
                 self.buffer_once(
                     waiter,
                     format,
-                    decrypter.as_deref_mut(),
+                    decrypter,
                 )?
             ) {
                 return Poll::Ready(Ok(None));
@@ -819,7 +819,7 @@ impl GroupBuffer {
                 self.buffer_once(
                     waiter,
                     format,
-                    decrypter.as_deref_mut(),
+                    decrypter,
                 )?
             ) {
                 return Poll::Ready(Ok(false));
@@ -840,7 +840,7 @@ impl GroupBuffer {
             self.buffer_once(
                 waiter,
                 format,
-                decrypter.as_deref_mut(),
+                decrypter,
             )?
         ) {}
 
@@ -857,7 +857,7 @@ impl GroupBuffer {
         let _ = self.buffer_all(
             waiter,
             format,
-            decrypter.as_deref_mut(),
+            decrypter,
         )?;
 
         if let Some(max) = self.max_timestamp {
@@ -883,7 +883,7 @@ impl GroupBuffer {
         let _ = self.buffer_one(
             waiter,
             format,
-            decrypter.as_deref_mut(),
+            decrypter,
         )?;
 
         if let Some(min) = self.min_timestamp {
