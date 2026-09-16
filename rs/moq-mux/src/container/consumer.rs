@@ -5,7 +5,7 @@ use moq_net::Timestamp;
 
 use super::{Container, Frame};
 
-use crate::container::FrameDecrypter;
+use crate::container::Decrypter;
 use crate::container::group::GroupReader;
 use crate::container::reader::ProtectedFrame;
 
@@ -43,7 +43,7 @@ pub struct Consumer<F: Container> {
     end: Option<Timestamp>,
 
     /// Optional decrypter, persistent across reads and group transitions.
-    decrypter: Option<Box<dyn FrameDecrypter + Send + Sync>>,
+    decrypter: Option<Decrypter>,
 
 }
 
@@ -117,7 +117,7 @@ impl<F: Container<Error = crate::error::Error>> Consumer<F> {
 	}
 	pub fn with_decrypter<D>(mut self, decrypter: D) -> Self
 	where
-		D: FrameDecrypter + Send + Sync + 'static,
+		D: Decrypter + Send + Sync + 'static,
 	{
 		self.decrypter = Some(Box::new(decrypter));
 		self
@@ -711,7 +711,7 @@ fn poll_read<F: Container<Error = crate::error::Error>>(
     &mut self,
     waiter: &kio::Waiter,
     format: &F,
-    mut decrypter: Option<&mut (dyn FrameDecrypter + Send + Sync + '_)>,
+    mut decrypter: Option<Decrypter>,
 ) -> Poll<Result<Option<Event>, F::Error>> {
     loop {
         if self
