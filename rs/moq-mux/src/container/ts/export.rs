@@ -41,8 +41,7 @@ use crate::container::{ExportSource, Frame};
 
 use super::adts;
 use super::catalog;
-use crate::container::FrameDecrypter;
-use crate::container::Decrypter;
+use crate::container::{Decrypter, DecrypterFactory};
 
 /// PID of the single program's PMT.
 const PMT_PID: u16 = 0x1000;
@@ -144,7 +143,7 @@ pub struct Export<E: catalog::Catalog = ()> {
 	/// programs with no video track (nothing to align to).
 	video_start: Option<Timestamp>,
 
-	decrypter: Option<Decrypter>,
+	decrypter_factory: Option<DecrypterFactory>,
 }
 
 struct Pending {
@@ -464,32 +463,6 @@ impl Export<catalog::Ext> {
 	pub async fn with_ts(source: crate::Source, catalog_format: CatalogFormat) -> Result<Self, crate::Error> {
 		Self::build(source, catalog_format).await
 	}
-	//  instantiates decrypter_factory, making it ready to produce any number of decrypters with the given config
-	pub fn with_decryption<C, F>(
-        mut self,
-        config: C,
-        factory: F,
-    ) -> Self
-    where
-        C: Send + Sync + 'static,
-        F: Fn(&C) -> Option<Decrypter>
-            + Send
-            + Sync
-            + 'static,
-    {
-        self.decrypter_factory = Some(Box::new(move || {
-            factory(&config)
-        }));
-
-        self
-    }
-
-	// no need for decryption-related config args in methods creating a decrypter, simply call: self.new_decrypter()
-    fn new_decrypter(&self) -> Option<Decrypter> {
-        let factory = self.decrypter_factory.as_ref()?;
-
-        factory()
-    }
 }
 
 impl<E: catalog::Catalog> Export<E> {
@@ -523,36 +496,9 @@ impl<E: catalog::Catalog> Export<E> {
 			low: None,
 			watermark: None,
 			video_start: None,
-			decrypter: None,
+			decrypter_factory: None,
 		})
 	}
-
-	//  instantiates decrypter_factory, making it ready to produce any number of decrypters with the given config
-	pub fn with_decryption<C, F>(
-        mut self,
-        config: C,
-        factory: F,
-    ) -> Self
-    where
-        C: Send + Sync + 'static,
-        F: Fn(&C) -> Option<Decrypter>
-            + Send
-            + Sync
-            + 'static,
-    {
-        self.decrypter_factory = Some(Box::new(move || {
-            factory(&config)
-        }));
-
-        self
-    }
-
-	// no need for decryption-related config args in methods creating a decrypter, simply call: self.new_decrypter()
-    fn new_decrypter(&self) -> Option<Decrypter> {
-        let factory = self.decrypter_factory.as_ref()?;
-
-        factory()
-    }
 
 	/// Set the max age for each per-track source.
 	///
