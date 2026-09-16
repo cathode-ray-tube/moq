@@ -30,6 +30,7 @@ use super::{
 use crate::catalog::{CatalogFormat, Stream};
 use crate::container::FrameDecrypter;
 use crate::container::{ExportSource, Frame};
+use crate::container::{Decrypter, DecrypterFactor};
 
 /// Which FLV payload shape a bound track is muxed as: a legacy CodecID
 /// (`Avc`/`Aac`) or an enhanced-RTMP FourCC codec.
@@ -114,6 +115,7 @@ pub struct Export {
 
 	/// True once the file header and sequence headers have been emitted.
 	header_emitted: bool,
+	decrypter_factory: Option<DecrypterFactory>,
 }
 
 /// A subscribed rendition feeding the muxer.
@@ -185,8 +187,36 @@ impl Export {
 			video: Vec::new(),
 			audio: Vec::new(),
 			header_emitted: false,
+			decrypter_factory: None,
 		})
 	}
+
+	//  instantiates decrypter_factory, making it ready to produce any number of decrypters with the given config
+	pub fn with_decryption<C, F>(
+        mut self,
+        config: C,
+        factory: F,
+    ) -> Self
+    where
+        C: Send + Sync + 'static,
+        F: Fn(&C) -> Option<Decrypter>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.decrypter_factory = Some(Box::new(move || {
+            factory(&config)
+        }));
+
+        self
+    }
+
+	// no need for decryption-related config args in methods creating a decrypter, simply call self.new_decrypter
+    fn new_decrypter(&self) -> Option<Decrypter> {
+        let factory = self.decrypter_factory.as_ref()?;
+
+        factory()
+    }
 
 	/// Set the max age for each per-track source.
 	///
@@ -337,45 +367,62 @@ impl Export {
 	}
 
 	fn bind_video(
-		&mut self,
-		catalog: &Catalog,
-		decrypter_factory: &dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,
-	) -> anyhow::Result<()> {
-		for (name, config) in &catalog.video.renditions {
-			if !self.multitrack && !self.video.is_empty() {
-				tracing::warn!("FLV export only supports one video track; ignoring the rest (enable multitrack)");
-				break;
-			}
-			if self.video.iter().any(|t| &t.name == name) {
-				continue;
-			}
-			let flavor = video_flavor(config)?;
-			ensure_legacy(&config.container, "video", name)?;
-			// AV1's av1C is optional in the catalog; synthesize one from the codec
-			// struct so the enhanced SequenceStart tag always has a config record.
-			let fallback_description = match (&config.codec, config.description.as_ref()) {
-				(VideoCodec::AV1(av1), None) => Some(Bytes::copy_from_slice(&av1c_bytes(av1))),
-				_ => None,
-			};
-			let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age, decrypter_factory)?
-			else {
-				continue;
-			};
-			let track_id = u8::try_from(self.video.len()).context("too many FLV video tracks")?;
-			self.video.push(FlvTrack {
-				name: name.clone(),
-				track_id,
-				source,
-				pending: None,
-				finished: false,
-				flavor,
-				fallback_description,
-				dts_reserve: dts_reserve(config),
-				last_dts: None,
-			});
-		}
-		Ok(())
-	}
+    &mut self,
+    catalog: &Catalog,
+) -> anyhow::Result<()> {
+    for (name, config) in &catalog.video.renditions {
+        if !self.multitrack && !self.video.is_empty() {
+            tracing::warn!(
+                "FLV export only supports one video track; ignoring the rest \
+                 (enable multitrack)"
+            );
+            break;
+        }
+
+        if self.video.iter().any(|t| &t.name == name) {
+            continue;
+        }
+
+        let flavor = video_flavor(config)?;
+        ensure_legacy(&config.container, "video", name)?;
+
+        let fallback_description = match (&config.codec, config.description.as_ref()) {
+            (VideoCodec::AV1(av1), None) => {
+                Some(Bytes::copy_from_slice(&av1c_bytes(av1)))
+            }
+            _ => None,
+        };
+
+        let decrypter = self.new_decrypter();
+
+        let Some(source) = ExportSource::for_video(
+            &self.source,
+            name,
+            config,
+            self.max_age,
+            decrypter,
+        )? else {
+            continue;
+        };
+
+        let track_id =
+            u8::try_from(self.video.len()).context("too many FLV video tracks")?;
+
+        self.video.push(FlvTrack {
+            name: name.clone(),
+            track_id,
+            source,
+            pending: None,
+            finished: false,
+            flavor,
+            fallback_description,
+            dts_reserve: dts_reserve(config),
+            last_dts: None,
+        });
+    }
+
+    Ok(())
+}
 
 	fn bind_audio(
 		&mut self,
