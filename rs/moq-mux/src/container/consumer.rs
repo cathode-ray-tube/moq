@@ -117,7 +117,7 @@ impl<F: Container<Error = crate::error::Error>> Consumer<F> {
 	}
 	pub fn with_decrypter<D>(mut self, decrypter: D) -> Self
 	where
-		D: Decrypter + Send + Sync + 'static,
+		D: Decrypter,
 	{
 		self.decrypter = Some(Box::new(decrypter));
 		self
