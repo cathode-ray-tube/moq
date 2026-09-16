@@ -65,7 +65,6 @@ impl<S: Stream> Export<S> {
 	pub fn new(
 		source: crate::Source,
 		catalog: S,
-		decrypter_factory: Option<Decrypter>,
 	) -> Self {
 		Self {
 			source,
