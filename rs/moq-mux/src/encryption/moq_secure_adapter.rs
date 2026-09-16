@@ -114,7 +114,7 @@ impl FrameEncrypter for MoqSecureEncrypter {
 			ctr,
 			self.n_signed,
 			self.maybe_sign,
-			1,
+			1u8,
 			self.pad_len,
 			plaintext,
 		)?;
