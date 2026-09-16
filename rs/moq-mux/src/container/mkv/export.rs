@@ -12,8 +12,7 @@ use crate::Result;
 use crate::catalog::Stream;
 use crate::container::ExportSource;
 use crate::container::Frame;
-use crate::container::FrameDecrypter;
-use crate::container::Decrypter;
+use crate::container::{Decrypter, DecrypterFactory},
 use crate::container::mkv::Error;
 
 /// Matroska TimestampScale: 1 ms (in nanoseconds).
@@ -63,7 +62,7 @@ pub struct Export<S: Stream> {
 	/// Currently-open cluster, accumulating frames until it's time to flush.
 	cluster: Option<ClusterBuilder>,
 
-	decrypter: Option<Decrypter>,
+	decrypter_factory: Option<DecrypterFactory>,
 }
 
 struct MkvTrack {
@@ -172,7 +171,7 @@ impl<S: Stream> Export<S> {
 			catalog_snapshot: None,
 			header_emitted: false,
 			cluster: None,
-			decrypter: None,
+			decrypter_factory: None,
 		}
 	}
 
@@ -375,7 +374,7 @@ impl<S: Stream> Export<S> {
 				continue;
 			}
 			ensure_legacy(&config.container, "video", name)?;
-			let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age, self.decrypter)?
+			let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age, self.new_decrypter())?
 			else {
 				continue;
 			};
@@ -397,7 +396,7 @@ impl<S: Stream> Export<S> {
 				continue;
 			}
 			ensure_legacy(&config.container, "audio", name)?;
-			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, self.decrypter)?
+			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, self.new_decrypter())?
 			else {
 				continue;
 			};
