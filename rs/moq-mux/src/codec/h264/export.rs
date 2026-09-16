@@ -29,6 +29,7 @@ pub struct Export<S: Stream> {
 	catalog: Option<S>,
 	max_age: std::time::Duration,
 	track: Option<H264Track>,
+	decrypter_factory: Box<dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>> + Send + Sync>,
 }
 
 struct H264Track {
@@ -57,12 +58,21 @@ impl<S: Stream> Export<S> {
 	/// `consumer.select(select::Broadcast::default().video(select::Video::default().name("hd")))`).
 	/// Renditions of other codecs are ignored; if multiple H.264 renditions appear
 	/// in a snapshot, the first by BTreeMap order wins and a warning is logged.
-	pub fn new(source: crate::Source, catalog: S) -> Self {
+	///
+	/// `decrypter_factory` is a closure that produces `FrameDecrypter` instances. It will be
+	/// called to decrypt frames if the stream is encrypted. Return `None` if decryption is not
+	/// available or needed.
+	pub fn new(
+		source: crate::Source,
+		catalog: S,
+		decrypter_factory: Box<dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>> + Send + Sync>,
+	) -> Self {
 		Self {
 			source,
 			catalog: Some(catalog),
 			max_age: std::time::Duration::ZERO,
 			track: None,
+			decrypter_factory,
 		}
 	}
 
@@ -83,7 +93,7 @@ impl<S: Stream> Export<S> {
 	pub fn poll_next(&mut self, waiter: &kio::Waiter) -> Poll<crate::Result<Option<Bytes>>> {
 		while let Some(catalog) = self.catalog.as_mut() {
 			match catalog.poll_next(waiter)? {
-				Poll::Ready(Some(snapshot)) => self.update_catalog(&snapshot.media(), decrypter_factory)?,
+				Poll::Ready(Some(snapshot)) => self.update_catalog(&snapshot.media())?,
 				Poll::Ready(None) => {
 					self.catalog = None;
 					break;
@@ -122,11 +132,7 @@ impl<S: Stream> Export<S> {
 		}
 	}
 
-	fn update_catalog(
-		&mut self,
-		catalog: &Catalog,
-		decrypter_factory: impl Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,
-	) -> crate::Result<()> {
+	fn update_catalog(&mut self, catalog: &Catalog) -> crate::Result<()> {
 		let mut catalog = catalog.clone();
 		self.source.retain_valid_media(&mut catalog);
 
@@ -158,7 +164,7 @@ impl<S: Stream> Export<S> {
 			return Ok(());
 		}
 
-		let Some(source) = ExportSource::for_video_raw(&self.source, name, config, self.max_age, &decrypter_factory)?
+		let Some(source) = ExportSource::for_video_raw(&self.source, name, config, self.max_age, &self.decrypter_factory)?
 		else {
 			unreachable!("invalid broadcast references were removed above");
 		};
@@ -192,6 +198,7 @@ impl<S: Stream> Export<S> {
 		Ok(())
 	}
 }
+
 
 #[cfg(test)]
 mod tests {
