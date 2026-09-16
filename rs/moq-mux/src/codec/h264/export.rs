@@ -65,7 +65,7 @@ impl<S: Stream> Export<S> {
 	pub fn new(
 		source: crate::Source,
 		catalog: S,
-		decrypter_factory: Box<dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>> + Send + Sync>,
+		decrypter_factory: Option<Decrypter>,
 	) -> Self {
 		Self {
 			source,
