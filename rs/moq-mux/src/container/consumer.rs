@@ -596,7 +596,7 @@ pub(crate) fn poll_event(
         index: usize,
         waiter: &kio::Waiter,
     ) -> Poll<Result<Option<Event>, F::Error>> {
-        let mut decrypter = self.decrypter.take();
+        let decrypter = self.decrypter.take();
 
         let result = self.pending[index].poll_read(
             waiter,
@@ -708,7 +708,7 @@ fn poll_read<F: Container<Error = crate::error::Error>>(
     &mut self,
     waiter: &kio::Waiter,
     format: &F,
-    mut decrypter: Option<Decrypter>,
+    decrypter: Option<Decrypter>,
 ) -> Poll<Result<Option<Event>, F::Error>> {
     loop {
         if self
@@ -740,7 +740,7 @@ fn buffer_once<F: Container<Error = crate::error::Error>>(
     &mut self,
     waiter: &kio::Waiter,
     format: &F,
-    mut decrypter: Option<Decrypter>,
+    decrypter: Option<Decrypter>,
 ) -> Poll<Result<bool, F::Error>> {
     let frames = if let Some(decrypter) = decrypter.as_deref_mut() {
         let raw_reader = GroupReader::new(&mut self.group);
