@@ -12,8 +12,8 @@ use crate::Result;
 use crate::catalog::Stream;
 use crate::container::ExportSource;
 use crate::container::Frame;
-use crate::container::mkv::Error;
 use crate::container::FrameDecrypter;
+use crate::container::mkv::Error;
 
 /// Matroska TimestampScale: 1 ms (in nanoseconds).
 const TIMESTAMP_SCALE_NS: u64 = 1_000_000;
@@ -206,9 +206,7 @@ impl<S: Stream> Export<S> {
 		// 1. Drain catalog updates.
 		while let Some(catalog) = self.catalog.as_mut() {
 			match catalog.poll_next(waiter)? {
-				Poll::Ready(Some(snapshot)) => {
-				    self.update_catalog(snapshot.media(), &decrypter_factory)?
-				}
+				Poll::Ready(Some(snapshot)) => self.update_catalog(snapshot.media(), decrypter_factory)?,
 				Poll::Ready(None) => {
 					self.catalog = None;
 					break;
@@ -308,7 +306,11 @@ impl<S: Stream> Export<S> {
 		Poll::Pending
 	}
 
-	fn update_catalog(&mut self, mut catalog: Catalog, decrypter_factory: &dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,) -> Result<()> {
+	fn update_catalog(
+		&mut self,
+		mut catalog: Catalog,
+		decrypter_factory: &dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,
+	) -> Result<()> {
 		self.source.retain_valid_media(&mut catalog);
 
 		let mut active: HashMap<String, ()> = HashMap::new();
@@ -343,7 +345,8 @@ impl<S: Stream> Export<S> {
 				continue;
 			}
 			ensure_legacy(&config.container, "video", name)?;
-			let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age, decrypter_factory)? else {
+			let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age, decrypter_factory)?
+			else {
 				continue;
 			};
 			self.tracks.insert(
@@ -364,7 +367,8 @@ impl<S: Stream> Export<S> {
 				continue;
 			}
 			ensure_legacy(&config.container, "audio", name)?;
-			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, None, decrypter_factory())? else {
+			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, decrypter_factory)?
+			else {
 				continue;
 			};
 			self.tracks.insert(

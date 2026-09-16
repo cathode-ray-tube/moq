@@ -28,8 +28,8 @@ use super::{
 	VIDEO_EX_HEADER, VIDEO_PACKET_CODED_FRAMES, VIDEO_PACKET_MULTITRACK, VIDEO_PACKET_SEQUENCE_START,
 };
 use crate::catalog::{CatalogFormat, Stream};
-use crate::container::{ExportSource, Frame};
 use crate::container::FrameDecrypter;
+use crate::container::{ExportSource, Frame};
 
 /// Which FLV payload shape a bound track is muxed as: a legacy CodecID
 /// (`Avc`/`Aac`) or an enhanced-RTMP FourCC codec.
@@ -316,8 +316,8 @@ impl Export {
 		// unmuxed rather than emitted as undecodable config-less frames. (This
 		// mirrors the single-track path ignoring extra renditions.)
 		if !self.header_emitted {
-			self.bind_video(&catalog, &decrypter_factory)?;
-            self.bind_audio(&catalog, &decrypter_factory)?;
+			self.bind_video(&catalog, decrypter_factory)?;
+			self.bind_audio(&catalog, decrypter_factory)?;
 		} else if catalog.video.renditions.len() > self.video.len() || catalog.audio.renditions.len() > self.audio.len()
 		{
 			tracing::warn!("ignoring FLV rendition that appeared after the stream header");
@@ -336,7 +336,11 @@ impl Export {
 		Ok(())
 	}
 
-	fn bind_video(&mut self, catalog: &Catalog, decrypter_factory: &dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,) -> anyhow::Result<()> {
+	fn bind_video(
+		&mut self,
+		catalog: &Catalog,
+		decrypter_factory: &dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,
+	) -> anyhow::Result<()> {
 		for (name, config) in &catalog.video.renditions {
 			if !self.multitrack && !self.video.is_empty() {
 				tracing::warn!("FLV export only supports one video track; ignoring the rest (enable multitrack)");
@@ -353,14 +357,8 @@ impl Export {
 				(VideoCodec::AV1(av1), None) => Some(Bytes::copy_from_slice(&av1c_bytes(av1))),
 				_ => None,
 			};
-			let Some(source) = ExportSource::for_video(
-				    &self.source,
-				    name,
-				    config,
-				    self.max_age,
-				    None,
-				    decrypter_factory,
-				)? else {
+			let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age, decrypter_factory)?
+			else {
 				continue;
 			};
 			let track_id = u8::try_from(self.video.len()).context("too many FLV video tracks")?;
@@ -379,7 +377,11 @@ impl Export {
 		Ok(())
 	}
 
-	fn bind_audio(&mut self, catalog: &Catalog, decrypter_factory: &dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,) -> anyhow::Result<()> {
+	fn bind_audio(
+		&mut self,
+		catalog: &Catalog,
+		decrypter_factory: &dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,
+	) -> anyhow::Result<()> {
 		for (name, config) in &catalog.audio.renditions {
 			if !self.multitrack && !self.audio.is_empty() {
 				tracing::warn!("FLV export only supports one audio track; ignoring the rest (enable multitrack)");
@@ -390,15 +392,8 @@ impl Export {
 			}
 			let flavor = audio_flavor(config)?;
 			ensure_legacy(&config.container, "audio", name)?;
-			let Some(source) = ExportSource::for_audio(
-			    &self.source,
-			    name,
-			    config,
-			    self.max_age,
-			    None,
-			    decrypter_factory,
-			)?
-			 else {
+			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, decrypter_factory)?
+			else {
 				continue;
 			};
 			let track_id = u8::try_from(self.audio.len()).context("too many FLV audio tracks")?;
