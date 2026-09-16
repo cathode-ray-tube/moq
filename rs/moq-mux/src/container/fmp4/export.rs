@@ -564,7 +564,7 @@ impl<S: Stream> Export<S> {
 			if self.tracks.contains_key(name) {
 				continue;
 			}
-			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, self.new_decrypter)?
+			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, self.new_decrypter())?
 			else {
 				continue;
 			};
