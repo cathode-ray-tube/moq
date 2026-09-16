@@ -22,7 +22,7 @@ pub struct Export<S: Stream> {
 	catalog: Option<S>,
 	max_age: std::time::Duration,
 	track: Option<H265Track>,
-	decrypter_factory: Option<Decrypter>,
+	decrypter_factory: Option<DecrypterFactory>,
 }
 
 struct H265Track {
