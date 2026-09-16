@@ -11,6 +11,7 @@ use crate::catalog::Stream;
 use crate::container::ExportSource;
 use crate::container::Frame;
 use crate::container::FrameDecrypter;
+use crate::container::Decrypter;
 use crate::container::consumer::Event;
 use crate::container::fmp4::Error;
 use moq_net::Timestamp;
@@ -61,6 +62,8 @@ pub struct Export<S: Stream> {
 	/// fragment. Each track's own numbers still ascend within the shared sequence, which
 	/// is what CMAF asks for.
 	sequence_number: u32,
+
+	decrypter: Option<Decrypter>,
 }
 
 /// One emitted CMAF chunk: the init segment, then media fragments.
@@ -192,8 +195,36 @@ impl<S: Stream> Export<S> {
 			catalog_snapshot: None,
 			init_emitted: false,
 			sequence_number: 1,
+			decrypter: None,
 		}
 	}
+
+	//  instantiates decrypter_factory, making it ready to produce any number of decrypters with the given config
+	pub fn with_decryption<C, F>(
+        mut self,
+        config: C,
+        factory: F,
+    ) -> Self
+    where
+        C: Send + Sync + 'static,
+        F: Fn(&C) -> Option<Decrypter>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.decrypter_factory = Some(Box::new(move || {
+            factory(&config)
+        }));
+
+        self
+    }
+
+	// no need for decryption-related config args in methods creating a decrypter, simply call: self.new_decrypter()
+    fn new_decrypter(&self) -> Option<Decrypter> {
+        let factory = self.decrypter_factory.as_ref()?;
+
+        factory()
+    }
 
 	/// Set the max age for each per-track source.
 	///
@@ -472,7 +503,6 @@ impl<S: Stream> Export<S> {
 	fn update_catalog(
 		&mut self,
 		catalog: &Catalog,
-		decrypter_factory: &dyn Fn() -> Option<Box<dyn FrameDecrypter + Send + Sync>>,
 	) -> Result<()> {
 		// A rendition we can't parse is ignored rather than failing the whole export. Drop it
 		// before the snapshot is cached, since the init segment expects a track for every
@@ -535,7 +565,7 @@ impl<S: Stream> Export<S> {
 			if self.tracks.contains_key(name) {
 				continue;
 			}
-			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, decrypter_factory)?
+			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, decrypter)?
 			else {
 				continue;
 			};
