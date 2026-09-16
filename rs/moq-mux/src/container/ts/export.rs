@@ -870,7 +870,7 @@ impl<E: catalog::Catalog> Export<E> {
 				}
 				None => {
 					let Some(source) =
-						ExportSource::for_video(&self.source, name, config, self.max_age, self.decrypter)?
+						ExportSource::for_video(&self.source, name, config, self.max_age, self.new_decrypter())?
 					else {
 						continue;
 					};
@@ -891,7 +891,7 @@ impl<E: catalog::Catalog> Export<E> {
 				}
 				None => {
 					let Some(source) =
-						ExportSource::for_audio(&self.source, name, config, self.max_age, self.decrypter)?
+						ExportSource::for_audio(&self.source, name, config, self.max_age, self.new_decrypter())?
 					else {
 						continue;
 					};
@@ -918,7 +918,7 @@ impl<E: catalog::Catalog> Export<E> {
 					self.tracks.insert(name.clone(), existing);
 				}
 				None => {
-					let source = ExportSource::for_stream(&self.source, name, self.max_age, self.decrypter)?;
+					let source = ExportSource::for_stream(&self.source, name, self.max_age, self.new_decrypter())?;
 					self.insert_track(name, source, pid, kind, descriptors, DEFAULT_DTS_RESERVE);
 				}
 			}
