@@ -205,6 +205,26 @@ pub struct Server {
 	websocket: Option<crate::websocket::Listener>,
 }
 
+/// A clone of a worker member's QUIC endpoint, keeping its socket in the
+/// reuseport group after the serving [`Server`] is gone.
+///
+/// Dropping a serving server closes its socket, which renumbers the survivors.
+/// The worker group holds one of these per member until serving has stopped,
+/// so a dropped or finished member leaves the steering intact. The fields are
+/// never read: holding the endpoint clones is what keeps the sockets open.
+///
+/// Only compiled with a QUIC backend, matching the worker group that is its
+/// only caller.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+#[cfg(any(feature = "noq", feature = "quinn", feature = "quiche"))]
+pub(crate) struct SocketRetainer {
+	#[cfg(feature = "noq")]
+	noq: Option<web_transport_noq::noq::Endpoint>,
+	#[cfg(feature = "quinn")]
+	quinn: Option<quinn::Endpoint>,
+}
+
 impl Server {
 	/// Build a server from its config, binding the QUIC socket up front.
 	///
@@ -461,6 +481,21 @@ impl Server {
 		}
 		// No QUIC backend (e.g. a stream-only `--listen-tcp-bind`): no certificates.
 		crate::tls::Certificates::empty()
+	}
+
+	/// Clone this server's QUIC endpoint, keeping its socket in the reuseport
+	/// group after this server is gone.
+	///
+	/// Crate-private: only the worker group retains sockets this way. A worker
+	/// member never serves quiche, so there is nothing to retain there.
+	#[cfg(any(feature = "noq", feature = "quinn", feature = "quiche"))]
+	pub(crate) fn retain(&self) -> SocketRetainer {
+		SocketRetainer {
+			#[cfg(feature = "noq")]
+			noq: self.noq.as_ref().map(|server| server.quic.clone()),
+			#[cfg(feature = "quinn")]
+			quinn: self.quinn.as_ref().map(|server| server.quic.clone()),
+		}
 	}
 
 	#[cfg(not(any(
@@ -1478,12 +1513,6 @@ impl Request {
 	pub fn peer_identity(&self) -> Option<crate::tls::PeerIdentity> {
 		self.identity.clone()
 	}
-
-	#[doc(hidden)]
-	#[deprecated(note = "use `peer_identity` instead")]
-	pub fn has_peer_certificate(&self) -> bool {
-		self.peer_identity().is_some()
-	}
 }
 
 #[cfg(test)]
@@ -1796,12 +1825,19 @@ mod tests {
 
 	#[test]
 	fn bind_string_or_listen_alias() {
-		// The QUIC bind is a plain address; the `listen` alias still works.
 		let bind: crate::listen::Config = toml::from_str(r#"bind = "[::]:443""#).unwrap();
 		assert_eq!(bind.bind.as_deref(), Some("[::]:443"));
+		assert!(bind.deprecated().is_empty());
 
+		// The released key still parses so the process can name `bind`, but it
+		// configures nothing.
 		let alias: crate::listen::Config = toml::from_str(r#"listen = "0.0.0.0:4443""#).unwrap();
-		assert_eq!(alias.bind.as_deref(), Some("0.0.0.0:4443"));
+		assert_eq!(alias.bind, None);
+		assert!(
+			alias.deprecated().to_string().contains("listen -> bind"),
+			"{}",
+			alias.deprecated()
+		);
 	}
 
 	#[cfg(all(feature = "uds", unix))]
