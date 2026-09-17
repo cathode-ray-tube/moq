@@ -48,13 +48,11 @@ impl VideoTransform {
 
 /// A subscription that resolves on first poll, then the live consumer.
 enum SourceState {
-	/// Waiting for the target broadcast (the catalog broadcast, or a
-	/// cross-broadcast reference) to resolve; the track is subscribed once it
-	/// does.
-	Requesting(kio::Pending<moq_net::origin::Requesting>, String),
+	/// Waiting for the target broadcast (the catalog broadcast, or a cross-broadcast
+	/// reference) to resolve; the track (by name) is subscribed once it does.
+	Requesting(kio::Pending<moq_net::origin::Pending>, String),
+	/// Waiting for the subscription to resolve (blocks on the publisher's SUBSCRIBE_OK).
 
-	/// Waiting for the subscription to resolve. This blocks on the publisher's
-	/// SUBSCRIBE_OK.
 	Subscribing(kio::Pending<moq_net::track::Subscribing>),
 
 	/// The resolved consumer, reading frames.

@@ -16,7 +16,7 @@ use web_transport_trait::{MaybeSend, MaybeSync};
 
 use super::{Requests, WeakCache, WeakEntry};
 use crate::{
-	AsPath, Error, Path, PathOwned, PathPrefixes, Pattern, Patterns,
+	AsPath, Error, InvalidPattern, Path, PathOwned, PathPrefixes, Pattern, Patterns,
 	coding::{BoundsExceeded, Decode, DecodeError, Encode, EncodeError},
 	runtime::{AnyTimers, Instant, Timers, TimersSlot},
 	util::{TaskSet, Tasks, TasksWeak},
@@ -85,7 +85,7 @@ impl Hop {
 /// bump), so it's stored by value rather than behind another `Arc`.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
-pub struct Info {
+pub struct Config {
 	/// The origin's wire identity, appended to broadcast hop chains for loop
 	/// detection and shortest-path routing.
 	pub id: Hop,
@@ -94,7 +94,7 @@ pub struct Info {
 	/// down the ownership chain (origin -> broadcast -> track -> group): a track opens
 	/// an account against it, and its groups charge through that. It has no byte target
 	/// and uses [`cache::DEFAULT_EXPIRY`] by default; a relay sets a shared configured
-	/// pool (via [`Self::with_pool`]) so cached groups across the whole process share
+	/// pool (assign [`Self::pool`]) so cached groups across the whole process share
 	/// one policy.
 	pub pool: cache::Pool,
 
@@ -119,7 +119,7 @@ pub struct Info {
 	pub default_max_age: Duration,
 }
 
-impl Default for Info {
+impl Default for Config {
 	/// An unknown origin (id `0`, no loop detection) with no byte target and the
 	/// default idle expiry. This is what a standalone broadcast inherits.
 	fn default() -> Self {
@@ -133,35 +133,15 @@ impl Default for Info {
 	}
 }
 
-impl Info {
+impl Config {
 	/// Config for the given origin id with no byte target and the default idle expiry.
 	pub fn new(id: Hop) -> Self {
 		Self { id, ..Self::default() }
 	}
-
-	/// Set the cache pool this origin's broadcasts inherit, returning `self` for chaining.
-	pub fn with_pool(mut self, pool: cache::Pool) -> Self {
-		self.pool = pool;
-		self
-	}
-
-	/// Set the retention ceiling (see [`Self::cache_duration`]) applied to every track
-	/// under this origin, returning `self` for chaining.
-	pub fn with_cache_duration(mut self, cache_duration: Duration) -> Self {
-		self.cache_duration = cache_duration;
-		self
-	}
-
-	/// Set the retention window (see [`Self::default_max_age`]) used for tracks whose
-	/// publisher advertises none, returning `self` for chaining.
-	pub fn with_default_max_age(mut self, default_max_age: Duration) -> Self {
-		self.default_max_age = default_max_age;
-		self
-	}
 }
 
-impl From<Hop> for Info {
-	/// Config for the given origin id with the defaults of [`Info::new`].
+impl From<Hop> for Config {
+	/// Config for the given origin id with the defaults of [`Config::new`].
 	fn from(id: Hop) -> Self {
 		Self::new(id)
 	}
@@ -939,13 +919,14 @@ impl OriginNodes {
 		}
 	}
 
-	// Returns nested roots that match the prefixes.
+	// Returns nested roots that match the patterns.
 	// PathPrefixes guarantees no duplicates or overlapping prefixes.
-	pub fn select(&self, prefixes: &PathPrefixes) -> Option<Self> {
+	pub fn select(&self, patterns: &Patterns) -> Option<Self> {
+		let prefixes = PathPrefixes::from_patterns(patterns)?;
 		let mut roots = Vec::new();
 
 		for (root, absolute) in &self.nodes {
-			for prefix in prefixes {
+			for prefix in &prefixes {
 				if root.has_prefix(prefix) {
 					// Keep the existing subtree if we're allowed to access it.
 					roots.push((root.to_owned(), absolute.clone()));
@@ -1065,11 +1046,11 @@ pub struct Producer {
 	pool: cache::Pool,
 
 	// Retention ceiling inherited by broadcasts created under this origin (see
-	// [`Info::cache_duration`]). `Duration::MAX` (no ceiling) by default.
+	// [`Config::cache_duration`]). `Duration::MAX` (no ceiling) by default.
 	cache_duration: Duration,
 
 	// Retention window for a track whose publisher advertises none (see
-	// [`Info::default_max_age`]).
+	// [`Config::default_max_age`]).
 	default_max_age: Duration,
 
 	// Ingress stats context. Broadcasts created through this producer are attributed
@@ -1095,7 +1076,7 @@ impl std::ops::Deref for Producer {
 }
 
 impl Producer {
-	/// Build a producer from an [`Info`] (identity + cache pool) with no scoped
+	/// Build a producer from a [`Config`] (identity + cache pool) with no scoped
 	/// prefix and no pre-existing broadcasts, paired with the [`Driver`] that runs
 	/// the origin's lifecycle work.
 	///
@@ -1103,20 +1084,20 @@ impl Producer {
 	/// returned [`Run`] (spawn it, await it, or step [`Run::poll`]) for the
 	/// origin to make progress; see the [`Driver`] docs for the exact contract.
 	/// `moq_tokio::origin::spawn` wraps this for tokio callers.
-	pub fn new(info: Info) -> (Self, Driver) {
+	pub fn new(config: Config) -> (Self, Driver) {
 		let (tasks, set) = TaskSet::new();
 		let nodes = OriginNodes::default();
 		let shared = kio::Shared::<OriginState>::default();
 		let timers = TimersSlot::default();
-		let pool = info.pool.clone();
+		let pool = config.pool.clone();
 		let producer = Self {
-			info: info.id,
+			info: config.id,
 			nodes: nodes.clone(),
 			root: PathOwned::default(),
 			shared: shared.clone(),
-			pool: info.pool,
-			cache_duration: info.cache_duration,
-			default_max_age: info.default_max_age,
+			pool: config.pool,
+			cache_duration: config.cache_duration,
+			default_max_age: config.default_max_age,
 			stats: stats::Session::default(),
 			tasks,
 			timers: timers.clone(),
@@ -1143,10 +1124,10 @@ impl Producer {
 		self
 	}
 
-	/// This origin's [`Info`] (identity + cache pool), the parent handle a broadcast
+	/// This origin's [`Config`] (identity + cache pool), the parent handle a broadcast
 	/// created under this origin carries (see [`broadcast::Info::origin`]).
-	pub fn info(&self) -> Info {
-		Info {
+	pub fn config(&self) -> Config {
+		Config {
 			id: self.info,
 			pool: self.pool.clone(),
 			cache_duration: self.cache_duration,
@@ -1155,7 +1136,7 @@ impl Producer {
 	}
 
 	// The retention window for a track whose publisher advertises none (see
-	// [`Info::default_max_age`]). Cheaper than `info()`, which clones the pool.
+	// [`Config::default_max_age`]). Cheaper than `config()`, which clones the pool.
 	pub(crate) fn default_max_age(&self) -> Duration {
 		self.default_max_age
 	}
@@ -1259,7 +1240,7 @@ impl Producer {
 		};
 
 		let source = broadcast::Info {
-			origin: self.info(),
+			origin: self.config(),
 			path: full.clone(),
 		}
 		.produce()
@@ -1269,7 +1250,7 @@ impl Producer {
 
 		// Attach synchronously: the source is visible to exact lookups before this
 		// returns; only lifecycle work needs the driver.
-		let origin = self.info();
+		let origin = self.config();
 		let ctx = AttachContext {
 			origin: &origin,
 			tree: &tree,
@@ -1311,7 +1292,7 @@ impl Producer {
 		let full = self.root.join(&path).to_owned();
 		let ingress = self.stats.ingress(&full);
 		broadcast::Info {
-			origin: self.info(),
+			origin: self.config(),
 			path: full,
 		}
 		.produce()
@@ -1389,16 +1370,16 @@ impl Producer {
 		Ok(prefixes)
 	}
 
-	/// Returns a new Producer restricted to publishing under one of `prefixes`.
+	/// Returns a new Producer restricted to publishing under one of `patterns`.
 	///
-	/// Returns None if there are no legal prefixes (the requested prefixes are
-	/// disjoint from this producer's current scope).
-	// TODO accept PathPrefixes instead of &[Path]
-	pub fn scope(&self, prefixes: &[Path]) -> Option<Producer> {
-		let prefixes = PathPrefixes::new(prefixes);
+	/// Each member must be prefix-shaped (`foo/**` for the old `foo` prefix, `**` for
+	/// the old empty prefix). Returns None when any member cannot be represented yet
+	/// (an exact `foo`, the empty pattern, a suffix, or any segment wildcard), or when
+	/// the requested patterns are disjoint from this producer's current scope.
+	pub fn scope(&self, patterns: &Patterns) -> Option<Producer> {
 		Some(Producer {
 			info: self.info,
-			nodes: self.nodes.select(&prefixes)?,
+			nodes: self.nodes.select(patterns)?,
 			root: self.root.clone(),
 			shared: self.shared.clone(),
 			pool: self.pool.clone(),
@@ -1446,10 +1427,14 @@ impl Producer {
 		&self.root
 	}
 
-	/// Iterate over the path prefixes this handle is permitted to publish or subscribe under.
-	// TODO return PathPrefixes
-	pub fn allowed(&self) -> impl Iterator<Item = &Path<'_>> {
-		self.nodes.nodes.iter().map(|(root, _)| root)
+	/// The granted scopes as prefix-shaped patterns: `foo/**` for the old `foo`
+	/// prefix, `**` for the old empty prefix.
+	pub fn allowed(&self) -> Patterns {
+		self.nodes
+			.nodes
+			.iter()
+			.map(|(root, _)| Pattern::subtree(root.as_str()).expect("scope roots are literal paths"))
+			.collect()
 	}
 
 	/// Converts a relative path to an absolute path.
@@ -2071,7 +2056,7 @@ async fn run_source(task: SourceTask) {
 
 /// Everything about a source's attach that does not change between attempts.
 struct AttachContext<'a> {
-	origin: &'a Info,
+	origin: &'a Config,
 	/// The origin's tree root: the one node pruning never removes, so the leaf is
 	/// resolved from here rather than pinned by a handle that a prune can orphan.
 	tree: &'a Lock<OriginNode>,
@@ -3283,7 +3268,7 @@ impl Drop for Request {
 /// immediately when the broadcast was already announced, or once an [`Dynamic`]
 /// handler serves the request. Resolves to an error if the request is rejected or every
 /// handler drops before serving it.
-pub struct Requesting {
+pub struct Pending {
 	inner: RequestState,
 	// The path the requester asked for, relative to its cursor's root. Stamped on the
 	// resolved broadcast (see [`broadcast::Info::path`]) because a handler is free to
@@ -3307,7 +3292,7 @@ enum RequestState {
 	Pending(kio::Consumer<PendingBroadcast>),
 }
 
-impl Requesting {
+impl Pending {
 	fn ready(broadcast: broadcast::Consumer) -> Self {
 		Self::new(RequestState::Ready(broadcast))
 	}
@@ -3316,7 +3301,7 @@ impl Requesting {
 		Self::new(RequestState::Failed(error))
 	}
 
-	fn pending(consumer: kio::Consumer<PendingBroadcast>) -> Self {
+	fn queued(consumer: kio::Consumer<PendingBroadcast>) -> Self {
 		Self::new(RequestState::Pending(consumer))
 	}
 
@@ -3385,7 +3370,7 @@ impl Requesting {
 	}
 }
 
-impl kio::Pollable for Requesting {
+impl kio::Pollable for Pending {
 	type Output = Result<broadcast::Consumer, Error>;
 
 	fn poll(&self, waiter: &kio::Waiter) -> Poll<Self::Output> {
@@ -3481,7 +3466,7 @@ pub struct Consumer {
 
 	// The origin config remote fronts inherit (identity, cache pool, retention),
 	// mirroring what `create_broadcast` gives a local front.
-	origin: Info,
+	origin: Config,
 
 	// Non-owning submission handle to the origin's [`Driver`], for the front
 	// watcher a routed `request_broadcast` spawns. Non-owning so a lingering
@@ -3510,7 +3495,7 @@ impl Consumer {
 			shared: producer.shared.clone(),
 			stats,
 			exclude: None,
-			origin: producer.info(),
+			origin: producer.config(),
 			tasks: producer.tasks.downgrade(),
 			timers: producer.timers.clone(),
 		}
@@ -3610,14 +3595,20 @@ impl Consumer {
 	pub async fn routed(&self, path: impl AsPath) -> Option<Route> {
 		let path = path.as_path();
 
-		// Scope a fresh consumer down to this path: any covering route then clamps
-		// to exactly the path, so we only wake for relevant announcements.
-		let consumer = self.scope(std::slice::from_ref(&path))?;
+		// Scope a fresh consumer down to this path's subtree: any covering route then
+		// clamps to exactly the path, so we only wake for relevant announcements.
+		// A max-depth path cannot be spelled as `path/**` (`**` would be a 33rd
+		// segment), so watch the existing stream and match covering claims instead.
+		let consumer = match Pattern::subtree(path.as_str()) {
+			Ok(subtree) => self.scope(&Patterns::from(subtree))?,
+			Err(InvalidPattern::TooManySegments) => self.clone(),
+			Err(_) => return None,
+		};
 
 		// `scope` keeps narrower permissions intact: if we ask for `foo` on a
 		// consumer limited to `foo/specific`, no route can ever clamp to exactly
 		// `foo`. Bail rather than loop forever.
-		if !consumer.allowed().any(|allowed| path.has_prefix(allowed)) {
+		if !consumer.allowed().matches(path.as_str()) {
 			return None;
 		}
 
@@ -3626,7 +3617,10 @@ impl Consumer {
 		let mut announced = consumer.untagged().announced();
 		loop {
 			let update = announced.next().await?;
-			if update.active && update.pattern.as_prefix() == Some(path.as_str()) {
+			if !update.active {
+				continue;
+			}
+			if update.pattern.as_prefix() == Some(path.as_str()) || update.pattern.matches(path.as_str()) {
 				return Some(update.route);
 			}
 		}
@@ -3646,10 +3640,9 @@ impl Consumer {
 	pub async fn routed_broadcast(&self, path: impl AsPath) -> Result<broadcast::Consumer, Error> {
 		let path = path.as_path();
 
-		// `scope` keeps narrower permissions intact: if the whole path is not
+		// `allowed` keeps narrower permissions intact: if the whole path is not
 		// reachable, no route can ever cover it, so bail rather than loop forever.
-		let scoped = self.scope(std::slice::from_ref(&path)).ok_or(Error::Unauthorized)?;
-		if !scoped.allowed().any(|allowed| path.has_prefix(allowed)) {
+		if !self.allowed().matches(path.as_str()) {
 			return Err(Error::Unauthorized);
 		}
 		loop {
@@ -3687,15 +3680,15 @@ impl Consumer {
 		}
 	}
 
-	/// Returns a new Consumer restricted to broadcasts under one of `prefixes`.
+	/// Returns a new Consumer restricted to broadcasts under one of `patterns`.
 	///
-	/// Returns None if there are no legal prefixes (the requested prefixes are
-	/// disjoint from this consumer's current scope, so it would always return None).
-	// TODO accept PathPrefixes instead of &[Path]
-	pub fn scope(&self, prefixes: &[Path]) -> Option<Consumer> {
-		let prefixes = PathPrefixes::new(prefixes);
+	/// Each member must be prefix-shaped (`foo/**` for the old `foo` prefix, `**` for
+	/// the old empty prefix). Returns None when any member cannot be represented yet
+	/// (an exact `foo`, the empty pattern, a suffix, or any segment wildcard), or when
+	/// the requested patterns are disjoint from this consumer's current scope.
+	pub fn scope(&self, patterns: &Patterns) -> Option<Consumer> {
 		Some(Consumer {
-			nodes: self.nodes.select(&prefixes)?,
+			nodes: self.nodes.select(patterns)?,
 			..self.clone()
 		})
 	}
@@ -3722,7 +3715,7 @@ impl Consumer {
 	/// A route claims capability, not inventory: resolving a covered path
 	/// succeeds optimistically, and a path that names nothing surfaces as
 	/// [`Error::NotFound`] on its tracks instead.
-	pub fn request_broadcast(&self, path: impl AsPath) -> kio::Pending<Requesting> {
+	pub fn request_broadcast(&self, path: impl AsPath) -> kio::Pending<Pending> {
 		let path = path.as_path();
 
 		// Key requests by absolute path so scoped/rooted consumers and handlers
@@ -3737,20 +3730,20 @@ impl Consumer {
 
 		// A local broadcast at the exact path wins.
 		if let Some(broadcast) = self.resolve(&path) {
-			let resolved = Requesting::ready(broadcast).with_path(requested).with_stats(scope);
+			let resolved = Pending::ready(broadcast).with_path(requested).with_stats(scope);
 			return kio::Pending::new(resolved);
 		}
 
 		// Routes only cover paths within this consumer's scope.
 		if self.nodes.get(&path).is_none() {
-			return kio::Pending::new(Requesting::failed(Error::Unroutable));
+			return kio::Pending::new(Pending::failed(Error::Unroutable));
 		}
 
 		let mut state = self.shared.lock();
 
 		// The origin's driver dropped: nothing will ever serve this.
 		if state.closed {
-			return kio::Pending::new(Requesting::failed(Error::Closed));
+			return kio::Pending::new(Pending::failed(Error::Closed));
 		}
 
 		// Join the live front for this path and exclusion, if any: its watcher
@@ -3760,7 +3753,7 @@ impl Consumer {
 		// for as long as its session does.
 		let key = (absolute.clone(), self.exclude);
 		if let Some(front) = state.fronts.get(&key) {
-			let pending = Requesting::pending(front.request.consume())
+			let pending = Pending::queued(front.request.consume())
 				.with_path(requested)
 				.with_stats(scope)
 				.with_generation(state.generation);
@@ -3772,7 +3765,7 @@ impl Consumer {
 			.best_route(&absolute.as_path(), self.exclude, None, &HashSet::new())
 			.is_none()
 		{
-			return kio::Pending::new(Requesting::failed(Error::Unroutable));
+			return kio::Pending::new(Pending::failed(Error::Unroutable));
 		}
 
 		// A route covers the path: mint the front and hand its watcher the
@@ -3811,7 +3804,7 @@ impl Consumer {
 			timers: self.timers.clone(),
 		}));
 		kio::Pending::new(
-			Requesting::pending(consumer)
+			Pending::queued(consumer)
 				.with_path(requested)
 				.with_stats(scope)
 				.with_generation(generation),
@@ -3837,10 +3830,14 @@ impl Consumer {
 		&self.root
 	}
 
-	/// Iterate over the path prefixes this handle is permitted to publish or subscribe under.
-	// TODO return PathPrefixes
-	pub fn allowed(&self) -> impl Iterator<Item = &Path<'_>> {
-		self.nodes.nodes.iter().map(|(root, _)| root)
+	/// The granted scopes as prefix-shaped patterns: `foo/**` for the old `foo`
+	/// prefix, `**` for the old empty prefix.
+	pub fn allowed(&self) -> Patterns {
+		self.nodes
+			.nodes
+			.iter()
+			.map(|(root, _)| Pattern::subtree(root.as_str()).expect("scope roots are literal paths"))
+			.collect()
 	}
 
 	/// Converts a relative path to an absolute path.
@@ -4066,7 +4063,7 @@ pub(crate) trait ProduceTest {
 }
 
 #[cfg(test)]
-impl ProduceTest for Info {
+impl ProduceTest for Config {
 	fn produce(self) -> Producer {
 		let (producer, driver) = Producer::new(self);
 		if tokio::runtime::Handle::try_current().is_ok() {
@@ -4083,7 +4080,7 @@ impl ProduceTest for Info {
 #[cfg(test)]
 impl ProduceTest for Hop {
 	fn produce(self) -> Producer {
-		Info::new(self).produce()
+		Config::new(self).produce()
 	}
 }
 
@@ -4106,6 +4103,11 @@ mod tests {
 
 	fn subtree(prefix: &str) -> Pattern {
 		Pattern::subtree(prefix).unwrap()
+	}
+
+	/// The scope granting these prefixes: each spelled as its subtree pattern.
+	fn scopes(prefixes: &[&str]) -> Patterns {
+		prefixes.iter().map(|prefix| subtree(prefix)).collect()
 	}
 
 	/// Yield to the driver until `check` passes, bounded so a bug fails instead
@@ -4246,10 +4248,7 @@ mod tests {
 		let producer = origin(1).produce();
 		let bare = producer.node_count();
 
-		let scoped = producer
-			.consume()
-			.scope(&[Path::new("room/a"), Path::new("room/b")])
-			.unwrap();
+		let scoped = producer.consume().scope(&scopes(&["room/a", "room/b"])).unwrap();
 		assert_eq!(producer.node_count(), bare, "scoping should not create nodes");
 		assert!(producer.consume().with_root("room/c").is_some());
 		assert_eq!(producer.node_count(), bare, "rooting should not create nodes");
@@ -4267,8 +4266,8 @@ mod tests {
 	#[tokio::test]
 	async fn scoped_handles_survive_a_prune() {
 		let producer = origin(1).produce();
-		let scoped = producer.scope(&[Path::new("channel")]).unwrap();
-		let consumer = producer.consume().scope(&[Path::new("channel")]).unwrap();
+		let scoped = producer.scope(&scopes(&["channel"])).unwrap();
+		let consumer = producer.consume().scope(&scopes(&["channel"])).unwrap();
 
 		// Create the scoped subtree and prune it straight back out.
 		let mut first = scoped.create_broadcast("channel/chat").unwrap();
@@ -4286,7 +4285,7 @@ mod tests {
 	#[tokio::test]
 	async fn announce_clamps_to_producer_scope() {
 		let producer = origin(1).produce();
-		let scoped = producer.scope(&[Path::new("room")]).unwrap();
+		let scoped = producer.scope(&scopes(&["room"])).unwrap();
 
 		// A broad claim through a narrow scope advertises only the intersection.
 		let _a = scoped.announce("", Route::default()).unwrap();
@@ -4305,7 +4304,7 @@ mod tests {
 		let producer = origin(1).produce();
 		let _a = producer.announce("", Route::default()).unwrap();
 
-		let consumer = producer.consume().scope(&[Path::new("room")]).unwrap();
+		let consumer = producer.consume().scope(&scopes(&["room"])).unwrap();
 		let mut announced = consumer.announced();
 		announced.assert_next_active("room");
 	}
@@ -4583,7 +4582,7 @@ mod tests {
 	#[test]
 	fn wildcard_scope_is_refused_not_clamped() {
 		let producer = origin(1).produce();
-		let scoped = producer.scope(&[Path::new("room")]).unwrap();
+		let scoped = producer.scope(&scopes(&["room"])).unwrap();
 		let err = scoped
 			.dynamic("**".parse().unwrap(), Route::default())
 			.err()
@@ -4949,7 +4948,7 @@ mod tests {
 	async fn out_of_scope_request_never_reaches_the_dynamic_handler() {
 		let producer = origin(1).produce();
 		let dynamic = producer.dynamic(Pattern::all(), Route::default()).unwrap();
-		let scoped = producer.consume().scope(&[Path::new("tenant-a")]).unwrap();
+		let scoped = producer.consume().scope(&scopes(&["tenant-a"])).unwrap();
 
 		// `tenant-a-other` shares a character prefix but not a segment, so this
 		// also pins that the check is segment-aware rather than textual.
@@ -5002,8 +5001,29 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn routed_accepts_a_max_depth_path() {
+		let producer = origin(1).produce();
+		let consumer = producer.consume();
+		let path = (0..Path::MAX_PARTS)
+			.map(|i| format!("s{i}"))
+			.collect::<Vec<_>>()
+			.join("/");
+		assert_eq!(Path::new(&path).parts().count(), Path::MAX_PARTS);
+		assert_eq!(Pattern::subtree(&path), Err(InvalidPattern::TooManySegments));
+
+		assert!(consumer.allowed().matches(&path));
+
+		let mut fut = consumer.routed(&path).boxed();
+		assert!((&mut fut).now_or_never().is_none());
+
+		// A covering root still resolves: the lookup must not require `path/**`.
+		let _a = producer.announce("", Route::default()).unwrap();
+		fut.now_or_never().expect("covered").expect("routed");
+	}
+
+	#[tokio::test]
 	async fn teardown_ends_everything() {
-		let (producer, driver) = Producer::new(Info::new(origin(1)));
+		let (producer, driver) = Producer::new(Config::new(origin(1)));
 		let consumer = producer.consume();
 		let _announcement = producer.announce("room", Route::default()).unwrap();
 		let mut announced = consumer.announced();
@@ -5135,7 +5155,7 @@ mod tests {
 	/// drops, however many read handles remain.
 	#[tokio::test]
 	async fn driver_resolves_with_live_consumers() {
-		let (producer, driver) = Producer::new(Info::new(origin(1)));
+		let (producer, driver) = Producer::new(Config::new(origin(1)));
 		let consumer = producer.consume();
 		let run = driver.run(crate::runtime::tokio_test::Tokio::<()>::new());
 		drop(producer);
@@ -5469,14 +5489,113 @@ mod tests {
 		let producer = origin(1).produce();
 		let _a = producer.announce("", Route::default()).unwrap();
 
-		let consumer = producer
-			.consume()
-			.scope(&[Path::new("alpha"), Path::new("beta")])
-			.unwrap();
+		let consumer = producer.consume().scope(&scopes(&["alpha", "beta"])).unwrap();
 		let mut announced = consumer.announced();
 		announced.assert_next_active("alpha");
 		announced.assert_next_active("beta");
 		announced.assert_next_wait();
+	}
+
+	#[test]
+	fn scope_reports_prefix_shaped_grants() {
+		let producer = origin(1).produce();
+
+		// The root grant is `**`, the old empty prefix.
+		let root = producer.scope(&Patterns::from(Pattern::all())).unwrap();
+		assert_eq!(root.allowed(), Patterns::from(Pattern::all()));
+
+		// `foo/**` keeps the old `foo` prefix meaning.
+		let scoped = producer.scope(&scopes(&["room"])).unwrap();
+		assert_eq!(scoped.allowed(), scopes(&["room"]));
+
+		// Multiple prefixes round-trip, with overlap collapsed.
+		let multi = producer.scope(&scopes(&["room", "room/chat", "anon"])).unwrap();
+		assert_eq!(multi.allowed(), scopes(&["room", "anon"]));
+
+		// The consumer side reports the same way.
+		let consumer = producer.consume().scope(&scopes(&["room"])).unwrap();
+		assert_eq!(consumer.allowed(), scopes(&["room"]));
+	}
+
+	#[test]
+	fn scope_empty_union_grants_nothing() {
+		let producer = origin(1).produce();
+
+		// An empty union grants nothing: scoping is refused, like a disjoint prefix.
+		assert!(producer.scope(&Patterns::new()).is_none());
+		assert!(producer.consume().scope(&Patterns::new()).is_none());
+	}
+
+	#[test]
+	fn scope_nests_and_rebases_roots() {
+		let producer = origin(1).produce();
+
+		// Narrowing twice intersects; the grant stays in the new vocabulary.
+		let scoped = producer.scope(&scopes(&["room"])).unwrap();
+		let nested = scoped.scope(&scopes(&["room/chat"])).unwrap();
+		assert_eq!(nested.allowed(), scopes(&["room/chat"]));
+
+		// A disjoint nesting is refused, not widened.
+		assert!(scoped.scope(&scopes(&["other"])).is_none());
+
+		// A literal root rebases the grant without changing its meaning.
+		let rooted = nested.with_root("room/chat").unwrap();
+		assert_eq!(rooted.allowed(), scopes(&[""]));
+
+		// Publishing through the nested view lands where the root says.
+		let mut broadcast = nested.create_broadcast("room/chat/live").unwrap();
+		assert!(producer.consume().get_broadcast("room/chat/live").is_some());
+		broadcast.finish();
+	}
+
+	#[test]
+	fn scope_refuses_non_prefix_grants() {
+		let producer = origin(1).produce();
+		let refused = |text: &str| {
+			let pattern: Pattern = text.parse().unwrap();
+			let union = Patterns::from(pattern);
+			assert!(
+				producer.scope(&union).is_none(),
+				"{text} is not a prefix grant and must be refused"
+			);
+			assert!(
+				producer.consume().scope(&union).is_none(),
+				"{text} is not a prefix grant and must be refused"
+			);
+		};
+
+		// An exact path is not a grant over its subtree.
+		refused("room");
+		// The empty pattern names only the root, not everything beneath it.
+		refused("");
+		// Suffixes and segment wildcards name sets a prefix cannot cover.
+		refused("*room");
+		refused("room/*");
+		refused("*");
+		// A `**` anywhere but the end is not a subtree.
+		refused("**/room");
+		refused("room/**/chat");
+	}
+
+	#[test]
+	fn scope_validates_the_whole_union() {
+		let producer = origin(1).produce();
+
+		// A supported member cannot conceal an unsupported one: neither member
+		// contains the other, so both survive reduction and the union is refused.
+		let mixed: Patterns = ["room/**".parse().unwrap(), "other".parse().unwrap()]
+			.into_iter()
+			.collect();
+		assert_eq!(mixed.len(), 2);
+		assert!(producer.scope(&mixed).is_none());
+		assert!(producer.consume().scope(&mixed).is_none());
+
+		let mixed: Patterns = ["room/**".parse().unwrap(), "other/*.jpg".parse().unwrap()]
+			.into_iter()
+			.collect();
+		assert_eq!(mixed.len(), 2);
+		assert!(producer.scope(&mixed).is_none());
+		assert!(producer.consume().scope(&mixed).is_none());
 	}
 
 	/// Charging a link accumulates onto both halves, saturating rather than wrapping
@@ -5496,7 +5615,11 @@ mod tests {
 	/// Mint an origin whose pool reclaims idle content after `expiry`.
 	fn expiring_origin(expiry: Duration) -> Producer {
 		let pool = cache::Pool::new(cache::Config::default().with_expiry(expiry));
-		Info::default().with_pool(pool).produce()
+		Config {
+			pool,
+			..Config::default()
+		}
+		.produce()
 	}
 
 	/// A publisher that stalls with a group still open runs no write path, so the
@@ -5535,7 +5658,11 @@ mod tests {
 	/// window keeps idle content until byte pressure takes it, sweep or no sweep.
 	#[tokio::test(start_paused = true)]
 	async fn sweep_respects_a_disabled_expiry() {
-		let origin = Info::default().with_pool(cache::Pool::unbounded()).produce();
+		let origin = Config {
+			pool: cache::Pool::unbounded(),
+			..Config::default()
+		}
+		.produce();
 		let mut broadcast = origin.create_broadcast("test").unwrap();
 		let mut track = broadcast.create_track("video", None).unwrap();
 

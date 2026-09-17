@@ -122,6 +122,9 @@ pub struct Producer<E: CatalogExt = ()> {
 	decoder_boundary: bool,
 	/// How the encoder classified the packet it published most recently.
 	activity: Activity,
+	/// Set after a successful [`finish`](Self::finish). Writes then fail with
+	/// [`moq_net::Error::Closed`]; [`abort`](Self::abort) can still run.
+	finished: bool,
 }
 
 struct Terminal {
@@ -211,6 +214,7 @@ impl<E: CatalogExt> Reserved<E> {
 			pending_discontinuity: false,
 			decoder_boundary: true,
 			activity: Activity::Active,
+			finished: false,
 		}
 	}
 }
@@ -238,7 +242,7 @@ impl<E: CatalogExt> Reserved<E> {
 	}
 
 	/// Finalize a track that never got a rendition.
-	pub(crate) fn finish(mut self) -> Result<(), Error> {
+	pub(crate) fn finish(&mut self) -> Result<(), Error> {
 		self.track.finish()?;
 		Ok(())
 	}
@@ -339,7 +343,13 @@ impl<E: CatalogExt> Producer<E> {
 	///
 	/// [`Frame::activity`] is ignored: the encoder classifies what it actually
 	/// produced, which [`activity`](Self::activity) reports.
+	///
+	/// Writes after a successful [`finish`](Self::finish) fail with
+	/// [`moq_net::Error::Closed`].
 	pub fn write(&mut self, frame: &Frame) -> Result<(), Error> {
+		if self.finished {
+			return Err(moq_net::Error::Closed.into());
+		}
 		if self.pending_discontinuity {
 			self.track.discontinuity()?;
 			self.pending_discontinuity = false;
@@ -451,7 +461,14 @@ impl<E: CatalogExt> Producer<E> {
 
 	/// Flush pending samples, resampler output, and codec lookahead, then finalize
 	/// the track.
-	pub fn finish(mut self) -> Result<(), Error> {
+	///
+	/// Borrows rather than consumes, so a later [`abort`](Self::abort) can still
+	/// run after a successful finish. Writes after this fail with
+	/// [`moq_net::Error::Closed`].
+	pub fn finish(&mut self) -> Result<(), Error> {
+		if self.finished {
+			return Ok(());
+		}
 		// Whatever the resampler still holds belongs to this track: its last partial
 		// chunk, plus the audio its filter is running behind on. Dropping it here
 		// would publish a track that ends before its source did.
@@ -470,7 +487,7 @@ impl<E: CatalogExt> Producer<E> {
 		let source_frames = self.pending.len() / channels;
 		let start = Self::timestamp(epoch_us, self.frames_produced, codec_rate)?;
 		let end = Self::timestamp(epoch_us, self.frames_produced + source_frames as u64, codec_rate)?;
-		let finish = self.encoder.finish(&self.pending)?;
+		let finish = self.encoder.drain(&self.pending)?;
 		let discard_padding = finish.discard_padding();
 		let packets = finish.into_packets();
 
@@ -495,11 +512,14 @@ impl<E: CatalogExt> Producer<E> {
 		}
 
 		self.track.finish()?;
+		self.finished = true;
 		Ok(())
 	}
 
 	/// Abort the track with `err` instead of finishing it, so subscribers see the
 	/// real cause rather than [`moq_net::Error::Dropped`]. Pending samples are dropped.
+	///
+	/// Consumes the producer. Still callable after [`finish`](Self::finish).
 	pub fn abort(self, err: moq_net::Error) {
 		self.track.abort(err);
 	}
@@ -896,6 +916,69 @@ mod tests {
 		// appear in the PTS (otherwise audio drifts behind a wall-clock video track).
 		let pts = published_pts(&[full_frame(0), full_frame(5_000_000)], Some(1)).await;
 		assert_eq!(pts, vec![0, 5_000_000]);
+	}
+
+	/// Finish leaves the handle, so abort can still run.
+	#[tokio::test]
+	async fn abort_after_finish() {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let consumer = broadcast.consume();
+		let options = Options {
+			track: Some("audio".to_string()),
+			..Options::default()
+		};
+		let mut producer = Producer::new(
+			&mut broadcast,
+			catalog,
+			Input {
+				channels: 1,
+				..Input::default()
+			},
+			&options,
+		)
+		.unwrap();
+		let mut track = moq_mux::container::Consumer::new(
+			consumer
+				.track("audio")
+				.unwrap()
+				.subscribe(moq_net::track::Subscription::default())
+				.await
+				.unwrap(),
+			moq_mux::container::legacy::Wire(moq_mux::container::Kind::Audio),
+		);
+
+		producer.write(&full_frame(0)).unwrap();
+		producer.finish().unwrap();
+		assert!(track.read().await.unwrap().is_some());
+		producer.abort(moq_net::Error::Cancel);
+	}
+
+	/// A sub-frame write never reaches the closed track, so the producer must
+	/// refuse it itself rather than buffering samples that cannot be published.
+	#[tokio::test]
+	async fn write_after_finish_is_closed() {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let options = Options {
+			track: Some("audio".to_string()),
+			..Options::default()
+		};
+		let mut producer = Producer::new(
+			&mut broadcast,
+			catalog,
+			Input {
+				channels: 1,
+				..Input::default()
+			},
+			&options,
+		)
+		.unwrap();
+
+		producer.finish().unwrap();
+		let err = producer.write(&pcm_frame(&[0.1; 100], 0)).unwrap_err();
+		assert!(matches!(err, Error::Net(moq_net::Error::Closed)));
+		producer.abort(moq_net::Error::Cancel);
 	}
 
 	/// `Options::track = None` derives a codec-suffixed name rather than making
