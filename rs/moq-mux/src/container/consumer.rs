@@ -210,7 +210,14 @@ impl<F: Container<Error = crate::error::Error>> Consumer<F> {
 			let any_frame = self
 				.pending
 				.iter_mut()
-				.any(|group| matches!(group.poll_min_timestamp(waiter, &self.format), Poll::Ready(Ok(_))));
+				.any(|group| matches!(
+					    group.poll_min_timestamp(
+					        waiter,
+					        &self.format,
+					        &mut self.decrypter,
+					    ),
+					    Poll::Ready(Ok(_))
+					));
 			if any_frame {
 				self.current = self.pending.front().expect("a group has a frame").sequence;
 				self.startup = false;
@@ -236,7 +243,7 @@ impl<F: Container<Error = crate::error::Error>> Consumer<F> {
 			if let Some(group) = self.pending.front_mut()
 				&& group.sequence <= self.current
 			{
-				match group.poll_read(waiter, &self.format) {
+				match group.poll_read(waiter, &self.format, &mut self.decrypter,) {
 					Poll::Ready(Ok(Some(Event::Frame(frame)))) => {
 						let seq = group.group.sequence;
 						let ts = frame.timestamp;
@@ -303,7 +310,7 @@ impl<F: Container<Error = crate::error::Error>> Consumer<F> {
 			let (oldest_timestamp, current_end) = if let Some(current) = self.pending.front_mut()
 				&& current.sequence <= self.current
 			{
-				match current.poll_min_timestamp(waiter, &self.format) {
+				match current.poll_min_timestamp(waiter, &self.format, &mut self.decrypter,) {
 					Poll::Ready(Ok(ts)) => (Some(std::time::Duration::from(ts)), current.max_end),
 					_ => (None, None),
 				}
@@ -318,7 +325,7 @@ impl<F: Container<Error = crate::error::Error>> Consumer<F> {
 					continue;
 				}
 
-				if let Poll::Ready(Ok(ts)) = group.poll_min_timestamp(waiter, &self.format) {
+				if let Poll::Ready(Ok(ts)) = group.poll_min_timestamp(waiter, &self.format, &mut self.decrypter,) {
 					next_group = Some((i, std::time::Duration::from(ts)));
 					break;
 				}
@@ -331,7 +338,7 @@ impl<F: Container<Error = crate::error::Error>> Consumer<F> {
 					break;
 				}
 
-				if let Poll::Ready(Ok(ts)) = group.poll_max_timestamp(waiter, &self.format) {
+				if let Poll::Ready(Ok(ts)) = group.poll_max_timestamp(waiter, &self.format, &mut self.decrypter,) {
 					max_timestamp = max_timestamp.max(ts.into());
 					break; // We know older groups won't be newer than this.
 				}
@@ -401,7 +408,7 @@ impl<F: Container<Error = crate::error::Error>> Consumer<F> {
 				&& let Some(front_sequence) = self.pending.front().map(|g| g.sequence)
 				&& front_sequence > self.current
 			{
-				let _ = self.pending.front_mut().unwrap().buffer_all(waiter, &self.format);
+				let _ = self.pending.front_mut().unwrap().buffer_all(waiter, &self.format, &mut self.decrypter,);
 				let next_start = self
 					.pending
 					.front()
@@ -471,7 +478,7 @@ impl<F: Container<Error = crate::error::Error>> Consumer<F> {
 			if group.group.sequence <= prev_group {
 				continue;
 			}
-			if let Poll::Ready(Ok(min)) = group.poll_min_timestamp(waiter, &self.format)
+			if let Poll::Ready(Ok(min)) = group.poll_min_timestamp(waiter, &self.format, &mut self.decrypter,)
 				&& min.as_micros() < edge.as_micros()
 			{
 				return Err(TimestampRewind.into());
