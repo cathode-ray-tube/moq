@@ -128,7 +128,7 @@ With `--raw`, frame payloads are written directly to standard output:
 
 ```bash
 MOQ_AEAD_KEY=<key> \\
-cargo run -- \\
+cargo run -p moq-mux --example publish_encrypted_fmp4 \\
   input.mp4 \\
   --relay https://relay.example.com/anon \\
   --broadcast stream.hang \\
