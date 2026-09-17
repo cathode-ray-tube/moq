@@ -18,7 +18,7 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 ed25519-dalek = { version = "2", default-features = false, features = ["pkcs8"] }
 futures = { workspace = true }
-h264-parser = { version = "0.4.0" }
+h264-parser = { version = "0.4.2" }
 hang = { workspace = true }
 hex = "0.4"
 kio = { workspace = true }
