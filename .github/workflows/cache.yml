@@ -5,9 +5,8 @@ name: Cache
 #
 # Actions scopes cache reads to the current branch plus the default branch, so
 # only caches written here on `main` are reachable from a pull request. This
-# workflow is therefore the single trusted writer, with one cache per runner
-# architecture. Pull requests restore it without publishing private entries
-# that fill the repository's 10 GB budget.
+# workflow is therefore the single trusted writer, with one store per runner
+# architecture. The action refuses to publish from a pull request regardless.
 #
 # This runs the unscoped suite rather than the diff-scoped one: the point is to
 # leave artifacts for whatever a future PR happens to touch, not to check `main`
@@ -28,8 +27,9 @@ on:
       - "flake.nix"
       - "flake.lock"
       - ".github/workflows/cache.yml"
-      # The shared cache implementation lives here. Re-warm immediately when it
-      # changes instead of waiting for the next Rust change to land.
+      # The action pin and the cache key both live here, and either can roll
+      # the store. Without this the sole writer would not re-run after such a
+      # change, leaving every PR reader cold until something else landed.
       - ".github/actions/rust-cache/**"
   # Priming a cold cache by hand, e.g. after a toolchain bump rolls the key.
   workflow_dispatch:
@@ -79,7 +79,7 @@ jobs:
       # buildRustPackage from a git tag) was therefore compiled from source by
       # every job that entered the shell. Push it once here so pull requests
       # substitute it instead.
-      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
         with:
           name: kixelated
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -92,8 +92,9 @@ jobs:
           nix develop --profile /tmp/devshell --command true
           cachix push kixelated /tmp/devshell
 
-      # The single writer. `save-on-dispatch` lets the `workflow_dispatch` above
-      # prime a cold cache; pull request jobs are restore-only.
+      # The single writer. `save-on-dispatch` is what lets the
+      # `workflow_dispatch` above prime a cold store; the action otherwise saves
+      # only on pushes to the default branch.
       - name: Rust cache
         uses: ./.github/actions/rust-cache
         with:

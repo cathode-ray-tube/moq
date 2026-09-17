@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.18](https://github.com/moq-dev/moq/compare/moq-relay-v0.14.17...moq-relay-v0.14.18) - 2026-09-17
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.14.17](https://github.com/moq-dev/moq/compare/moq-relay-v0.14.16...moq-relay-v0.14.17) - 2026-09-13
+
+### Added
+
+- *(moq-net)* add moq-transport draft-21 (moqt-21) ([#3574](https://github.com/moq-dev/moq/pull/3574))
+
+## [0.14.16](https://github.com/moq-dev/moq/compare/moq-relay-v0.14.15...moq-relay-v0.14.16) - 2026-09-09
+
+### Fixed
+
+- *(relay)* stop the cache headroom governor with its pool ([#3487](https://github.com/moq-dev/moq/pull/3487))
+- *(moq-native)* stop logging credentials in relay URLs and RTMP stream keys ([#3379](https://github.com/moq-dev/moq/pull/3379))
+
+### Other
+
+- *(relay)* drill cancellation, relay death, and republish over real QUIC ([#3525](https://github.com/moq-dev/moq/pull/3525))
+- give each harness run its own directory, ports, and process groups ([#3509](https://github.com/moq-dev/moq/pull/3509))
+- make the agent guides minimal and situational ([#3469](https://github.com/moq-dev/moq/pull/3469))
+- *(quest)* plan the abort guard, an advisory quest gate, and what the echo-delay test already establishes ([#3466](https://github.com/moq-dev/moq/pull/3466))
+- reorganize the site around what a reader can do ([#3426](https://github.com/moq-dev/moq/pull/3426))
+
+## [0.14.15](https://github.com/moq-dev/moq/compare/moq-relay-v0.14.14...moq-relay-v0.14.15) - 2026-09-02
+
+### Other
+
+- updated the following local packages: moq-net, moq-native, moq-stats
+
+## [0.14.14](https://github.com/moq-dev/moq/compare/moq-relay-v0.14.13...moq-relay-v0.14.14) - 2026-09-01
+
+### Added
+
+- *(moq-net)* add moq-transport draft-20 (moqt-20) ([#3255](https://github.com/moq-dev/moq/pull/3255))
+
+### Other
+
+- *(relay)* avoid WebSocket message copies ([#3277](https://github.com/moq-dev/moq/pull/3277))
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
 ## [0.14.13](https://github.com/moq-dev/moq/compare/moq-relay-v0.14.12...moq-relay-v0.14.13) - 2026-08-24
 
 ### Added

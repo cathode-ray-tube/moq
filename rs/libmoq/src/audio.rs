@@ -349,11 +349,9 @@ pub unsafe extern "C" fn moq_publish_audio_raw_frame(producer: u32, frame: *cons
 		let frame = unsafe { frame.as_ref() }.ok_or(Error::InvalidPointer)?;
 		let data = unsafe { ffi::parse_slice(frame.data, frame.data_size)? };
 
-		let owned = moq_audio::Frame {
-			// The C ABI carries plain microseconds; scale them at the boundary.
-			timestamp: moq_net::Timestamp::from_micros(frame.timestamp_us).map_err(moq_audio::Error::from)?,
-			data: Bytes::copy_from_slice(data),
-		};
+		// The C ABI carries plain microseconds; scale them at the boundary.
+		let timestamp = moq_net::Timestamp::from_micros(frame.timestamp_us).map_err(moq_audio::Error::from)?;
+		let owned = moq_audio::Frame::new(Bytes::copy_from_slice(data), timestamp);
 
 		let producer = State::lock().audio.producer(producer)?;
 		producer.lock().as_mut().ok_or(Error::MediaNotFound)?.write(&owned)?;
@@ -389,6 +387,8 @@ pub extern "C" fn moq_publish_audio_raw_finish(producer: u32) -> i32 {
 /// `user_data` is never touched again, so release `user_data` there. The
 /// terminal callback fires even after [`moq_consume_audio_raw_close`].
 ///
+/// Starts at the newest cached group so reopening live playback skips the backlog.
+///
 /// A packet the codec cannot decode is logged and skipped rather than ending
 /// the subscription, so a single bad frame costs that frame and not the stream.
 ///
@@ -408,6 +408,7 @@ pub unsafe extern "C" fn moq_consume_audio_raw(
 		let raw = unsafe { output.as_ref() }.ok_or(Error::InvalidPointer)?;
 
 		let mut config = moq_audio::decode::Config::default();
+		config.start = moq_audio::decode::Start::Latest;
 		config.format = audio_format_from_u32(raw.format)?;
 		config.sample_rate = zeroable(raw.sample_rate);
 		config.channels = zeroable(raw.channels);

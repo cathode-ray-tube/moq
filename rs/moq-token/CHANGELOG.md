@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.4](https://github.com/moq-dev/moq/compare/moq-token-v0.7.3...moq-token-v0.7.4) - 2026-09-13
+
+### Other
+
+- prefer the moq token subcommand ([#3557](https://github.com/moq-dev/moq/pull/3557))
+
+## [0.7.3](https://github.com/moq-dev/moq/compare/moq-token-v0.7.2...moq-token-v0.7.3) - 2026-09-01
+
+### Other
+
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
 ## [0.7.2](https://github.com/moq-dev/moq/compare/moq-token-v0.7.1...moq-token-v0.7.2) - 2026-08-05
 
 ### Other

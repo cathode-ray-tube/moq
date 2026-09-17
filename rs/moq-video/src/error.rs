@@ -12,18 +12,61 @@ pub enum Error {
 	#[error("no usable video decoder found (tried: {0})")]
 	NoDecoder(String),
 
+	/// `Kind::Named` asked for an encoder this build does not have for that
+	/// codec: a name that is not a backend, one whose feature is off, or one
+	/// that does not encode the codec requested.
+	#[error("no encoder named {name} for {codec:?} (this build has: {available})")]
+	UnknownEncoder {
+		/// The name that was asked for.
+		name: String,
+		/// The codec it was asked for.
+		codec: crate::encode::Codec,
+		/// The encoders this build does have for that codec.
+		available: String,
+	},
+
+	/// `Kind::Named` asked for a decoder this build does not have for that
+	/// codec: a name that is not a backend, one whose feature is off, or one
+	/// that does not decode the codec requested.
+	#[error("no decoder named {name} for {codec:?} (this build has: {available})")]
+	UnknownDecoder {
+		/// The name that was asked for.
+		name: String,
+		/// The codec it was asked for.
+		codec: crate::decode::Codec,
+		/// The decoders this build does have for that codec.
+		available: String,
+	},
+
 	/// A track's codec is not supported by the native decoders.
 	#[error("unsupported codec for native decode: {0}")]
 	UnsupportedCodec(String),
+
+	/// The codec session is over: its worker thread stopped, or a cancelled
+	/// call left it out of step with the stream it was decoding.
+	///
+	/// Distinct from [`Codec`](Self::Codec), which describes the bytes of one
+	/// picture and which a caller can reasonably skip past. Nothing about this
+	/// one improves by reading on: the session that would have decoded the next
+	/// picture no longer exists, and only a new encoder or decoder recovers it.
+	#[error("codec session ended: {0}")]
+	CodecGone(String),
 
 	/// The requested capture source or enumeration has no implementation on this
 	/// platform (the message names what is missing).
 	#[error("not supported on this platform: {0}")]
 	Unsupported(String),
 
-	/// The configured framerate was zero (would divide by zero / produce a
-	/// degenerate codec time base).
-	#[error("invalid framerate: {0} (must be non-zero)")]
+	/// The operating system denied access to a capture source.
+	#[error("capture permission denied: {0}")]
+	PermissionDenied(String),
+
+	/// A requested capture source does not exist or disappeared while capturing.
+	#[error("capture source unavailable: {0}")]
+	SourceUnavailable(String),
+
+	/// The configured framerate is outside the supported range.
+	#[error("invalid framerate: {0} (must be between 1 and 1,000,000)")]
 	InvalidFramerate(u32),
 
 	/// This encoder can't change its bitrate once open, so it can't follow a

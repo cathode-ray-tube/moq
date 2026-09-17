@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.11](https://github.com/moq-dev/moq/compare/moq-srt-v0.2.10...moq-srt-v0.2.11) - 2026-09-17
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, hang
+
+## [0.2.10](https://github.com/moq-dev/moq/compare/moq-srt-v0.2.9...moq-srt-v0.2.10) - 2026-09-13
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux
+
+## [0.2.9](https://github.com/moq-dev/moq/compare/moq-srt-v0.2.8...moq-srt-v0.2.9) - 2026-09-09
+
+### Fixed
+
+- *(moq-srt)* re-anchor egress pacing after a publisher rewind ([#3488](https://github.com/moq-dev/moq/pull/3488))
+
+## [0.2.8](https://github.com/moq-dev/moq/compare/moq-srt-v0.2.7...moq-srt-v0.2.8) - 2026-09-02
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux
+
+## [0.2.7](https://github.com/moq-dev/moq/compare/moq-srt-v0.2.6...moq-srt-v0.2.7) - 2026-09-01
+
+### Other
+
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
 ## [0.2.6](https://github.com/moq-dev/moq/compare/moq-srt-v0.2.5...moq-srt-v0.2.6) - 2026-08-26
 
 ### Fixed

@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.11](https://github.com/moq-dev/moq/compare/moq-rtmp-v0.2.10...moq-rtmp-v0.2.11) - 2026-09-17
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, moq-native, hang
+
+## [0.2.10](https://github.com/moq-dev/moq/compare/moq-rtmp-v0.2.9...moq-rtmp-v0.2.10) - 2026-09-13
+
+### Other
+
+- updated the following local packages: moq-net, moq-native, hang, moq-mux
+
+## [0.2.9](https://github.com/moq-dev/moq/compare/moq-rtmp-v0.2.8...moq-rtmp-v0.2.9) - 2026-09-09
+
+### Fixed
+
+- *(moq-native)* stop logging credentials in relay URLs and RTMP stream keys ([#3379](https://github.com/moq-dev/moq/pull/3379))
+
+## [0.2.8](https://github.com/moq-dev/moq/compare/moq-rtmp-v0.2.7...moq-rtmp-v0.2.8) - 2026-09-02
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux, moq-native
+
+## [0.2.7](https://github.com/moq-dev/moq/compare/moq-rtmp-v0.2.6...moq-rtmp-v0.2.7) - 2026-09-01
+
+### Other
+
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
 ## [0.2.6](https://github.com/moq-dev/moq/compare/moq-rtmp-v0.2.5...moq-rtmp-v0.2.6) - 2026-08-26
 
 ### Fixed

@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.16](https://github.com/moq-dev/moq/compare/libmoq-v0.5.15...libmoq-v0.5.16) - 2026-09-17
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, moq-native, hang, moq-json, moq-loc, moq-audio, moq-video
+
+## [0.5.15](https://github.com/moq-dev/moq/compare/libmoq-v0.5.14...libmoq-v0.5.15) - 2026-09-13
+
+### Added
+
+- *(moq-net)* add moq-transport draft-21 (moqt-21) ([#3574](https://github.com/moq-dev/moq/pull/3574))
+
+### Fixed
+
+- *(moq-video,moq-audio)* open a decoder at the live edge ([#3565](https://github.com/moq-dev/moq/pull/3565))
+
+### Other
+
+- reach Cargo through mbx's shim and delete RUST_CARGO ([#3553](https://github.com/moq-dev/moq/pull/3553))
+
+## [0.5.14](https://github.com/moq-dev/moq/compare/libmoq-v0.5.13...libmoq-v0.5.14) - 2026-09-09
+
+### Added
+
+- *(obs)* add connection stats and encoding controls to the MoQ dock ([#3453](https://github.com/moq-dev/moq/pull/3453))
+- *(audio,video)* compile the device, render, and VAAPI code by default ([#3353](https://github.com/moq-dev/moq/pull/3353))
+
+### Fixed
+
+- *(native)* default noq and iroh to BBRv3 now that noq 1.2.0 lands the loss fix ([#3536](https://github.com/moq-dev/moq/pull/3536))
+
+### Other
+
+- take every feature that needs a library or libclang at build time off the defaults ([#3464](https://github.com/moq-dev/moq/pull/3464))
+
+### Added
+
+- `moq_session_snapshot` for statistics and negotiated protocol from the same live connection
+
+## [0.5.13](https://github.com/moq-dev/moq/compare/libmoq-v0.5.12...libmoq-v0.5.13) - 2026-09-02
+
+### Added
+
+- *(moq-audio)* expose Opus DTX classification ([#3238](https://github.com/moq-dev/moq/pull/3238))
+
+## [0.5.12](https://github.com/moq-dev/moq/compare/libmoq-v0.5.11...libmoq-v0.5.12) - 2026-09-01
+
+### Added
+
+- *(moq-net)* add moq-transport draft-20 (moqt-20) ([#3255](https://github.com/moq-dev/moq/pull/3255))
+
+### Other
+
+- restore Swatinem Rust cache ([#3273](https://github.com/moq-dev/moq/pull/3273))
+- try mr boxington cache ([#3175](https://github.com/moq-dev/moq/pull/3175))
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
 ## [0.5.11](https://github.com/moq-dev/moq/compare/libmoq-v0.5.10...libmoq-v0.5.11) - 2026-08-26
 
 ### Other

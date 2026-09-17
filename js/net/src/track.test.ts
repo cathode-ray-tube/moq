@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { Producer as GroupProducer } from "./group.ts";
+import { Producer as GroupProducer, MAX_GROUP_FRAMES } from "./group.ts";
 import { Timestamp } from "./time.ts";
 import { Producer as TrackProducer } from "./track.ts";
 
@@ -139,6 +139,36 @@ test("subscriber options and updates are forwarded to the producer's aggregate",
 	const next = producer.subscription.changed();
 	track.update({ priority: 7, ordered: true, latencyMax: 250, startGroup: 2, endGroup: 9 });
 	expect(await next).toEqual({ priority: 7, ordered: true, latencyMax: 250, startGroup: 2, endGroup: 9 });
+});
+
+test("a fractional latencyMax is rounded up before the wire sees it", async () => {
+	const producer = new TrackProducer("test");
+
+	// Subscribers derive this from measurements (a jitter estimate scaled off RTT), so a
+	// fractional millisecond is expected. The wire encodes it as a varint, which throws on a
+	// non-integer, and rounding down would shorten a budget the subscriber asked for.
+	const track = producer.subscribe({ latencyMax: 38.75 });
+	expect(producer.subscription.peek()?.latencyMax).toBe(39);
+
+	const next = producer.subscription.changed();
+	track.update({ latencyMax: 500.25 });
+	expect((await next)?.latencyMax).toBe(501);
+
+	// The publisher half of the budget lands on the wire through TRACK_INFO, with the same hazard.
+	producer.accept({ latencyMax: 1000.5 });
+	expect((await producer.info()).latencyMax).toBe(1001);
+});
+
+test("a latencyMax that is not a duration is refused, not rounded into one", () => {
+	const producer = new TrackProducer("test");
+
+	// The wire carries an unsigned varint, so rounding these would encode a budget the
+	// caller never asked for: -0.5 would ceil to zero and silently take the live edge.
+	expect(() => producer.subscribe({ latencyMax: -0.5 })).toThrow(RangeError);
+	expect(() => producer.subscribe({ latencyMax: -100 })).toThrow(RangeError);
+	expect(() => producer.subscribe({ latencyMax: Number.NaN })).toThrow(RangeError);
+	expect(() => producer.subscribe({ latencyMax: Number.POSITIVE_INFINITY })).toThrow(RangeError);
+	expect(() => producer.accept({ latencyMax: -0.5 })).toThrow(RangeError);
 });
 
 test("multiple subscriber options aggregate like Rust", async () => {
@@ -414,3 +444,56 @@ test("readFrame does not livelock when a sole group finishes before the next arr
 
 	expect(await track.readString()).toBe("hello");
 }, 2000);
+
+// The IETF publisher resolves Largest Object from this, so it has to name a frame, not just
+// a group: a filter is applied down to the object.
+test("largest names the newest frame written", async () => {
+	const producer = new TrackProducer("test").accept();
+	const subscriber = producer.subscribe();
+
+	// Nothing published yet.
+	expect(subscriber.largest()).toBeUndefined();
+
+	const first = producer.appendGroup();
+	first.writeFrame({ payload: enc.encode("a"), timestamp: Timestamp.now() });
+	first.writeFrame({ payload: enc.encode("b"), timestamp: Timestamp.now() });
+	expect(subscriber.largest()).toEqual({ group: 0, frame: 1 });
+	first.close();
+
+	// A group with no frames yet has no object of its own, so the edge stays in the group
+	// before it rather than reading as an empty track.
+	const second = producer.appendGroup();
+	expect(subscriber.largest()).toEqual({ group: 0, frame: 1 });
+
+	second.writeFrame({ payload: enc.encode("c"), timestamp: Timestamp.now() });
+	expect(subscriber.largest()).toEqual({ group: 1, frame: 0 });
+	second.close();
+
+	// Reading a group does not move the edge: it is what the track produced, not what is left.
+	await subscriber.recvGroup();
+	expect(subscriber.largest()).toEqual({ group: 1, frame: 0 });
+
+	producer.close();
+});
+
+// A subscriber that arrives after the frames were written reads mirrors, and a mirror only
+// replays what is still buffered. Once a group has evicted from its front, a replay-local
+// count would put the edge below the frames actually written.
+test("largest survives a mirror replay of an evicted group", async () => {
+	const producer = new TrackProducer("test").accept();
+
+	// Overflow the group's frame cap so the front is evicted, which is the only case where
+	// the replayed frames and the frames ever written disagree.
+	const written = MAX_GROUP_FRAMES + 5;
+	const group = producer.appendGroup();
+	for (let i = 0; i < written; i++) {
+		group.writeFrame({ payload: enc.encode(`${i}`), timestamp: Timestamp.now() });
+	}
+	group.close();
+
+	// Subscribing now replays the retained window into a fresh sink.
+	const late = producer.subscribe();
+	expect(late.largest()).toEqual({ group: 0, frame: written - 1 });
+
+	producer.close();
+});

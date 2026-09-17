@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.19](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.18...moq-ffi-v0.3.19) - 2026-09-17
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.3.18](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.17...moq-ffi-v0.3.18) - 2026-09-13
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.3.17](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.16...moq-ffi-v0.3.17) - 2026-09-09
+
+### Added
+
+- *(audio,video)* compile the device, render, and VAAPI code by default ([#3353](https://github.com/moq-dev/moq/pull/3353))
+
+### Fixed
+
+- *(rs)* compile the lib tests at --no-default-features ([#3397](https://github.com/moq-dev/moq/pull/3397))
+
+### Other
+
+- make the agent guides minimal and situational ([#3469](https://github.com/moq-dev/moq/pull/3469))
+- take every feature that needs a library or libclang at build time off the defaults ([#3464](https://github.com/moq-dev/moq/pull/3464))
+- *(deps)* bump the cargo group across 1 directory with 5 updates ([#3395](https://github.com/moq-dev/moq/pull/3395))
+
+## [0.3.16](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.15...moq-ffi-v0.3.16) - 2026-09-02
+
+### Added
+
+- *(moq-audio)* expose Opus DTX classification ([#3238](https://github.com/moq-dev/moq/pull/3238))
+- *(dart)* add native Flutter bindings ([#3215](https://github.com/moq-dev/moq/pull/3215))
+
+## [0.3.15](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.14...moq-ffi-v0.3.15) - 2026-09-01
+
+### Added
+
+- *(py)* add ergonomic route update iterator ([#3229](https://github.com/moq-dev/moq/pull/3229))
+
+### Fixed
+
+- *(ffi)* default optional record fields ([#3227](https://github.com/moq-dev/moq/pull/3227))
+
+### Other
+
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
 ## [0.3.14](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.13...moq-ffi-v0.3.14) - 2026-08-26
 
 ### Other

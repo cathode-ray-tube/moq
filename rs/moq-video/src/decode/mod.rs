@@ -3,8 +3,8 @@
 //! The decode counterpart to [`encode`](crate::encode), and the mirror of
 //! `moq_audio::decode::Consumer`. [`Consumer`] subscribes to a moq-mux video
 //! track and hands back decoded [`Frame`](crate::Frame)s; a native backend does the work
-//! (VideoToolbox on macOS, Media Foundation / DXVA on Windows, NVDEC on Linux,
-//! openh264 everywhere as the software fallback for H.264).
+//! (VideoToolbox on macOS, Media Foundation / DXVA on Windows, NVDEC or VAAPI
+//! on Linux, openh264 everywhere as the software fallback for H.264).
 //!
 //! H.264 and H.265 are supported, symmetric with what [`encode`](crate::encode)
 //! produces. AV1 is decode-only on NVDEC. H.265 and AV1 are hardware-only (no
@@ -15,12 +15,17 @@
 // output with the software decoder (an in-crate, ffmpeg-free encode->decode
 // check that catches input-pitch corruption).
 pub(crate) mod backend;
+// H.264 decode against committed libx264 bitstreams, the one place here that
+// decodes something no encoder in this crate produced.
+#[cfg(test)]
+mod conformance;
 mod consumer;
 mod decoder;
 mod sink;
 
+pub use backend::{Codec, NAMES};
 pub use consumer::Consumer;
-pub use decoder::{Config, Decoder, Kind};
+pub use decoder::{Config, Decoder, Kind, Start};
 pub use sink::Sink;
 
 #[cfg(test)]

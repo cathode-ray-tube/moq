@@ -9,20 +9,12 @@
 
 set working-directory := '..'
 
-# Plain `cargo` unless set. A developer can select a compatible wrapper such as
-# mbx to share build artifacts across worktrees instead of using one target/
-# per worktree.
-#
-# Every recipe that compiles reads it, with three exceptions. `package` hands
-# nfpm a literal target/release path, and a managed target/ is a symlink.
-# `fix`/`wasm-fix` run `cargo fix`, which drops rustc wrappers. `fuzz` puts
-# nightly on PATH so a bare cargo/rustc resolve to it, and the sanitizer flags
-# are what break if anything else sits in front.
-# Empty counts as unset: `RUST_CARGO= just build` is how you opt one command out
-# of a shell that exports it, and just would otherwise hand the recipes an empty
-# program name.
-_rust_cargo := env_var_or_default("RUST_CARGO", "cargo")
-cargo_compile := if _rust_cargo == "" { "cargo" } else { _rust_cargo }
+# `moq-net-fuzz` is a workspace member only so it shares the root lockfile; libFuzzer
+# needs a nightly toolchain and sanitizer flags, so `just rs fuzz` is the one recipe
+# that may compile it. Every `--workspace` below therefore carries this, and a new
+# one that forgets it pays a vendored C++ libFuzzer build for nothing. The root
+# justfile's `check-all` and `fix-all` spell it out, since a module cannot read this.
+no_fuzz := "--exclude moq-net-fuzz"
 
 default:
     just check
@@ -46,10 +38,11 @@ check *args:
     just rs _select-test
     just rs _publish-test
     just rs _doc-names-test
-    {{ cargo_compile }} clippy --locked --all-targets {{ args }} -- -D warnings
+    rs/scripts/package-nfpm.test.sh
+    cargo clippy --locked --all-targets {{ args }} -- -D warnings
     cargo fmt --all --check
     just rs _doc-names
-    RUSTDOCFLAGS="-D warnings" {{ cargo_compile }} doc --locked --no-deps {{ args }}
+    RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps {{ args }}
     cargo shear
     cargo sort --workspace --check --no-format
 
@@ -165,8 +158,19 @@ _select $FILES:
     # `--no-deps` keeps this to workspace members and off the network.
     metadata=$(cargo metadata --format-version 1 --no-deps)
 
-    # Every crate directory is named after the crate it holds, which is what
-    # makes a changed path a seed below. Verify it rather than trust it: under-
+    # A seed is the first path segment under `rs/`, so only a crate whose manifest
+    # sits directly at `rs/<dir>/Cargo.toml` can ever be one. Drop the rest here:
+    # `moq-net-fuzz` lives at `rs/moq-net/fuzz`, so its seed is already `moq-net`,
+    # and leaving it in the graph would select it as a dependent of the crate it
+    # fuzzes and compile libFuzzer on every moq-net diff.
+    #
+    # `manifest_path` is a native path, so normalize the separator before splitting
+    # on it. Windows would otherwise match no segment, drop every package, and
+    # select nothing at all, where the assertion below fails safe to ALL.
+    metadata=$(jq '.packages |= map((.manifest_path |= gsub("\\\\"; "/")) | select(.manifest_path | split("/")[-3] == "rs"))' <<< "$metadata")
+
+    # Every remaining crate directory is named after the crate it holds, which is
+    # what makes a changed path a seed below. Verify it rather than trust it: under-
     # selecting silently checks nothing, so fall back to checking everything.
     if jq -e '.packages[] | select((.manifest_path | split("/")[-2]) != .name)' <<< "$metadata" > /dev/null; then
     	echo "rs: a crate directory no longer matches its crate name; selecting everything." >&2
@@ -233,8 +237,8 @@ _select $FILES:
 # spelling keeps those call sites working whatever spec form `_select` uses; the
 # previous alternation matched `--package <name>` literally and silently stopped
 # firing the moment the spec form changed. Ids are `path+file://<dir>#<version>`
-# and `_select` has already verified every crate directory matches its crate
-# name, so the last path segment is the name.
+# and `_select` only emits crates whose directory it has verified matches
+# their crate name, so the last path segment is the name.
 
 # True when a selection includes a crate the wasm32 pass covers. One predicate
 # rather than the same alternation in each gate, so the test below exercises what
@@ -291,6 +295,13 @@ _select-test:
     [[ -z "$(just rs _select "rs/scripts/package-binary.sh")" ]] \
     	|| fail "a non-crate seed must select nothing"
 
+    # A crate nested inside another crate's directory is covered by its parent's
+    # seed. Selecting it directly would compile libFuzzer on every moq-net diff,
+    # and its directory name is not its crate name, so it would also mis-report.
+    fuzz=$(just rs _names "$(just rs _select "rs/moq-net/fuzz/fuzz_targets/lite.rs")")
+    grep -qw moq-net <<< "$fuzz" || fail "a fuzz diff must select moq-net: $fuzz"
+    ! grep -qw fuzz <<< "$fuzz" || fail "a fuzz diff must not select the harness: $fuzz"
+
     echo "rs: selection ok"
 
 # Published crates need the current workspace version as the lower bound for
@@ -334,7 +345,7 @@ check-changed $FILES:
     packages=$(just rs _select "$FILES")
     case "$packages" in
     	"")    echo "rs: no crates affected; skipping." ;;
-    	ALL)   just rs check --workspace ;;
+    	ALL)   just rs check --workspace {{ no_fuzz }} ;;
     	*)     echo "rs: checking $(just rs _names "$packages")"; just rs check $packages ;;
     esac
 
@@ -357,7 +368,7 @@ fix-changed $FILES:
     packages=$(just rs _select "$FILES")
     case "$packages" in
     	"")    echo "rs: no crates affected; skipping." ;;
-    	ALL)   just rs fix --workspace ;;
+    	ALL)   just rs fix --workspace {{ no_fuzz }} ;;
     	*)     echo "rs: fixing $(just rs _names "$packages")"; just rs fix $packages ;;
     esac
 
@@ -373,44 +384,63 @@ fix-changed $FILES:
 # builds vendored C++ that needs an MSVC toolchain and openh264 is a
 # non-optional dependency.
 #
-# Nothing in CI runs this. Windows runners cost too much for a per-PR gate, so
-# the code compiles for the first time in a tag-triggered release build unless
-# someone runs this by hand on a Windows host.
+# Windows runners are throttled too hard for a per-PR gate, so nightly.yml runs
+# this once a day instead. A break there lands on main rather than being caught
+# in review, which is the same trade the other nightly gates make.
 #
 # Default features rather than `--all-features`: jemalloc and the quiche
 # backend don't build on MSVC, while moq-video's Linux-only `nvidia` default
 # are already no-ops off Linux. moq-gst is excluded because it links
 # GStreamer via pkg-config, which the Windows runner doesn't have.
 #
-# `moq-cli/play` is named explicitly because it's off by default and is what
-# turns on moq-video's wgpu renderer and moq-audio's cpal output, neither of
-# which any default-feature build compiles.
+# `moq-cli/play` and `moq-cli/capture` are named explicitly because they are
+# off by default, and they are the only thing that compiles the cli's own
+# device and render code.
 
 # Compile the whole workspace on a Windows host. Must run ON Windows.
 windows *args:
-    {{ cargo_compile }} check --locked --workspace --exclude moq-gst --all-targets --features "moq-cli/play moq-cli/capture" {{ args }}
+    cargo check --locked --workspace --exclude moq-gst {{ no_fuzz }} --all-targets --features "moq-cli/play moq-cli/capture" {{ args }}
 
 # Runs the `#[cfg(target_os = "macos")]` code past the compiler: moq-video's
 # VideoToolbox encode/decode and its ScreenCaptureKit / AVFoundation capture,
 # plus moq-audio's ScreenCaptureKit system audio and TCC permission pre-check.
 #
-# Nothing in CI runs this either; Mac runners cost too much for a per-PR gate.
-# The moq-video half has a release-time backstop, since libmoq's `libmoq-v*` tag
-# build compiles it on Apple Silicon. The moq-audio half has none: its
-# capture backend is behind an off-by-default feature no release build enables,
-# so this recipe is the only thing that ever compiles it.
+# Same trade as `windows`: nightly.yml runs this once a day rather than gating a
+# merge on a Mac runner. The moq-video half also has a release-time backstop,
+# since libmoq's `libmoq-v*` tag build compiles it on Apple Silicon. The
+# moq-audio half has none: libmoq and moq-ffi take it codecs-only, so no release
+# build compiles its capture backend and this recipe is the only thing that does.
 #
 # Scoped to those two crates instead of the workspace, because they hold all
 # the Apple-gated code the Linux gate misses. moq-ffi (and through it the
 # Swift/Kotlin/Go wrappers) already compiles on macOS in swift.yml.
-# `--all-features` is required, not just tidy: moq-audio's capture backend sits
-# behind an off-by-default feature, so a plain check would skip the very code
-# this recipe exists for. moq-video's Linux-only nvidia/vaapi/pipewire
-# deps are no-ops here.
+# `--all-features` also compiles the off-by-default cpal hosts and PipeWire
+# capture, which are Linux-only and no-ops here, so it costs nothing extra.
 
 # Compile the Apple-only code paths. Must run ON macOS.
 macos *args:
-    {{ cargo_compile }} check --locked -p moq-video -p moq-audio --all-targets --all-features {{ args }}
+    cargo check --locked -p moq-video -p moq-audio --all-targets --all-features {{ args }}
+
+# Same idea as `windows`/`macos`, for Android: moq-video's MediaCodec encoder and
+# decoder, its `Surface::HardwareBuffer` variant, and the `frame::android` module
+# are all `#[cfg(target_os = "android")]`, so a host-target check compiles none of
+# them and every error in them stays invisible.
+#
+# Unlike `windows` and `macos` this needs no special host: the Android targets
+# cross-compile from the Linux dev shell in about half a minute. It needs an NDK,
+# which `cargo-ndk` finds through `ANDROID_NDK_HOME` or the standard SDK layout,
+# so it is a manual gate rather than a CI one until the shell provides one.
+#
+# arm64-v8a alone: it is the only ABI anything here ships, and the code is not
+# ABI-specific, so the other two would compile the same source twice more.
+#
+# `check` rather than a `-D warnings` clippy, matching `windows` and `macos`:
+# the capture module's plumbing is dead on a target with no capture backend, so
+# a denying lint would fail on code this recipe is not here to police.
+
+# Compile the Android backends, which the host-target check skips.
+android *args:
+    cargo ndk -t arm64-v8a --platform 26 check --locked -p moq-video --all-targets {{ args }}
 
 # Same idea as `windows`/`macos`, for the browser: moq-wasm's whole crate root is
 # `#![cfg(target_arch = "wasm32")]`, so a host-target `cargo check --workspace`
@@ -432,7 +462,7 @@ macos *args:
 
 # Compile and lint the browser/WASM bindings, which the host-target check skips.
 wasm *args:
-    {{ cargo_compile }} clippy --locked -p moq-wasm -p moq-mux -p moq-ffi --target wasm32-unknown-unknown --lib {{ args }} -- -D warnings
+    cargo clippy --locked -p moq-wasm -p moq-mux -p moq-ffi --target wasm32-unknown-unknown --lib {{ args }} -- -D warnings
 
 # The `fix` counterpart to `wasm`. `cargo fmt` is scoped rather than `--all`
 # because this runs alongside `fix`, which already formats everything else.
@@ -457,16 +487,21 @@ audit:
 # for the all-features clippy alone), which is why this is nightly rather than
 # part of the per-PR gate.
 #
-# `--all-features` is the only thing that compiles moq-cli's play/capture,
-# moq-audio's capture backend, quiche, and jemalloc. `--no-default-features` is
+# `--all-features` is the only thing that compiles moq-cli's play/capture, the
+# moq-video and moq-audio device features, the Linux bindgen codecs (vaapi,
+# v4l2), PipeWire, quiche, and jemalloc. `--no-default-features` is
 # the only thing that compiles the `#[cfg(not(feature = ...))]` arms.
+#
+# Both carry `--all-targets`. A `#[cfg(test)]` module leans on whatever the
+# default features happened to import, so a test that only compiles by accident
+# is invisible to a lib-only check.
 
 # Compile the workspace at the feature extremes.
 features:
-    {{ cargo_compile }} check --locked --workspace --no-default-features
-    {{ cargo_compile }} clippy --locked --workspace --all-targets --all-features -- -D warnings
-    RUSTDOCFLAGS="-D warnings" {{ cargo_compile }} doc --locked --workspace --all-features --no-deps
-    {{ cargo_compile }} nextest run --locked --workspace --all-targets --all-features
+    cargo check --locked --workspace {{ no_fuzz }} --all-targets --no-default-features
+    cargo clippy --locked --workspace {{ no_fuzz }} --all-targets --all-features -- -D warnings
+    RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace {{ no_fuzz }} --all-features --no-deps
+    cargo nextest run --locked --workspace {{ no_fuzz }} --all-targets --all-features
 
 # nextest, not `cargo test`, so a wedged test is killed instead of pinning a core
 # until someone notices (`.config/nextest.toml` sets the timeout). The trade is
@@ -499,7 +534,7 @@ features:
 
 # Run the test suite, reporting clippy findings from the same compile.
 test *args:
-    RUSTC_WORKSPACE_WRAPPER="$(command -v clippy-driver || true)" {{ cargo_compile }} nextest run --locked --all-targets {{ args }}
+    RUSTC_WORKSPACE_WRAPPER="$(command -v clippy-driver || true)" cargo nextest run --locked --all-targets {{ args }}
 
 # Same selection as `check-changed`: compiling a crate's test binaries is the
 # expensive half of a test run, so scoping matters more here than anywhere else.
@@ -516,13 +551,13 @@ test-changed $FILES:
     packages=$(just rs _select "$FILES")
     case "$packages" in
     	"")    echo "rs: no crates affected; skipping tests." ;;
-    	ALL)   just rs test --workspace ;;
+    	ALL)   just rs test --workspace {{ no_fuzz }} ;;
     	*)     echo "rs: testing $(just rs _names "$packages")"; just rs test --no-tests=pass $packages ;;
     esac
 
 # Compile and run the `/// ```` examples, which nextest skips.
 doctest *args:
-    {{ cargo_compile }} test --locked --doc {{ args }}
+    cargo test --locked --doc {{ args }}
 
 # Permutation-test the concurrent handoffs with loom.
 #
@@ -541,8 +576,8 @@ doctest *args:
 # kio's own unit tests are `cfg(not(loom))`: they'd construct loom primitives
 # outside `loom::model`, which panics.
 loom *args:
-    RUSTFLAGS="--cfg loom" {{ cargo_compile }} test --locked --release -p kio --lib loom:: {{ args }}
-    RUSTFLAGS="--cfg loom" {{ cargo_compile }} test --locked --release -p moq-net --test loom {{ args }}
+    RUSTFLAGS="--cfg loom" cargo test --locked --release -p kio --lib loom:: {{ args }}
+    RUSTFLAGS="--cfg loom" cargo test --locked --release -p moq-net --test loom {{ args }}
 
 # Coverage-guided fuzzing of the moq-net wire codecs (libFuzzer, via cargo-fuzz).
 #
@@ -586,17 +621,17 @@ fuzz target *args:
     	rs/moq-net/fuzz/corpus/{{ target }} rs/moq-net/fuzz/seeds/{{ target }} {{ args }}
 
 build:
-    {{ cargo_compile }} build --locked
+    cargo build --locked
 
 # Run a moq-bench preset against a relay, e.g. `just rs bench chat https://relay.example.com`.
 # Extra args pass through, so `--connections 500 --output stats.jsonl` work as-is.
 bench preset url *args:
-    {{ cargo_compile }} run --release -p moq-bench -- --file 'rs/moq-bench/config/{{ preset }}.toml' --client-connect '{{ url }}' {{ args }}
+    cargo run --release -p moq-bench -- --file 'rs/moq-bench/config/{{ preset }}.toml' --client-connect '{{ url }}' {{ args }}
 
 # Sample a process's CPU/memory/context switches on this host (run it where the
 # relay runs; it only reads /proc). E.g. `just rs bench-host --name moq-relay`.
 bench-host *args:
-    {{ cargo_compile }} run --release -p moq-bench --bin moq-bench-host -- {{ args }}
+    cargo run --release -p moq-bench --bin moq-bench-host -- {{ args }}
 
 # Remove the Rust target directory.
 clean:
@@ -656,7 +691,9 @@ package crate packager:
     cargo build --locked --release -p {{ crate }}
     mkdir -p dist
     VERSION="$version" ARCH="$arch" BINARY_PATH="target/release/$bin" \
-    	nfpm pkg --packager {{ packager }} \
-    		--config packaging/{{ crate }}/nfpm.yaml \
-    		--target dist/
+        rs/scripts/package-nfpm.sh packaging/{{ crate }}/nfpm.yaml {{ packager }} dist/
+    if [[ "{{ packager }}" == deb && -f "packaging/{{ crate }}/transition.yaml" ]]; then
+        VERSION="$version" ARCH="$arch" \
+            rs/scripts/package-nfpm.sh packaging/{{ crate }}/transition.yaml deb dist/
+    fi
     ls -1 dist/

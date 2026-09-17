@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.25](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.24...moq-audio-v0.0.25) - 2026-09-17
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, hang
+
+## [0.0.24](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.23...moq-audio-v0.0.24) - 2026-09-13
+
+### Fixed
+
+- *(moq-video,moq-audio)* open a decoder at the live edge ([#3565](https://github.com/moq-dev/moq/pull/3565))
+
+## [0.0.23](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.22...moq-audio-v0.0.23) - 2026-09-09
+
+### Added
+
+- *(moq-audio)* [**breaking**] let publish_capture carry a catalog extension ([#3356](https://github.com/moq-dev/moq/pull/3356))
+- *(audio,video)* compile the device, render, and VAAPI code by default ([#3353](https://github.com/moq-dev/moq/pull/3353))
+
+### Fixed
+
+- *(audio)* stamp resampled output from the frames it starts with ([#3482](https://github.com/moq-dev/moq/pull/3482))
+- *(moq-audio)* treat a media gap as a hole rather than a splice ([#3386](https://github.com/moq-dev/moq/pull/3386))
+
+### Other
+
+- *(deps)* bump the cargo group with 2 updates ([#3476](https://github.com/moq-dev/moq/pull/3476))
+- take every feature that needs a library or libclang at build time off the defaults ([#3464](https://github.com/moq-dev/moq/pull/3464))
+- *(moq-audio)* scope the local-task guidance to macOS ([#3436](https://github.com/moq-dev/moq/pull/3436))
+- *(moq-audio,moq-cli)* assert publish_capture stays Send off macOS ([#3433](https://github.com/moq-dev/moq/pull/3433))
+- *(deps)* bump the cargo group across 1 directory with 5 updates ([#3395](https://github.com/moq-dev/moq/pull/3395))
+
+## [0.0.22](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.21...moq-audio-v0.0.22) - 2026-09-02
+
+### Added
+
+- *(moq-audio)* [**breaking**] reach devices through PipeWire or PulseAudio ([#3328](https://github.com/moq-dev/moq/pull/3328))
+- *(moq-audio)* expose Opus DTX classification ([#3238](https://github.com/moq-dev/moq/pull/3238))
+- *(moq-audio)* control microphone publication ([#3235](https://github.com/moq-dev/moq/pull/3235))
+
+### Fixed
+
+- *(moq-audio)* let a capture publication outlive a missing input ([#3337](https://github.com/moq-dev/moq/pull/3337))
+- *(moq-audio)* negotiate a stereo output before a mono one ([#3327](https://github.com/moq-dev/moq/pull/3327))
+
+### Added
+
+- [**breaking**] *(moq-audio)* report Opus discontinuous transmission as an `Activity` on the audio itself: `Frame` gains an `activity` field (build one with the new `Frame::new`), `Encoder::encode` returns `encode::Encoded`, `Decoder::decode` returns `decode::Decoded`, and `encode::Producer::activity` reports what was published most recently ([#2481](https://github.com/moq-dev/moq/issues/2481))
+- [**breaking**] *(moq-audio)* reject an Opus bitrate too low for the frame duration to code any audio, which libopus otherwise accepts and answers with empty frames
+
+## [0.0.21](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.20...moq-audio-v0.0.21) - 2026-09-01
+
+### Fixed
+
+- *(moq-audio)* keep capture callbacks realtime-safe ([#3245](https://github.com/moq-dev/moq/pull/3245))
+- *(moq-audio)* bound playback driver commands ([#3170](https://github.com/moq-dev/moq/pull/3170))
+- *(audio)* recover microphone capture after device errors ([#3179](https://github.com/moq-dev/moq/pull/3179))
+
+### Other
+
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
 ## [0.0.20](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.19...moq-audio-v0.0.20) - 2026-08-26
 
 ### Other

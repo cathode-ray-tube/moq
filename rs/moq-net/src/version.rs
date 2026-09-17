@@ -26,6 +26,7 @@ pub const ALPNS: &[&str] = &[
 	ALPN_LITE_04,
 	ALPN_LITE_03,
 	ALPN_LITE,
+	ALPN_21,
 	ALPN_20,
 	ALPN_19,
 	ALPN_18,
@@ -48,14 +49,16 @@ pub(crate) const ALPN_17: &str = "moqt-17";
 pub(crate) const ALPN_18: &str = "moqt-18";
 pub(crate) const ALPN_19: &str = "moqt-19";
 pub(crate) const ALPN_20: &str = "moqt-20";
+pub(crate) const ALPN_21: &str = "moqt-21";
 
-const ALL: [Version; 13] = [
+const ALL: [Version; 14] = [
 	Version::Lite(lite::Version::Lite06Wip),
 	Version::Lite(lite::Version::Lite05),
 	Version::Lite(lite::Version::Lite04),
 	Version::Lite(lite::Version::Lite03),
 	Version::Lite(lite::Version::Lite02),
 	Version::Lite(lite::Version::Lite01),
+	Version::Ietf(ietf::Version::Draft21),
 	Version::Ietf(ietf::Version::Draft20),
 	Version::Ietf(ietf::Version::Draft19),
 	Version::Ietf(ietf::Version::Draft18),
@@ -78,10 +81,11 @@ pub enum Version {
 impl Version {
 	/// Iterate the names accepted by [`FromStr`].
 	pub fn names() -> impl Iterator<Item = &'static str> {
-		ALL.iter().map(Self::name)
+		ALL.iter().map(Self::as_str)
 	}
 
-	fn name(&self) -> &'static str {
+	/// Handshake / config name, e.g. `moq-lite-05` or `moq-transport-20`.
+	pub fn as_str(&self) -> &'static str {
 		match self {
 			Self::Lite(lite::Version::Lite01) => "moq-lite-01",
 			Self::Lite(lite::Version::Lite02) => "moq-lite-02",
@@ -96,6 +100,7 @@ impl Version {
 			Self::Ietf(ietf::Version::Draft18) => "moq-transport-18",
 			Self::Ietf(ietf::Version::Draft19) => "moq-transport-19",
 			Self::Ietf(ietf::Version::Draft20) => "moq-transport-20",
+			Self::Ietf(ietf::Version::Draft21) => "moq-transport-21",
 		}
 	}
 
@@ -115,6 +120,7 @@ impl Version {
 			0xff000012 => Some(Self::Ietf(ietf::Version::Draft18)),
 			0xff000013 => Some(Self::Ietf(ietf::Version::Draft19)),
 			0xff000014 => Some(Self::Ietf(ietf::Version::Draft20)),
+			0xff000015 => Some(Self::Ietf(ietf::Version::Draft21)),
 			_ => None,
 		}
 	}
@@ -135,6 +141,7 @@ impl Version {
 			Self::Ietf(ietf::Version::Draft18) => 0xff000012,
 			Self::Ietf(ietf::Version::Draft19) => 0xff000013,
 			Self::Ietf(ietf::Version::Draft20) => 0xff000014,
+			Self::Ietf(ietf::Version::Draft21) => 0xff000015,
 		}
 	}
 
@@ -156,6 +163,7 @@ impl Version {
 			ALPN_18 => Some(Self::Ietf(ietf::Version::Draft18)),
 			ALPN_19 => Some(Self::Ietf(ietf::Version::Draft19)),
 			ALPN_20 => Some(Self::Ietf(ietf::Version::Draft20)),
+			ALPN_21 => Some(Self::Ietf(ietf::Version::Draft21)),
 			_ => None,
 		}
 	}
@@ -175,6 +183,7 @@ impl Version {
 			Self::Ietf(ietf::Version::Draft18) => ALPN_18,
 			Self::Ietf(ietf::Version::Draft19) => ALPN_19,
 			Self::Ietf(ietf::Version::Draft20) => ALPN_20,
+			Self::Ietf(ietf::Version::Draft21) => ALPN_21,
 		}
 	}
 
@@ -206,7 +215,7 @@ impl Version {
 
 impl fmt::Display for Version {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.write_str(self.name())
+		f.write_str(self.as_str())
 	}
 }
 
@@ -215,7 +224,7 @@ impl FromStr for Version {
 
 	fn from_str(s: &str) -> Result<Self, Self::Err> {
 		ALL.iter()
-			.find(|version| version.name() == s)
+			.find(|version| version.as_str() == s)
 			.copied()
 			.ok_or_else(|| format!("unknown version: {s}"))
 	}

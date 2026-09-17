@@ -214,6 +214,9 @@ struct BroadcastState {
 	// broadcast churning distinct track names stays bounded by the live count.
 	tracks: WeakCache<Arc<str>, track::TrackWeak>,
 
+	// Shared across suffixes and producer clones; cache eviction must not reset IDs.
+	unique: u64,
+
 	// Pending requests keyed by track name, coalescing concurrent `track()` calls
 	// and waiting for a dynamic handler to accept or deny them. A request leaves
 	// here once handed out (the handler caches it in `tracks`, so lookups keep
@@ -272,6 +275,22 @@ impl BroadcastState {
 		match self.tracks.insert(weak.name().clone(), weak) {
 			Some(_) => Err(Error::Duplicate),
 			None => Ok(()),
+		}
+	}
+
+	/// Resolve every name the broadcast never filled, so subscribers waiting on a
+	/// [`track::Info`] that can no longer arrive fail with `err` instead of parking.
+	///
+	/// Covers a reservation nobody accepted, a request handed to a [`Dynamic`] that
+	/// never answered it, and one still queued for a handler. A track that carries
+	/// its info has a publisher and is left alone: an end there is that publisher's
+	/// call, and its cache stays readable.
+	fn reject_unserved(&mut self, err: Error) {
+		for request in self.requests.drain_queued() {
+			request.reject(err.clone());
+		}
+		for track in self.tracks.iter() {
+			track.reject(err.clone());
 		}
 	}
 
@@ -397,6 +416,8 @@ impl Producer {
 	}
 
 	/// Remove a track from the lookup.
+	///
+	/// Removing a track does not make its minted name available to [`Self::unique_name`] again.
 	pub fn remove_track(&mut self, name: &str) -> Result<(), Error> {
 		self.state.lock().tracks.remove(name).ok_or(Error::NotFound)?;
 		Ok(())
@@ -441,6 +462,10 @@ impl Producer {
 	/// the producer can't pick the track's properties (e.g. timescale) until it has
 	/// inspected the media, the same shape as a consumer-driven
 	/// [`Dynamic::requested_track`].
+	///
+	/// Subscribers wait on the name until it is accepted, so a reservation the producer
+	/// ends up never filling has to be dropped or rejected. Ending the broadcast
+	/// ([`Self::finish`] or [`Self::abort`]) resolves whatever is left.
 	pub fn reserve_track(&mut self, name: impl Into<Arc<str>>) -> Result<track::Request, Error> {
 		let request = track::Request::new(self.info.clone(), name).with_stats(self.stats.clone());
 		self.state.lock().insert_track(request.weak())?;
@@ -449,8 +474,7 @@ impl Producer {
 
 	/// Create a track with a unique name using the given suffix.
 	///
-	/// Generates names like `0{suffix}`, `1{suffix}`, etc. and picks the first
-	/// one not already used in this broadcast.
+	/// Uses [`Self::unique_name`]; minted names are never reused, even after removal or closure.
 	pub fn unique_track(
 		&mut self,
 		suffix: &str,
@@ -462,15 +486,30 @@ impl Producer {
 
 	/// Generate a unique track name from a suffix without creating the track.
 	///
-	/// Returns a fresh name like `0{suffix}`, `1{suffix}`, etc. Use this when
-	/// you need to set non-default Track properties (e.g. `with_timescale`,
-	/// `with_latency_max`) before handing the Track to [`Self::create_track`].
+	/// Returns `{id}{suffix}` with an increasing ID shared across all suffixes and
+	/// producer clones in this broadcast, skipping names already in the lookup.
+	/// A digit-leading suffix gets a `-` separator so it cannot be confused with the ID.
+	/// Minted names are never reused, even if no track is created or it is removed or closed.
+	/// Explicit calls to [`Self::create_track`] can still reuse names.
+	///
+	/// # Panics
+	///
+	/// Panics if the broadcast exhausts its `u64` IDs.
 	pub fn unique_name(&self, suffix: &str) -> String {
-		let state = self.state.read();
-		(0u16..)
-			.map(|i| format!("{i}{suffix}"))
-			.find(|name| !state.tracks.contains_key(name.as_str()))
-			.expect("u16 namespace exhausted; wow")
+		let mut state = self.state.lock();
+		let separator = if suffix.starts_with(|c: char| c.is_ascii_digit()) {
+			"-"
+		} else {
+			""
+		};
+		loop {
+			let id = state.unique;
+			state.unique = id.checked_add(1).expect("unique track IDs exhausted");
+			let name = format!("{id}{separator}{suffix}");
+			if !state.tracks.contains_key(name.as_str()) {
+				return name;
+			}
+		}
 	}
 
 	/// Create a dynamic producer that handles on-demand track requests from consumers.
@@ -577,6 +616,10 @@ impl Producer {
 	/// new tracks are served, whether or not other producer clones are still alive.
 	/// Existing tracks stay readable so consumers can drain what they already have.
 	///
+	/// A name that was reserved or requested but never served resolves with
+	/// [`Error::NotFound`]: nothing can fill it now, so its subscribers fail rather
+	/// than waiting on a [`track::Info`] that is never coming.
+	///
 	/// Borrows rather than consumes, matching [`track::Producer::finish`]. Finishing
 	/// declares the end, so it must not depend on the caller also surrendering the
 	/// handle.
@@ -585,6 +628,10 @@ impl Producer {
 			let mut state = self.state.lock();
 			state.closing = true;
 			state.finished = true;
+			// A name that was reserved or requested but never served can't arrive now,
+			// and `Consumer::track` already answers `NotFound` for one asked about after
+			// this point. Say the same to whoever asked earlier.
+			state.reject_unserved(Error::NotFound);
 		}
 		// Ending the broadcast is what consumers wait on, so signal it here rather
 		// than leaving it to the last handle drop.
@@ -596,7 +643,8 @@ impl Producer {
 	/// Like [`finish`](Self::finish) the end is immediate, whether or not other
 	/// producer clones are still alive, and existing tracks stay readable so
 	/// consumers can drain what they already have (an abort does not cascade into
-	/// the tracks). Unlike a finish, consumers observe `err` from
+	/// the tracks), while a name nothing ever served resolves with `err` the same
+	/// way [`finish`](Self::finish) resolves it. Unlike a finish, consumers observe `err` from
 	/// [`Consumer::closed`], and an origin treats the source as ungracefully lost,
 	/// so the path may linger for a replacement (see
 	/// [`origin::Info::linger`](crate::origin::Info::linger)).
@@ -610,7 +658,10 @@ impl Producer {
 				return Err(Error::Closed);
 			}
 			state.closing = true;
-			state.abort = Some(err);
+			state.abort = Some(err.clone());
+			// Same as a finish: an unserved name is answerable now, with the reason the
+			// broadcast ended. Published tracks keep their cache (no cascade).
+			state.reject_unserved(err);
 		}
 		let _ = self.alive.token.close();
 		Ok(())
@@ -1005,6 +1056,14 @@ impl Consumer {
 			// created the track may have it now. Drop it so this request reaches a
 			// source again, exactly as the plain lookup below reclaims a closed
 			// entry. A *finished* one stays, since its cache is still readable.
+			//
+			// So a name, once finished, never comes back here: a publisher that
+			// finishes a track and publishes it again is serving new content, not
+			// resuming this one, and a subscriber has to re-read the catalog and
+			// re-initialize rather than be spliced onto it. Resuming the same
+			// content across routes is the transparent case, and that is what
+			// `resume::Producer` already does. Publish new content under a new
+			// name.
 			if spliced.tracks.get(name).is_some_and(|track| track.is_aborted()) {
 				spliced.tracks.remove(name);
 			}
@@ -1058,7 +1117,18 @@ impl Consumer {
 	}
 
 	/// A watch-only handle to the broadcast's demand. See [`Demand`].
-	pub(crate) fn demand(&self) -> Demand {
+	///
+	/// The consumer-side sibling of [`Producer::demand`], for a holder that has
+	/// only a read handle: a relay pulling a broadcast from upstream owns no
+	/// producer for it (the ingesting session does), yet the question it has to
+	/// answer is whether anything downstream is still reading. Holding this
+	/// handle, or the [`Consumer`] it came from, is not itself demand.
+	///
+	/// Two endings a caller has to tell apart. Demand going away is
+	/// [`Demand::unused`] resolving, and means nobody downstream is reading.
+	/// The broadcast going away is [`Error::Dropped`], and here that is the
+	/// upstream producer, not the readers.
+	pub fn demand(&self) -> Demand {
 		Demand {
 			alive: self.alive.weak(),
 			state: self.state.clone(),
@@ -1164,8 +1234,8 @@ impl super::WeakEntry for WeakConsumer {
 
 /// A cloneable, watch-only handle to a broadcast's subscriber demand.
 ///
-/// Obtained from [`Producer::demand`]; the broadcast-level sibling of
-/// [`track::Demand`](crate::track::Demand). Demand means live interest in the
+/// Obtained from [`Producer::demand`] or [`Consumer::demand`]; the broadcast-level
+/// sibling of [`track::Demand`](crate::track::Demand). Demand means live interest in the
 /// broadcast's content: a subscribed spliced track on a route-fed broadcast, or
 /// a pending track request / a consumed track on an ordinary one. A publisher
 /// uses it to run expensive work only while someone is watching, and routing
@@ -1250,6 +1320,57 @@ impl Consumer {
 mod test {
 	use super::*;
 
+	#[test]
+	fn unique_names_are_never_reused() {
+		let mut producer = Info::new().produce();
+		let name = producer.unique_name(".opus");
+		assert_eq!(name, "0.opus");
+		let track = producer.create_track(name.clone(), None).unwrap();
+		producer.remove_track(&name).unwrap();
+		assert_eq!(producer.unique_name(".opus"), "1.opus");
+		drop(track);
+	}
+
+	#[test]
+	fn unique_names_survive_closed_track_pruning() {
+		let mut producer = Info::new().produce();
+		let consumer = producer.consume();
+		let track = producer.unique_track(".opus", None).unwrap();
+		assert_eq!(track.name(), "0.opus");
+		drop(track);
+		assert!(matches!(consumer.track_inner("0.opus"), Err(Error::NotFound)));
+		assert_eq!(producer.unique_name(".opus"), "1.opus");
+	}
+
+	#[test]
+	fn unique_name_skips_a_live_collision() {
+		let mut producer = Info::new().produce();
+		let track = producer.create_track("0.opus", None).unwrap();
+		assert_eq!(producer.unique_name(".opus"), "1.opus");
+		drop(track);
+		assert_eq!(producer.unique_name(".opus"), "2.opus");
+	}
+
+	#[test]
+	fn unique_names_share_a_counter() {
+		let producer = Info::new().produce();
+		assert_eq!(producer.unique_name("-video"), "0-video");
+		assert_eq!(producer.clone().unique_name("-audio"), "1-audio");
+		assert_eq!(producer.unique_name("-video"), "2-video");
+	}
+
+	#[test]
+	fn unique_names_separate_numeric_suffixes() {
+		let producer = Info::new().produce();
+		assert_eq!(producer.unique_name(""), "0");
+		let name = producer.unique_name("2");
+		assert_eq!(name, "1-2");
+		for _ in 2..12 {
+			producer.unique_name("");
+		}
+		assert_eq!(producer.unique_name(""), "12");
+	}
+
 	/// Await with a timeout so a missed demand wake fails the test instead of
 	/// hanging it (time is paused, so the timeout fires instantly when idle).
 	async fn expect<T>(fut: impl Future<Output = T>) -> T {
@@ -1302,20 +1423,56 @@ mod test {
 		let producer = Producer::new_spliced(Info::new());
 		let consumer = producer.consume();
 		let demand = producer.demand();
+		// The read handle answers the same question, which is all a relay
+		// holding a pulled broadcast has.
+		let watched = consumer.demand();
 
 		assert!(!demand.is_used());
+		assert!(!watched.is_used());
 		let track = consumer.track("video").unwrap();
 		assert!(demand.is_used());
+		assert!(watched.is_used());
 
 		// Dropping the only consumer wakes a parked `unused`, even though the
-		// logical track itself stays cached in the broadcast.
-		let (unused, ()) = tokio::join!(expect(demand.unused()), async { drop(track) });
+		// logical track itself stays cached in the broadcast. Parked on the read
+		// handle: that edge is what tells a relay its pull has no readers left.
+		let (unused, ()) = tokio::join!(expect(watched.unused()), async { drop(track) });
 		unused.unwrap();
 		assert!(!demand.is_used());
+		assert!(!watched.is_used());
 
 		// A repeat consumer for the cached track counts again.
 		let _track = consumer.track("video").unwrap();
 		assert!(demand.is_used());
+	}
+
+	/// A read handle's demand reports the producer going away as `Dropped`,
+	/// distinct from its readers going away.
+	///
+	/// The distinction a relay has to act on: no readers means stop pulling,
+	/// while an upstream that vanished means the pull is over. Both arrive on
+	/// the same handle, so the two have to be told apart by their result rather
+	/// than by which one resolved.
+	#[tokio::test]
+	async fn a_read_handle_reports_a_dropped_producer_apart_from_lost_demand() {
+		let producer = Producer::new_spliced(Info::new());
+		let consumer = producer.consume();
+		let watched = consumer.demand();
+
+		let track = consumer.track("video").unwrap();
+		assert!(watched.is_used());
+
+		// Readers go, the broadcast stays: demand ends, and the handle keeps
+		// answering.
+		let (unused, ()) = tokio::join!(expect(watched.unused()), async { drop(track) });
+		unused.unwrap();
+
+		// The producer goes: the same handle now refuses rather than reporting
+		// no demand, which is what stops a relay retrying a pull that has no
+		// source left.
+		drop(producer);
+		assert!(matches!(watched.used().await, Err(Error::Dropped)));
+		assert!(matches!(watched.unused().await, Err(Error::Dropped)));
 	}
 
 	/// Subscribe and assert the result hasn't resolved yet (it stays pending until
@@ -1605,5 +1762,165 @@ mod test {
 		// Original handle is still live, so the request registers (stays pending)
 		// instead of failing with NotFound.
 		let _fut = subscribe_pending!(consumer, "track1");
+	}
+
+	/// A reserved name nobody accepts is the parking case a publisher has to be able to
+	/// end. Ending the broadcast is where it does: `Consumer::track` already answers
+	/// `NotFound` for a name asked about after this point, so whoever asked earlier gets
+	/// the same answer instead of waiting on info that can never arrive.
+	#[tokio::test]
+	async fn finish_resolves_a_reserved_name() {
+		let mut producer = Info::new().produce();
+		let consumer = producer.consume();
+
+		let _request = producer.reserve_track("track1").unwrap();
+		let pending = subscribe_pending!(consumer, "track1");
+
+		producer.finish();
+		assert!(matches!(pending.await, Err(Error::NotFound)));
+	}
+
+	/// An abort says why the broadcast ended, and an unserved name resolves with that
+	/// reason rather than a generic failure.
+	#[tokio::test]
+	async fn abort_resolves_a_reserved_name_with_its_reason() {
+		let mut producer = Info::new().produce();
+		let consumer = producer.consume();
+
+		let request = producer.reserve_track("track1").unwrap();
+		let pending = subscribe_pending!(consumer, "track1");
+
+		producer.abort(Error::Cancel).unwrap();
+		assert!(matches!(pending.await, Err(Error::Cancel)));
+
+		let track = request.accept(None);
+		let mut subscriber = track.subscribe(None);
+		assert!(matches!(subscriber.recv_group().await, Err(Error::Cancel)));
+	}
+
+	/// A request still queued for a handler is the same parking case reached from the
+	/// consumer side, so it ends the same way.
+	#[tokio::test]
+	async fn finish_resolves_a_queued_request() {
+		let mut producer = Info::new().produce();
+		let dynamic = producer.dynamic();
+		let consumer = dynamic.consume();
+
+		let pending = subscribe_pending!(consumer, "track1");
+
+		producer.finish();
+		assert!(matches!(pending.await, Err(Error::NotFound)));
+		drop(dynamic);
+	}
+
+	/// A request a handler already took parks the same way if the handler never answers
+	/// it, so the sweep has to reach that one too.
+	#[tokio::test]
+	async fn finish_resolves_a_request_a_handler_never_answered() {
+		let mut producer = Info::new().produce();
+		let mut dynamic = producer.dynamic();
+		let consumer = dynamic.consume();
+
+		let pending = subscribe_pending!(consumer, "track1");
+		let _request = dynamic.requested_track().await.unwrap();
+
+		producer.finish();
+		assert!(matches!(pending.await, Err(Error::NotFound)));
+		drop(dynamic);
+	}
+
+	/// A reverse fetch can install the track metadata before the live request is
+	/// accepted, but it does not create a live publisher. Finishing the broadcast
+	/// must still reject that name so an arrival-order subscriber does not park on
+	/// backfill that is deliberately absent from its queue.
+	#[tokio::test]
+	async fn finish_resolves_an_unaccepted_track_with_fetched_info() {
+		let mut producer = Info::new().produce();
+		let consumer = producer.consume();
+
+		let request = producer.reserve_track("track1").unwrap();
+		let dynamic = request.dynamic();
+		let track = consumer.track("track1").unwrap();
+		let pending_fetch = track.fetch_group(0, None);
+		let fetch = dynamic.requested_group().await.unwrap();
+		let mut group = fetch.accept(None).unwrap();
+		group.finish().unwrap();
+		pending_fetch.await.unwrap();
+
+		let mut subscriber = track.subscribe(None).await.unwrap();
+		producer.finish();
+		assert!(matches!(subscriber.recv_group().await, Err(Error::NotFound)));
+
+		let mut stale = request.accept(None);
+		assert!(stale.append_group().is_err());
+	}
+
+	/// Ending the broadcast doesn't cascade into a track someone is publishing: it keeps
+	/// its cache and its publisher decides when it ends.
+	#[tokio::test]
+	async fn finish_spares_a_served_track() {
+		let mut producer = Info::new().produce();
+		let consumer = producer.consume();
+
+		let mut track = producer.create_track("track1", None).unwrap();
+		let mut subscriber = consumer.track("track1").unwrap().subscribe(None).await.unwrap();
+
+		producer.finish();
+
+		track.append_group().unwrap();
+		subscriber.assert_group();
+		track.finish().unwrap();
+	}
+
+	/// The publisher may still be holding the `track::Request` for a name the broadcast
+	/// just gave up on. Accepting it afterwards must not resurrect the track, or a
+	/// subscriber that was told `NotFound` could be contradicted by a later one.
+	#[tokio::test]
+	async fn finish_leaves_a_stale_reservation_inert() {
+		let mut producer = Info::new().produce();
+		let consumer = producer.consume();
+
+		let request = producer.reserve_track("track1").unwrap();
+		let pending = subscribe_pending!(consumer, "track1");
+
+		producer.finish();
+		assert!(matches!(pending.await, Err(Error::NotFound)));
+
+		let mut track = request.accept(None);
+		assert!(track.append_group().is_err());
+		let mut subscriber = track.subscribe(None);
+		assert!(matches!(subscriber.recv_group().await, Err(Error::NotFound)));
+		assert!(consumer.track("track1").is_err());
+	}
+
+	/// Dropping a `track::Request` is not a verdict about the name, so it resolves as
+	/// `Dropped` (a handler lost to a crashed publisher or a dead transport), never as
+	/// `NotFound`. Only an explicit rejection may claim the track is absent.
+	#[tokio::test]
+	async fn dropping_a_reserved_request_resolves_dropped() {
+		let mut producer = Info::new().produce();
+		let consumer = producer.consume();
+
+		let request = producer.reserve_track("track1").unwrap();
+		let pending = subscribe_pending!(consumer, "track1");
+
+		drop(request);
+		assert!(matches!(pending.await, Err(Error::Dropped)));
+		producer.finish();
+	}
+
+	/// `track::Request::reject` carries its reason the same way, which is what lets a
+	/// subscriber tell "no such track" from "the publisher went away".
+	#[tokio::test]
+	async fn rejecting_a_reserved_request_carries_the_reason() {
+		let mut producer = Info::new().produce();
+		let consumer = producer.consume();
+
+		let request = producer.reserve_track("track1").unwrap();
+		let pending = subscribe_pending!(consumer, "track1");
+
+		request.reject(Error::NotFound);
+		assert!(matches!(pending.await, Err(Error::NotFound)));
+		producer.finish();
 	}
 }

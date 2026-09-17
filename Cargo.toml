@@ -17,8 +17,10 @@ members = [
     "rs/moq-mux",
     "rs/moq-native",
     "rs/moq-net",
+    "rs/moq-net/fuzz",
     "rs/moq-nvenc",
     "rs/moq-relay",
+    "rs/moq-room",
     "rs/moq-rtc",
     "rs/moq-rtmp",
     "rs/moq-srt",
@@ -50,6 +52,7 @@ default-members = [
     "rs/moq-native",
     "rs/moq-nvenc",
     "rs/moq-relay",
+    "rs/moq-room",
     "rs/moq-rtc",
     "rs/moq-rtmp",
     "rs/moq-srt",
@@ -62,6 +65,10 @@ default-members = [
     "rs/quest",
 ]
 resolver = "2"
+
+[workspace.metadata.cargo-shear]
+# Feature-only dependency selecting the wasm_js backend for browser consumers.
+ignored = ["getrandom"]
 
 [workspace.package]
 # Floor for the library surface: iroh 1.0 (via moq-native) needs 1.91. This is
@@ -91,12 +98,12 @@ dispatch2 = "0.3.1"
 flate2 = "1.1"
 futures = "0.3"
 getrandom = { version = "0.4", features = ["wasm_js"] }
-hang = { version = "0.20.7", path = "rs/hang" }
+hang = { version = "0.20.13", path = "rs/hang" }
 hex = "0.4"
 humantime = "2.3"
 humantime-serde = "1.1"
 jsonwebtoken = "11"
-kio = { version = "0.5.6", path = "rs/kio" }
+kio = { version = "0.5.9", path = "rs/kio" }
 lazy_static = "1.5"
 libc = "0.2"
 libloading = "0.9"
@@ -104,40 +111,40 @@ linux-raw-sys = { version = "0.12.1", features = ["ioctl"] }
 # Permutation testing for the kio primitives (and everything built on them).
 # Only compiled under `--cfg loom`; see `just rs loom`.
 loom = { version = "0.7.2", features = ["futures"] }
-moq-audio = { version = "0.0.20", path = "rs/moq-audio" }
-moq-flate = { version = "0.1.1", path = "rs/moq-flate" }
-moq-hls = { version = "0.4.11", path = "rs/moq-hls", default-features = false }
-moq-json = { version = "0.3.6", path = "rs/moq-json" }
-moq-loc = { version = "0.2.2", path = "rs/moq-loc" }
-moq-msf = { version = "0.4.1", path = "rs/moq-msf" }
-moq-mux = { version = "0.9.10", path = "rs/moq-mux" }
-moq-native = { version = "0.19.14", path = "rs/moq-native", default-features = false }
-moq-net = { version = "0.2.15", path = "rs/moq-net" }
+moq-audio = { version = "0.0.25", path = "rs/moq-audio", default-features = false }
+moq-flate = { version = "0.1.2", path = "rs/moq-flate" }
+moq-hls = { version = "0.4.16", path = "rs/moq-hls", default-features = false }
+moq-json = { version = "0.3.12", path = "rs/moq-json" }
+moq-loc = { version = "0.2.8", path = "rs/moq-loc" }
+moq-msf = { version = "0.4.2", path = "rs/moq-msf" }
+moq-mux = { version = "0.9.16", path = "rs/moq-mux" }
+moq-native = { version = "0.19.19", path = "rs/moq-native", default-features = false }
+moq-net = { version = "0.2.22", path = "rs/moq-net" }
 # NVENC bindings, forked from ViliamVadocz/nvidia-video-codec-sdk to dlopen the
 # driver at runtime. Compiles on any platform (macOS included) but only actually
 # used by moq-video on Linux.
-moq-nvenc = { version = "0.0.3", path = "rs/moq-nvenc" }
-moq-rtc = { version = "0.2.6", path = "rs/moq-rtc" }
-moq-rtmp = { version = "0.2.6", path = "rs/moq-rtmp" }
-moq-srt = { version = "0.2.6", path = "rs/moq-srt" }
-moq-stats = { version = "0.1.6", path = "rs/moq-stats" }
-moq-token = { version = "0.7.2", path = "rs/moq-token" }
-moq-token-cli = { version = "0.5.45", path = "rs/moq-token-cli" }
+moq-nvenc = { version = "0.0.5", path = "rs/moq-nvenc" }
+moq-rtc = { version = "0.2.11", path = "rs/moq-rtc" }
+moq-rtmp = { version = "0.2.11", path = "rs/moq-rtmp" }
+moq-srt = { version = "0.2.11", path = "rs/moq-srt" }
+moq-stats = { version = "0.1.11", path = "rs/moq-stats" }
+moq-token = { version = "0.7.4", path = "rs/moq-token" }
+moq-token-cli = { version = "0.5.48", path = "rs/moq-token-cli" }
 # default-features off (the NVIDIA hardware codecs) on moq-transcode and
 # moq-video so each consumer opts in. Binaries enable them, but a self-compiler
 # can leave them off to drop the CUDA dependencies. Both crates still default
-# them on when depended on directly. VAAPI is opt-in everywhere, since that
-# backend has never been validated on real hardware.
-moq-transcode = { version = "0.0.14", path = "rs/moq-transcode", default-features = false }
+# them on when depended on directly. VAAPI is opt-in everywhere; its decoder is
+# hardware-validated, while its encoder is not yet.
+moq-transcode = { version = "0.0.19", path = "rs/moq-transcode", default-features = false }
 # Standalone crate (moq-dev/vaapi); vendored from cros-libva + cros-codecs.
 # dlopen's libva at runtime (no libva-dev at build, no NEEDED libva in the binary).
-moq-vaapi = "0.0.3"
+moq-vaapi = "0.0.4"
 # `default-features = false` is here for `capture` (V4L2, libclang), which the
 # cross-compiled Python, Swift, Kotlin, and Go builds have no use for: adding
 # `features = ["capture"]` to a consumer that ships in those bindings pulls the
 # whole device graph into every one of them. The NVIDIA codecs are not part of
 # that argument, so moq-ffi and libmoq opt them back in by name.
-moq-video = { version = "0.0.20", path = "rs/moq-video", default-features = false }
+moq-video = { version = "0.0.25", path = "rs/moq-video", default-features = false }
 num_enum = "0.7"
 objc2 = "0.6.4"
 objc2-av-foundation = "0.3.2"
@@ -175,10 +182,17 @@ web-transport-iroh = "0.7"
 # Keep the `qlog` passthrough feature available for moq-native to forward.
 web-transport-noq = { version = "0.3.0", default-features = false }
 web-transport-proto = "0.6"
-web-transport-quiche = "0.6"
+web-transport-quiche = "0.7"
 web-transport-quinn = "0.12"
 web-transport-trait = "0.4.0"
-web-transport-wasm = "0.5"
+web-transport-wasm = "0.6"
+x11rb = { version = "0.14.0", features = ["randr", "xfixes"] }
+
+[patch.crates-io]
+# web-transport-quinn and web-transport-iroh depend on kio from crates.io. Without
+# this, the lock carries a second kio whose pin drifts behind the member, and the
+# next publish that reaches both fails to resolve a single version (#3551).
+kio = { path = "rs/kio" }
 
 [profile.dev]
 panic = "abort"
@@ -205,6 +219,35 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.rsa]
+opt-level = 3
+
+# Same for the sonora echo canceller. Its hot loops are `core::arch` NEON/SSE
+# intrinsics, which at opt-level 0 compile to out-of-line calls carrying the
+# debug UB preconditions of `read_unaligned` and `copy_nonoverlapping`: a
+# profile of `aec::tests::survives_a_moving_echo_delay` spends 65% of its
+# samples in those checks and intrinsic shims and only 20% in sonora's own
+# arithmetic. Unoptimized, cancelling 15 seconds of audio costs 12 seconds of
+# CPU, which is slower than the realtime callback this runs in and leaves the
+# test no headroom under the nextest timeout.
+[profile.dev.package.sonora]
+opt-level = 3
+
+[profile.dev.package.sonora-aec3]
+opt-level = 3
+
+[profile.dev.package.sonora-agc2]
+opt-level = 3
+
+[profile.dev.package.sonora-common-audio]
+opt-level = 3
+
+[profile.dev.package.sonora-fft]
+opt-level = 3
+
+[profile.dev.package.sonora-ns]
+opt-level = 3
+
+[profile.dev.package.sonora-simd]
 opt-level = 3
 
 [profile.release]

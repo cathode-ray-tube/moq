@@ -12,18 +12,15 @@ its verdict lands and the follow-on work becomes concrete.
 
 ## Quests
 
-- [Embedded video](/quest/m3/video-embedded.md) - V4L2 M2M codecs and EGL import, so moq-video works on a Pi
+- [Embedded video](/quest/m3/video-embedded.md) - EGL import in the renderer, so moq-video presents on a Pi
+- [Decoder drain](/quest/m3/decode-drain.md) - flush and finish for pipelined decoders, so no picture is lost at a track end or crosses a group boundary
 - [#2819](/quest/m3/2819-moq-video-carry-pipewire-dma-bufs-safely-into-the-vulkan.md) - moq-video: carry PipeWire DMA-BUFs safely into the Vulkan renderer
 - [#2893](/quest/m3/2893-video-validate-pipewire-dma-buf-capture-on-kde-hardware.md) - video: validate PipeWire DMA-BUF capture on KDE hardware
-- [#3100](/quest/m3/3100-dart-flutter-bindings-via-uniffi.md) - Dart/Flutter bindings via UniFFI
 - [Video hardware validation](/quest/m3/video-hardware.md) - run the encode, capture, and zero-copy paths that were written but never run on real machines
-- [QUIC backend bakeoff](/quest/m3/quic-backend-bakeoff.md) - choose the custom-QUIC foundation by scored measurement
 - [Multipath spike](/quest/m3/multipath-spike.md) - whether bonded contribution over multipath QUIC is worth building, given it needs noq on both ends
-- [Quiche GCC](/quest/m3/quiche-gcc.md) - a measured verdict on delay-based congestion control for media egress
-- [Quiche FEC](/quest/m3/quiche-fec.md) - a measured verdict on transport-level FEC vs retransmission
-- [SEI delivery](/quest/m3/sei-delivery.md) - prove a sidecar can reach a live stitcher before video; a no-go keeps SEI in-band
+- [QUIC GCC](/quest/m3/quic-gcc.md) - a measured verdict on delay-based congestion control for media egress
+- [QUIC FEC](/quest/m3/quic-fec.md) - a measured verdict on transport-level FEC vs retransmission
 - [GOP overhead](/quest/m3/gop-overhead.md) - price the I-frames a short GOP pays for, deciding whether a long GOP plus a keyframe request is worth designing
-- [#697](/quest/m3/697-conferencing-demo.md) - Conferencing Demo
 - [#703](/quest/m3/703-experimental-webgpu-renderer.md) - Experimental WebGPU renderer
 - [#823](/quest/m3/823-svc-support.md) - SVC support?
 - [#1838](/quest/m3/1838-tr-101-290-monitoring-requirements-broadcast-contribution.md) - TR 101 290 monitoring: requirements (broadcast/contribution health metrics)
@@ -32,3 +29,4 @@ its verdict lands and the follow-on work becomes concrete.
 - [Carrier voice](/quest/m3/carrier-voice/README.md) - determine whether MoQ should be the call fabric for programmable carrier voice
 - [LiveKit WebRTC bridge](/quest/m3/livekit-webrtc-bridge.md) - a go/no-go verdict, backed by a spike, on per-track LiveKit-to-MoQ bridging
 - [Vision worker](/quest/m3/processor-vision.md) - a documented customer-run vision worker proves the processor contract
+- [Common Access Tokens](/quest/m3/cat/README.md) - a moq-transport client presents a CAT in SETUP and `moq auth serve` admits it with the scope its `moqt` claim names

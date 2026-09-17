@@ -90,6 +90,37 @@ impl Status {
 	}
 }
 
+/// Convert only transport metrics actually supplied by the active backend into the public property.
+fn connection_stats_structure(stats: moq_net::ConnectionStats) -> gst::Structure {
+	let mut structure = gst::Structure::new_empty("moq-connection-stats");
+	if let Some(rtt) = stats.rtt {
+		structure.set("rtt-us", u64::try_from(rtt.as_micros()).unwrap_or(u64::MAX));
+	}
+	for (name, value) in [
+		("estimated-send-rate-bps", stats.estimated_send_rate),
+		("estimated-recv-rate-bps", stats.estimated_recv_rate),
+		("bytes-sent", stats.bytes_sent),
+		("bytes-received", stats.bytes_received),
+		("bytes-lost", stats.bytes_lost),
+		("packets-sent", stats.packets_sent),
+		("packets-received", stats.packets_received),
+		("packets-lost", stats.packets_lost),
+	] {
+		if let Some(value) = value {
+			structure.set(name, value);
+		}
+	}
+	structure
+}
+
+/// One coherent readout of both presence counters, so `started - ended` never mixes two samples.
+pub(super) fn sessions_structure(presence: moq_net::stats::Presence) -> gst::Structure {
+	gst::Structure::builder("moq-sessions")
+		.field("started", presence.sessions)
+		.field("ended", presence.sessions_closed)
+		.build()
+}
+
 /// The connection settings, validated out of the GObject properties.
 #[derive(Clone)]
 pub struct ResolvedSettings {
@@ -209,6 +240,7 @@ pub(crate) struct Session {
 	/// The live recv-bitrate estimate, tracked across reconnects by the reconnect loop. Read directly
 	/// by the `estimated-recv-bitrate` getter.
 	recv_bandwidth: moq_net::bandwidth::Consumer,
+	connection_stats: moq_native::ConnectionStatsReader,
 	/// This publication's completion. The task moves it to `Failed` on a fatal transport error, so the
 	/// pad streaming threads stop feeding a dead session without consulting the element.
 	completion: CompletionHandle,
@@ -252,6 +284,7 @@ impl Session {
 		// Persistent handles that survive reconnects; the getters read them without touching the loop.
 		let send_bandwidth = reconnect.send_bandwidth();
 		let recv_bandwidth = reconnect.recv_bandwidth();
+		let connection_stats = reconnect.stats();
 
 		// The task is spawned parked. An immediate auth rejection would otherwise race the element
 		// installing this session, and its bus error would be discarded for belonging to no live one.
@@ -271,6 +304,7 @@ impl Session {
 				status,
 				send_bandwidth,
 				recv_bandwidth,
+				connection_stats,
 				completion,
 			},
 			SessionRegistration { gate },
@@ -292,6 +326,16 @@ impl Session {
 	/// The estimated receive bitrate in bits per second, 0 when disconnected or unavailable.
 	pub fn recv_bitrate(&self) -> u64 {
 		self.recv_bandwidth.peek().unwrap_or(0)
+	}
+
+	/// Snapshot the current connection statistics, or None while disconnected.
+	pub fn connection_stats(&self) -> Option<gst::Structure> {
+		self.connection_stats.stats().map(connection_stats_structure)
+	}
+
+	/// Cumulative connects and disconnects recorded by the reconnect loop.
+	pub fn presence(&self) -> moq_net::stats::Presence {
+		self.connection_stats.presence()
 	}
 
 	/// Share this publication's completion with a pad's buffer path.
@@ -319,8 +363,9 @@ impl Drop for Session {
 /// status/version into the `Status` the getters read, and watches the persistent bandwidth consumers
 /// only to `notify` the bitrate properties (the getters read the estimates directly). Each source is
 /// notified on its own change: a status edge notifies `status`/`connected`/`moq-version` together, a
-/// bitrate change notifies just that bitrate. The loop stops only on a terminal error (a non-retryable
-/// auth failure, or a bounded backoff's give-up), which the `Err` arm posts as a bus error.
+/// presence change notifies `sessions` and `connection-stats`, and a bitrate change notifies just that
+/// bitrate. The loop stops only on a terminal error (a non-retryable auth failure, or a bounded backoff's
+/// give-up), which the `Err` arm posts as a bus error.
 /// [`Session`]'s `Drop` aborts this task, which drops the `Reconnect` handle and quietly tears the loop
 /// down.
 async fn forward(
@@ -356,6 +401,7 @@ async fn forward_registered(
 	// Persistent across reconnects; watched only to fire property notifications.
 	let mut send_bandwidth = reconnect.send_bandwidth();
 	let mut recv_bandwidth = reconnect.recv_bandwidth();
+	let mut connection_stats = reconnect.stats();
 
 	loop {
 		tokio::select! {
@@ -375,7 +421,7 @@ async fn forward_registered(
 						moq_native::Status::Disconnected => gst::warning!(CAT, "session disconnected, reconnecting"),
 						_ => {}
 					}
-					notify(&element, &["status", "connected", "moq-version"]);
+					notify(&element, &["status", "connected", "moq-version", "connection-stats"]);
 				}
 				Err(err) => {
 					// The reconnect loop stopped on a terminal error (a non-retryable auth failure, or a
@@ -383,7 +429,7 @@ async fn forward_registered(
 					// dead session; losing that race means it already ended, so there is nothing to report.
 					let won = completion.fail();
 					status.set(ConnectionStatus::Failed, None);
-					notify(&element, &["status", "connected", "moq-version"]);
+					notify(&element, &["status", "connected", "moq-version", "connection-stats", "sessions"]);
 					if won && let Some(obj) = element.upgrade() {
 						obj.imp().post_session_error(&completion, format!("{err:?}"));
 					}
@@ -402,13 +448,23 @@ async fn forward_registered(
 					Ok(_) => notify(&element, &["estimated-recv-bitrate"]),
 					Err(_) => return,
 				},
+			result = connection_stats.presence_changed() => match result {
+				Ok(_) => {
+					// A flap that lands back on the reported status (Connected -> Disconnected ->
+					// Connected) never wakes the status arm above, so refresh the cached version
+					// here or moq-version would keep the previous session's value.
+					status.set(status.status(), reconnect.version().map(|v| v.to_string()));
+					notify(&element, &["sessions", "connection-stats", "moq-version"]);
+				}
+				Err(_) => return,
+			},
 		}
 	}
 }
 
 /// Emit a GObject `notify` for each named property, on the connect/disconnect/bitrate edges, never per
 /// sample.
-fn notify(element: &glib::WeakRef<Element>, props: &[&str]) {
+pub(super) fn notify(element: &glib::WeakRef<Element>, props: &[&str]) {
 	if let Some(obj) = element.upgrade() {
 		for prop in props {
 			obj.notify(prop);
@@ -419,6 +475,32 @@ fn notify(element: &glib::WeakRef<Element>, props: &[&str]) {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn connection_stats_preserve_unavailable_separately_from_zero() {
+		gst::init().unwrap();
+		let mut stats = moq_net::ConnectionStats::default();
+		stats.rtt = Some(std::time::Duration::ZERO);
+		stats.bytes_sent = Some(0);
+		stats.packets_lost = Some(7);
+		let structure = connection_stats_structure(stats);
+		assert_eq!(structure.get::<u64>("rtt-us"), Ok(0));
+		assert_eq!(structure.get::<u64>("bytes-sent"), Ok(0));
+		assert_eq!(structure.get::<u64>("packets-lost"), Ok(7));
+		assert!(!structure.has_field("bytes-received"));
+	}
+
+	#[test]
+	fn sessions_structure_reads_both_counters_together() {
+		gst::init().unwrap();
+		let mut presence = moq_net::stats::Presence::default();
+		presence.sessions = 3;
+		presence.sessions_closed = 2;
+		let structure = sessions_structure(presence);
+		assert_eq!(structure.name(), "moq-sessions");
+		assert_eq!(structure.get::<u64>("started"), Ok(3));
+		assert_eq!(structure.get::<u64>("ended"), Ok(2));
+	}
 
 	#[tokio::test]
 	async fn a_terminal_result_waits_until_the_session_is_registered() {

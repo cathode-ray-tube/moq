@@ -22,9 +22,10 @@ just test wasm --timeout 60
 ```
 
 Everything is built from this checkout: `just wasm` for the bindings, `cargo
-build -p moq-relay` for the relay. `WASM_PORT` moves the relay ports (three
-consecutive, from 4460), `WASM_PROFILE` picks the relay's cargo profile, and
-`RELAY_BIN` points at a prebuilt relay instead.
+build -p moq-relay` for the relay. Each relay reserves its own port (see
+[the harness contract](../README.md)); `WASM_PORT` pins the first one instead.
+`WASM_PROFILE` picks the relay's cargo profile, and `RELAY_BIN` points at a
+prebuilt relay instead.
 
 ## Shape
 
@@ -90,3 +91,13 @@ would land green under the same marker.
 The publish direction: `moq-wasm` binds the consume path only. When
 [#2814](https://github.com/moq-dev/moq/pull/2814) lands, the fixture publisher
 here becomes a second wasm session and the interop runs both ways.
+
+Firefox. Playwright can launch it and it opens WebTransport sessions here, but
+it ships no `WebTransport.prototype.protocol`, so it cannot request or read a
+subprotocol. Run against Firefox 153, the `lite` relay negotiates `moq-lite-02`
+over SETUP instead of `moq-lite-05` and the `ietf` relay rejects the connection
+outright: four of the nine cases fail, including the version-negotiation case
+this harness exists for. There is nothing left to assert about negotiation, so
+Firefox joins the matrix when Gecko implements the subprotocol, not before.
+`@moq/net` sidesteps this in the browser by routing Firefox below 153 to
+WebSocket; `@moq/wasm` has no such fallback.

@@ -243,6 +243,7 @@ impl Web {
 			// Dual-stack so the cert endpoint + WebSocket fallback answer over IPv4
 			// too, even on Windows where `[::]` is IPv6-only by default.
 			let listener = moq_native::bind::tcp(listen).context("failed to bind HTTP listener")?;
+			log_bound("http", &listener);
 			// Same socket capture the HTTPS path gets from `MtlsAcceptor`: without it
 			// a `ws://` session reaches qmux with no descriptor and reports no RTT.
 			let server =
@@ -271,6 +272,7 @@ impl Web {
 				ws: config.ws,
 			};
 			let listener = moq_native::bind::tcp(listen).context("failed to bind HTTPS listener")?;
+			log_bound("https", &listener);
 			let server = crate::listener::server(listener, self.health.clone())?.acceptor(acceptor);
 			Some(server.serve(app))
 		} else {
@@ -292,6 +294,20 @@ impl Web {
 	pub async fn run(self) -> anyhow::Result<()> {
 		let app = self.routes();
 		self.serve(app).await
+	}
+}
+
+/// Log the address a web listener actually bound, matching the QUIC `listening`
+/// line in [`Relay::load`](crate::Relay::load).
+///
+/// The configured address is not the bound one when the port is 0, and the TCP
+/// port is chosen independently of the QUIC port, so without this the only way to
+/// learn where the relay is serving HTTP is to already know. Best-effort: a
+/// `local_addr` that fails is a diagnostic, never a reason to refuse to serve.
+fn log_bound(kind: &str, listener: &std::net::TcpListener) {
+	match listener.local_addr() {
+		Ok(addr) => tracing::info!(%addr, kind, "listening"),
+		Err(err) => tracing::warn!(%err, kind, "could not resolve the bound address"),
 	}
 }
 
@@ -572,8 +588,12 @@ async fn serve_health() -> Response {
 }
 
 async fn serve_fingerprint(State(state): State<Arc<WebState>>) -> Response {
-	// Get the first certificate's fingerprint.
-	// TODO serve all of them so we can support multiple signature algorithms.
+	// The first certificate in configuration order, deliberately. The endpoint
+	// exists so an `http://` client can pin a self-signed development
+	// certificate, where there is exactly one. With several configured there is
+	// no single answer: quinn and noq select by SNI at handshake, so those
+	// clients use `https://`, while quiche serves the first pair to everyone and
+	// the rest need an explicit `--client-tls-fingerprint` pin.
 	match state.certificates.fingerprints().into_iter().next() {
 		Some(fingerprint) => fingerprint.into_response(),
 		// A stream-only relay has no certificate to pin.

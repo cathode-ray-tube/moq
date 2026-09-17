@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.12](https://github.com/moq-dev/moq/compare/moq-json-v0.3.11...moq-json-v0.3.12) - 2026-09-17
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.3.11](https://github.com/moq-dev/moq/compare/moq-json-v0.3.10...moq-json-v0.3.11) - 2026-09-13
+
+### Other
+
+- updated the following local packages: kio, moq-net
+
+## [0.3.10](https://github.com/moq-dev/moq/compare/moq-json-v0.3.9...moq-json-v0.3.10) - 2026-09-09
+
+### Other
+
+- updated the following local packages: kio, moq-net
+
+## [0.3.9](https://github.com/moq-dev/moq/compare/moq-json-v0.3.8...moq-json-v0.3.9) - 2026-09-02
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.3.8](https://github.com/moq-dev/moq/compare/moq-json-v0.3.7...moq-json-v0.3.8) - 2026-09-01
+
+### Other
+
+- *(rs)* simplify poll propagation ([#3307](https://github.com/moq-dev/moq/pull/3307))
+
+## [0.3.7](https://github.com/moq-dev/moq/compare/moq-json-v0.3.6...moq-json-v0.3.7) - 2026-09-01
+
+### Added
+
+- *(json)* add a sliding-window mode ([#3168](https://github.com/moq-dev/moq/pull/3168))
+
+### Other
+
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
 ## [0.3.6](https://github.com/moq-dev/moq/compare/moq-json-v0.3.5...moq-json-v0.3.6) - 2026-08-26
 
 ### Other

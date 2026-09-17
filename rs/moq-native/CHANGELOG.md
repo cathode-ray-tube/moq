@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.19](https://github.com/moq-dev/moq/compare/moq-native-v0.19.18...moq-native-v0.19.19) - 2026-09-17
+
+### Added
+
+- *(moq-gst)* expose connection statistics ([#3679](https://github.com/moq-dev/moq/pull/3679))
+
+## [0.19.18](https://github.com/moq-dev/moq/compare/moq-native-v0.19.17...moq-native-v0.19.18) - 2026-09-13
+
+### Added
+
+- *(moq-native)* expose the dialed authority on Request, including raw QUIC ([#3618](https://github.com/moq-dev/moq/pull/3618))
+- *(moq-net)* add moq-transport draft-21 (moqt-21) ([#3574](https://github.com/moq-dev/moq/pull/3574))
+
+## [0.19.17](https://github.com/moq-dev/moq/compare/moq-native-v0.19.16...moq-native-v0.19.17) - 2026-09-09
+
+### Added
+
+- *(obs)* add connection stats and encoding controls to the MoQ dock ([#3453](https://github.com/moq-dev/moq/pull/3453))
+- *(moq-net)* stitch a draft-20 fill into the group it joined ([#3325](https://github.com/moq-dev/moq/pull/3325))
+
+### Fixed
+
+- *(native)* default noq and iroh to BBRv3 now that noq 1.2.0 lands the loss fix ([#3536](https://github.com/moq-dev/moq/pull/3536))
+- *(moq-native)* stop logging credentials in relay URLs and RTMP stream keys ([#3379](https://github.com/moq-dev/moq/pull/3379))
+
+### Other
+
+- *(deps)* bump the cargo group across 1 directory with 5 updates ([#3395](https://github.com/moq-dev/moq/pull/3395))
+
+## [0.19.16](https://github.com/moq-dev/moq/compare/moq-native-v0.19.15...moq-native-v0.19.16) - 2026-09-02
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.19.15](https://github.com/moq-dev/moq/compare/moq-native-v0.19.14...moq-native-v0.19.15) - 2026-09-01
+
+### Added
+
+- *(moq-net)* add moq-transport draft-20 (moqt-20) ([#3255](https://github.com/moq-dev/moq/pull/3255))
+
+### Fixed
+
+- *(native)* make heap profiling signals safe ([#3216](https://github.com/moq-dev/moq/pull/3216))
+- *(native)* remove deadlock detection ([#3166](https://github.com/moq-dev/moq/pull/3166))
+- *(cli)* serve TCP and Unix listeners without QUIC ([#3149](https://github.com/moq-dev/moq/pull/3149))
+
+### Other
+
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
 ## [0.19.14](https://github.com/moq-dev/moq/compare/moq-native-v0.19.13...moq-native-v0.19.14) - 2026-08-26
 
 ### Fixed

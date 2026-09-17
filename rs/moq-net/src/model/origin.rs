@@ -643,17 +643,21 @@ impl Drop for ExclusionGuard {
 
 /// How a path resolves against the announce tree for one consumer.
 ///
-/// `Excluded` is deliberately not folded into `Missing`: they mean opposite
-/// things to a caller holding a dynamic handler. Missing is "nobody here, go
-/// ask"; excluded is "here, but not for you", and asking a handler to route it
-/// anyway is how a split-horizon violation gets in through the back door.
+/// Neither `Excluded` nor `OutOfScope` is folded into `Missing`. Missing is
+/// "nobody here, go ask"; both of the others are "not for you", and asking a
+/// handler to route one anyway is how a split-horizon violation, or a scope
+/// bypass, gets in through the back door.
 enum Resolved {
 	/// A broadcast this consumer may read: the shared front, or a single source
 	/// pinned because the front holds a route back through the requester.
 	Found(broadcast::Consumer),
 	/// The path is live, but every route to it flows through the requester.
 	Excluded,
-	/// Nothing is published at the path, or it is outside the consumer's scope.
+	/// The path is outside the consumer's scope, whether or not anything is
+	/// published there. Distinct from `Missing` because the difference is about
+	/// the asker rather than the tree: see [`Consumer::request_broadcast`].
+	OutOfScope,
+	/// Nothing is published at the path.
 	Missing,
 }
 
@@ -661,6 +665,12 @@ struct OriginNode {
 	// The origin-owned broadcast published at this node, if any (see
 	// [`Producer::create_broadcast`]).
 	broadcast: Option<OriginBroadcast>,
+
+	// Sources whose lifecycle task is running at this node, counted from
+	// [`Producer::create_broadcast`] rather than from the attach. Keeps the node in
+	// the tree across the window where it holds nothing yet (see
+	// [`SourceReservation`]).
+	sources: usize,
 
 	// Nested nodes, one level down the tree.
 	nested: HashMap<String, Lock<OriginNode>>,
@@ -673,6 +683,7 @@ impl OriginNode {
 	fn new(parent: Option<Lock<NotifyNode>>) -> Self {
 		Self {
 			broadcast: None,
+			sources: 0,
 			nested: HashMap::new(),
 			notify: Lock::new(NotifyNode::new(parent)),
 		}
@@ -714,6 +725,23 @@ impl OriginNode {
 		} else {
 			notify.unannounce(&path);
 		}
+	}
+
+	/// Register `id` at `relative`, creating the nodes on the way down.
+	///
+	/// Descends under the caller's lock rather than resolving the node and locking
+	/// it separately: an empty node can be pruned the instant the tree lock is
+	/// released, so a two-step register would land in an orphan and then panic in
+	/// [`Self::detach`], which would find no node to unregister from.
+	fn consume_at(&mut self, id: ConsumerId, notify: AnnounceConsumerNotify, relative: impl AsPath) {
+		let relative = relative.as_path();
+
+		let Some((dir, relative)) = relative.next_part() else {
+			return self.consume(id, notify);
+		};
+
+		let nested = self.entry(dir);
+		nested.lock().consume_at(id, notify, &relative);
 	}
 
 	fn consume(&mut self, id: ConsumerId, mut notify: AnnounceConsumerNotify) {
@@ -789,12 +817,50 @@ impl OriginNode {
 		}
 	}
 
-	fn unconsume(&mut self, id: ConsumerId) {
-		self.notify.lock().consumers.remove(&id).expect("consumer not found");
-		if self.is_empty() {
-			//tracing::warn!("TODO: empty node; memory leak");
-			// This happens when consuming a path that is not being broadcasted.
+	/// Give up a claim at `relative`, pruning every node the removal empties on the
+	/// way back up.
+	///
+	/// The mirror of [`Self::remove`], and the reason an origin's tree does not grow
+	/// forever: creating the node is what registering a claim does, so releasing one
+	/// has to be able to take the node away again. Otherwise the tree gains a node
+	/// per distinct path anyone ever asked about and never gives one back.
+	fn detach(&mut self, claim: Claim, relative: impl AsPath) {
+		let relative = relative.as_path();
+
+		let Some((dir, relative)) = relative.next_part() else {
+			match claim {
+				Claim::Consumer(id) => {
+					self.notify.lock().consumers.remove(&id).expect("consumer not found");
+				}
+				Claim::Source => self.sources -= 1,
+			}
+			return;
+		};
+
+		// The claim itself keeps every node on the way down non-empty, so nothing can
+		// have pruned the chain out from under us.
+		let nested = self.nested.get(dir).expect("claimed node missing").clone();
+		let mut locked = nested.lock();
+		locked.detach(claim, &relative);
+
+		if locked.is_empty() {
+			drop(locked);
+			self.nested.remove(dir);
 		}
+	}
+
+	/// Claim this node for a source at `relative`, creating the nodes on the way
+	/// down. Released by [`Self::detach`]; see [`SourceReservation`].
+	fn reserve(&mut self, relative: impl AsPath) {
+		let relative = relative.as_path();
+
+		let Some((dir, relative)) = relative.next_part() else {
+			self.sources += 1;
+			return;
+		};
+
+		let nested = self.entry(dir);
+		nested.lock().reserve(&relative);
 	}
 
 	/// Remove the broadcast at `relative` if it is `expect`, unannouncing it if
@@ -824,33 +890,103 @@ impl OriginNode {
 	}
 
 	fn is_empty(&self) -> bool {
-		self.broadcast.is_none() && self.nested.is_empty() && self.notify.lock().consumers.is_empty()
+		self.broadcast.is_none()
+			&& self.sources == 0
+			&& self.nested.is_empty()
+			&& self.notify.lock().consumers.is_empty()
+	}
+
+	/// Nodes in this subtree, counting self. Test-only: pruning is invisible
+	/// through the public surface, so the tests assert on the tree's size.
+	#[cfg(test)]
+	fn count(&self) -> usize {
+		1 + self.nested.values().map(|nested| nested.lock().count()).sum::<usize>()
 	}
 }
 
+/// What a [`OriginNode::detach`] walk gives up at the leaf. Both kinds keep a node
+/// in the tree, so both have to be able to take it back out.
+#[derive(Clone, Copy)]
+enum Claim {
+	/// An announce cursor registered at the node.
+	Consumer(ConsumerId),
+	/// A source whose lifecycle task is running at the node.
+	Source,
+}
+
+/// Keeps a source's node in the tree for as long as its lifecycle task runs.
+///
+/// A source spends its whole pre-attach life at a node that holds nothing yet, and
+/// a node holding nothing is exactly what pruning removes. Without this claim the
+/// node could be pruned between [`Producer::create_broadcast`] and the attach - an
+/// announce cursor on that exact path dropping is enough - and the attach would
+/// then publish into an orphan: still wired to its parents' notify chain, so it
+/// announces normally, but off the tree every lookup walks, so nobody can resolve
+/// what was announced.
+///
+/// Held by [`run_source`] and released on every exit, including a cancelled task.
+struct SourceReservation {
+	tree: Lock<OriginNode>,
+	path: PathOwned,
+}
+
+impl SourceReservation {
+	fn new(tree: Lock<OriginNode>, path: PathOwned) -> Self {
+		tree.lock().reserve(&path);
+		Self { tree, path }
+	}
+}
+
+impl Drop for SourceReservation {
+	fn drop(&mut self) {
+		self.tree.lock().detach(Claim::Source, &self.path);
+	}
+}
+
+/// A handle's view of an origin's path tree: the subtrees it may reach, named by
+/// path rather than by node handle.
+///
+/// Paths, because pruning removes empty nodes: a pinned `Lock<OriginNode>` outlives
+/// the prune as an orphan that publishes and subscribes where no lookup can reach.
+/// Only [`Self::tree`] is stable, so every operation resolves against it and node
+/// identity lives in exactly one place.
 #[derive(Clone)]
 struct OriginNodes {
-	nodes: Vec<(PathOwned, Lock<OriginNode>)>,
+	// The tree root, shared by every handle derived from one origin. Never pruned:
+	// it hangs off no parent.
+	tree: Lock<OriginNode>,
+
+	// The reachable subtrees: the prefix relative to this handle's root (what
+	// `allowed()` advertises), paired with its absolute path under `tree`.
+	nodes: Vec<(PathOwned, PathOwned)>,
 }
 
 impl OriginNodes {
+	/// A view over a fresh tree with no reachable subtrees: it resolves nothing and
+	/// publishes nothing.
+	fn empty() -> Self {
+		Self {
+			tree: Lock::new(OriginNode::new(None)),
+			nodes: Vec::new(),
+		}
+	}
+
 	// Returns nested roots that match the prefixes.
 	// PathPrefixes guarantees no duplicates or overlapping prefixes.
 	pub fn select(&self, prefixes: &PathPrefixes) -> Option<Self> {
 		let mut roots = Vec::new();
 
-		for (root, state) in &self.nodes {
+		for (root, absolute) in &self.nodes {
 			for prefix in prefixes {
 				if root.has_prefix(prefix) {
-					// Keep the existing node if we're allowed to access it.
-					roots.push((root.to_owned(), state.clone()));
+					// Keep the existing subtree if we're allowed to access it.
+					roots.push((root.to_owned(), absolute.clone()));
 					continue;
 				}
 
 				if let Some(suffix) = prefix.strip_prefix(root) {
 					// If the requested prefix is larger than the allowed prefix, then we further scope it.
-					let nested = state.lock().leaf(&suffix);
-					roots.push((prefix.to_owned(), nested));
+					roots.push((prefix.to_owned(), absolute.join(&suffix)));
 				}
 			}
 		}
@@ -858,7 +994,7 @@ impl OriginNodes {
 		if roots.is_empty() {
 			None
 		} else {
-			Some(Self { nodes: roots })
+			Some(self.with_nodes(roots))
 		}
 	}
 
@@ -870,32 +1006,38 @@ impl OriginNodes {
 			return Some(self.clone());
 		}
 
-		for (root, state) in &self.nodes {
+		for (root, absolute) in &self.nodes {
 			if let Some(suffix) = root.strip_prefix(&new_root) {
 				// If the old root is longer than the new root, shorten the keys.
-				roots.push((suffix.to_owned(), state.clone()));
+				roots.push((suffix.to_owned(), absolute.clone()));
 			} else if let Some(suffix) = new_root.strip_prefix(root) {
 				// If the new root is longer than the old root, add a new root.
 				// NOTE: suffix can't be empty
-				let nested = state.lock().leaf(&suffix);
-				roots.push(("".into(), nested));
+				roots.push(("".into(), absolute.join(&suffix)));
 			}
 		}
 
 		if roots.is_empty() {
 			None
 		} else {
-			Some(Self { nodes: roots })
+			Some(self.with_nodes(roots))
 		}
 	}
 
-	// Returns the root that has this prefix.
-	pub fn get(&self, path: impl AsPath) -> Option<(Lock<OriginNode>, PathOwned)> {
+	fn with_nodes(&self, nodes: Vec<(PathOwned, PathOwned)>) -> Self {
+		Self {
+			tree: self.tree.clone(),
+			nodes,
+		}
+	}
+
+	// Returns the absolute path under `tree`, if this handle is allowed to reach it.
+	pub fn get(&self, path: impl AsPath) -> Option<PathOwned> {
 		let path = path.as_path();
 
-		for (root, state) in &self.nodes {
+		for (root, absolute) in &self.nodes {
 			if let Some(suffix) = path.strip_prefix(root) {
-				return Some((state.clone(), suffix.to_owned()));
+				return Some(absolute.join(&suffix));
 			}
 		}
 
@@ -906,7 +1048,8 @@ impl OriginNodes {
 impl Default for OriginNodes {
 	fn default() -> Self {
 		Self {
-			nodes: vec![("".into(), Lock::new(OriginNode::new(None)))],
+			tree: Lock::new(OriginNode::new(None)),
+			nodes: vec![("".into(), "".into())],
 		}
 	}
 }
@@ -1038,7 +1181,7 @@ impl Producer {
 	pub(crate) fn empty(info: Origin) -> Self {
 		Self {
 			info,
-			nodes: OriginNodes { nodes: Vec::new() },
+			nodes: OriginNodes::empty(),
 			root: PathOwned::default(),
 			dynamic: kio::Shared::default(),
 			pool: cache::Pool::default(),
@@ -1107,8 +1250,12 @@ impl Producer {
 			"create_broadcast called with a looping hop chain",
 		);
 
-		let (node, rest) = self.nodes.get(&path).ok_or(Error::Unauthorized)?;
-		let full = self.root.join(&path).to_owned();
+		// `get` resolves the path against the tree root, which is the same absolute
+		// path the handle's own root produces: an allowed prefix is always stored
+		// alongside its absolute position. So one path serves both the front's
+		// identity and its position in the tree.
+		let full = self.nodes.get(&path).ok_or(Error::Unauthorized)?;
+		let tree = self.nodes.tree.clone();
 
 		// A decoded announce prefix and suffix are each within the wire limit, but their
 		// join might not be. Enforcing here bounds the tree depth and guarantees the path
@@ -1127,7 +1274,17 @@ impl Producer {
 			.with_stats(ingress.clone());
 		source.set_route(route).expect("fresh producer");
 
-		web_async::spawn(run_source(self.info(), node, full, rest, source.consume(), ingress));
+		// Claimed here, synchronously, rather than inside the spawned task: the node
+		// is prunable until the source attaches.
+		let reservation = SourceReservation::new(tree.clone(), full.clone());
+		web_async::spawn(run_source(
+			self.info(),
+			tree,
+			full,
+			source.consume(),
+			ingress,
+			reservation,
+		));
 
 		Ok(source)
 	}
@@ -1224,6 +1381,12 @@ impl Producer {
 	pub fn absolute(&self, path: impl AsPath) -> Path<'_> {
 		self.root.join(path)
 	}
+
+	/// Nodes in the whole path tree, counting the root. Test-only.
+	#[cfg(test)]
+	pub(crate) fn node_count(&self) -> usize {
+		self.nodes.tree.lock().count()
+	}
 }
 
 /// How long a spliced track stays warm after its last reader leaves.
@@ -1268,6 +1431,9 @@ struct FrontState {
 	/// an exact tie toward the newest source.
 	next_route: u64,
 	routes: Vec<FrontRoute>,
+	/// Immutable track metadata, retained across idle release and aborted attempts.
+	/// Every route of this broadcast must serve the same content.
+	track_info: HashMap<Arc<str>, track::Info>,
 	/// Peers this front is exposed to, refcounted by live [`ExclusionGuard`]s: those
 	/// reading it through the shared broadcast, and those we merely advertise it to.
 	/// The resolve-time check only proves the table is clean for a requester at that
@@ -1294,6 +1460,31 @@ struct FrontState {
 }
 
 impl FrontState {
+	/// Admit only copies with the broadcast's established track properties.
+	fn accept_track_info(&mut self, name: &Arc<str>, info: track::Info) -> Result<(), Error> {
+		if self.closed {
+			return Err(Error::Closed);
+		}
+		if let Some(expected) = self.track_info.get(name) {
+			let track::Info {
+				timescale,
+				latency_max,
+				priority,
+				ordered,
+			} = info;
+			if timescale != expected.timescale
+				|| latency_max != expected.latency_max
+				|| priority != expected.priority
+				|| ordered != expected.ordered
+			{
+				return Err(Error::Unsupported);
+			}
+		} else {
+			self.track_info.insert(name.clone(), info);
+		}
+		Ok(())
+	}
+
 	/// The one selection primitive every picker goes through: the best route by
 	/// [`route_order`] among those surviving `keep`. With `untainted`, the pick
 	/// also steers away from routes that flow through a peer currently reading
@@ -1338,6 +1529,18 @@ impl FrontState {
 	/// whatever its chain claims.
 	fn taints_a_reader(&self, route: &broadcast::Route) -> bool {
 		route.hops.iter().any(|hop| self.excluded.contains_key(hop))
+	}
+
+	/// Whether the front is a broadcast published in this process and still
+	/// announced. Only a remote source calls this (a local one shares the empty
+	/// chain and splices instead), and it can never win: the process publishing a
+	/// path is that path's origin, so a remote copy is our own content reflected by
+	/// a peer that carries no hop ids, which `excluded` cannot recognize when the
+	/// peer is anonymous, or an unrelated publisher that must not reach our
+	/// subscribers in place of what we are producing. An unannounced local source
+	/// (cached content reachable by exact path) is not a claim on the path.
+	fn holds_local_publisher(&self) -> bool {
+		self.publisher.is_none() && self.routes.iter().any(|r| r.route.announce)
 	}
 
 	/// Narrow `candidates` to the routes clean for every peer currently reading the
@@ -1540,17 +1743,17 @@ fn sync_announce(guard: &mut Option<stats::Announce>, announced: bool, ingress: 
 /// publisher swap is always a replacement, never a silent splice.
 async fn run_source(
 	origin: Info,
-	node: Lock<OriginNode>,
+	tree: Lock<OriginNode>,
 	full: PathOwned,
-	rest: PathOwned,
 	mut source: broadcast::Consumer,
 	ingress: stats::Scope,
+	// Held, not read: dropping it releases this source's claim on the node.
+	_reservation: SourceReservation,
 ) {
 	let ctx = AttachContext {
 		origin: &origin,
-		node: &node,
+		tree: &tree,
 		full: &full,
-		rest: &rest,
 	};
 
 	// The first `route_changed` yields the current route immediately; nothing is
@@ -1573,17 +1776,16 @@ async fn run_source(
 	// announced is a separate gate, owned by `attach_source`.
 	let mut may_take_over = true;
 
-	'attach: loop {
-		// Re-resolved every attempt: between attaches the previous front's
-		// teardown may have pruned the (then-empty) leaf from the tree, and
-		// attaching to the stale lock would publish into an orphan that lookups
-		// can no longer reach.
-		let leaf = if rest.is_empty() {
-			node.clone()
-		} else {
-			node.lock().leaf(&rest)
-		};
+	// Resolved once: `_reservation` holds this node in the tree for as long as this
+	// source lives, so no teardown between attaches can prune it and leave us
+	// attaching to an orphan. The root is its own leaf and is never pruned.
+	let leaf = if full.is_empty() {
+		tree.clone()
+	} else {
+		tree.lock().leaf(&full)
+	};
 
+	'attach: loop {
 		let (state, broadcast, id) = match attach_source(&ctx, &leaf, &source, route.clone(), may_take_over) {
 			Attach::Ready(state, broadcast, id) => (state, broadcast, id),
 			Attach::Parked(incumbent) => {
@@ -1591,16 +1793,28 @@ async fn run_source(
 					broadcast = %full,
 					"path already live with a different publisher; parking this source until it ends",
 				);
-				// Wait for the incumbent front to close, or for our own route to
-				// change: a new route observation earns another takeover attempt, and
-				// our source closing means giving up.
+				// Snapshot the local-publisher hold: a remote parked by it must retry
+				// when the hold releases (the local route unannounces or its last
+				// source detaches into linger), not just when the front closes, or
+				// the path stays dark despite an announced remote waiting.
+				let held = incumbent.read().holds_local_publisher();
+				// Wait for the incumbent front to close or release its hold, or for
+				// our own route to change: a new route observation earns another
+				// takeover attempt, and our source closing means giving up.
 				let update = kio::wait(|waiter| {
 					if let Poll::Ready(update) = source.poll_route_changed(waiter) {
 						return Poll::Ready(Some(update));
 					}
-					// Ready on either the closed flag or the channel itself dying;
-					// both mean the incumbent is gone.
-					match incumbent.poll(waiter, |s| if s.closed { Poll::Ready(()) } else { Poll::Pending }) {
+					// Ready on the closed flag, the channel itself dying (both mean
+					// the incumbent is gone), or the local-publisher hold changing
+					// shape so a parked remote gets another attempt.
+					match incumbent.poll(waiter, |s| {
+						if s.closed || s.holds_local_publisher() != held {
+							Poll::Ready(())
+						} else {
+							Poll::Pending
+						}
+					}) {
 						Poll::Ready(_) => Poll::Ready(None),
 						Poll::Pending => Poll::Pending,
 					}
@@ -1709,20 +1923,22 @@ enum Attach {
 	/// The path's live front belongs to a different original publisher and this
 	/// source may not take it: either the source is offline (so it would rank below
 	/// every route the front holds), it already spent its takeover attempt on this
-	/// route and lost, or its chain leads back through a peer the front is already
-	/// exposed to, making it a reflection rather than rival content. The caller
-	/// parks on the returned table until the front closes.
+	/// route and lost, its chain leads back through a peer the front is already
+	/// exposed to, making it a reflection rather than rival content, or the front
+	/// is held by a local publisher. The caller parks on the returned table until
+	/// the front closes or the local-publisher hold releases.
 	Parked(kio::Producer<FrontState>),
 }
 
 /// Everything about a source's attach that does not change between attempts.
 struct AttachContext<'a> {
 	origin: &'a Info,
-	node: &'a Lock<OriginNode>,
-	/// Absolute path, for the front's identity and log lines.
+	/// The origin's tree root: the one node pruning never removes, so the leaf is
+	/// resolved from here rather than pinned by a handle that a prune can orphan.
+	tree: &'a Lock<OriginNode>,
+	/// Absolute path: the front's identity, its log lines, and its position under
+	/// `tree` are all the same path.
 	full: &'a PathOwned,
-	/// Path relative to `node`, for locating (and later pruning) the leaf.
-	rest: &'a PathOwned,
 }
 
 /// Whether two sources carry the same content and may therefore splice.
@@ -1759,7 +1975,10 @@ fn same_publisher(a: Option<Origin>, b: Option<Origin>) -> bool {
 /// chain that does not lead back through a peer this front is already exposed to
 /// (see [`FrontState::taints_a_reader`]): such a source is our own broadcast
 /// reflected by a peer that cannot detect the loop itself, and letting it evict the
-/// front is how a publish direction ends up withdrawing its own announce.
+/// front is how a publish direction ends up withdrawing its own announce. A front
+/// held by a local publisher is never taken over at all (see
+/// [`FrontState::holds_local_publisher`]): the exposure check needs the reflecting
+/// peer to have an identity, and an anonymous peer's echo has none.
 ///
 /// `may_take_over` is the caller's third gate: [`run_source`] clears it once this
 /// source has been displaced, so a route that already lost the path stands by
@@ -1793,7 +2012,7 @@ fn attach_source(
 				});
 				s.reselect(carrying);
 				joined = Some(id);
-			} else if !may_take_over || !route.announce || s.taints_a_reader(&route) {
+			} else if !may_take_over || !route.announce || s.taints_a_reader(&route) || s.holds_local_publisher() {
 				return Attach::Parked(existing.state.clone());
 			} else {
 				// New content at a live path: the newest publisher wins it. Closing
@@ -1828,6 +2047,7 @@ fn attach_source(
 		publisher,
 		next_route: 1,
 		excluded: HashMap::new(),
+		track_info: HashMap::new(),
 		routes: vec![FrontRoute {
 			id: 0,
 			route,
@@ -1864,8 +2084,8 @@ fn attach_source(
 	web_async::spawn(run_front(
 		state.clone(),
 		broadcast.clone(),
-		ctx.node.clone(),
-		ctx.rest.clone(),
+		ctx.tree.clone(),
+		ctx.full.clone(),
 	));
 
 	Attach::Ready(state, broadcast, 0)
@@ -1876,8 +2096,8 @@ fn attach_source(
 async fn run_front(
 	state: kio::Producer<FrontState>,
 	mut broadcast: broadcast::Producer,
-	node: Lock<OriginNode>,
-	rest: PathOwned,
+	tree: Lock<OriginNode>,
+	full: PathOwned,
 ) {
 	enum Step {
 		Serve(Arc<str>, super::resume::Producer),
@@ -1969,13 +2189,14 @@ async fn run_front(
 
 	// Remove the broadcast from the tree (identity-checked, so a replacement is
 	// untouched) and prune empty nodes.
-	node.lock().remove(&state, &rest);
+	tree.lock().remove(&state, &full);
 }
 
 /// Serves one spliced logical track: splices in the best source's copy of the
 /// track, re-splicing on handover or failure, until the track completes or the
-/// front closes. A refusal (a source rejecting the track, or its copy dying
-/// before delivering anything) is authoritative and never retried: the refuser
+/// front closes. A refusal (a source rejecting the track, returning incompatible
+/// metadata, or dying before delivering anything) is authoritative and never
+/// retried: the refuser
 /// is skipped for this track so a joining standby cannot kill a subscription
 /// the incumbent is serving, and once every attached source has refused, the
 /// track aborts with the last refusal's error. The verdict belongs to this
@@ -2216,9 +2437,12 @@ async fn serve_track(state: kio::Producer<FrontState>, name: Arc<str>, mut resum
 							None => continue,
 							// A copy that is already aborted can't be spliced;
 							// its error is the source's answer for the track.
-							Some(Ok(_)) => match track.poll_complete(&kio::Waiter::noop()) {
+							Some(Ok(info)) => match track.poll_complete(&kio::Waiter::noop()) {
 								Poll::Ready(Err(err)) => Err(err),
-								_ => Ok(track),
+								_ => match state.write() {
+									Ok(mut state) => state.accept_track_info(&name, info).map(|()| track),
+									Err(_) => Err(Error::Dropped),
+								},
 							},
 							Some(Err(err)) => Err(err),
 						}
@@ -2707,7 +2931,7 @@ impl Consumer {
 	pub(crate) fn empty(&self) -> Self {
 		Self {
 			info: self.info,
-			nodes: OriginNodes { nodes: Vec::new() },
+			nodes: OriginNodes::empty(),
 			root: self.root.clone(),
 			dynamic: self.dynamic.clone(),
 			stats: self.stats.clone(),
@@ -2731,8 +2955,8 @@ impl Consumer {
 	}
 
 	/// Internal synchronous lookup: how the broadcast at `path` resolves for this
-	/// consumer, telling "announced but every route loops back through you" apart
-	/// from "nothing here".
+	/// consumer, telling "announced but every route loops back through you" and
+	/// "outside your scope" apart from "nothing here".
 	///
 	/// Races announcement gossip (a freshly-connected consumer sees `Missing` even when
 	/// the broadcast is about to arrive), so it is not public. [`Self::request_broadcast`]
@@ -2740,10 +2964,10 @@ impl Consumer {
 	/// a dynamic handler. [`Self::announced_broadcast`] waits for a future announcement.
 	fn resolve(&self, path: impl AsPath) -> Resolved {
 		let path = path.as_path();
-		let Some((root, rest)) = self.nodes.get(&path) else {
-			return Resolved::Missing;
+		let Some(rest) = self.nodes.get(&path) else {
+			return Resolved::OutOfScope;
 		};
-		let state = root.lock();
+		let state = self.nodes.tree.lock();
 		state.resolve_broadcast(&rest, self.exclude)
 	}
 
@@ -2752,7 +2976,7 @@ impl Consumer {
 	pub(crate) fn get_broadcast(&self, path: impl AsPath) -> Option<broadcast::Consumer> {
 		match self.resolve(path) {
 			Resolved::Found(broadcast) => Some(broadcast),
-			Resolved::Excluded | Resolved::Missing => None,
+			Resolved::Excluded | Resolved::OutOfScope | Resolved::Missing => None,
 		}
 	}
 
@@ -2831,8 +3055,9 @@ impl Consumer {
 	///
 	/// The returned future resolves to [`Error::Unroutable`] when no broadcast is reachable and no
 	/// dynamic handler exists. A request that is registered while a handler is live but then loses
-	/// every handler before being served also resolves to [`Error::Unroutable`]. Unlike an announced
-	/// broadcast, a dynamically served one is never visible to [`Self::announced`].
+	/// every handler before being served also resolves to [`Error::Unroutable`]. A path outside this
+	/// consumer's scope resolves to [`Error::Unauthorized`]. Unlike an announced broadcast, a
+	/// dynamically served one is never visible to [`Self::announced`].
 	pub fn request_broadcast(&self, path: impl AsPath) -> kio::Pending<Requesting> {
 		let path = path.as_path();
 
@@ -2847,9 +3072,19 @@ impl Consumer {
 		// serve this requester is unroutable, not missing: a handler resolves paths
 		// with no route chain to check, so falling through would let it route around
 		// the split horizon and rebuild the loop.
+		//
+		// A path outside the consumer's scope falls to the same rule for the same
+		// reason, and to the same error [`Producer::create_broadcast`] already
+		// returns for a scope miss on the write side. The handler has no scope to
+		// check either. A `Request` carries only a path, and a handler obtained
+		// from any view drains one shared queue, so a consumer that may not read a
+		// path must not be able to ask for it to be created. Otherwise the
+		// consumer's scope holds on the announced path and not on this one, and the
+		// gap widens with every handler an application installs.
 		match self.resolve(&path) {
 			Resolved::Found(broadcast) => return kio::Pending::new(Requesting::ready(broadcast).with_stats(scope)),
 			Resolved::Excluded => return kio::Pending::new(Requesting::failed(Error::Unroutable)),
+			Resolved::OutOfScope => return kio::Pending::new(Requesting::failed(Error::Unauthorized)),
 			Resolved::Missing => {}
 		}
 
@@ -2972,13 +3207,13 @@ impl AnnounceConsumer {
 		let state = kio::Producer::<OriginConsumerState>::default();
 		let id = ConsumerId::new();
 
-		for (_, node) in &nodes.nodes {
+		for (_, absolute) in &nodes.nodes {
 			let notify = AnnounceConsumerNotify {
 				root: root.clone(),
 				state: state.clone(),
 				exclude,
 			};
-			node.lock().consume(id, notify);
+			nodes.tree.lock().consume_at(id, notify, absolute);
 		}
 
 		Self {
@@ -3075,8 +3310,8 @@ impl AnnounceConsumer {
 
 impl Drop for AnnounceConsumer {
 	fn drop(&mut self) {
-		for (_, root) in &self.nodes.nodes {
-			root.lock().unconsume(self.id);
+		for (_, absolute) in &self.nodes.nodes {
+			self.nodes.tree.lock().detach(Claim::Consumer(self.id), absolute);
 		}
 	}
 }
@@ -3146,6 +3381,7 @@ impl AnnounceConsumer {
 
 #[cfg(test)]
 mod tests {
+	use crate::Timescale;
 	use crate::coding::Decode;
 	use crate::group;
 
@@ -3180,6 +3416,7 @@ mod tests {
 			publisher: routes.first().and_then(|r| r.hops.iter().next().copied()),
 			next_route: routes.len() as u64,
 			excluded: HashMap::new(),
+			track_info: HashMap::new(),
 			routes: routes
 				.into_iter()
 				.enumerate()
@@ -3402,6 +3639,11 @@ mod tests {
 	/// tests pause tokio time, so this advances the clock instantly.
 	async fn settle() {
 		tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+	}
+
+	/// An origin producer restricted to `prefixes`, for the scoped-handle tests.
+	fn origin_scoped(prefixes: &[Path]) -> Producer {
+		Origin::random().produce().scope(prefixes).expect("in scope")
 	}
 
 	/// Serve one requested track from a source like a session would: wait for the
@@ -3688,6 +3930,172 @@ mod tests {
 		assert_eq!(OriginList::try_from(over), Err(TooManyOrigins));
 	}
 
+	/// An announce cursor over a path nobody broadcasts creates the node on the way
+	/// in, so dropping it has to take the node away again. Otherwise a relay grows
+	/// by one node per distinct idle path for as long as it runs.
+	#[tokio::test]
+	async fn test_idle_announce_prunes_its_nodes() {
+		tokio::time::pause();
+
+		let origin = Origin::random().produce();
+		let consumer = origin.consume();
+		let start = origin.node_count();
+
+		for i in 0..32 {
+			let path = format!("channel{i}/chat");
+			let scoped = consumer.scope(&[Path::new(path.as_str())]).expect("in scope");
+
+			let mut announced = scoped.announced();
+			announced.assert_next_wait();
+			assert_eq!(origin.node_count(), start + 2, "the subtree exists while subscribed");
+
+			drop(announced);
+			drop(scoped);
+			assert_eq!(origin.node_count(), start, "cycle {i} left a node behind");
+		}
+	}
+
+	/// Pruning only takes nodes that are doing nothing: an announced broadcast holds
+	/// its node, and so does any cursor still attached to it.
+	#[tokio::test]
+	async fn test_prune_spares_live_nodes() {
+		tokio::time::pause();
+
+		let origin = Origin::random().produce();
+		let consumer = origin.consume();
+		let bare = origin.node_count();
+
+		let mut broadcast = origin.create_broadcast("channel/chat", announce()).unwrap();
+		settle().await;
+		let live = origin.node_count();
+		assert_eq!(live, bare + 2, "the broadcast should have created its subtree");
+
+		// A cursor that comes and goes leaves the announced path alone.
+		let mut announced = consumer.announced();
+		announced.assert_next_some("channel/chat");
+		drop(announced);
+		assert_eq!(origin.node_count(), live, "an announced path was pruned");
+		assert!(consumer.get_broadcast("channel/chat").is_some());
+
+		// A second cursor over an idle path holds the node while the first drops.
+		let idle = consumer.scope(&[Path::new("idle")]).expect("in scope");
+		let first = idle.announced();
+		let second = idle.announced();
+		assert_eq!(origin.node_count(), live + 1);
+		drop(first);
+		assert_eq!(origin.node_count(), live + 1, "a node with a consumer was pruned");
+		drop(second);
+		assert_eq!(origin.node_count(), live, "the last cursor left the node behind");
+
+		// And the broadcast leaving takes its own nodes with it.
+		broadcast.finish();
+		settle().await;
+		assert_eq!(origin.node_count(), bare);
+	}
+
+	/// One cursor scoped to two sibling prefixes registers at both, so its drop has
+	/// to unwind both branches and the ancestor they share. Also pins that scoping
+	/// alone creates nothing: the handle names its subtrees, it does not build them.
+	#[tokio::test]
+	async fn test_multi_prefix_cursor_prunes_both_branches() {
+		tokio::time::pause();
+
+		let origin = Origin::random().produce();
+		let consumer = origin.consume();
+		let bare = origin.node_count();
+
+		let scoped = consumer
+			.scope(&[Path::new("room/a"), Path::new("room/b")])
+			.expect("in scope");
+		assert_eq!(origin.node_count(), bare, "scoping should not create nodes");
+		assert!(consumer.with_root("room/c").is_some());
+		assert_eq!(origin.node_count(), bare, "rooting should not create nodes");
+
+		let announced = scoped.announced();
+		assert_eq!(origin.node_count(), bare + 3, "room, room/a and room/b");
+
+		drop(announced);
+		assert_eq!(origin.node_count(), bare, "a two-branch cursor left nodes behind");
+	}
+
+	/// A node with a live descendant is not empty, so pruning a deep cursor stops
+	/// where the tree is still in use rather than unwinding to the root.
+	#[tokio::test]
+	async fn test_prune_stops_at_a_live_ancestor() {
+		tokio::time::pause();
+
+		let origin = Origin::random().produce();
+		let consumer = origin.consume();
+		let bare = origin.node_count();
+
+		let outer = consumer.scope(&[Path::new("room/a")]).expect("in scope").announced();
+		let inner = consumer
+			.scope(&[Path::new("room/a/deep/leaf")])
+			.expect("in scope")
+			.announced();
+		assert_eq!(origin.node_count(), bare + 4, "room, a, deep and leaf");
+
+		drop(inner);
+		assert_eq!(origin.node_count(), bare + 2, "pruning ran past the cursor above it");
+
+		drop(outer);
+		assert_eq!(origin.node_count(), bare);
+	}
+
+	/// A source claims its node from `create_broadcast`, before it has attached
+	/// anything to it. A cursor on that exact path dropping inside that window must
+	/// not prune the node away: the attach would then publish into an orphan that
+	/// announces through its parents but that no lookup can reach.
+	#[tokio::test]
+	async fn test_pending_source_holds_its_node() {
+		tokio::time::pause();
+
+		let origin = Origin::random().produce();
+		let consumer = origin.consume();
+		let bare = origin.node_count();
+
+		// A cursor waiting on the exact path the publisher is about to take.
+		let waiting = consumer
+			.scope(&[Path::new("channel/chat")])
+			.expect("in scope")
+			.announced();
+		assert_eq!(origin.node_count(), bare + 2);
+
+		let _broadcast = origin.create_broadcast("channel/chat", announce()).unwrap();
+
+		// The source holds the node, but has not attached to it yet.
+		drop(waiting);
+		assert_eq!(origin.node_count(), bare + 2, "a pending source's node was pruned");
+
+		settle().await;
+		assert!(
+			consumer.get_broadcast("channel/chat").is_some(),
+			"the source attached into an orphan"
+		);
+	}
+
+	/// A scoped handle names its subtree by path, not by node, so a prune between
+	/// its creation and its use cannot strand it on an orphan the tree no longer
+	/// reaches.
+	#[tokio::test]
+	async fn test_scoped_handles_survive_a_prune() {
+		tokio::time::pause();
+
+		let scope = [Path::new("channel")];
+		let producer = origin_scoped(&scope);
+		let consumer = producer.consume().scope(&scope).expect("in scope");
+
+		// Create the scoped subtree and prune it straight back out.
+		drop(consumer.announced());
+
+		let _broadcast = producer.create_broadcast("channel/chat", announce()).unwrap();
+		settle().await;
+
+		let mut announced = consumer.announced();
+		announced.assert_next_some("channel/chat");
+		assert!(consumer.get_broadcast("channel/chat").is_some());
+	}
+
 	#[tokio::test]
 	async fn test_announce() {
 		tokio::time::pause();
@@ -3850,6 +4258,91 @@ mod tests {
 		producer.create_group(group::Info { sequence: 2 }).unwrap();
 		assert_eq!(sub.assert_group().sequence, 2, "groups below the boundary are filtered");
 		sub.assert_not_closed();
+	}
+
+	/// A source claiming the same content cannot change immutable track metadata.
+	#[tokio::test]
+	async fn test_failover_rejects_different_track_info() {
+		tokio::time::pause();
+
+		for replacement in [
+			track::Info::default().with_timescale(Timescale::MICRO),
+			track::Info::default().with_priority(7),
+			track::Info::default().with_ordered(true),
+			track::Info::default().with_latency_max(Duration::from_secs(7)),
+		] {
+			let origin = Origin::random().produce();
+			let consumer = origin.consume();
+
+			// Both routes share the first hop: interchangeable content.
+			let hops_a = OriginList::try_from(vec![Origin::new(1).unwrap()]).unwrap();
+			let hops_b = OriginList::try_from(vec![Origin::new(1).unwrap(), Origin::new(3).unwrap()]).unwrap();
+
+			let source_a = origin.create_broadcast("test", announce().with_hops(hops_a)).unwrap();
+			let mut dynamic_a = source_a.dynamic();
+			settle().await;
+			settle().await;
+			let broadcast = consumer.request_broadcast("test").await.unwrap();
+
+			let source_b = origin.create_broadcast("test", announce().with_hops(hops_b)).unwrap();
+			let mut dynamic_b = source_b.dynamic();
+			settle().await;
+			settle().await;
+
+			// Held for the whole test: the reader's handle is what keeps the logical
+			// track spliced across the failover instead of releasing it.
+			let track = broadcast.track("video").unwrap();
+
+			// A is dispatched the track and serves it on the default grid.
+			let querying = track.info();
+			let mut producer = accept_track(&mut dynamic_a, "video").await;
+			let info = tokio::time::timeout(std::time::Duration::from_secs(1), querying)
+				.await
+				.expect("timed out resolving the first source's info")
+				.unwrap();
+			assert_eq!(info.timescale, Timescale::default());
+
+			let mut reader = track.subscribe(None).await.unwrap();
+			producer
+				.create_group(group::Info { sequence: 0 })
+				.unwrap()
+				.finish()
+				.unwrap();
+			assert_eq!(reader.recv_group().await.unwrap().unwrap().sequence, 0);
+
+			// Establish a subscriber but do not read its cached predecessor group yet.
+			let mut joining = track.subscribe(None).await.unwrap();
+
+			// A dies; B claims the same content with incompatible metadata.
+			source_a.abort(Error::Dropped).unwrap();
+			drop(dynamic_a);
+			settle().await;
+
+			let request = tokio::time::timeout(std::time::Duration::from_secs(1), dynamic_b.requested_track())
+				.await
+				.expect("timed out waiting for a track request")
+				.expect("source closed");
+			let mut successor = request.accept(replacement);
+			successor
+				.create_group(group::Info { sequence: 1 })
+				.unwrap()
+				.finish()
+				.unwrap();
+			settle().await;
+
+			assert!(matches!(track.info().await, Err(Error::Unsupported)));
+			let cached = joining.recv_group().await.unwrap().unwrap();
+			assert_eq!(cached.sequence, 0);
+			assert_eq!(cached.timescale(), info.timescale);
+			assert!(matches!(joining.recv_group().await, Err(Error::Unsupported)));
+			assert!(matches!(track.subscribe(None).await, Err(Error::Unsupported)));
+			assert!(matches!(reader.recv_group().await, Err(Error::Unsupported)));
+			assert!(matches!(track.fetch_group(1, None).await, Err(Error::Unsupported)));
+
+			// Reopening an aborted logical track must not forget the broadcast's metadata.
+			let reopened = broadcast.track("video").unwrap();
+			assert!(matches!(reopened.info().await, Err(Error::Unsupported)));
+		}
 	}
 
 	/// Failover restores *every* subscribed track, not just one. A single-track
@@ -4323,63 +4816,76 @@ mod tests {
 	/// re-requesting the track (and its info) every linger.
 	#[tokio::test(start_paused = true)]
 	async fn test_idle_track_releases_without_respinning() {
-		let origin = Info::new(Origin::random()).produce();
-		let consumer = origin.consume();
+		for incompatible in [false, true] {
+			let origin = Info::new(Origin::random()).produce();
+			let consumer = origin.consume();
 
-		let hops = OriginList::try_from(vec![Origin::new(1).unwrap()]).unwrap();
-		let source = origin.create_broadcast("test", announce().with_hops(hops)).unwrap();
-		let mut dynamic = source.dynamic();
-		settle().await;
-		let broadcast = consumer.request_broadcast("test").await.unwrap();
+			let hops = OriginList::try_from(vec![Origin::new(1).unwrap()]).unwrap();
+			let source = origin.create_broadcast("test", announce().with_hops(hops)).unwrap();
+			let mut dynamic = source.dynamic();
+			settle().await;
+			let broadcast = consumer.request_broadcast("test").await.unwrap();
 
-		let subscribing = broadcast.track("video").unwrap().subscribe(None);
-		let producer = accept_track(&mut dynamic, "video").await;
-		settle().await;
-		let sub = subscribing.await.unwrap();
+			let subscribing = broadcast.track("video").unwrap().subscribe(None);
+			let producer = accept_track(&mut dynamic, "video").await;
+			settle().await;
+			let sub = subscribing.await.unwrap();
 
-		// The reader leaves, but the copy stays warm inside the window so a viewer
-		// coming back (or a follow-up fetch) reuses it.
-		drop(sub);
-		tokio::time::sleep(TRACK_IDLE_LINGER / 2).await;
-		settle().await;
-		assert!(
-			producer.poll_unused(&kio::Waiter::noop()).is_pending(),
-			"the copy must stay spliced inside the linger",
-		);
+			// The reader leaves, but the copy stays warm inside the window so a viewer
+			// coming back (or a follow-up fetch) reuses it.
+			drop(sub);
+			tokio::time::sleep(TRACK_IDLE_LINGER / 2).await;
+			settle().await;
+			assert!(
+				producer.poll_unused(&kio::Waiter::noop()).is_pending(),
+				"the copy must stay spliced inside the linger",
+			);
 
-		// Past the window the segment is released, so the serving session sees its
-		// copy go unused and can drop it (along with the track info).
-		tokio::time::sleep(TRACK_IDLE_LINGER).await;
-		settle().await;
-		assert!(
-			producer.poll_unused(&kio::Waiter::noop()).is_ready(),
-			"an idle copy must be released after the linger",
-		);
-
-		// The anti-spin property: the release must not re-arm the splice. Ungated,
-		// the loop re-attaches the copy immediately and drops it again every linger,
-		// re-requesting the track (and its info) from the session each time it dies.
-		for _ in 0..3 {
+			// Past the window the segment is released, so the serving session sees its
+			// copy go unused and can drop it (along with the track info).
 			tokio::time::sleep(TRACK_IDLE_LINGER).await;
 			settle().await;
 			assert!(
 				producer.poll_unused(&kio::Waiter::noop()).is_ready(),
-				"an unread copy must stay released, not be re-spliced",
+				"an idle copy must be released after the linger",
 			);
-		}
-		assert!(
-			dynamic.requested_track().now_or_never().is_none(),
-			"an unread track must not be re-requested",
-		);
-		drop(producer);
 
-		// A returning reader re-splices: the origin asks the source for a fresh copy.
-		let subscribing = broadcast.track("video").unwrap().subscribe(None);
-		let mut producer = accept_track(&mut dynamic, "video").await;
-		settle().await;
-		let mut sub = subscribing.await.unwrap();
-		producer.append_group().unwrap();
-		assert_eq!(sub.assert_group().sequence, 0);
+			// The anti-spin property: the release must not re-arm the splice. Ungated,
+			// the loop re-attaches the copy immediately and drops it again every linger,
+			// re-requesting the track (and its info) from the session each time it dies.
+			for _ in 0..3 {
+				tokio::time::sleep(TRACK_IDLE_LINGER).await;
+				settle().await;
+				assert!(
+					producer.poll_unused(&kio::Waiter::noop()).is_ready(),
+					"an unread copy must stay released, not be re-spliced",
+				);
+			}
+			assert!(
+				dynamic.requested_track().now_or_never().is_none(),
+				"an unread track must not be re-requested",
+			);
+			drop(producer);
+
+			// A returning reader re-splices: the origin asks the source for a fresh copy.
+			let subscribing = broadcast.track("video").unwrap().subscribe(None);
+			let request = dynamic.requested_track().await.unwrap();
+			let info = track::Info::default().with_timescale(if incompatible {
+				Timescale::MICRO
+			} else {
+				Timescale::MILLI
+			});
+			let mut producer = request.accept(info);
+			if incompatible {
+				assert!(matches!(subscribing.await, Err(Error::Unsupported)));
+				continue;
+			}
+
+			settle().await;
+			let mut sub = subscribing.await.unwrap();
+			producer.append_group().unwrap();
+			assert_eq!(sub.assert_group().sequence, 0);
+		}
 	}
 
 	/// Back-to-back fetches reuse the source's copy: only the first asks the source
@@ -5000,6 +5506,97 @@ mod tests {
 		source_a2.finish();
 	}
 
+	/// A locally published broadcast holds its path against any remote source. A
+	/// client that shares one origin between its publish and subscribe halves sees
+	/// its own announce echoed back by a relay that does no loop detection, and an
+	/// anonymous relay's echo carries an UNKNOWN first hop, so the exposure-based
+	/// reflection check (`excluded`) cannot recognize it. Without this rule the echo
+	/// evicts the local publisher and the client ends up subscribing to the relay
+	/// for its own broadcast.
+	#[tokio::test]
+	async fn test_remote_source_cannot_displace_a_local_publisher() {
+		tokio::time::pause();
+
+		let origin = Origin::random().produce();
+		let consumer = origin.consume();
+		let mut announced = consumer.announced();
+
+		// Published in this process: no hop chain.
+		let mut local = origin.create_broadcast("test", announce()).unwrap();
+		settle().await;
+		let face = announced.assert_next_some("test");
+
+		// The echo, as an anonymous relay reflects it.
+		let echo = OriginList::try_from(vec![Origin::UNKNOWN]).unwrap();
+		let mut remote = origin.create_broadcast("test", announce().with_hops(echo)).unwrap();
+		settle().await;
+		settle().await;
+		announced.assert_next_wait();
+		assert!(
+			consumer.get_broadcast("test").unwrap().is_clone(&face),
+			"the local publisher must keep the path"
+		);
+		assert!(consumer.get_broadcast("test").unwrap().route().hops.is_empty());
+
+		// The parked remote leaving changes nothing.
+		remote.finish();
+		settle().await;
+		settle().await;
+		announced.assert_next_wait();
+
+		// Once the local publisher ends, the path is free for a remote source again.
+		local.finish();
+		settle().await;
+		settle().await;
+		announced.assert_next_none("test");
+		let echo = OriginList::try_from(vec![Origin::UNKNOWN]).unwrap();
+		let _remote = origin
+			.create_broadcast("test", announce().with_hops(echo.clone()))
+			.unwrap();
+		settle().await;
+		settle().await;
+		announced.assert_next_some("test");
+		assert_eq!(consumer.get_broadcast("test").unwrap().route().hops, echo);
+	}
+
+	/// A parked remote retries when the local-publisher hold releases without the
+	/// front closing. If the local route unannounces while its source stays open,
+	/// the hold is gone and the waiting announced remote must take the path,
+	/// otherwise the path stays dark despite an available source.
+	#[tokio::test]
+	async fn test_parked_remote_retries_when_local_unannounces() {
+		tokio::time::pause();
+
+		let origin = Origin::random().produce();
+		let consumer = origin.consume();
+		let mut announced = consumer.announced();
+
+		let mut local = origin.create_broadcast("test", announce()).unwrap();
+		settle().await;
+		announced.assert_next_some("test");
+
+		// Parked by the local hold: the echo of our own announce.
+		let echo = OriginList::try_from(vec![Origin::UNKNOWN]).unwrap();
+		let _remote = origin
+			.create_broadcast("test", announce().with_hops(echo.clone()))
+			.unwrap();
+		settle().await;
+		settle().await;
+		announced.assert_next_wait();
+
+		// The local source stays open but stops announcing: cached content
+		// reachable by exact path is not a claim on the path.
+		local.set_route(broadcast::Route::new()).unwrap();
+		settle().await;
+		settle().await;
+
+		// The parked remote takes over: unannounce of the local front, then an
+		// announce for the remote one.
+		announced.assert_next_none("test");
+		announced.assert_next_some("test");
+		assert_eq!(consumer.get_broadcast("test").unwrap().route().hops, echo);
+	}
+
 	/// A repricing is not new content: a standby source must not use a cost-only
 	/// route update to evict the live front it already lost to.
 	#[tokio::test]
@@ -5454,62 +6051,69 @@ mod tests {
 	/// refused, so the subscription aborts and the consumer's next request asks
 	/// afresh.
 	#[tokio::test]
-	async fn test_standby_missing_track_keeps_incumbent() {
+	async fn test_standby_refusal_keeps_incumbent() {
 		tokio::time::pause();
+		for incompatible in [false, true] {
+			let origin = Origin::random().produce();
+			let consumer = origin.consume();
 
-		let origin = Origin::random().produce();
-		let consumer = origin.consume();
+			let publisher = Origin::new(1).unwrap();
+			let peer = Origin::new(5).unwrap();
+			let via_peer = OriginList::try_from(vec![publisher, peer]).unwrap();
+			let local = OriginList::try_from(vec![publisher]).unwrap();
 
-		let publisher = Origin::new(1).unwrap();
-		let peer = Origin::new(5).unwrap();
-		let via_peer = OriginList::try_from(vec![publisher, peer]).unwrap();
-		let local = OriginList::try_from(vec![publisher]).unwrap();
+			// Carrying via the peer, with a live subscriber mid-stream.
+			let source_remote = origin
+				.create_broadcast("test", announce().with_hops(via_peer).with_cost(2))
+				.unwrap();
+			let mut dynamic_remote = source_remote.dynamic();
+			settle().await;
+			settle().await;
+			let broadcast = consumer.request_broadcast("test").await.unwrap();
+			let subscribing = broadcast.track("audio").unwrap().subscribe(None);
+			let mut producer_remote = accept_track(&mut dynamic_remote, "audio").await;
+			settle().await;
+			let mut sub = subscribing.await.unwrap();
+			producer_remote.append_group().unwrap();
+			assert_eq!(sub.assert_group().sequence, 0);
 
-		// Carrying via the peer, with a live subscriber mid-stream.
-		let source_remote = origin
-			.create_broadcast("test", announce().with_hops(via_peer).with_cost(2))
-			.unwrap();
-		let mut dynamic_remote = source_remote.dynamic();
-		settle().await;
-		settle().await;
-		let broadcast = consumer.request_broadcast("test").await.unwrap();
-		let subscribing = broadcast.track("audio").unwrap().subscribe(None);
-		let mut producer_remote = accept_track(&mut dynamic_remote, "audio").await;
-		settle().await;
-		let mut sub = subscribing.await.unwrap();
-		producer_remote.append_group().unwrap();
-		assert_eq!(sub.assert_group().sequence, 0);
+			// The standby wins dispatch but either lacks audio or serves incompatible
+			// metadata. Its refusal must cost the incumbent nothing.
+			let source_local = origin.create_broadcast("test", announce().with_hops(local)).unwrap();
+			let mut dynamic_local = source_local.dynamic();
+			settle().await;
+			let request = dynamic_local.requested_track().await.unwrap();
+			assert_eq!(request.name(), "audio");
+			let incompatible_track = if incompatible {
+				Some(request.accept(track::Info::default().with_timescale(Timescale::MICRO)))
+			} else {
+				request.reject(Error::NotFound);
+				None
+			};
+			settle().await;
 
-		// The standby joins and wins dispatch, but has not created "audio" yet.
-		// Its refusal must cost the incumbent nothing.
-		let source_local = origin.create_broadcast("test", announce().with_hops(local)).unwrap();
-		let mut dynamic_local = source_local.dynamic();
-		settle().await;
-		let request = dynamic_local.requested_track().await.unwrap();
-		assert_eq!(request.name(), "audio");
-		request.reject(Error::NotFound);
-		settle().await;
+			// Still spliced to the incumbent, still delivering.
+			producer_remote.append_group().unwrap();
+			assert_eq!(sub.assert_group().sequence, 1);
+			sub.assert_not_closed();
 
-		// Still spliced to the incumbent, still delivering.
-		producer_remote.append_group().unwrap();
-		assert_eq!(sub.assert_group().sequence, 1);
-		sub.assert_not_closed();
+			// The incumbent leaving exhausts the table (the standby's refusal is
+			// never retried): the subscription aborts.
+			source_remote.abort(Error::Dropped).unwrap();
+			settle().await;
+			settle().await;
+			sub.assert_closed();
+			dynamic_local.assert_no_request();
 
-		// The incumbent leaving exhausts the table (the standby's refusal is
-		// never retried): the subscription aborts.
-		source_remote.abort(Error::Dropped).unwrap();
-		settle().await;
-		settle().await;
-		sub.assert_closed();
-		dynamic_local.assert_no_request();
-
-		// A fresh consumer request asks the standby anew, which has the track now.
-		let retry = broadcast.track("audio").unwrap().subscribe(None);
-		let mut producer_local = accept_track(&mut dynamic_local, "audio").await;
-		settle().await;
-		let mut sub = retry.await.expect("a fresh request must reach the standby");
-		producer_local.create_group(group::Info { sequence: 2 }).unwrap();
-		assert_eq!(sub.assert_group().sequence, 2);
+			drop(incompatible_track);
+			// A fresh consumer request asks the standby anew, which has the track now.
+			let retry = broadcast.track("audio").unwrap().subscribe(None);
+			let mut producer_local = accept_track(&mut dynamic_local, "audio").await;
+			settle().await;
+			let mut sub = retry.await.expect("a fresh request must reach the standby");
+			producer_local.create_group(group::Info { sequence: 2 }).unwrap();
+			assert_eq!(sub.assert_group().sequence, 2);
+		}
 	}
 
 	/// A refused track aborts, but the verdict is not cached: it belongs to the
@@ -5818,6 +6422,109 @@ mod tests {
 			dynamic.requested_broadcast().now_or_never().is_some(),
 			"a genuinely missing path must still fall back"
 		);
+	}
+
+	/// A path outside the consumer's scope never reaches the dynamic handler.
+	///
+	/// `scope` is a read filter over the announce tree, so an out-of-scope path
+	/// resolves to nothing there, and "nothing here" is exactly what sends a
+	/// request to the handler. A `Request` carries only a path, so the handler
+	/// cannot tell who asked and would create the broadcast on the requester's
+	/// behalf, which is `scope` holding on one path and not the other.
+	#[tokio::test]
+	async fn test_out_of_scope_path_never_reaches_the_dynamic_handler() {
+		let origin = Origin::random().produce();
+		let mut dynamic = origin.dynamic();
+
+		let scoped = origin.consume().scope(&["tenant-a".into()]).unwrap();
+
+		// `tenant-a-other` shares a character prefix but not a segment, so this
+		// also pins that the check is segment-aware rather than textual.
+		for path in ["tenant-b/live", "tenant-a-other/live"] {
+			// now_or_never rather than await: the refusal is synchronous, and a
+			// request that instead reached the queue would stay pending forever
+			// waiting on a handler that never accepts it.
+			let refused = scoped
+				.request_broadcast(path)
+				.now_or_never()
+				.expect("an out-of-scope request must be refused synchronously, not queued");
+			assert!(matches!(refused, Err(Error::Unauthorized)));
+			assert!(
+				dynamic.requested_broadcast().now_or_never().is_none(),
+				"the dynamic handler was asked to create a broadcast the requester may not read"
+			);
+		}
+	}
+
+	/// Out of scope is refused with no handler live too, where the old code
+	/// answered `Unroutable` after falling through to an empty queue.
+	#[tokio::test]
+	async fn test_out_of_scope_path_is_unauthorized_without_a_handler() {
+		let origin = Origin::random().produce();
+		let scoped = origin.consume().scope(&["tenant-a".into()]).unwrap();
+
+		let refused = scoped
+			.request_broadcast("tenant-b/live")
+			.now_or_never()
+			.expect("an out-of-scope request must be refused synchronously, not queued");
+		assert!(matches!(refused, Err(Error::Unauthorized)));
+	}
+
+	/// The check refuses only what it should: an unannounced path *inside* the
+	/// scope still falls back to the handler and is served.
+	#[tokio::test]
+	async fn test_in_scope_path_still_reaches_the_dynamic_handler() {
+		let origin = Origin::random().produce();
+		let mut dynamic = origin.dynamic();
+
+		let scoped = origin.consume().scope(&["tenant-a".into()]).unwrap();
+		let requested = scoped.request_broadcast("tenant-a/live");
+
+		// Registration and `accept` are both synchronous, so `now_or_never`
+		// throughout: a regression that over-refuses fails here rather than
+		// hanging on a handler request that never arrives.
+		let served = broadcast::Info::new().produce();
+		let request = dynamic
+			.requested_broadcast()
+			.now_or_never()
+			.expect("an in-scope request must reach the handler")
+			.unwrap();
+		assert_eq!(request.path(), &Path::new("tenant-a/live"));
+		request.accept(&served);
+
+		let broadcast = requested.now_or_never().expect("served synchronously").unwrap();
+		assert!(broadcast.is_clone(&served.consume()));
+	}
+
+	/// An unscoped consumer is scoped to the whole tree, so every path is in
+	/// scope and the fallback is unchanged for it.
+	///
+	/// This is the case an application relying on a catch-all handler depends
+	/// on, and it holds structurally rather than by special case: the default
+	/// node is the empty prefix, and every path has the empty prefix.
+	#[tokio::test]
+	async fn test_whole_tree_scope_still_reaches_the_dynamic_handler() {
+		let origin = Origin::random().produce();
+		let mut dynamic = origin.dynamic();
+
+		for (consumer, path) in [
+			(origin.consume(), "tenant-a/live"),
+			(origin.consume().scope(&["".into()]).unwrap(), "tenant-b/live"),
+		] {
+			let requested = consumer.request_broadcast(path);
+
+			let served = broadcast::Info::new().produce();
+			let request = dynamic
+				.requested_broadcast()
+				.now_or_never()
+				.expect("a whole-tree request must reach the handler")
+				.unwrap();
+			assert_eq!(request.path(), &Path::new(path));
+			request.accept(&served);
+
+			let broadcast = requested.now_or_never().expect("served synchronously").unwrap();
+			assert!(broadcast.is_clone(&served.consume()));
+		}
 	}
 
 	/// When every route flows through the requester, the path is unroutable for

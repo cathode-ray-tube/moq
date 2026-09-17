@@ -33,6 +33,14 @@ type BufferedDatagram = { datagram: Datagram; time: number };
  */
 const MAX_DATAGRAM_BYTES = 65535;
 
+/** A position within a track: a group's sequence and a frame's index inside it. */
+export interface Location {
+	/** The group's sequence number within the track. */
+	group: number;
+	/** The frame's index within that group. */
+	frame: number;
+}
+
 /**
  * A track's immutable publisher properties, fixed for the lifetime of the track.
  *
@@ -51,6 +59,8 @@ export interface Info {
 	 * Publisher Max Latency: the maximum age (milliseconds) of a non-latest group before
 	 * the publisher evicts it. Reported in TRACK_INFO (Lite05+) so relays re-serve with the
 	 * same bound. The publisher-side half of the budget a subscriber sets for itself.
+	 * Rounded up to a whole millisecond by {@link infoDefaults}, which refuses a negative
+	 * or non-finite value.
 	 */
 	latencyMax: number;
 	/** Tie-break priority between subscriptions of equal subscriber priority. */
@@ -62,11 +72,24 @@ export interface Info {
 	ordered: boolean;
 }
 
+// Normalize a latency budget for the wire, which carries it as an unsigned varint.
+//
+// Callers derive it from measurements (a jitter estimate scaled off RTT), so a fractional
+// millisecond is expected; ceil rather than round, because a budget shortened by rounding
+// skips a group the subscriber still wants. Anything that is not a duration is refused
+// here, where the field is named, rather than deep in the encoder.
+function latencyMaxMillis(value: number): number {
+	if (!Number.isFinite(value) || value < 0) {
+		throw new RangeError(`latencyMax must be a non-negative number of milliseconds: ${value}`);
+	}
+	return Math.ceil(value);
+}
+
 /** Fill in any unset {@link Info} fields with their defaults. */
 export function infoDefaults(info: Partial<Info> = {}): Info {
 	return {
 		timescale: info.timescale ?? Timescale.MILLI,
-		latencyMax: info.latencyMax ?? DEFAULT_LATENCY_MAX_MS,
+		latencyMax: latencyMaxMillis(info.latencyMax ?? DEFAULT_LATENCY_MAX_MS),
 		priority: info.priority ?? 0,
 		ordered: info.ordered ?? false,
 	};
@@ -81,7 +104,11 @@ export interface Subscription {
 	priority?: number;
 	/** Whether groups are prioritized in sequence order. Defaults to `false` (newest-first). */
 	ordered?: boolean;
-	/** Maximum age (milliseconds) of a non-latest group before it is skipped. Defaults to `0`. */
+	/**
+	 * Maximum age (milliseconds) of a non-latest group before it is skipped. Defaults to `0`.
+	 * Rounded up to a whole millisecond, so a value derived from a measurement is never
+	 * shortened. A negative or non-finite value is refused.
+	 */
 	latencyMax?: number;
 	/** First group the publisher should deliver, or omit to start at the latest group. */
 	startGroup?: number;
@@ -95,7 +122,7 @@ function subscriptionDefaults(subscription: Subscription = {}): Subscription {
 	return {
 		priority: subscription.priority ?? 0,
 		ordered: subscription.ordered ?? false,
-		latencyMax: subscription.latencyMax ?? 0,
+		latencyMax: latencyMaxMillis(subscription.latencyMax ?? 0),
 		startGroup: subscription.startGroup,
 		endGroup: subscription.endGroup,
 	};
@@ -146,11 +173,14 @@ export class Request {
 
 	#producer: Producer;
 	#sequences: TrackSequences;
+	#pending: Set<Request>;
 
 	private constructor(options: TrackRequestOptions) {
 		this.name = options.name;
 		this.#producer = options.producer;
 		this.#sequences = options.sequences;
+		this.#pending = options.pending;
+		this.#pending.add(this);
 	}
 
 	static {
@@ -169,12 +199,14 @@ export class Request {
 
 	/** Accept the request, committing the track's immutable {@link Info}. */
 	accept(info: Partial<Info> = {}): Producer {
+		this.#pending.delete(this);
 		bindProducer(this.name, this.#producer, this.#sequences);
 		return this.#producer.accept(info);
 	}
 
 	/** Reject the request, closing the track optionally with an error. */
 	reject(err?: Error): void {
+		this.#pending.delete(this);
 		this.#producer.close(err);
 	}
 }
@@ -236,6 +268,8 @@ export class Consumer {
 // The shared state behind a Producer / Subscriber pair. Package-internal
 // wiring, unexported so it never appears in the published type declarations.
 class TrackState {
+	/** The producer fanning into this sink, so a subscriber can mint a sibling of itself. */
+	producer?: Producer;
 	groups = new Signal<GroupConsumer[]>([]);
 	/** Best-effort datagram channel, parallel to {@link groups}; an age-evicted send buffer per subscriber. */
 	datagrams = new Signal<BufferedDatagram[]>([]);
@@ -366,6 +400,7 @@ export class Producer {
 
 	/** Commit the immutable publisher properties, resolving {@link info}. Returns `this`. */
 	accept(info: Partial<Info> = {}): this {
+		if (this.#state.closed.peek() !== undefined) return this;
 		const resolved = infoDefaults(info);
 		this.#state.info.set(resolved);
 		// Propagate to any sink handed out before accept (the on-demand path).
@@ -402,6 +437,7 @@ export class Producer {
 	// the track is open) mirror future groups into it. A late subscriber to a closed
 	// track still drains the buffered groups before seeing the end.
 	#addSink(sink: TrackState): void {
+		sink.producer = this;
 		const info = this.#state.info.peek();
 		if (info) sink.info.set(info);
 
@@ -688,6 +724,46 @@ export class Subscriber {
 		return this.#state.latest;
 	}
 
+	/**
+	 * The newest frame this track has produced, or `undefined` while it has none.
+	 *
+	 * Read from the groups buffered for this subscriber, so nothing is consumed. A newest
+	 * group that has no frames yet falls back to the newest older group that does. It
+	 * reads as `undefined` once the newest group has been evicted or received: what is
+	 * left can no longer say where the edge is.
+	 */
+	largest(): Location | undefined {
+		const latest = this.#state.latest;
+		if (latest === undefined) return undefined;
+
+		const groups = this.#state.groups.peek();
+		const newest = groups[groups.length - 1];
+		if (!newest || newest.sequence !== latest) return undefined;
+
+		for (let i = groups.length - 1; i >= 0; i--) {
+			const count = groups[i].frameCount;
+			if (count > 0) return { group: groups[i].sequence, frame: count - 1 };
+		}
+		return undefined;
+	}
+
+	/**
+	 * An independent subscriber to the same track, with its own cursor and its own replay of
+	 * the retained window.
+	 *
+	 * Reads here do not consume anything this one would deliver, which is what lets a
+	 * publisher read the cache alongside the cursor it is serving from. Resolving the track
+	 * again through the broadcast would not do: a dynamic serve is one request per peer
+	 * subscription, so that mints a second producer the application has to answer separately.
+	 *
+	 * @internal Wire layers only.
+	 */
+	fork(options?: Subscription): Subscriber {
+		const producer = this.#state.producer;
+		if (!producer) throw new Error("track has no producer to fork from");
+		return producer.subscribe(options);
+	}
+
 	/** Start this subscriber's local read cursor at `sequence`, without changing its wire request. */
 	startAt(sequence: number): void {
 		this.#cursor.update((cursor) => ({ ...cursor, start: sequence }));
@@ -729,26 +805,42 @@ export class Subscriber {
 	 */
 	async recvGroup(): Promise<GroupConsumer | undefined> {
 		for (;;) {
-			const groups = this.#state.groups.peek();
-			const { start, end } = this.#cursor.peek();
-			while (groups.length > 0 && groups[0].sequence < start) groups.shift()?.close();
-
-			// The buffer is sequence-sorted, so an in-range group that arrives behind a
-			// beyond-cap one sorts in front of it and is never blocked by it.
-			const group = groups[0];
-			if (group && (end === undefined || group.sequence <= end)) {
-				groups.shift();
-				return group;
-			}
+			const group = this.tryRecvGroup();
+			if (group) return group;
 
 			const closed = this.#state.closed.peek();
 			if (closed instanceof Error) throw closed;
 			// A group beyond the cap outlives a clean close: it becomes deliverable if
 			// the cap rises, so the track isn't over while any are held.
-			if (closed !== undefined && !group) return undefined;
+			if (closed !== undefined && !this.#state.groups.peek()[0]) return undefined;
 
 			await Signal.race(this.#state.groups, this.#cursor, this.#state.closed);
 		}
+	}
+
+	/**
+	 * Take the next buffered group without blocking, honoring the same cursor bounds as
+	 * {@link recvGroup}.
+	 *
+	 * Returns `undefined` when nothing is deliverable right now, which is not by itself the
+	 * end of the track: a group may still arrive, or one may be parked beyond the
+	 * {@link endAt} cap. Use it to drain what the retained window already holds, where
+	 * waiting for a sequence nothing will republish would park forever.
+	 */
+	tryRecvGroup(): GroupConsumer | undefined {
+		const groups = this.#state.groups.peek();
+		const { start, end } = this.#cursor.peek();
+		while (groups.length > 0 && groups[0].sequence < start) groups.shift()?.close();
+
+		// The buffer is sequence-sorted, so an in-range group that arrives behind a
+		// beyond-cap one sorts in front of it and is never blocked by it.
+		const group = groups[0];
+		if (group && (end === undefined || group.sequence <= end)) {
+			groups.shift();
+			return group;
+		}
+
+		return undefined;
 	}
 
 	/**

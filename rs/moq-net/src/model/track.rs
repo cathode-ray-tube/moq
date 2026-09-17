@@ -141,6 +141,9 @@ pub(crate) struct TrackState {
 	// The publisher's properties, once known; always Some for Subscriber/Producer.
 	// Copied by value into each group it creates.
 	info: Option<Info>,
+	// Whether a live Producer was minted. A reverse fetch may install `info`
+	// before acceptance, so the two states are deliberately separate.
+	published: bool,
 
 	// The broadcast this track belongs to. Supplies the cache pool its groups charge
 	// into and the `cache_duration` ceiling clamping `Info::latency_max`.
@@ -242,6 +245,16 @@ struct Slot {
 	stamp: u32,
 }
 
+/// Heap the track keeps per cached group, excluding the group itself
+/// ([`group::CACHE_OVERHEAD`]).
+///
+/// One [`Slot`] under its sequence in `lookup`, plus a hint in each of `arrival` and
+/// `evict`. Doubled because both containers run half empty in the worst case: a
+/// `BTreeMap` node sits between half and fully packed, and a `VecDeque` holds up to
+/// twice the entries in it. Half of [`cache::ENTRY_OVERHEAD`]; see it for why this is
+/// derived rather than measured.
+pub(crate) const CACHE_OVERHEAD: u64 = 2 * (size_of::<u64>() + size_of::<Slot>() + 2 * size_of::<(u64, u32)>()) as u64;
+
 /// The registered subscriptions, aggregated by the producer.
 type Subscriptions = Vec<kio::Consumer<Subscription>>;
 
@@ -271,9 +284,23 @@ struct FetchOutcome {
 }
 
 impl TrackState {
+	fn normalize_info(broadcast: &broadcast::Info, mut info: Info) -> Info {
+		info.latency_max = info.latency_max.min(broadcast.origin.cache_duration);
+		info
+	}
+
+	fn accept(&mut self, info: Info) {
+		self.published = true;
+		self.install(info);
+	}
+
 	fn poll_info(&self) -> Poll<Result<Info>> {
 		if let Some(info) = &self.info {
 			Poll::Ready(Ok(info.clone()))
+		} else if let Some(err) = &self.abort {
+			// Aborted before anyone served it, so the info can never arrive: fail the
+			// waiting subscribes instead of parking them on a track nobody will fill.
+			Poll::Ready(Err(err.clone()))
 		} else {
 			Poll::Pending
 		}
@@ -566,8 +593,8 @@ impl TrackState {
 	/// group is never retained longer than the origin allows. Every path that binds an
 	/// info to a track funnels through here, covering local publishers and relayed
 	/// (lite / IETF) tracks alike.
-	fn install(&mut self, mut info: Info) {
-		info.latency_max = info.latency_max.min(self.broadcast.origin.cache_duration);
+	fn install(&mut self, info: Info) {
+		let info = Self::normalize_info(&self.broadcast, info);
 		self.info = Some(info);
 	}
 
@@ -849,6 +876,7 @@ impl TrackState {
 #[derive(Clone)]
 pub struct Producer {
 	name: Arc<str>,
+	info: Info,
 	// The parent broadcast's info, inherited from [`broadcast::Producer::create_track`].
 	// Top link of the ownership chain; carried for identity and future inheritance.
 	broadcast: Arc<broadcast::Info>,
@@ -878,16 +906,14 @@ impl Producer {
 		info: impl Into<Option<Info>>,
 	) -> Self {
 		let name = name.into();
+		let info = TrackState::normalize_info(&broadcast, info.into().unwrap_or_default());
 		let state = TrackState::spawn(broadcast.clone());
-		state
-			.write()
-			.ok()
-			.expect("a new track is open")
-			.install(info.into().unwrap_or_default());
+		state.write().ok().expect("a new track is open").accept(info.clone());
 		let alive = Alive::new(name.clone(), state.clone());
 		alive.publish(None);
 		Self {
 			name,
+			info,
 			state,
 			broadcast,
 			prev_subscription: None,
@@ -1181,7 +1207,7 @@ impl Producer {
 		// requiring a live producer state. If the track already ended, the returned
 		// subscriber surfaces the close/abort on its first read; the preferences are
 		// simply never registered (nothing aggregates them anymore).
-		let info = self.state.read().info.clone().expect("producer always has info");
+		let info = self.info.clone();
 		let subscription = kio::Producer::new(preferences);
 		register_subscription(self.state.read(), &subscription);
 
@@ -1245,7 +1271,7 @@ impl Producer {
 
 		let prev = &self.prev_subscription;
 		let mut combined = None;
-		let mut guard = match subs.poll(waiter, |subs| {
+		let mut guard = ready!(subs.poll(waiter, |subs| {
 			let next = combined_subscription(subs, bound, waiter);
 			if &next == prev {
 				Poll::Pending
@@ -1253,10 +1279,7 @@ impl Producer {
 				combined = next;
 				Poll::Ready(())
 			}
-		}) {
-			Poll::Ready(guard) => guard,
-			Poll::Pending => return Poll::Pending,
-		};
+		}));
 		// The aggregate changed: prune any closed subscribers now that we hold the lock.
 		guard.retain(|sub| !sub.is_closed());
 		drop(guard);
@@ -1577,6 +1600,29 @@ impl TrackWeak {
 	/// refcount bump, and the same `Arc` is shared with the track's handles).
 	pub(crate) fn name(&self) -> &Arc<str> {
 		&self.name
+	}
+
+	/// Reject a track nothing ever served, resolving its pending subscribes with `err`.
+	///
+	/// A track whose [`Producer`] was minted is left alone and this returns false;
+	/// so is one that already carries an abort reason. Fetched backfill can install
+	/// [`Info`] before acceptance, so metadata alone does not prove a publisher exists.
+	///
+	/// Closes the state like [`Producer::abort`], so a [`Request`] still held by the
+	/// publisher can't `accept` its way back to life afterwards.
+	pub(crate) fn reject(&self, err: Error) -> bool {
+		let Some(producer) = self.state.produce() else {
+			return false;
+		};
+		let Ok(mut state) = producer.write() else {
+			return false;
+		};
+		if state.published || state.abort.is_some() {
+			return false;
+		}
+		state.abort = Some(err);
+		state.close();
+		true
 	}
 
 	/// Whether anyone is consuming the track right now. A closed track doesn't
@@ -2698,16 +2744,18 @@ impl Request {
 	/// [`Producer`] is inert: writes fail with the abort error, as if it had been
 	/// aborted immediately after accepting.
 	pub fn accept(self, info: impl Into<Option<Info>>) -> Producer {
+		let info = TrackState::normalize_info(&self.broadcast, info.into().unwrap_or_default());
 		// A closed state means the track was aborted under us. Mirror `reject` and
 		// tolerate it: the Producer we hand back simply can't write.
 		if let Ok(mut state) = self.state.write() {
-			state.install(info.into().unwrap_or_default());
+			state.accept(info.clone());
 		}
 		// Accepting the request creates the track producer: count it as one ingress
 		// subscription (closed when the last handle drops). No-op when untagged.
 		self.alive.publish(Some(&self.stats));
 		Producer {
 			name: self.name,
+			info,
 			broadcast: self.broadcast,
 			state: self.state,
 			prev_subscription: None,
@@ -3438,6 +3486,7 @@ mod test {
 			Duration::from_secs(1),
 		);
 		assert_eq!(capped.state.read().latency_bound(), Some(Duration::from_secs(1)));
+		assert_eq!(capped.subscribe(None).info().latency_max, Duration::from_secs(1));
 
 		let under = track_producer_capped(
 			"test",
@@ -4780,7 +4829,11 @@ mod test {
 		assert!(consumer.peek_group(2).is_some(), "latest group survives");
 		// Steady state carries the protected live edge plus the just-demoted group
 		// (debt is charged before the demotion, so eviction lags one append).
-		assert!(pool.used() <= 21_000, "usage hovers near capacity: {}", pool.used());
+		assert!(
+			pool.used() <= 2 * (10_000 + cache::ENTRY_OVERHEAD),
+			"usage hovers near capacity: {}",
+			pool.used()
+		);
 
 		// A fresh subscriber skips the evicted groups entirely.
 		let mut subscriber = producer.subscribe(None);

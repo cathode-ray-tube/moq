@@ -50,17 +50,17 @@ if(${BUILD_PLUGIN})
   # ship ffmpeg with no pkg-config .pc files, so it searches the prefix). On
   # Linux there's no obs-deps; pkg-config finds the system ffmpeg.
   if(WIN32 OR APPLE)
-    find_package(FFmpeg REQUIRED avcodec avutil swscale swresample)
+    find_package(FFmpeg 5.1 REQUIRED COMPONENTS avcodec avutil swscale swresample)
     target_link_libraries(obs-moq PRIVATE FFmpeg::avcodec FFmpeg::avutil FFmpeg::swscale FFmpeg::swresample)
   else()
     include(FindPkgConfig)
-    pkg_check_modules(FFMPEG REQUIRED libavcodec libavutil libswscale libswresample)
+    pkg_check_modules(FFMPEG REQUIRED libavcodec>=59.37 libavutil>=57.28 libswscale>=6.7 libswresample>=4.7)
     target_include_directories(obs-moq PRIVATE ${FFMPEG_INCLUDE_DIRS})
     target_link_directories(obs-moq PRIVATE ${FFMPEG_LIBRARY_DIRS})
     target_link_libraries(obs-moq PRIVATE ${FFMPEG_LIBRARIES})
   endif()
 else()
-  find_package(FFmpeg REQUIRED avcodec avutil swscale swresample)
+  find_package(FFmpeg 5.1 REQUIRED COMPONENTS avcodec avutil swscale swresample)
   target_link_libraries(obs-moq PRIVATE FFmpeg::avcodec FFmpeg::avutil FFmpeg::swscale FFmpeg::swresample)
 endif()
 
@@ -165,7 +165,10 @@ target_sources(
 # without Qt the same settings are still reachable through the service properties.
 if(ENABLE_FRONTEND_API AND ENABLE_QT)
   target_sources(obs-moq PRIVATE src/moq-dock.cpp src/moq-dock.h src/moq-advanced-dialog.cpp src/moq-advanced-dialog.h)
-  target_compile_definitions(obs-moq PRIVATE MOQ_FRONTEND_ENABLED MOQ_VERSION_STRING="${_moq_link_version}")
+  target_compile_definitions(
+    obs-moq
+    PRIVATE MOQ_FRONTEND_ENABLED MOQ_VERSION_STRING="${_moq_link_version}" PLUGIN_VERSION_STRING="${PLUGIN_VERSION}"
+  )
 endif()
 
 if(${BUILD_PLUGIN})

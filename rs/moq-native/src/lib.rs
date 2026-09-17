@@ -51,8 +51,8 @@ pub mod websocket;
 pub use client::{Client, ClientConfig};
 pub use connect::ConnectError;
 pub use error::{Error, Result};
-pub use log::Log;
-pub use reconnect::{Backoff, ConnectionStatsReader, Reconnect, Status};
+pub use log::{Log, RedactedUrl};
+pub use reconnect::{Backoff, ConnectionSnapshot, ConnectionStatsReader, Reconnect, Status};
 pub use server::{Request, Server, ServerConfig, Transport};
 
 /// Spawn the session's protocol driver on the current tokio runtime, handing back

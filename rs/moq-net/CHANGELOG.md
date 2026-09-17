@@ -7,6 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.22](https://github.com/moq-dev/moq/compare/moq-net-v0.2.21...moq-net-v0.2.22) - 2026-09-17
+
+### Fixed
+
+- *(moq-net)* a remote source never displaces a local publisher ([#3694](https://github.com/moq-dev/moq/pull/3694))
+
+## [0.2.21](https://github.com/moq-dev/moq/compare/moq-net-v0.2.20...moq-net-v0.2.21) - 2026-09-13
+
+### Fixed
+
+- *(kio)* bound waiter registration work ([#3635](https://github.com/moq-dev/moq/pull/3635))
+- *(moq-net)* scope-check the dynamic fallback in request_broadcast ([#3624](https://github.com/moq-dev/moq/pull/3624))
+- *(net)* never reuse generated track names ([#3594](https://github.com/moq-dev/moq/pull/3594))
+- satisfy the nightly license audit ([#3592](https://github.com/moq-dev/moq/pull/3592))
+- *(moq-net)* reject incompatible copies during failover ([#3521](https://github.com/moq-dev/moq/pull/3521))
+
+## [0.2.19](https://github.com/moq-dev/moq/compare/moq-net-v0.2.18...moq-net-v0.2.19) - 2026-09-09
+
+### Added
+
+- *(obs)* add connection stats and encoding controls to the MoQ dock ([#3453](https://github.com/moq-dev/moq/pull/3453))
+- *(moq-net)* stitch a draft-20 fill into the group it joined ([#3325](https://github.com/moq-dev/moq/pull/3325))
+
+### Fixed
+
+- *(moq-net)* prune origin nodes that nothing is using ([#3537](https://github.com/moq-dev/moq/pull/3537))
+- *(moq-net)* a group consumer is one cursor, so an evicted group skips instead of ending the export ([#3515](https://github.com/moq-dev/moq/pull/3515))
+- *(moq-net)* keep the draft-14/15 namespace map consistent and let it shrink ([#3481](https://github.com/moq-dev/moq/pull/3481))
+- *(relay)* stop the cache headroom governor with its pool ([#3487](https://github.com/moq-dev/moq/pull/3487))
+- *(moq-net)* answer for a name the broadcast never served ([#3366](https://github.com/moq-dev/moq/pull/3366))
+- *(moq-net)* give control streams a send order above the media ([#3389](https://github.com/moq-dev/moq/pull/3389))
+
+### Other
+
+- fold the moq-net fuzz harness into the workspace ([#3543](https://github.com/moq-dev/moq/pull/3543))
+- run orphaned test suites nightly ([#3538](https://github.com/moq-dev/moq/pull/3538))
+- make the agent guides minimal and situational ([#3469](https://github.com/moq-dev/moq/pull/3469))
+- *(moq-net)* guard the fuzz workspace lockfile ([#3465](https://github.com/moq-dev/moq/pull/3465))
+- abandon the track re-announce quest ([#3459](https://github.com/moq-dev/moq/pull/3459))
+
+## [0.2.18](https://github.com/moq-dev/moq/compare/moq-net-v0.2.17...moq-net-v0.2.18) - 2026-09-02
+
+### Added
+
+- *(moq-net)* expose broadcast demand on the read handle ([#3330](https://github.com/moq-dev/moq/pull/3330))
+
+### Fixed
+
+- *(moq-net)* serve the rest of a group whose front evicted ([#3323](https://github.com/moq-dev/moq/pull/3323))
+- *(moq-net)* drop an incoming group that starts after object 0 ([#3308](https://github.com/moq-dev/moq/pull/3308))
+- *(moq-net)* walk every spliced segment when resolving the live edge ([#3290](https://github.com/moq-dev/moq/pull/3290))
+- *(moq-net)* stop stamping objects with an undeclared timescale ([#3310](https://github.com/moq-dev/moq/pull/3310))
+
+## [0.2.17](https://github.com/moq-dev/moq/compare/moq-net-v0.2.16...moq-net-v0.2.17) - 2026-09-01
+
+### Other
+
+- *(rs)* simplify poll propagation ([#3307](https://github.com/moq-dev/moq/pull/3307))
+
+## [0.2.16](https://github.com/moq-dev/moq/compare/moq-net-v0.2.15...moq-net-v0.2.16) - 2026-09-01
+
+### Added
+
+- *(moq-net)* add moq-transport draft-20 (moqt-20) ([#3255](https://github.com/moq-dev/moq/pull/3255))
+- *(json)* add a sliding-window mode ([#3168](https://github.com/moq-dev/moq/pull/3168))
+- add local regression benchmark suite ([#3093](https://github.com/moq-dev/moq/pull/3093))
+- *(net)* batch frame reads and writes through a reusable buffer ([#3090](https://github.com/moq-dev/moq/pull/3090))
+
+### Fixed
+
+- *(net)* send registered PUBLISH_DONE statuses ([#3232](https://github.com/moq-dev/moq/pull/3232))
+- *(net)* escape slashes in IETF namespaces ([#3226](https://github.com/moq-dev/moq/pull/3226))
+- *(net)* bound lite message sizes ([#3222](https://github.com/moq-dev/moq/pull/3222))
+
+### Other
+
+- *(net)* fuzz the wire codecs ([#3198](https://github.com/moq-dev/moq/pull/3198))
+- *(net)* reduce priority queue churn ([#3211](https://github.com/moq-dev/moq/pull/3211))
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+- *(net)* seek instead of scan for the next in-range group ([#3088](https://github.com/moq-dev/moq/pull/3088))
+- *(net)* assert a stalled write releases the group it was serving ([#3095](https://github.com/moq-dev/moq/pull/3095))
+
 ## [0.2.15](https://github.com/moq-dev/moq/compare/moq-net-v0.2.14...moq-net-v0.2.15) - 2026-08-26
 
 ### Fixed

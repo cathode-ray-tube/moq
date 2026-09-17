@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { Getter } from "@moq/signals";
-import { Producer as BroadcastProducer } from "./broadcast.ts";
+import { type Consumer as BroadcastConsumer, Producer as BroadcastProducer } from "./broadcast.ts";
 import { accept, connect } from "./connection/index.ts";
 import { RemoteError } from "./error.ts";
 import * as Ietf from "./ietf/index.ts";
@@ -144,6 +144,52 @@ test("integration: lite subscription options and updates reach the publisher", a
 		startGroup: 2,
 		endGroup: 12,
 	});
+
+	subscriber.close();
+	remote.close();
+	broadcast.close();
+	await serving;
+	client.close();
+	server.close();
+});
+
+test("integration: lite carries a fractional latencyMax as a whole millisecond", async () => {
+	const pair = createMockTransportPair(Lite.ALPN_05);
+	const [client, server] = await Promise.all([connect(url, { transport: pair.client }), accept(pair.server, url)]);
+
+	const broadcast = new BroadcastProducer();
+	server.publish(Path.from("test"), broadcast);
+
+	let resolveProducer: ((producer: TrackProducer) => void) | undefined;
+	const accepted = new Promise<TrackProducer>((resolve) => {
+		resolveProducer = resolve;
+	});
+	const serving = (async () => {
+		for (;;) {
+			const request = await broadcast.requested();
+			if (!request) return;
+			const producer = request.accept();
+			if (request.subscription.startGroup === 0) resolveProducer?.(producer);
+		}
+	})();
+
+	const remote = client.consume(Path.from("test"));
+	// A varint cannot encode 38.75, so an unrounded value fails the SUBSCRIBE outright and
+	// nothing resubscribes. The publisher must see the budget rounded up instead.
+	const subscriber = remote.track("video").subscribe({ latencyMax: 38.75, startGroup: 0 });
+
+	// A failed subscribe never reaches the publisher, so race its closure to report the
+	// encode error rather than block until the suite times out.
+	const failed = Promise.resolve(subscriber.closed).then<never>((err) => {
+		throw err ?? new Error("subscription closed before the publisher saw it");
+	});
+
+	const producer = await Promise.race([accepted, failed]);
+	expect(producer.subscription.peek()?.latencyMax).toBe(39);
+
+	const updated = producer.subscription.changed();
+	subscriber.update({ latencyMax: 500.25, startGroup: 0 });
+	expect((await Promise.race([updated, failed]))?.latencyMax).toBe(501);
 
 	subscriber.close();
 	remote.close();
@@ -1120,6 +1166,67 @@ test("integration: a republish is not served from the previous generation's cach
 	await servingSecond;
 	client.close();
 	server.close();
+});
+
+// #3363: an `invisible muted` <moq-publish> unpublishes and republishes the same path on one
+// session every time it is toggled. Each generation is a new producer under the old name, and the
+// gap between them can be a single microtask, so the announce loop has to key the path on which
+// producer holds it rather than on the path alone.
+async function runRepublishCycle(protocol: string, version?: number) {
+	const pair = createMockTransportPair(protocol);
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, version !== undefined ? { version } : undefined),
+	]);
+
+	const serve = async (broadcast: BroadcastProducer, payload: string) => {
+		for (;;) {
+			const req = await broadcast.requested();
+			if (!req) break;
+			req.accept().writeString(payload);
+		}
+	};
+
+	const watched = client.announcedBroadcast(Path.from("toggle"));
+
+	let previous: BroadcastConsumer | undefined;
+	for (let generation = 0; generation < 3; generation++) {
+		const payload = `gen${generation}`;
+		const producer = new BroadcastProducer();
+		const serving = serve(producer, payload);
+		server.publish(Path.from("toggle"), producer);
+
+		// A dead consumer left in place would still satisfy `!== undefined`, so wait for the swap.
+		const active = await withTimeout(
+			waitFor(watched.active, (b) => b !== undefined && b !== previous),
+			1000,
+			`generation ${generation} never came online`,
+		);
+		if (!active) throw new Error("expected an active broadcast");
+		const frame = withTimeout(
+			active.subscribe("audio").readString(),
+			1000,
+			`generation ${generation} never served a frame`,
+		);
+		expect(await frame).toBe(payload);
+		previous = active;
+
+		// Unpublish, as the element does when it runs out of media, and go straight back around.
+		producer.close();
+		await serving;
+	}
+
+	watched.close();
+	client.close();
+	server.close();
+}
+
+test("integration: lite republish on one session swaps the handle every generation", async () => {
+	await runRepublishCycle(Lite.ALPN_06_WIP);
+});
+
+test("integration: ietf republish on one session swaps the handle every generation", async () => {
+	await runRepublishCycle("", Ietf.Version.DRAFT_14);
 });
 
 test("integration: a blind handle picks up a publisher that arrives late", async () => {

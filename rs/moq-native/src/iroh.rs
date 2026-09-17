@@ -15,16 +15,6 @@ use web_transport_proto::{ConnectRequest, ConnectResponse};
 pub use iroh::Endpoint;
 pub use web_transport_iroh;
 
-/// The congestion control family to install, defaulting to loss-based.
-///
-/// Unlike the other backends we don't default to BBR here: noq's BBRv3 subtracts
-/// without a floor when computing the inflight bytes at the loss event, so a single
-/// packet loss can underflow and panic, taking the whole process with it. Delay-based
-/// stays reachable, but only when an operator asks for it by name.
-fn congestion_control(quic: &crate::quic::Resolved) -> CongestionControl {
-	quic.congestion_control.unwrap_or(CongestionControl::Loss)
-}
-
 /// The iroh controller factory for a congestion control family.
 ///
 /// iroh is built on noq, so its BBR is v3. It re-exports the `ControllerFactory`
@@ -212,7 +202,7 @@ impl EndpointConfig {
 		if !quic.mtu_discovery {
 			transport = transport.mtu_discovery_config(None);
 		}
-		transport = transport.congestion_controller_factory(congestion_factory(congestion_control(&quic)));
+		transport = transport.congestion_controller_factory(congestion_factory(quic.congestion()));
 
 		let mut builder = if self.disable_relay.unwrap_or(false) {
 			Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -238,14 +228,12 @@ impl EndpointConfig {
 
 /// Accept an iroh connection, negotiate WebTransport or raw QUIC, and complete the
 /// handshake. Returns the established session plus the request URL (raw QUIC carries
-/// none). iroh exposes no client-certificate identity, so the identity is always `None`.
+/// none). iroh exposes no client-certificate identity, so the identity is always `None`,
+/// and it addresses peers by EndpointId rather than a dialed hostname, so the authority
+/// is always `None` too.
 pub(crate) async fn accept(
 	conn: iroh::endpoint::Incoming,
-) -> Result<(
-	web_transport_iroh::Session,
-	Option<Url>,
-	Option<crate::tls::PeerIdentity>,
-)> {
+) -> Result<crate::server::Accepted<web_transport_iroh::Session>> {
 	let conn = conn.accept()?.await?;
 	let alpn = String::from_utf8(conn.alpn().to_vec())?;
 	tracing::Span::current().record("id", conn.stable_id());
@@ -262,12 +250,22 @@ pub(crate) async fn accept(
 				response = response.with_protocol(protocol);
 			}
 			let session = request.respond(response).await.map_err(Error::Server)?;
-			Ok((session, url, None))
+			Ok(crate::server::Accepted {
+				session,
+				url,
+				identity: None,
+				authority: None,
+			})
 		}
 		// Raw QUIC carries no request URL; the path rides the SETUP.
 		alpn if moq_net::ALPNS.contains(&alpn) => {
 			let session = web_transport_iroh::QuicRequest::accept(conn).ok();
-			Ok((session, None, None))
+			Ok(crate::server::Accepted {
+				session,
+				url: None,
+				identity: None,
+				authority: None,
+			})
 		}
 		_ => Err(Error::UnsupportedAlpn(alpn)),
 	}
@@ -372,17 +370,5 @@ mod tests {
 
 		let delay = congestion_factory(CongestionControl::Delay).build(now, mtu);
 		assert!(delay.into_any().downcast::<noq_proto::congestion::Bbr3>().is_ok());
-	}
-
-	/// noq's BBRv3 panics on loss, so an unset knob must land on CUBIC here even
-	/// though every other backend defaults to BBR.
-	#[test]
-	fn congestion_control_defaults_to_loss() {
-		let mut quic = crate::quic::Client::default();
-		assert_eq!(congestion_control(&quic.resolve()), CongestionControl::Loss);
-
-		// An explicit request still gets through.
-		quic.congestion_control = Some(CongestionControl::Delay);
-		assert_eq!(congestion_control(&quic.resolve()), CongestionControl::Delay);
 	}
 }

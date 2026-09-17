@@ -40,8 +40,8 @@ pub enum Kind {
 	Hardware,
 	/// Software only (openh264 for H.264).
 	Software,
-	/// A specific backend by name, e.g. `"videotoolbox"`, `"nvenc"`, `"vaapi"`,
-	/// or `"openh264"`.
+	/// A specific backend by name, e.g. `"videotoolbox"`, `"mediacodec"`,
+	/// `"nvenc"`, `"vaapi"`, `"v4l2"`, or `"openh264"`.
 	Named(String),
 }
 
@@ -514,7 +514,14 @@ mod tests {
 			kind: Kind::Named("definitely_not_a_codec".into()),
 			..Config::new(320, 240, 30)
 		};
-		assert!(matches!(Encoder::new(&config), Err(Error::NoEncoder(_))));
+		// Not `NoEncoder`: that reads "no usable video encoder found (tried: )"
+		// and describes a machine with no encoder rather than a name that is not
+		// one. The name asked for and the names available are both here.
+		let err = Encoder::new(&config).err().expect("an unknown name cannot open");
+		assert!(
+			matches!(&err, Error::UnknownEncoder { name, .. } if name == "definitely_not_a_codec"),
+			"unexpected error: {err:?}",
+		);
 	}
 
 	/// Exercises the hand-rolled VideoToolbox backend end to end on macOS:
@@ -793,13 +800,14 @@ mod tests {
 		let mut frames = Vec::new();
 		let mut textures = 0;
 		for i in 0..30 {
-			let surface = camera.read().await.expect("frame, not end of stream");
-			if matches!(surface, Surface::Texture(_)) {
+			let surface = camera.read().await.expect("read camera frame");
+			if matches!(surface, Some(Surface::Texture(_))) {
 				textures += 1;
 			}
 			if i == 0 {
 				encoder.keyframe();
 			}
+			let surface = surface.expect("frame, not end of stream");
 			frames.extend(encoder.encode(&Frame::new(surface, at(i))).unwrap());
 		}
 		frames.extend(encoder.finish().unwrap());

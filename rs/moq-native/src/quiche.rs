@@ -1,6 +1,7 @@
 //! QUIC backend built on [`web_transport_quiche`], speaking WebTransport over HTTP/3
 //! (`https://`) or raw QUIC (`moqt://` / `moql://`).
 
+use crate::RedactedUrl;
 use crate::client::ClientConfig;
 use crate::crypto;
 use crate::quic::CongestionControl;
@@ -178,10 +179,7 @@ fn apply_settings(settings: &mut web_transport_quiche::Settings, quic: &Resolved
 	settings.max_idle_timeout = Some(quic.idle_timeout);
 	settings.discover_path_mtu = quic.mtu_discovery;
 
-	// Live media wants a steady send rate an encoder can track, not CUBIC's sawtooth,
-	// so default to BBR rather than quiche's own CUBIC.
-	let family = quic.congestion_control.unwrap_or(CongestionControl::Delay);
-	settings.cc_algorithm = cc_algorithm(family).to_owned();
+	settings.cc_algorithm = cc_algorithm(quic.congestion()).to_owned();
 
 	// quiche writes one file per connection itself, named after the connection ID.
 	if let Some(dir) = quic.qlog_dir() {
@@ -341,7 +339,7 @@ impl QuicheClient {
 			candidates = candidates.with_limit(1);
 		}
 
-		tracing::debug!(%url, "connecting via quiche");
+		tracing::debug!(url = %RedactedUrl::new(&url), "connecting via quiche");
 
 		// Race only the QUIC handshake: the winner alone performs the WebTransport
 		// CONNECT below, so the server sees a single request no matter how many
@@ -457,7 +455,7 @@ async fn fetch_fingerprint(url: &Url) -> Result<[u8; 32]> {
 	fp.set_query(None);
 	fp.set_fragment(None);
 
-	tracing::warn!(url = %fp, "performing insecure HTTP request for certificate fingerprint");
+	tracing::warn!(url = %RedactedUrl::new(&fp), "performing insecure HTTP request for certificate fingerprint");
 
 	let resp = reqwest::get(fp.as_str())
 		.await
@@ -701,17 +699,14 @@ fn generate_quiche_cert(
 
 /// A raw QUIC connection request via the quiche backend (not using HTTP/3).
 /// Accept a quiche QUIC connection, negotiate WebTransport or raw moq, and complete the
-/// handshake (a `200 OK` for WebTransport). Returns the established connection plus the
-/// request URL and any validated client identity. Raw QUIC carries no request URL
-/// because the path rides the SETUP instead.
+/// handshake (a `200 OK` for WebTransport). Returns the established connection, the request
+/// URL and any validated client identity, and the dialed authority (the CONNECT authority
+/// on WebTransport, the TLS SNI on raw QUIC). Raw QUIC carries no request URL because the
+/// path rides the SETUP instead.
 pub(crate) async fn accept(
 	incoming: web_transport_quiche::ez::Incoming,
 	alpns: Vec<&'static str>,
-) -> Result<(
-	web_transport_quiche::Connection,
-	Option<Url>,
-	Option<crate::tls::PeerIdentity>,
-)> {
+) -> Result<crate::server::Accepted<web_transport_quiche::Connection>> {
 	tracing::debug!(ip = %incoming.peer_addr(), "accepting via quiche");
 
 	// Accept the connection and wait for it to be established
@@ -730,6 +725,8 @@ pub(crate) async fn accept(
 				.await
 				.map_err(Error::AcceptRequest)?;
 			let url = Some(request.url.clone());
+			// The authority the client put in its CONNECT URL.
+			let authority = request.url.host_str().filter(|h| !h.is_empty()).map(str::to_owned);
 
 			let mut response = web_transport_quiche::proto::ConnectResponse::OK;
 			// Pick the first sub-protocol that we actually support.
@@ -738,15 +735,27 @@ pub(crate) async fn accept(
 				response = response.with_protocol(protocol);
 			}
 			let session = request.respond(response).await.map_err(Error::Accept)?;
-			Ok((session, url, identity))
+			Ok(crate::server::Accepted {
+				session,
+				url,
+				identity,
+				authority,
+			})
 		}
 		// Recognize any moq ALPN this server actually offered (its configured versions),
 		// not the global default set, so opt-in / work-in-progress versions (e.g.
 		// moq-lite-06-wip) that are deliberately absent from `moq_net::ALPNS` still work.
 		alpn if alpns.contains(&alpn) => {
-			// Raw QUIC carries no request URL; the path rides the SETUP.
+			// Raw QUIC carries no request URL; the path rides the SETUP. The TLS SNI is the
+			// only authority the client can offer here, and it is optional.
+			let authority = conn.server_name().filter(|h| !h.is_empty());
 			let session = web_transport_quiche::Connection::raw(conn);
-			Ok((session, None, identity))
+			Ok(crate::server::Accepted {
+				session,
+				url: None,
+				identity,
+				authority,
+			})
 		}
 		_ => Err(Error::UnsupportedAlpn(alpn.to_string())),
 	}

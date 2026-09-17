@@ -1,5 +1,6 @@
 //! The quinn QUIC backend, used for both WebTransport (`https://`) and raw QUIC (`moqt://`, `moql://`).
 
+use crate::RedactedUrl;
 use crate::client::ClientConfig;
 use crate::quic::CongestionControl;
 use crate::quic::Resolved;
@@ -67,15 +68,7 @@ fn apply_transport(transport: &mut quinn::TransportConfig, quic: &Resolved) {
 		transport.enable_segmentation_offload(gso);
 	}
 
-	transport.congestion_controller_factory(congestion_factory(congestion_control(quic)));
-}
-
-/// The congestion control family to install, defaulting to delay-based.
-///
-/// Live media wants a steady send rate an encoder can track, not CUBIC's sawtooth,
-/// so override quinn's own CUBIC default.
-fn congestion_control(quic: &Resolved) -> CongestionControl {
-	quic.congestion_control.unwrap_or(CongestionControl::Delay)
+	transport.congestion_controller_factory(congestion_factory(quic.congestion()));
 }
 
 /// The quinn controller factory for a congestion control family. quinn's BBR is v1.
@@ -327,7 +320,7 @@ impl QuinnClient {
 				fingerprint.set_query(None);
 				fingerprint.set_fragment(None);
 
-				tracing::warn!(url = %fingerprint, "performing insecure HTTP request for certificate");
+				tracing::warn!(url = %RedactedUrl::new(&fingerprint), "performing insecure HTTP request for certificate");
 
 				let resp = reqwest::get(fingerprint.as_str())
 					.await
@@ -362,7 +355,7 @@ impl QuinnClient {
 		let mut config = quinn::ClientConfig::new(Arc::new(config));
 		config.transport_config(self.transport.clone());
 
-		tracing::debug!(%url, "connecting");
+		tracing::debug!(url = %RedactedUrl::new(&url), "connecting");
 
 		// Use the configured host_name override for SNI + cert verification, else the URL host.
 		let host_name = self.host_name.clone().unwrap_or(host);
@@ -596,17 +589,14 @@ impl QuinnServer {
 // ── QuinnRequest ────────────────────────────────────────────────────
 
 /// Accept a QUIC connection, negotiate WebTransport or raw moq, and complete the
-/// handshake (a `200 OK` for WebTransport). Returns the established session plus the
-/// request URL and validated mTLS identity, both captured before the response consumes
-/// the request. Raw QUIC carries no request URL (the path rides the SETUP instead).
+/// handshake (a `200 OK` for WebTransport). Returns the established session, the request
+/// URL and validated mTLS identity (both captured before the response consumes the
+/// request), and the dialed authority (the CONNECT authority on WebTransport, the TLS
+/// SNI on raw QUIC). Raw QUIC carries no request URL (the path rides the SETUP instead).
 pub(crate) async fn accept(
 	conn: quinn::Incoming,
 	alpns: Vec<&'static str>,
-) -> Result<(
-	web_transport_quinn::Session,
-	Option<Url>,
-	Option<crate::tls::PeerIdentity>,
-)> {
+) -> Result<crate::server::Accepted<web_transport_quinn::Session>> {
 	let mut conn = conn.accept()?;
 
 	let handshake = conn
@@ -637,6 +627,8 @@ pub(crate) async fn accept(
 				.map_err(Error::RecvRequest)?;
 			let url = Some(request.url.clone());
 			let identity = crate::tls::PeerIdentity::from_any(request.conn().peer_identity());
+			// The authority the client put in its CONNECT URL.
+			let authority = request.url.host_str().filter(|h| !h.is_empty()).map(str::to_owned);
 
 			let mut response = web_transport_quinn::proto::ConnectResponse::OK;
 			// Pick the first sub-protocol that we actually support.
@@ -648,7 +640,12 @@ pub(crate) async fn accept(
 				response = response.with_protocol(protocol);
 			}
 			let session = request.respond(response).await.map_err(Error::Server)?;
-			Ok((session, url, identity))
+			Ok(crate::server::Accepted {
+				session,
+				url,
+				identity,
+				authority,
+			})
 		}
 		// Recognize any moq ALPN this server actually offered (its configured versions),
 		// not the global default set. rustls only negotiates an ALPN the server offered, so
@@ -656,9 +653,16 @@ pub(crate) async fn accept(
 		// deliberately absent from `moq_net::ALPNS`.
 		alpn if alpns.contains(&alpn) => {
 			let identity = crate::tls::PeerIdentity::from_any(conn.peer_identity());
-			// Raw QUIC carries no request URL; the path rides the SETUP.
+			// Raw QUIC carries no request URL; the path rides the SETUP. The TLS SNI is the
+			// only authority the client can offer here, and it is optional.
+			let authority = (!host.is_empty()).then_some(host);
 			let session = web_transport_quinn::Session::raw(conn);
-			Ok((session, None, identity))
+			Ok(crate::server::Accepted {
+				session,
+				url: None,
+				identity,
+				authority,
+			})
 		}
 		_ => Err(Error::UnsupportedAlpn(alpn)),
 	}
@@ -751,17 +755,6 @@ mod tests {
 
 		let delay = congestion_factory(CongestionControl::Delay).build(now, mtu);
 		assert!(delay.into_any().downcast::<quinn::congestion::Bbr>().is_ok());
-	}
-
-	/// An unset knob must land on BBR rather than quinn's own CUBIC default.
-	#[test]
-	fn congestion_control_defaults_to_delay() {
-		let mut quic = crate::quic::Client::default();
-		assert_eq!(congestion_control(&quic.resolve()), CongestionControl::Delay);
-
-		// An explicit request still gets through.
-		quic.congestion_control = Some(CongestionControl::Loss);
-		assert_eq!(congestion_control(&quic.resolve()), CongestionControl::Loss);
 	}
 
 	/// Loopback regression test: a config selecting BBR must produce live

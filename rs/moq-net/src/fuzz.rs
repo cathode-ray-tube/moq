@@ -49,13 +49,14 @@ const IETF_VERSIONS: &[ietf::Version] = &[
 	ietf::Version::Draft18,
 	ietf::Version::Draft19,
 	ietf::Version::Draft20,
+	ietf::Version::Draft21,
 ];
 
 /// How many types [`lite_wire`] dispatches over.
 const LITE_KINDS: u8 = 21;
 
 /// How many types [`ietf_wire`] dispatches over.
-const IETF_KINDS: u8 = 37;
+const IETF_KINDS: u8 = 38;
 
 /// Split the two selector bytes off the input: a version and a type.
 fn select(data: &[u8], versions: usize) -> Option<(usize, u8, &[u8])> {
@@ -202,6 +203,7 @@ pub fn ietf_wire(data: &[u8]) -> bool {
 		34 => roundtrip::<ietf::GroupHeader, _>(rest, version, stable),
 		35 => roundtrip::<ietf::Parameters, _>(rest, version, stable),
 		36 => roundtrip::<ietf::Location, _>(rest, version, stable),
+		37 => roundtrip::<ietf::FetchObject, _>(rest, version, stable),
 		_ => unreachable!("kind is taken modulo IETF_KINDS"),
 	}
 }
@@ -429,6 +431,34 @@ pub fn seeds() -> Vec<Seed> {
 		seeds.push(Seed {
 			target: "ietf",
 			kind: 1,
+			data,
+		});
+	}
+
+	// A SUBSCRIBE_OK carrying LARGEST_OBJECT, whose value encoding changed at draft-17
+	// from a length-prefixed Location to two bare varints. A uniform fill never lands a
+	// valid parameter count followed by a Location, so build it from the encoder.
+	for (index, version) in IETF_VERSIONS.iter().enumerate() {
+		let subscribe_ok = ietf::SubscribeOk {
+			request_id: matches!(
+				version,
+				ietf::Version::Draft14 | ietf::Version::Draft15 | ietf::Version::Draft16
+			)
+			.then_some(ietf::RequestId(0)),
+			track_alias: 0,
+			largest: Some(ietf::Location { group: 427, object: 0 }),
+			properties: Default::default(),
+		};
+
+		let Ok(encoded) = subscribe_ok.encode_bytes(*version) else {
+			continue;
+		};
+
+		let mut data = vec![index as u8, 19];
+		data.extend_from_slice(&encoded);
+		seeds.push(Seed {
+			target: "ietf",
+			kind: 19,
 			data,
 		});
 	}

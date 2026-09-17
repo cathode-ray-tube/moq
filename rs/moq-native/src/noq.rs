@@ -1,5 +1,6 @@
 //! The noq QUIC backend, used for both WebTransport (`https://`) and raw QUIC (`moqt://`, `moql://`).
 
+use crate::RedactedUrl;
 use crate::client::ClientConfig;
 use crate::quic::CongestionControl;
 use crate::quic::Resolved;
@@ -10,8 +11,6 @@ use std::net;
 use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
-
-use web_transport_noq::noq;
 
 pub use web_transport_noq;
 
@@ -56,17 +55,7 @@ fn apply_transport(transport: &mut noq::TransportConfig, quic: &Resolved) {
 		transport.enable_segmentation_offload(gso);
 	}
 
-	transport.congestion_controller_factory(congestion_factory(congestion_control(quic)));
-}
-
-/// The congestion control family to install, defaulting to loss-based.
-///
-/// Unlike the other backends we don't default to BBR here: noq's BBRv3 subtracts
-/// without a floor when computing the inflight bytes at the loss event, so a single
-/// packet loss can underflow and panic, taking the whole process with it. Delay-based
-/// stays reachable, but only when an operator asks for it by name.
-fn congestion_control(quic: &Resolved) -> CongestionControl {
-	quic.congestion_control.unwrap_or(CongestionControl::Loss)
+	transport.congestion_controller_factory(congestion_factory(quic.congestion()));
 }
 
 /// The noq controller factory for a congestion control family. noq's BBR is v3.
@@ -314,7 +303,7 @@ impl NoqClient {
 				fingerprint.set_query(None);
 				fingerprint.set_fragment(None);
 
-				tracing::warn!(url = %fingerprint, "performing insecure HTTP request for certificate");
+				tracing::warn!(url = %RedactedUrl::new(&fingerprint), "performing insecure HTTP request for certificate");
 
 				let resp = reqwest::get(fingerprint.as_str())
 					.await
@@ -349,7 +338,7 @@ impl NoqClient {
 		let mut config = noq::ClientConfig::new(Arc::new(config));
 		config.transport_config(self.transport.clone());
 
-		tracing::debug!(%url, "connecting");
+		tracing::debug!(url = %RedactedUrl::new(&url), "connecting");
 
 		// Use the configured host_name override for SNI + cert verification, else the URL host.
 		let host_name = self.host_name.clone().unwrap_or(host);
@@ -586,17 +575,14 @@ impl NoqServer {
 
 /// A raw QUIC connection request without WebTransport framing (noq backend).
 /// Accept a QUIC connection, negotiate WebTransport or raw moq, and complete the
-/// handshake (a `200 OK` for WebTransport). Returns the established session plus the
-/// request URL and validated mTLS identity, both captured before the response consumes
-/// the request. Raw QUIC carries no request URL (the path rides the SETUP instead).
+/// handshake (a `200 OK` for WebTransport). Returns the established session, the request
+/// URL and validated mTLS identity (both captured before the response consumes the
+/// request), and the dialed authority (the CONNECT authority on WebTransport, the TLS
+/// SNI on raw QUIC). Raw QUIC carries no request URL (the path rides the SETUP instead).
 pub(crate) async fn accept(
 	conn: noq::Incoming,
 	alpns: Vec<&'static str>,
-) -> Result<(
-	web_transport_noq::Session,
-	Option<Url>,
-	Option<crate::tls::PeerIdentity>,
-)> {
+) -> Result<crate::server::Accepted<web_transport_noq::Session>> {
 	let mut conn = conn.accept()?;
 
 	let handshake = conn
@@ -630,13 +616,20 @@ pub(crate) async fn accept(
 				.map_err(Error::RecvRequest)?;
 			let url = Some(request.url.clone());
 			let identity = crate::tls::PeerIdentity::from_any(request.conn().peer_identity());
+			// The authority the client put in its CONNECT URL.
+			let authority = request.url.host_str().filter(|h| !h.is_empty()).map(str::to_owned);
 
 			let mut response = web_transport_noq::proto::ConnectResponse::OK;
 			if let Some(protocol) = request.protocols.iter().find(|p| alpns.contains(&p.as_str())) {
 				response = response.with_protocol(protocol);
 			}
 			let session = request.respond(response).await.map_err(Error::Server)?;
-			Ok((session, url, identity))
+			Ok(crate::server::Accepted {
+				session,
+				url,
+				identity,
+				authority,
+			})
 		}
 		// Recognize any moq ALPN this server actually offered (its configured versions),
 		// not the global default set. rustls only negotiates an ALPN the server offered, so
@@ -644,9 +637,16 @@ pub(crate) async fn accept(
 		// deliberately absent from `moq_net::ALPNS`.
 		alpn if alpns.contains(&alpn) => {
 			let identity = crate::tls::PeerIdentity::from_any(conn.peer_identity());
-			// Raw QUIC carries no request URL; the path rides the SETUP.
+			// Raw QUIC carries no request URL; the path rides the SETUP. The TLS SNI is the
+			// only authority the client can offer here, and it is optional.
+			let authority = (!host.is_empty()).then_some(host);
 			let session = web_transport_noq::Session::raw(conn);
-			Ok((session, None, identity))
+			Ok(crate::server::Accepted {
+				session,
+				url: None,
+				identity,
+				authority,
+			})
 		}
 		_ => Err(Error::UnsupportedAlpn(alpn)),
 	}
@@ -704,15 +704,71 @@ mod tests {
 		assert!(delay.into_any().downcast::<noq::congestion::Bbr3>().is_ok());
 	}
 
-	/// noq's BBRv3 panics on loss, so an unset knob must land on CUBIC here even
-	/// though every other backend defaults to BBR.
-	#[test]
-	fn congestion_control_defaults_to_loss() {
-		let mut quic = crate::quic::Client::default();
-		assert_eq!(congestion_control(&quic.resolve()), CongestionControl::Loss);
+	/// Loopback regression test: with the knob unset, live noq connections must run
+	/// BBRv3 on both ends.
+	#[tokio::test]
+	async fn default_reaches_the_live_connection() {
+		let server_config = ServerConfig {
+			bind: Some("127.0.0.1:0".to_string()),
+			tls: crate::tls::Server {
+				generate: vec!["localhost".into()],
+				..Default::default()
+			},
+			..Default::default()
+		};
 
-		// An explicit request still gets through.
-		quic.congestion_control = Some(CongestionControl::Delay);
-		assert_eq!(congestion_control(&quic.resolve()), CongestionControl::Delay);
+		let server = NoqServer::new(server_config).expect("server init");
+		let addr = server.local_addr().expect("local addr");
+
+		let accepted = tokio::spawn(async move {
+			let incoming = server.accept().await.expect("no incoming connection");
+			let conn = incoming.accept().expect("accept").await.expect("handshake");
+			is_bbr3(&conn)
+		});
+
+		// tls::Client has a private field, so it can't be built with a struct literal.
+		let mut tls_config = crate::tls::Client::default();
+		tls_config.disable_verify = Some(true);
+
+		let client_config = ClientConfig {
+			bind: "127.0.0.1:0".parse().unwrap(),
+			tls: tls_config,
+			..Default::default()
+		};
+
+		let tls = client_config.tls.build().expect("tls config");
+		let client = NoqClient::new(&client_config).expect("client init");
+		// Dial the loopback IP directly so the system resolver is never involved.
+		let url: Url = format!("moqt://127.0.0.1:{}", addr.port()).parse().unwrap();
+
+		// Bound the whole connect + accept + assert flow so a handshake
+		// regression fails fast instead of stalling CI.
+		tokio::time::timeout(Duration::from_secs(5), async move {
+			let session = client
+				.connect(&tls, url, &moq_net::Versions::default())
+				.await
+				.expect("connect failed");
+
+			// web_transport_noq::Session derefs to the noq connection.
+			assert!(is_bbr3(&session), "client connection is not running BBRv3");
+			assert!(
+				accepted.await.expect("server task panicked"),
+				"server connection is not running BBRv3"
+			);
+		})
+		.await
+		.expect("test timed out");
+	}
+
+	/// Whether a live connection's initial path is running BBRv3.
+	///
+	/// noq is multipath, so the controller is per path rather than per connection;
+	/// `PathId::ZERO` is the path the handshake came up on.
+	fn is_bbr3(conn: &noq::Connection) -> bool {
+		conn.congestion_state(noq::PathId::ZERO)
+			.expect("no controller on the initial path")
+			.into_any()
+			.downcast::<noq::congestion::Bbr3>()
+			.is_ok()
 	}
 }

@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.16](https://github.com/moq-dev/moq/compare/moq-boy-v0.4.15...moq-boy-v0.4.16) - 2026-09-17
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.4.15](https://github.com/moq-dev/moq/compare/moq-boy-v0.4.14...moq-boy-v0.4.15) - 2026-09-13
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.4.14](https://github.com/moq-dev/moq/compare/moq-boy-v0.4.13...moq-boy-v0.4.14) - 2026-09-09
+
+### Added
+
+- *(audio,video)* compile the device, render, and VAAPI code by default ([#3353](https://github.com/moq-dev/moq/pull/3353))
+
+### Fixed
+
+- *(moq-native)* stop logging credentials in relay URLs and RTMP stream keys ([#3379](https://github.com/moq-dev/moq/pull/3379))
+
+## [0.4.13](https://github.com/moq-dev/moq/compare/moq-boy-v0.4.12...moq-boy-v0.4.13) - 2026-09-02
+
+### Added
+
+- *(moq-audio)* expose Opus DTX classification ([#3238](https://github.com/moq-dev/moq/pull/3238))
+
+## [0.4.12](https://github.com/moq-dev/moq/compare/moq-boy-v0.4.11...moq-boy-v0.4.12) - 2026-09-01
+
+### Other
+
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
 ## [0.4.11](https://github.com/moq-dev/moq/compare/moq-boy-v0.4.10...moq-boy-v0.4.11) - 2026-08-26
 
 ### Other

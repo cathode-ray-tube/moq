@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11](https://github.com/moq-dev/moq/compare/moq-stats-v0.1.10...moq-stats-v0.1.11) - 2026-09-17
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.1.10](https://github.com/moq-dev/moq/compare/moq-stats-v0.1.9...moq-stats-v0.1.10) - 2026-09-13
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.1.9](https://github.com/moq-dev/moq/compare/moq-stats-v0.1.8...moq-stats-v0.1.9) - 2026-09-09
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.1.8](https://github.com/moq-dev/moq/compare/moq-stats-v0.1.7...moq-stats-v0.1.8) - 2026-09-02
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.1.7](https://github.com/moq-dev/moq/compare/moq-stats-v0.1.6...moq-stats-v0.1.7) - 2026-09-01
+
+### Other
+
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
 ## [0.1.6](https://github.com/moq-dev/moq/compare/moq-stats-v0.1.5...moq-stats-v0.1.6) - 2026-08-24
 
 ### Other

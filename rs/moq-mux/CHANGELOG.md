@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.16](https://github.com/moq-dev/moq/compare/moq-mux-v0.9.15...moq-mux-v0.9.16) - 2026-09-17
+
+### Fixed
+
+- bump h264-parser to 0.4.2 ([#3707](https://github.com/moq-dev/moq/pull/3707))
+
+## [0.9.15](https://github.com/moq-dev/moq/compare/moq-mux-v0.9.14...moq-mux-v0.9.15) - 2026-09-13
+
+### Other
+
+- updated the following local packages: kio, moq-net, hang, moq-json, moq-loc
+
+## [0.9.14](https://github.com/moq-dev/moq/compare/moq-mux-v0.9.13...moq-mux-v0.9.14) - 2026-09-09
+
+### Added
+
+- *(obs)* add connection stats and encoding controls to the MoQ dock ([#3453](https://github.com/moq-dev/moq/pull/3453))
+- *(moq-mux)* count and log MPEG-TS audio resyncs ([#3372](https://github.com/moq-dev/moq/pull/3372))
+
+### Fixed
+
+- *(moq-net)* a group consumer is one cursor, so an evicted group skips instead of ending the export ([#3515](https://github.com/moq-dev/moq/pull/3515))
+- *(mux)* refuse an fMP4 fragment whose decode time doesn't advance ([#3495](https://github.com/moq-dev/moq/pull/3495))
+- *(moq-mux)* recover buffered TS output after a rewind ([#3375](https://github.com/moq-dev/moq/pull/3375))
+- *(moq-mux)* slice the TS export on the PCR grid ([#3351](https://github.com/moq-dev/moq/pull/3351))
+- *(moq-mux)* keep H.265 suffix SEI on the access unit it follows ([#3384](https://github.com/moq-dev/moq/pull/3384))
+- *(moq-mux)* drive the fMP4 export poll with a loop, not tail recursion ([#3333](https://github.com/moq-dev/moq/pull/3333))
+
+### Other
+
+- make the agent guides minimal and situational ([#3469](https://github.com/moq-dev/moq/pull/3469))
+- *(deps)* bump the cargo group across 1 directory with 5 updates ([#3395](https://github.com/moq-dev/moq/pull/3395))
+
+## [0.9.13](https://github.com/moq-dev/moq/compare/moq-mux-v0.9.12...moq-mux-v0.9.13) - 2026-09-02
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-json, moq-loc
+
+## [0.9.12](https://github.com/moq-dev/moq/compare/moq-mux-v0.9.11...moq-mux-v0.9.12) - 2026-09-01
+
+### Other
+
+- *(rs)* simplify poll propagation ([#3307](https://github.com/moq-dev/moq/pull/3307))
+
+## [0.9.11](https://github.com/moq-dev/moq/compare/moq-mux-v0.9.10...moq-mux-v0.9.11) - 2026-09-01
+
+### Fixed
+
+- *(moq-mux)* wait for late groups within the latency budget ([#3271](https://github.com/moq-dev/moq/pull/3271))
+
+### Other
+
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
 ## [0.9.10](https://github.com/moq-dev/moq/compare/moq-mux-v0.9.9...moq-mux-v0.9.10) - 2026-08-26
 
 ### Added

@@ -33,14 +33,16 @@ quests don't re-litigate them:
 [Worker metrics](/quest/m1/uring-metrics.md) is a soft dependency: it adds
 the ring-level counters (enters, park/wake, batch effectiveness) several
 quests want as evidence. Use bench CPU/RSS until it lands. The
-[QUIC backend bakeoff](/quest/m3/quic-backend-bakeoff.md) has its own
-`SendMsgZc` measurement axis; the zero-copy quests here stay independently
-measured and scoped to the quiche backend we ship today.
+[noq parity gate](/quest/m2/quic/noq-parity.md) benchmarks noq against the
+quiche backend; the zero-copy quests here stay independently measured on the
+backend we ship today.
 
 ## Quests
 
 - [Frame send](/quest/m1/perf/frame-send.md) - a frame reaches quiche as zero-copy appends instead of two copying stream_send calls
 - [Ingest batch](/quest/m1/perf/ingest-batch.md) - relay ingest pays one lock, wake, and clock read per chunk burst instead of per chunk
+- [Egress cache refresh](/quest/m1/perf/egress-keepalive.md) - measure refresh costs while preserving slow-reader retention
+- [Owned decoding copies](/quest/m1/perf/coding-decode.md) - measure and reduce owned decode allocations and copies
 - [#3122](/quest/m1/perf/3122-moq-uring-2-5-of-relay-cpu-is-vdso-clock-reads-the-drive.md) - moq-uring: ~2.5% of relay CPU is vdso clock reads; the drive loop and its callers each re-read Instant::now()
 - [Cache shard](/quest/m1/perf/cache-shard.md) - stop hammering one process-global cache line and one clock read per frame from every worker
 - [Slot flags](/quest/m1/perf/slot-flags.md) - track delivery stops taking nested group locks under the track lock
@@ -48,7 +50,7 @@ measured and scoped to the quiche backend we ship today.
 - [#3199](/quest/m1/perf/3199-moq-uring-remove-sq-indirection-and-per-enter-ring-fd.md) - moq-uring: remove SQ indirection and per-enter ring fd lookup
 - [#3200](/quest/m1/perf/3200-moq-uring-batch-completion-wakeups-with-min-timeout.md) - moq-uring: batch completion wakeups with MIN_TIMEOUT
 - [#3129](/quest/m1/perf/3129-moq-uring-write-the-webtransport-stream-header-at-open.md) - moq-uring: write the WebTransport stream header at open time, so finish() never owes one
-- [Driver allocs](/quest/m1/perf/driver-allocs.md) - the egress driver stops heap-allocating per train and per pump, and its one-train-per-turn cadence becomes a measured knob
+- [Egress requeue](/quest/m1/perf/egress-requeue.md) - a requeue for the transmit pool stops re-walking every ready stream, and trains per turn becomes a measured budget
 - [#3201](/quest/m1/perf/3201-moq-uring-use-sendmsg-zc-for-large-udp-gso-trains.md) - moq-uring: use SENDMSG_ZC for large UDP GSO trains
 - [#3202](/quest/m1/perf/3202-moq-uring-use-fixed-file-slots-for-worker-udp-sockets.md) - moq-uring: use fixed-file slots for worker UDP sockets
 - [#3204](/quest/m1/perf/3204-moq-uring-register-tx-pool-buffers-for-zero-copy-sends.md) - moq-uring: register TX-pool buffers for zero-copy sends
@@ -61,4 +63,6 @@ measured and scoped to the quiche backend we ship today.
 ## Related
 
 - [Worker metrics](/quest/m1/uring-metrics.md) - the counters these quests are judged by
-- [QUIC backend bakeoff](/quest/m3/quic-backend-bakeoff.md) - overlapping SendMsgZc axis at larger measurement scope
+- [noq parity gate](/quest/m2/quic/noq-parity.md) - the benchmark that
+  decides whether quiche can go, run on these worker primitives
+- [Origin lookup CPU](/quest/m2/origin-cpu/README.md) - announce/subscribe table, not uring
