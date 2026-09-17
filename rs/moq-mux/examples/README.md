@@ -79,7 +79,7 @@ From repository root run the command below, **replacing**:
 
 - `<32-byte-key>` and `<32-byte-seed>` with your secret values
 - `input.mp4` with your mp4 file
-- `https://relay.example.com/anon` with the url of a real [moq-relay](https://github.com/moq-dev/moq/tree/main/rs/moq-relay):
+- `https://relay.example.com/anon` with the url of a real [moq-relay](https://github.com/moq-dev/moq/tree/main/rs/moq-relay)
 
 ```bash
 MOQ_AEAD_KEY=<32-byte-key> \\
