@@ -531,8 +531,12 @@ impl<C: Container<Error = crate::error::Error>> Producer<C> {
 		if let Some(recorder) = self.recorder.as_mut() {
 			recorder.record(group.sequence, timestamp, false);
 			recorder.end(timestamp);
-		}
+		};
+		let mut writer = MoqFrameWriter {
+		    group: &mut group,
+		};
 		self.container.write(
+			&mut writer,
 			&mut group,
 			&[Frame {
 				timestamp,
