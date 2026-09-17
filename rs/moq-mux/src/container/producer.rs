@@ -537,7 +537,6 @@ impl<C: Container<Error = crate::error::Error>> Producer<C> {
 		};
 		self.container.write(
 			&mut writer,
-			&mut group,
 			&[Frame {
 				timestamp,
 				payload: Bytes::new(),
