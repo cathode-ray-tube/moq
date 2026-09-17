@@ -74,10 +74,12 @@ If `MOQ_SIGNING_KEY` is omitted, a deterministic debug-only signing key is used.
 
 ## Usage
 
+From repository root run (replace "<32-byte-key>" and "<32-byte-seed>" with your secret values, "input.mp4" with your mp4 file and "https://relay.example.com/anon" with a real [moq-relay](https://github.com/moq-dev/moq/tree/main/rs/moq-relay)>:
+
 ```bash
 MOQ_AEAD_KEY=<32-byte-key> \\
 MOQ_SIGNING_KEY=<32-byte-seed> \\
-cargo run -- \\
+cargo run -p moq-mux --example publish_encrypted_fmp4 \\
   input.mp4 \\
   --relay https://relay.example.com/anon \\
   --broadcast stream.hang \\
