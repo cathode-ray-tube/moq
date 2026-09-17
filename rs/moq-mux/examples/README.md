@@ -75,7 +75,7 @@ If `MOQ_SIGNING_KEY` is omitted, a deterministic debug-only signing key is used.
 
 ## Usage
 
-From repository root run the command below, replacing: 
+From repository root run the command below, **replacing**: 
 
 - `<32-byte-key>` and `<32-byte-seed>` with your secret values
 - `input.mp4` with your mp4 file
