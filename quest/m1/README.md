@@ -34,7 +34,6 @@ does not require it.
 - [Announce names](/quest/m1/api-announce-names.md) - one name per announce, request, and origin config concept in Rust, JS, moq-ffi, and C
 - [moq-tokio names](/quest/m1/api-tokio-names.md) - moq-tokio's public names sit under their modules with no root compounds, adapter names, or forgettable close()
 - [JSON config names](/quest/m1/api-json-binary-config-names.md) - `Config` means the codec options and `producer::Config` / `consumer::Config` the track pair in all four json and binary packages
-- [FFI units](/quest/m1/api-ffi-units-verbs.md) - every moq-ffi duration is microseconds and `publish()` / `consume()` pair with their setters
 - [Deprecated sweep](/quest/m1/deprecated-sweep.md) - uncalled deprecated items, warn-then-ignore flags, and silent aliases are removed or become refusals before the release
 - [Joining FETCH](/quest/m1/joining-fetch.md) - moq-net: every subscribe to a draft-14 to draft-19 relay joins at a group boundary, with contiguous history for an explicit start, via Largest Object plus a joining FETCH
 - [Anonymous rank](/quest/m1/anonymous-route-rank.md) - moq-net: a route through an anonymous hop ranks below every identified route at any cost, and hop 0 travels the chain to say so

@@ -27,7 +27,10 @@ use serde::{Deserialize, Serialize};
 /// ```
 ///
 /// The unit type `()` is the no-extension case, so [`Catalog<()>`] is just the base media catalog.
-pub trait CatalogExt: Serialize + DeserializeOwned + Default + Clone + Send + Unpin + 'static {}
+///
+/// The same extension rides the MSF catalog track, so this requires [`moq_msf::CatalogExt`];
+/// that trait is blanket-implemented, so one `impl CatalogExt` is still all a caller writes.
+pub trait CatalogExt: moq_msf::CatalogExt {}
 
 impl CatalogExt for () {}
 
@@ -68,15 +71,21 @@ impl Extra {
 		self.0.is_empty()
 	}
 
-	/// Set (or replace) a section. Errors if `name` collides with a reserved base
-	/// section (`video`/`audio`/`text`/`archive`/`json`/`binary`) or the retired
-	/// `timeline` key, which the wire format forbids beside `archive`.
+	/// Set (or replace) a section. Errors if `name` collides with a reserved member of either
+	/// catalog: hang's base sections (`video`/`audio`/`text`/`archive`/`json`/`binary`), the
+	/// retired `timeline` key that the wire format forbids beside `archive`, or a root member
+	/// MSF defines ([`moq_msf::reserved_root`]).
+	///
+	/// The same sections ride both catalog tracks, so a name reserved on either is refused on
+	/// both. Without the MSF half a colliding name reaches that track as a duplicate JSON key,
+	/// which serde emits without complaint.
 	pub fn set(&mut self, name: impl Into<String>, value: serde_json::Value) -> crate::Result<()> {
 		let name = name.into();
 		if matches!(
 			name.as_str(),
 			"video" | "audio" | "text" | "archive" | "json" | "binary" | "timeline"
-		) {
+		) || moq_msf::reserved_root(&name)
+		{
 			return Err(crate::Error::ReservedSection(name));
 		}
 		self.0.insert(name, value);
@@ -324,6 +333,18 @@ mod test {
 				.set_section("timeline", serde_json::json!({})),
 			Err(crate::Error::ReservedSection(_))
 		));
+
+		// Nor can a member MSF defines: the same sections ride the MSF track, where a
+		// collision would serialize as a duplicate JSON key rather than an error.
+		for name in ["version", "generatedAt", "isComplete", "tracks", "initDataList"] {
+			assert!(
+				matches!(
+					producer.modify().unwrap().set_section(name, serde_json::json!("nope")),
+					Err(crate::Error::ReservedSection(_))
+				),
+				"{name} must be refused",
+			);
+		}
 
 		let waiter = kio::Waiter::noop();
 		let mut latest = None;
