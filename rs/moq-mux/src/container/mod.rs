@@ -146,15 +146,25 @@ pub struct MissingKeyframe;
 #[error("video group endpoint precedes its last frame")]
 pub struct InvalidEnd;
 
+/// A frame's timestamp sits below the live edge earlier groups reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("frame timestamp is below the live edge")]
+pub struct TimestampRewind;
+
 /// Encode and decode media frames over a moq-lite group.
 pub trait Container {
-    type Error: std::error::Error
-        + Send
-        + Sync
-        + Unpin
-        + From<moq_net::Error>
-        + From<MissingKeyframe>
-        + From<InvalidEnd>;
+
+	/// Container-specific error. Must be convertible from [`moq_net::Error`]
+	/// (so IO errors propagate), [`MissingKeyframe`], [`InvalidEnd`], and
+	/// [`TimestampRewind`] (so the producer can reject invalid group boundaries).
+	type Error: std::error::Error
+		+ Send
+		+ Sync
+		+ Unpin
+		+ From<moq_net::Error>
+		+ From<MissingKeyframe>
+		+ From<InvalidEnd>
+		+ From<TimestampRewind>;
 
     fn write<W>(
         &self,
