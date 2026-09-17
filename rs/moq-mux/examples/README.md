@@ -56,6 +56,7 @@ A small debugging application that:
 - Rust and Cargo
 - `ffmpeg` available on `PATH`
 - A compatible MoQ relay
+- An MP4 file
 - A track name created by the configured `Import` implementation
 
 ## Configuration
