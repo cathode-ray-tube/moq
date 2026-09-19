@@ -4,15 +4,18 @@ import { Time } from "@moq/net";
 export type { BufferedRange, BufferedRanges, Frame } from "./types";
 
 import type { AudioConfig, VideoConfig } from "../catalog";
-import type { Format as ContainerFormat } from "./format";
+import type { ContainerFormat } from "./format";
 import type { Recorder as TimelineRecorder } from "./timeline";
 import type { Frame } from "./types";
+import type { FrameDecrypter } from "../secure/decrypter.js";
 import type { FrameEncrypter } from "../secure/encrypter.js";
 
 /** The legacy hang container: a microsecond timestamp varint followed by the raw codec payload. */
 export class Format implements ContainerFormat {
 	/** Configure the format for the track's media kind. */
 	readonly kind: "audio" | "video" | "data";
+
+	#decrypter?: FrameDecrypter;
 
 	/** Configure the format from a catalog entry or an explicit media kind. */
 	constructor(config: AudioConfig | VideoConfig | "audio" | "video" | "data") {
@@ -22,6 +25,15 @@ export class Format implements ContainerFormat {
 				: "sampleRate" in config
 					? "audio"
 					: "video";
+	}
+
+	/**
+	 * Configure this format to decrypt complete legacy-container payloads
+	 * before decoding them.
+	 */
+	withDecrypter(decrypter: FrameDecrypter): this {
+		this.#decrypter = decrypter;
+		return this;
 	}
 
 	/** Write the final video frame's end timestamp before the group closes. */
@@ -41,8 +53,21 @@ export class Format implements ContainerFormat {
 			: undefined;
 	}
 
-	/** Decode one legacy frame, including an empty-payload duration marker. */
-	decode(frame: Uint8Array): Frame[] {
+	/**
+	 * Decode one legacy frame, including an empty-payload duration marker.
+	 *
+	 * Without a decrypter, this remains synchronous. With a decrypter,
+	 * the returned promise resolves after decryption and authentication.
+	 */
+	decode(frame: Uint8Array): Frame[] | Promise<Frame[]> {
+		if (!this.#decrypter) {
+			return this.#decodePlaintext(frame);
+		}
+
+		return this.#decodeEncrypted(frame);
+	}
+
+	#decodePlaintext(frame: Uint8Array): Frame[] {
 		const [timestamp, data] = Moq.Varint.decode(frame);
 
 		return [{
@@ -50,6 +75,16 @@ export class Format implements ContainerFormat {
 			timestamp: timestamp as Time.Micro,
 			keyframe: false,
 		}];
+	}
+
+	async #decodeEncrypted(frame: Uint8Array): Promise<Frame[]> {
+		/*
+		 * Legacy-format frames do not use a CMAF sequence number.
+		 * The secure-frame interface still requires one, so use zero.
+		 */
+		const plaintext = await this.#decrypter!.decrypt(0, frame);
+
+		return this.#decodePlaintext(plaintext);
 	}
 }
 
@@ -90,12 +125,6 @@ export interface ProducerProps {
 	 * timeline, so consumers can index the media without downloading it.
 	 */
 	timeline?: TimelineRecorder;
-
-	/**
-	 * Optionally encrypt complete legacy-container payloads before writing
-	 * them to the MoQ track.
-	 */
-	encrypter?: FrameEncrypter;
 }
 
 /** Writes legacy-container frames into a MoQ track, starting a new group on each keyframe. */
@@ -126,13 +155,21 @@ export class Producer {
 		this.#format = format;
 		this.#track = track;
 		this.#timeline = props.timeline;
-		this.#encrypter = props.encrypter;
+	}
+
+	/**
+	 * Configure this producer to encrypt complete legacy-container payloads
+	 * before writing them to the MoQ track.
+	 */
+	withEncrypter(encrypter: FrameEncrypter): this {
+		this.#encrypter = encrypter;
+		return this;
 	}
 
 	/**
 	 * Encode and append a frame; a keyframe starts a new group.
 	 *
-	 * With no encrypter, this follows the original synchronous path.
+	 * With no encrypter, the returned operation is synchronous.
 	 * With an encrypter, the returned promise resolves after encryption.
 	 */
 	encode(
