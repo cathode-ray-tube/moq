@@ -39,6 +39,8 @@ Prefer poll. New logic is a `poll_*` with an `async` helper, not the other way a
 - Derive `Serialize`/`Deserialize`; a hand-written impl is a second copy of the wire shape. Reach for `serde_with` for what the derive can't express.
 - Public modules with short names: `broadcast::Consumer`, not `BroadcastConsumer`. Keep `mod encoder` private and re-export flat as `encode::Encoder`.
 - Workspace members and shared dependency versions live in the root `Cargo.toml`; crates reference deps via `{ workspace = true }`.
+- Use newtypes and enums instead of untyped strings.
+- Have the language make misuse impossible: terminal operations consume `self`, cleanup in `Drop`, etc.
 
 # Semver
 

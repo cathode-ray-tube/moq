@@ -129,6 +129,7 @@ before format-specific metadata. Unrelated areas can proceed in parallel.
 - [Consume JSON snapshot patches](/quest/m2/json-merge.md) - measure consuming patches in snapshot encoding and decoding
 - [Relay memory](/quest/m2/relay-memory.md) - remeasure what an announcement costs after prefix routes
 - [Origin lookup CPU](/quest/m2/origin-cpu/README.md) - announce and subscribe stay cheap as the live advertisement set grows
+- [Routing cost domains](/quest/m2/routing-cost-domains.md) - design operator boundaries and policy without adding incomparable costs
 - [PoP skipping](/quest/m2/pop-skipping/README.md) - short cold paths for unpopular broadcasts without losing warm backhaul dedup
 - [Route cost in the JS origin](/quest/m2/route-cost.md) - the browser origin ranks routes by cost and hops like Rust instead of newest-first
 - [Publish channel count](/quest/m2/publish-audio-channel-count.md) - forcing a channel count on an Audio.Capture stops costing the subscriber gaps of silence
@@ -158,6 +159,7 @@ before format-specific metadata. Unrelated areas can proceed in parallel.
 - [Intra-refresh GOPs](/quest/m2/intra-refresh/README.md) - video with periodic intra refresh publishes, imports, and tunes in cleanly with one group per sweep and a catalog `warmup`
 - [Audio warmup](/quest/m2/audio-warmup.md) - a viewer joining an Opus rendition mid-stream never hears the unconverged first 80 ms
 - [#3021](/quest/m2/3021-moq-gst-anchor-generated-media-timelines-to-wall-clock.md) - GStreamer maps every pad onto one continuous broadcast clock across source restarts
+- [Mux rate](/quest/m2/ts-mux-rate.md) - moq ts: the source multiplex rate is recorded at import and export pads to it, so a CBR stream leaves as one
 - [#2779](/quest/m2/2779-moq-export-ts-continuity-counters-are-numbered-from.md) - moq export ts: continuity counters are numbered from process state, so two exporters of the same broadcast emit streams that can never be compared
 - [#2829](/quest/m2/2829-moq-export-ts-the-audio-video-interleave-is-decided-by.md) - moq export ts: the audio/video interleave is decided by arrival timing, so two exporters of one broadcast render the same media in different orders
 - [#3489](/quest/m2/3489-ts-import-stream-liveness.md) - moq import ts: every elementary stream reports its access units and how long it has been quiet
