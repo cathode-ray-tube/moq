@@ -9,6 +9,8 @@
 
 # Media over QUIC
 
+**Modified version of MoQ, adding [moq-secure](https://github.com/cathode-ray-tube/moq-secure).  The main changes are in `js/hang` and `rs/moq-mux`, integrating encryption and signing at the container layer.**
+
 [Media over QUIC](https://moq.dev) (MoQ) is a next-generation live media protocol that provides **real-time latency** at **massive scale**.
 Built using modern web technologies, MoQ delivers WebRTC-like latency without the constraints of WebRTC.
 The core networking is delegated to a QUIC library but the rest is in application-space, giving you full control over your media pipeline.
