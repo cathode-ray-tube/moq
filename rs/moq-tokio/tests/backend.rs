@@ -119,11 +119,11 @@ async fn connect_test(config: ConnectTest<'_>) {
 
 	// ── publisher (server) ──────────────────────────────────────────
 	let pub_origin = moq_tokio::origin::spawn(Hop::random());
-	let mut broadcast = pub_origin.create_broadcast("test").expect("failed to create broadcast");
+	let broadcast = pub_origin.create_broadcast("test").expect("failed to create broadcast");
 	broadcast
 		.announce(Default::default())
 		.expect("failed to create broadcast");
-	let mut track = broadcast.create_track("video", None).expect("failed to create track");
+	let track = broadcast.create_track("video", None).expect("failed to create track");
 
 	let mut group = track.append_group().expect("failed to append group");
 	group
@@ -192,8 +192,8 @@ async fn connect_test(config: ConnectTest<'_>) {
 		.await
 		.expect("announce timed out")
 		.expect("origin closed");
-	assert_eq!(update.pattern.as_prefix().expect("prefix announcement"), "test");
-	assert!(update.active, "expected announce, got retraction");
+	assert_eq!(update.path.as_str(), "test");
+	assert!(update.kind.is_active(), "expected announce, got retraction");
 	let bc = tokio::time::timeout(TIMEOUT, sub_consumer.request_broadcast("test"))
 		.await
 		.expect("request timed out")
@@ -355,7 +355,7 @@ async fn reload_test(backend: moq_tokio::QuicBackend) {
 	server_config.backend = Some(backend);
 
 	#[cfg(feature = "watch")]
-	if moq_tokio::watch::FileWatcher::new(std::slice::from_ref(&cert)).is_err() {
+	if moq_tokio::watch::Files::new(std::slice::from_ref(&cert)).is_err() {
 		eprintln!("skipping reload_test: host cannot start an inotify watcher");
 		return;
 	}
@@ -706,15 +706,15 @@ async fn quiche_webtransport() {
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn iroh_connect() {
-	use moq_tokio::iroh::EndpointConfig;
+	use moq_tokio::iroh::Config as IrohConfig;
 
 	// ── publisher (server) ──────────────────────────────────────────
 	let pub_origin = moq_tokio::origin::spawn(Hop::random());
-	let mut broadcast = pub_origin.create_broadcast("test").expect("failed to create broadcast");
+	let broadcast = pub_origin.create_broadcast("test").expect("failed to create broadcast");
 	broadcast
 		.announce(Default::default())
 		.expect("failed to create broadcast");
-	let mut track = broadcast.create_track("video", None).expect("failed to create track");
+	let track = broadcast.create_track("video", None).expect("failed to create track");
 
 	let mut group = track.append_group().expect("failed to append group");
 	group
@@ -723,7 +723,7 @@ async fn iroh_connect() {
 	group.finish().expect("failed to finish group");
 
 	// Create server iroh endpoint
-	let mut server_iroh_config = EndpointConfig::default();
+	let mut server_iroh_config = IrohConfig::default();
 	server_iroh_config.enabled = Some(true);
 	let server_endpoint = server_iroh_config
 		.bind(&moq_tokio::quic::Config::default())
@@ -754,7 +754,7 @@ async fn iroh_connect() {
 	let mut announcements = sub_consumer.announced();
 
 	// Create client iroh endpoint
-	let mut client_iroh_config = EndpointConfig::default();
+	let mut client_iroh_config = IrohConfig::default();
 	client_iroh_config.enabled = Some(true);
 	let client_endpoint = client_iroh_config
 		.bind(&moq_tokio::quic::Config::default())
@@ -805,8 +805,8 @@ async fn iroh_connect() {
 		.await
 		.expect("announce timed out")
 		.expect("origin closed");
-	assert_eq!(update.pattern.as_prefix().expect("prefix announcement"), "test");
-	assert!(update.active, "expected announce, got retraction");
+	assert_eq!(update.path.as_str(), "test");
+	assert!(update.kind.is_active(), "expected announce, got retraction");
 	let bc = tokio::time::timeout(TIMEOUT, sub_consumer.request_broadcast("test"))
 		.await
 		.expect("request timed out")

@@ -1324,7 +1324,7 @@ mod tests {
 	/// track ended.
 	#[tokio::test]
 	async fn empty_payload_is_skipped() {
-		let mut track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
 		let consumer_track =
 			track.subscribe(moq_net::track::Subscription::default().with_max_age(Duration::from_millis(500)));
 		let mut consumer = Consumer::new(consumer_track, Container::Legacy(crate::container::Kind::Video));
@@ -1355,7 +1355,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn leading_marker_preserves_the_first_media_keyframe() {
-		let mut track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
 		let consumer_track =
 			track.subscribe(moq_net::track::Subscription::default().with_max_age(Duration::from_millis(500)));
 		let mut consumer = Consumer::new(consumer_track, Container::Legacy(crate::container::Kind::Video));
@@ -1418,7 +1418,7 @@ mod tests {
 	/// LOC consumers skip an empty payload so later producers can write the duration marker.
 	#[tokio::test]
 	async fn loc_empty_payload_is_skipped() {
-		let mut track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
 		let consumer_track =
 			track.subscribe(moq_net::track::Subscription::default().with_max_age(Duration::from_millis(500)));
 		let mut consumer = Consumer::new(consumer_track, Container::Loc(crate::container::Kind::Video));
@@ -1533,7 +1533,7 @@ mod tests {
 	#[tokio::test]
 	async fn empty_track_returns_none() {
 		tokio::time::pause();
-		let mut track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
 		let consumer_track =
 			track.subscribe(moq_net::track::Subscription::default().with_max_age(Duration::from_millis(500)));
 		let mut consumer = Consumer::new(consumer_track, Container::Legacy(crate::container::Kind::Data));
@@ -1845,7 +1845,7 @@ mod tests {
 	#[tokio::test]
 	async fn decode_error_propagates() {
 		tokio::time::pause();
-		let mut track = track_producer("test", None);
+		let track = track_producer("test", None);
 		let consumer_track = track.subscribe(None);
 		let mut consumer = Consumer::new(consumer_track, FailingDecode);
 
@@ -1898,7 +1898,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn frame_payload_preserved() {
-		let mut track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
 		let consumer_track =
 			track.subscribe(moq_net::track::Subscription::default().with_max_age(Duration::from_millis(500)));
 		let mut consumer = Consumer::new(consumer_track, Container::Legacy(crate::container::Kind::Data));
@@ -2162,7 +2162,7 @@ mod tests {
 	#[tokio::test]
 	async fn aborted_frameless_group_after_a_gap_ends_the_track() {
 		tokio::time::pause();
-		let mut track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
 		let consumer_track =
 			track.subscribe(moq_net::track::Subscription::default().with_max_age(Duration::from_millis(500)));
 		let mut consumer = Consumer::new(consumer_track, Container::Legacy(crate::container::Kind::Data));
@@ -2537,7 +2537,7 @@ mod tests {
 			track.subscribe(moq_net::track::Subscription::default().with_max_age(Duration::from_millis(500)));
 		let mut consumer = Consumer::new(consumer_track, Container::Legacy(crate::container::Kind::Data));
 
-		let mut group0 = track.create_group(moq_net::group::Info { sequence: 0 }).unwrap();
+		let group0 = track.create_group(moq_net::group::Info { sequence: 0 }).unwrap();
 		group0.finish().unwrap();
 
 		write_group(&mut track, 1, &[ts(30_000)]);
@@ -2553,7 +2553,7 @@ mod tests {
 	async fn video_container_legacy() {
 		tokio::time::pause();
 
-		let mut track = track_producer("video", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let track = track_producer("video", hang::container::track_info(hang::catalog::PRIORITY.video));
 		let consumer_track =
 			track.subscribe(moq_net::track::Subscription::default().with_max_age(Duration::from_millis(500)));
 		let mut consumer = Consumer::new(consumer_track, Container::Legacy(crate::container::Kind::Data));
@@ -2598,7 +2598,7 @@ mod tests {
 		tokio::time::pause();
 		// DurationWire is a test-only container that doesn't stamp moq_net frame
 		// timestamps; leave the track untimed so model-layer validation matches.
-		let mut track = track_producer("test", None);
+		let track = track_producer("test", None);
 		let consumer_track =
 			track.subscribe(moq_net::track::Subscription::default().with_max_age(Duration::from_secs(10)));
 		// The max age dwarfs the gap, so only duration coverage can trigger the skip.
@@ -2636,7 +2636,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn a_nonsequential_contiguous_jump_does_not_bump_playhead() {
-		let mut track = track_producer("test", None);
+		let track = track_producer("test", None);
 		let mut consumer = Consumer::new(
 			track.subscribe(moq_net::track::Subscription::default().with_max_age(Duration::from_secs(10))),
 			DurationWire,
@@ -2667,7 +2667,7 @@ mod tests {
 	async fn duration_below_gap_does_not_skip() {
 		tokio::time::pause();
 		// DurationWire is untimed at the moq_net frame layer.
-		let mut track = track_producer("test", None);
+		let track = track_producer("test", None);
 		let consumer_track =
 			track.subscribe(moq_net::track::Subscription::default().with_max_age(Duration::from_secs(10)));
 		let mut consumer = Consumer::new(consumer_track, DurationWire);
@@ -2709,7 +2709,7 @@ mod tests {
 	}
 	#[tokio::test]
 	async fn live_duration_marker_follows_an_immediately_delivered_frame() {
-		let mut track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
 		let mut consumer = Consumer::new(track.subscribe(None), Container::Legacy(crate::container::Kind::Video));
 		let mut group = track.append_group().unwrap();
 		Container::Legacy(crate::container::Kind::Video)

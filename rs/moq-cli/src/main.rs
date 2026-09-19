@@ -73,10 +73,10 @@ impl Net {
 async fn spawn_server(
 	tasks: &mut JoinSet<anyhow::Result<()>>,
 	moq: &MoqSide,
-	cluster: &moq_relay::Cluster,
+	cluster: &moq_relay::cluster::Cluster,
 	net: &Net,
 	directions: Directions,
-) -> anyhow::Result<moq_relay::Started> {
+) -> anyhow::Result<moq_relay::cluster::Started> {
 	if !moq.serves() {
 		return cluster.clone().start().await.context("cluster failed to start");
 	}
@@ -89,7 +89,7 @@ async fn spawn_server(
 	let node = moq.cluster.node.clone().unwrap_or_default();
 	let auth = match moq.auth.validate() {
 		Ok(()) => moq.auth.init(node, &moq.client.tls)?,
-		Err(_) => moq_relay::Auth::refuse(node),
+		Err(_) => moq_relay::auth::Auth::refuse(node),
 	};
 	// Advertise before accepting, so a `/.cluster` dial is verified against a
 	// live credential rather than refused as "LAN discovery is not enabled".
@@ -128,10 +128,10 @@ async fn spawn_server(
 
 /// Advertise the bound listener on the LAN when `--cluster-lan` is on.
 fn attach_lan(
-	cluster: moq_relay::Cluster,
+	cluster: moq_relay::cluster::Cluster,
 	moq: &MoqSide,
 	server: &moq_tokio::Server,
-) -> anyhow::Result<moq_relay::Cluster> {
+) -> anyhow::Result<moq_relay::cluster::Cluster> {
 	if !moq.lan() {
 		return Ok(cluster);
 	}
@@ -139,7 +139,7 @@ fn attach_lan(
 		.local_addr()
 		.context("--cluster-lan needs a QUIC listener")?
 		.port();
-	let mut advertise = moq_relay::LanAdvertise::new(port);
+	let mut advertise = moq_relay::cluster::LanAdvertise::new(port);
 	if !moq.server_config().tls.generate.is_empty()
 		&& let Some(fingerprint) = server.certificates().fingerprints().into_iter().next()
 	{
@@ -155,8 +155,8 @@ fn attach_lan(
 fn spawn_cluster_serve(
 	tasks: &mut JoinSet<anyhow::Result<()>>,
 	mut listener: moq_tokio::Listener,
-	cluster: moq_relay::Cluster,
-	auth: moq_relay::Auth,
+	cluster: moq_relay::cluster::Cluster,
+	auth: moq_relay::auth::Auth,
 	origin: moq_net::origin::Producer,
 	directions: Directions,
 	public_quic: bool,
@@ -168,7 +168,7 @@ fn spawn_cluster_serve(
 		let mut sessions = tokio::task::JoinSet::new();
 		while let Some(request) = listener.accept().await {
 			while sessions.try_join_next().is_some() {}
-			if moq_relay::Cluster::is_lan_path(request.path()) {
+			if moq_relay::cluster::Cluster::is_lan_path(request.path()) {
 				let conn = moq_relay::Connection::new(request, cluster.clone(), auth.clone())
 					.with_id(cluster.next_connection_id());
 				sessions.spawn(async move {
@@ -202,14 +202,13 @@ fn spawn_cluster_serve(
 /// never announces what a viewer could not have had anyway.
 async fn serve_client(
 	request: moq_tokio::Request,
-	auth: &moq_relay::Auth,
+	auth: &moq_relay::auth::Auth,
 	origin: &moq_net::origin::Producer,
 	directions: Directions,
 ) -> anyhow::Result<()> {
-	let bytes = moq_auth::Counters::default();
-	let auth_request = moq_relay::request_for(auth, &request);
-	let moq_relay::Admitted { lease, token } = match auth.admit(auth_request, bytes.clone()).await {
-		Ok(admitted) => admitted,
+	let auth_request = moq_relay::auth::request_for(auth, &request);
+	let lease = match auth.admit(auth_request).await {
+		Ok(lease) => lease,
 		Err(err) => {
 			let status = axum::http::StatusCode::from(&err);
 			request.close(status.as_u16()).await.ok();
@@ -218,6 +217,7 @@ async fn serve_client(
 	};
 
 	// What the grant allows, as origin handles rooted where the session dialed.
+	let token = lease.token();
 	let rooted = origin.with_root(&token.root);
 	let publish = directions
 		.publish
@@ -240,7 +240,7 @@ async fn serve_client(
 		request = request.with_subscriber(subscribe);
 	}
 	let session = request.ok().await?;
-	moq_relay::supervise(session, lease, token, bytes, moq_relay::Shutdown::disabled()).await
+	moq_relay::supervise(session, lease, moq_relay::shutdown::Observer::disabled(), None).await
 }
 
 /// Whether ordinary clients may use this transport on the shared LAN server.
@@ -255,7 +255,7 @@ fn is_public_transport(transport: moq_tokio::Transport, public_quic: bool) -> bo
 fn spawn_serve(
 	tasks: &mut JoinSet<anyhow::Result<()>>,
 	mut listener: moq_tokio::Listener,
-	auth: moq_relay::Auth,
+	auth: moq_relay::auth::Auth,
 	origin: moq_net::origin::Producer,
 	directions: Directions,
 ) {
@@ -392,7 +392,7 @@ impl Directions {
 async fn spawn_moq(
 	moq: &MoqSide,
 	net: &Net,
-	cluster: moq_relay::Cluster,
+	cluster: moq_relay::cluster::Cluster,
 	directions: Directions,
 	tasks: &mut JoinSet<anyhow::Result<()>>,
 ) -> anyhow::Result<(moq_net::bandwidth::Allocator, moq_net::origin::Producer)> {
@@ -569,7 +569,7 @@ fn spawn_import(
 		reject_listener_cors(&rtc.cors, "import rtc")?;
 	}
 
-	let max_age = import.max_age.map(moq_tokio::Duration::into_std);
+	let max_age = import.max_age.map(moq_tokio::cli::Duration::into_std);
 	// The MoQ side every gateway publishes into, minted per source since each takes it
 	// by value onto its own task.
 	let target = |name: String| crate::moq::ImportTarget {

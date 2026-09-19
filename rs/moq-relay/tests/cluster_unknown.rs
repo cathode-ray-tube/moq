@@ -37,7 +37,7 @@ async fn spawn_relay(
 		config.auth.public = vec![moq_auth::Pattern::all()];
 	}
 	config.cluster.id = Some(id);
-	config.cluster.connect = connect;
+	config.cluster.connect = connect.into_iter().map(moq_relay::cluster::Peer::new).collect();
 
 	let relay = Relay::load(config).await.expect("relay load");
 	let handle = tokio::spawn(async move {
@@ -83,9 +83,9 @@ impl Drop for Publisher {
 async fn publish_version(port: u16, version: &str) -> Publisher {
 	let url: Url = format!("tcp://127.0.0.1:{port}").parse().expect("parse url");
 	let origin = moq_tokio::origin::spawn(Hop::random());
-	let mut broadcast = origin.create_broadcast(PATH).expect("create broadcast");
+	let broadcast = origin.create_broadcast(PATH).expect("create broadcast");
 	broadcast.announce(Default::default()).expect("create broadcast");
-	let mut track = broadcast.create_track("video", None).expect("create track");
+	let track = broadcast.create_track("video", None).expect("create track");
 
 	// Stream like a real publisher: a fresh group every 100ms, so a subscriber
 	// that attaches at any point receives one (and the test doesn't depend on
@@ -192,10 +192,7 @@ async fn watch_announces(port: u16, window: Duration) -> Vec<(String, bool)> {
 	let mut updates = Vec::new();
 	let deadline = tokio::time::Instant::now() + window;
 	while let Ok(Some(update)) = tokio::time::timeout_at(deadline, announced.next()).await {
-		updates.push((
-			update.pattern.as_prefix().expect("prefix announcement").to_string(),
-			update.active,
-		));
+		updates.push((update.path.as_str().to_string(), update.kind.is_active()));
 	}
 	updates
 }

@@ -20,11 +20,13 @@ with its PR and the replacement call:
   are explicit (#3647); groups expire on timestamps alone; an oversized group
   aborts with GROUP_TOO_LARGE instead of shedding its head (#3585); the
   `Latency` type became `max_age` and delivery order became the `Ordered`
-  handle (#2688, #2955); the moq-lite stream codes registered by
-  [Reserved codes](/quest/m1/lite-reserved-codes.md); subscriptions resume
+  handle (#2688, #2955); the four moq-lite stream codes sent from the
+  reserved range moved to 0x36-0x39 in the draft's own range; subscriptions resume
   across routes sharing a first hop (#3312); the send estimate is split among
   JS publishers (#3616); @moq/net and @moq/pattern mirror Rust (`consume`, `Time.Milli`,
-  one `readFrame()`, `InvalidPattern`); the announce and request names; and [moq-tokio names](/quest/m1/api-tokio-names.md).
+  one `readFrame()`, `InvalidPattern`); the announce and request names; and
+  moq-tokio's names sit under their modules (`connection::Goaway`, `cli::Duration`,
+  `transport::Session`, `watch::Files`, `resolve()`; #3745).
 - hang and json: the catalog `timeline` is `archive` (#3612); `json` and
   `binary` catalog sections (#3109) take one options object (#3640); Rust
   `modify()` is fallible and a failed dropped edit aborts the track (#3644),
@@ -38,7 +40,8 @@ with its PR and the replacement call:
 - relay and CLI: embedders own listeners and workers (#3638); the cluster
   origin is constructed once (#3582); LAN discovery is partitioned by
   application (#3621) and meshes CLI and relay peers (#3648); config merges
-  with provenance (#3587); `--auth-api-mode proxy` (#3044); the CLI parses
+  with provenance (#3587); auth is one contract, a `Request` in and a
+  `Grant` with a lease out, and `--auth-api-mode` is gone (#3688); the CLI parses
   with usage-rs and refuses the flags it dropped (#3030); moq-native is
   moq-tokio (#2896). Released spellings refuse rather than warn or silently
   alias: `--cluster-linger` is gone; `--cluster-connect` needs a full URL;
@@ -47,11 +50,13 @@ with its PR and the replacement call:
   `--name`/`--latency-max` and `publish`/`subscribe` name `--hop`/`--broadcast`/
   `--max-age` and `import`/`export`. Unused `#[deprecated]` items are gone.
   JS `announced()` always drops reflected announces (`ignoreSelf` is gone);
-  an `oct` JWK without `kty` is refused.
+  an `oct` JWK without `kty` is refused. The gstmoq properties
+  `estimated-send-bitrate`/`estimated-recv-bitrate` are `estimated-*-rate`
+  with no alias, a runtime failure for a `gst-launch` line.
 - bindings: the Go module is `moq.dev/moq` with `context.Context` on every
   blocking call (#2957); `MoqAudioCodec` is an `opus()` object (#3671); the
   configuration setters are fallible (#3642); durations are microseconds and
-  the rate estimates are `estimated_*` ([Rate estimate names](/quest/m1/api-rate-estimate-names.md)); the decode format knob from
+  the rate estimates are `estimated_*` (#3744); the decode format knob from
   [Decode format](/quest/m2/ffi-decode-format.md).
 
 Release-notes outline, the additions worth leading with, in order of value to
@@ -61,8 +66,8 @@ catalog and store (#3612); the delay/buffer split and playout clock (#3396,
 #3528); GROUP_TOO_LARGE (#3585); explicit reader limits and timestamp-only
 expiry (#3647); publish robustness (Firefox hardware encoding, file demux,
 `stalled` on lagging renditions #3630, stream resets at boundaries #3580);
-relay embedding and the LAN mesh (#3638, #3648, #3621, #3587); proxy auth
-(#3044); data tracks and captions (#3109, #3640); one `Connection` with URL
+relay embedding and the LAN mesh (#3638, #3648, #3621, #3587); one auth
+contract with leases (#3688, #3739); data tracks and captions (#3109, #3640); one `Connection` with URL
 replacement (#3614, #3636); first-hop resume and the shared send estimate
 (#3312, #3616). moq-e2ee ships as it is on dev; the
 [E2EE](/quest/m2/e2ee/README.md) questline owns its twin and interop.
@@ -80,4 +85,6 @@ Public API: none beyond the required quests. Wire: none.
 - [Binding audio tests](/quest/m2/binding-audio-tests.md) - every binding proves the audio config it exposes
 - [Decode format](/quest/m2/ffi-decode-format.md) - the C-only decode knob reaches every uniffi binding
 - [JSON mutate](/quest/m2/json-mutate.md) - Rust and JS share the closure edit
+- [Binding parity](/quest/m2/binding-parity.md) - every wrapper reaches every moq-ffi method
+- [Binding docs](/quest/m2/binding-docs.md) - the binding pages compile against the wrappers
 - The merged relay has soaked on moq.pro staging and the maintainer has signed it off

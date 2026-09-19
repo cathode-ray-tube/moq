@@ -661,7 +661,7 @@ impl Server {
 							// (like the stream bindings).
 							let Accepted { session, url, identity, authority, mut link } = super::noq::accept(_conn, alpns).await?;
 							link.local = local;
-							let request = server.accept_request(crate::runtime::Runtime::new(), crate::transport::Async::new(session)).await?;
+							let request = server.accept_request(crate::runtime::Runtime::new(), crate::transport::Session::new(session)).await?;
 							Ok(Request { transport: Transport::Quic, url, identity, authority, link, kind: RequestKind::Noq(Box::new(request)) })
 						}.boxed());
 					}
@@ -694,7 +694,7 @@ impl Server {
 					#[cfg(feature = "iroh")]
 					self.accept.push(async move {
 						let Accepted { session, url, identity, authority, link } = super::iroh::accept(_conn).await?;
-						let request = server.accept_request(crate::runtime::Runtime::new(), crate::transport::Async::new(session)).await?;
+						let request = server.accept_request(crate::runtime::Runtime::new(), crate::transport::Session::new(session)).await?;
 						Ok(Request { transport: Transport::Iroh, url, identity, authority, link, kind: RequestKind::Iroh(Box::new(request)) })
 					}.boxed());
 				}
@@ -706,7 +706,7 @@ impl Server {
 							// slow peer doesn't stall the accept loop (spawned like the others).
 							let local = self.websocket_local_addr();
 							self.accept.push(async move {
-								let request = server.accept_request(crate::runtime::Runtime::new(), crate::transport::Async::new(session)).await?;
+								let request = server.accept_request(crate::runtime::Runtime::new(), crate::transport::Session::new(session)).await?;
 								let authority = url.host_str().filter(|h| !h.is_empty()).map(str::to_owned);
 								let link = Link { remote: Some(accepted.remote), local, alpn: accepted.protocol, ..Default::default() };
 								Ok(Request { transport: Transport::WebSocket, url: Some(url), authority, identity: None, link, kind: RequestKind::Qmux(Box::new(request)) })
@@ -1120,7 +1120,7 @@ fn spawn_stream_request(
 ) {
 	tokio::spawn(async move {
 		match server
-			.accept_request(crate::runtime::Runtime::new(), crate::transport::Async::new(session))
+			.accept_request(crate::runtime::Runtime::new(), crate::transport::Session::new(session))
 			.await
 		{
 			Ok(request) => {
@@ -1146,19 +1146,19 @@ fn spawn_stream_request(
 /// every transport before the caller authorizes. The variant only distinguishes the
 /// underlying session type; all of them delegate identically.
 /// A pending moq-net request over transport `S`, driven by our tokio runtime.
-type PendingRequest<S> = moq_net::Request<S, crate::runtime::Runtime<S>>;
+type PendingRequest<S> = moq_net::server::Handshake<S, crate::runtime::Runtime<S>>;
 
 pub(crate) enum RequestKind {
 	#[cfg(feature = "noq")]
-	Noq(Box<PendingRequest<crate::transport::Async<web_transport_noq::Session>>>),
+	Noq(Box<PendingRequest<crate::transport::Session<web_transport_noq::Session>>>),
 	#[cfg(feature = "quinn")]
 	Quinn(Box<PendingRequest<web_transport_quinn::Session>>),
 	#[cfg(feature = "quiche")]
 	Quiche(Box<PendingRequest<web_transport_quiche::Connection>>),
 	#[cfg(feature = "iroh")]
-	Iroh(Box<PendingRequest<crate::transport::Async<web_transport_iroh::Session>>>),
+	Iroh(Box<PendingRequest<crate::transport::Session<web_transport_iroh::Session>>>),
 	#[cfg(any(feature = "tcp", all(feature = "uds", unix), feature = "websocket"))]
-	Qmux(Box<PendingRequest<crate::transport::Async<qmux::Session>>>),
+	Qmux(Box<PendingRequest<crate::transport::Session<qmux::Session>>>),
 }
 
 /// The transport-level facts a backend captures while accepting a connection, before the
@@ -1249,7 +1249,7 @@ pub struct Request {
 	kind: RequestKind,
 }
 
-/// Delegate a read-only call to the inner [`moq_net::Request`], whatever the transport.
+/// Delegate a read-only call to the inner [`moq_net::server::Handshake`], whatever the transport.
 macro_rules! request_ref {
 	($self:expr, $r:ident => $body:expr) => {
 		match &$self.kind {
@@ -1359,7 +1359,7 @@ impl Request {
 	}
 
 	/// Assign the identity this peer's routes are attributed to; see
-	/// [`moq_net::Request::with_peer_hop`]. Derive it from [`Self::peer_identity`],
+	/// [`moq_net::server::Handshake::with_peer_hop`]. Derive it from [`Self::peer_identity`],
 	/// never from something coarser.
 	pub fn with_peer_hop(self, hop: moq_net::Hop) -> Self {
 		let Request {
@@ -1626,9 +1626,9 @@ mod tests {
 		let _ = std::fs::remove_file(&path);
 
 		let origin = crate::origin::spawn(moq_net::Hop::random());
-		let mut broadcast = origin.create_broadcast("test").expect("create broadcast");
+		let broadcast = origin.create_broadcast("test").expect("create broadcast");
 		broadcast.announce(Default::default()).expect("announce broadcast");
-		let mut track = broadcast.create_track("video", None).expect("create track");
+		let track = broadcast.create_track("video", None).expect("create track");
 		let mut group = track.append_group().expect("append group");
 		group
 			.write_frame(moq_net::Timestamp::ZERO, b"hello".as_ref())
@@ -1680,8 +1680,8 @@ mod tests {
 			.await
 			.expect("announce timeout")
 			.expect("origin closed");
-		assert_eq!(update.pattern.as_prefix().expect("prefix announcement"), "test");
-		assert!(update.active);
+		assert_eq!(update.path.as_str(), "test");
+		assert!(update.kind.is_active());
 		let broadcast = consumer.request_broadcast("test").await.expect("resolve");
 
 		let mut track = broadcast

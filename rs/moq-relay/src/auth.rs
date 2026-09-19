@@ -1,16 +1,24 @@
-//! How a session is admitted: through an auth server behind `--auth-url`, or with
-//! the static grant `--auth-public` names for anonymous sessions. Nothing else admits
-//! anyone; a verified client certificate is reported to the server as a fact.
+//! How a session is admitted: through an auth server behind `--auth-url`, with the
+//! static grant `--auth-public` names for anonymous sessions, or by the embedding
+//! process answering [`Admissions`]. Nothing else admits anyone; a verified client
+//! certificate is reported to whoever decides as a fact.
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use axum::http;
-use moq_auth::{Counters, Grant, Request, lease};
+use moq_auth::{Bytes, Grant, Request, lease};
 use moq_auth::{Pattern, Patterns};
 use moq_net::{Path, PathOwned, stats::Tier};
 use serde::{Deserialize, Serialize};
 use serde_with::{OneOrMany, serde_as};
+use tokio::sync::{mpsc, oneshot};
 use url::Url;
+
+/// The longest an embedder may take to answer an admission, the bound
+/// `moq_auth::Client` puts on a server, so a stalled decider refuses rather
+/// than parks the sessions behind it.
+const ADMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Where every session's grant comes from. Exactly one of `url` and the public
 /// patterns is set; [`validate`](Self::validate) refuses anything else.
@@ -19,7 +27,7 @@ use url::Url;
 #[usage(unknown_flags = "error", args_override_self = false)]
 #[serde(default)]
 #[non_exhaustive]
-pub struct AuthConfig {
+pub struct Config {
 	/// The auth server asked once per session event: `connect`, `revalidate`, and
 	/// `end`, each one JSON POST carrying everything the relay knows. `https://`
 	/// presents the `--connect-tls-*` identity, `unix://` speaks HTTP over a socket,
@@ -64,12 +72,19 @@ pub struct AuthConfig {
 	pub public_publish: Vec<Pattern>,
 }
 
-impl AuthConfig {
+impl Config {
 	/// The static grant the public patterns name, or `None` when none is set.
 	fn public_grant(&self) -> Option<Grant> {
 		let publish: Patterns = self.public.iter().chain(&self.public_publish).cloned().collect();
 		let subscribe: Patterns = self.public.iter().chain(&self.public_subscribe).cloned().collect();
 		(!publish.is_empty() || !subscribe.is_empty()).then(|| Grant::new(publish, subscribe))
+	}
+
+	/// Whether no source is named at all. Such a relay admits nothing on its own:
+	/// [`Relay::load`](crate::Relay::load) hands its sessions to the embedder as
+	/// [`Admissions`], and [`validate`](Self::validate) refuses it for a binary.
+	pub(crate) fn is_empty(&self) -> bool {
+		self.url.is_none() && self.public_grant().is_none()
 	}
 
 	/// Refuse a configuration that admits nobody, or that names both a server and
@@ -107,7 +122,7 @@ impl AuthConfig {
 /// Why a session was refused, and the HTTP status a transport-level reject carries.
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
-pub enum AuthError {
+pub enum Error {
 	/// The auth server answered and the answer was no.
 	#[error("the auth server refused the session")]
 	Refused,
@@ -127,7 +142,7 @@ pub enum AuthError {
 	Request(String),
 }
 
-impl From<moq_auth::Error> for AuthError {
+impl From<moq_auth::Error> for Error {
 	fn from(err: moq_auth::Error) -> Self {
 		match err {
 			moq_auth::Error::Refused => Self::Refused,
@@ -136,24 +151,24 @@ impl From<moq_auth::Error> for AuthError {
 	}
 }
 
-impl From<&AuthError> for http::StatusCode {
-	fn from(err: &AuthError) -> Self {
+impl From<&Error> for http::StatusCode {
+	fn from(err: &Error) -> Self {
 		match err {
 			// A server-side problem, not a credential problem: the client may retry.
-			AuthError::Unavailable(_) => http::StatusCode::BAD_GATEWAY,
-			AuthError::Request(_) => http::StatusCode::BAD_REQUEST,
+			Error::Unavailable(_) => http::StatusCode::BAD_GATEWAY,
+			Error::Request(_) => http::StatusCode::BAD_REQUEST,
 			_ => http::StatusCode::UNAUTHORIZED,
 		}
 	}
 }
 
-impl From<AuthError> for http::StatusCode {
-	fn from(err: AuthError) -> Self {
+impl From<Error> for http::StatusCode {
+	fn from(err: Error) -> Self {
 		Self::from(&err)
 	}
 }
 
-impl axum::response::IntoResponse for AuthError {
+impl axum::response::IntoResponse for Error {
 	fn into_response(self) -> axum::response::Response {
 		http::StatusCode::from(self).into_response()
 	}
@@ -165,7 +180,7 @@ impl axum::response::IntoResponse for AuthError {
 /// dialed path whenever the lease changes, so a re-check is compared field by field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct AuthToken {
+pub struct Token {
 	/// The path the session dialed, which a grant without `root` is relative to.
 	pub(crate) path: String,
 	/// The root the session is scoped to: the grant's `root` alias, else the dialed path.
@@ -178,7 +193,7 @@ pub struct AuthToken {
 	pub tier: Tier,
 }
 
-impl AuthToken {
+impl Token {
 	/// Reduce `grant` for a session that dialed `path`.
 	///
 	/// The origin scopes by prefix, so only `foo/**` and `**` have an exact prefix.
@@ -186,10 +201,10 @@ impl AuthToken {
 	/// reading it as the prefix `foo` would widen one broadcast into a subtree.
 	/// The token keeps the Patterns the grant already yields rather than converting
 	/// them to prefixes.
-	pub fn new(path: &str, grant: &Grant) -> Result<Self, AuthError> {
-		let supported = |patterns: &Patterns| -> Result<Patterns, AuthError> {
+	pub fn new(path: &str, grant: &Grant) -> Result<Self, Error> {
+		let supported = |patterns: &Patterns| -> Result<Patterns, Error> {
 			match patterns.iter().find(|pattern| pattern.as_prefix().is_none()) {
-				Some(pattern) => Err(AuthError::UnsupportedPattern(pattern.to_string())),
+				Some(pattern) => Err(Error::UnsupportedPattern(pattern.to_string())),
 				None => Ok(patterns.clone()),
 			}
 		};
@@ -205,7 +220,7 @@ impl AuthToken {
 
 	/// Rebuild the token from a re-checked grant, relative to the same dialed path,
 	/// so a grant that drops its `root` alias resolves back to what was dialed.
-	pub(crate) fn recheck(&self, grant: &Grant) -> Result<Self, AuthError> {
+	pub(crate) fn recheck(&self, grant: &Grant) -> Result<Self, Error> {
 		Self::new(&self.path, grant)
 	}
 
@@ -217,51 +232,103 @@ impl AuthToken {
 	}
 }
 
-/// The lease a session holds, with whatever keeps it alive.
+/// What admitted a session and keeps it admitted: the grant's lease and the
+/// scope it was reduced to.
 ///
-/// A server-backed lease is driven by the [`moq_auth::Client`]; a static one holds
-/// its own [`lease::Producer`] so the grant never changes and never revokes.
+/// The lease is the decider's live word on the grant: the [`moq_auth::Client`]
+/// behind an auth server, the embedder answering an [`Admission`], or nobody for
+/// a fixed grant. [`ended`](Self::ended) resolves when that word no longer covers
+/// the session; the holder then closes the session, and the lease with the reason.
 pub struct Lease {
 	consumer: lease::Consumer,
-	_static: Option<lease::Producer>,
+	token: Token,
+	/// When the grant runs out, enforced here whoever drives the lease: a fixed
+	/// grant has no driver, and an auth server's may be mid-outage.
+	expires: Option<SystemTime>,
 }
 
 impl Lease {
-	/// A lease on a static grant: no expiry, no re-check, no `end`.
-	pub fn fixed(grant: Grant) -> Self {
-		let (producer, consumer) = lease::Producer::new(grant);
-		Self {
+	/// Hold `consumer` for a session that dialed `path`, reducing its grant to
+	/// what the origin scopes by.
+	pub fn new(path: &str, consumer: lease::Consumer) -> Result<Self, Error> {
+		let grant = consumer.grant();
+		Ok(Self {
+			token: Token::new(path, &grant)?,
+			expires: grant.expires,
 			consumer,
-			_static: Some(producer),
+		})
+	}
+
+	/// The scope the session was admitted under.
+	pub fn token(&self) -> &Token {
+		&self.token
+	}
+
+	/// Ask the lease's producer to re-check now. A no-op on a fixed lease.
+	pub fn revalidate(&self) {
+		self.consumer.revalidate();
+	}
+
+	/// Wait for the lease to stop covering the session: the grant expired, was
+	/// revoked, or was re-checked into one that no longer covers the token.
+	///
+	/// A changed root or a narrower grant ends it: the origin cannot be resized in
+	/// place until pattern scopes land. A changed tier is kept for this session and
+	/// applies to its next connection, since the stats carriers resolved their
+	/// counters at admission.
+	pub async fn ended(&mut self) -> lease::Reason {
+		loop {
+			let expire = async {
+				match self.expires {
+					Some(at) => tokio::time::sleep(at.duration_since(SystemTime::now()).unwrap_or_default()).await,
+					None => std::future::pending().await,
+				}
+			};
+			tokio::select! {
+				changed = self.consumer.changed() => match changed {
+					Ok(grant) => match self.token.recheck(&grant) {
+						Ok(fresh) if fresh.root != self.token.root => return "root changed".into(),
+						Ok(fresh) if !self.token.covered_by(&fresh) => return "grant narrowed".into(),
+						Ok(fresh) => {
+							if fresh.tier != self.token.tier {
+								tracing::info!(from = %self.token.tier, to = %fresh.tier, "tier changed; applies to the next session");
+							}
+							self.expires = grant.expires;
+						}
+						Err(err) => {
+							tracing::warn!(%err, "re-checked grant cannot scope the session");
+							return "unsupported grant".into();
+						}
+					},
+					Err(reason) => return reason,
+				},
+				() = expire => return lease::Reason::Expired,
+			}
 		}
 	}
 
-	/// The grant as it stands now.
-	pub fn grant(&self) -> Grant {
-		self.consumer.grant()
-	}
-
-	/// The next update: the new grant, or the reason the lease ended.
-	pub async fn changed(&mut self) -> Result<Grant, lease::Reason> {
-		self.consumer.changed().await
-	}
-
-	/// End the lease with the session's close classification.
-	pub fn close(self, reason: impl Into<lease::Reason>) {
-		self.consumer.close(reason);
+	/// End the lease with the session's close classification and the totals it
+	/// moved, and learn what it ended with: that, or the decider's reason if it
+	/// revoked first. Dropping the consumer reports zero bytes.
+	pub fn close(self, reason: impl Into<lease::Reason>, bytes: Bytes) -> lease::Reason {
+		self.consumer.close(reason, bytes)
 	}
 }
 
 enum Mode {
 	Server(moq_auth::Client),
 	Public(Grant),
+	/// The embedding process decides: every session is queued for whoever holds
+	/// the [`Admissions`], and admits nothing once they are gone.
+	Embedded(mpsc::UnboundedSender<Admission>),
 	/// Nothing admits an ordinary session; only a locally decided grant (the LAN
 	/// mesh credential) gets through. What a `--cluster-lan` process with no
 	/// listener of its own runs.
 	Refuse,
 }
 
-/// Admits sessions: asks the server, or hands out the static public grant.
+/// Admits sessions: asks the server, hands out the static public grant, or queues
+/// the session for the embedder.
 #[derive(Clone)]
 pub struct Auth {
 	mode: Arc<Mode>,
@@ -269,6 +336,18 @@ pub struct Auth {
 }
 
 impl Auth {
+	/// An `Auth` the embedding process answers for: every session is queued on the
+	/// returned [`Admissions`] and waits for its [`Admission`] to be granted or
+	/// refused. Dropping the `Admissions` fails every later session as unavailable.
+	pub fn embedded(node: impl Into<String>) -> (Self, Admissions) {
+		let (sender, receiver) = mpsc::unbounded_channel();
+		let auth = Self {
+			mode: Arc::new(Mode::Embedded(sender)),
+			node: Arc::from(node.into()),
+		};
+		(auth, Admissions(receiver))
+	}
+
 	/// An `Auth` that refuses every session a server or a public grant would have
 	/// decided, admitting only what the relay decides for itself (a LAN peer).
 	pub fn refuse(node: impl Into<String>) -> Self {
@@ -285,43 +364,81 @@ impl Auth {
 
 	/// A fresh `connect` request for this relay, before the transport's facts are filled in.
 	pub fn request(&self, transport: moq_auth::Transport, path: impl Into<String>) -> Request {
-		Request::connect(self.node.as_ref(), transport, path)
+		Request::new(self.node.as_ref(), transport, path)
 	}
 
-	/// Admit a session: the lease it holds and the scope the origin applies.
-	///
-	/// `bytes` is what the session meters, reported in the `end` event.
-	pub async fn admit(&self, request: Request, bytes: Counters) -> Result<Admitted, AuthError> {
+	/// Admit a session: the lease it holds, carrying the scope the origin applies.
+	pub async fn admit(&self, request: Request) -> Result<Lease, Error> {
 		let path = request.path.clone();
-		let lease = match self.mode.as_ref() {
-			Mode::Server(client) => Lease {
-				consumer: client.connect(request, bytes).await?,
-				_static: None,
-			},
+		let consumer = match self.mode.as_ref() {
+			Mode::Server(client) => client.connect(request).await?,
 			// A certificate is a fact for a server to weigh; with no server it admits
 			// nothing on its own, so the peer gets what any anonymous session gets.
-			Mode::Public(grant) => Lease::fixed(grant.clone()),
-			Mode::Refuse => return Err(AuthError::Refused),
+			Mode::Public(grant) => lease::Consumer::fixed(grant.clone()),
+			Mode::Embedded(admissions) => {
+				let (reply, answer) = oneshot::channel();
+				admissions
+					.send(Admission { request, reply })
+					.map_err(|_| Error::Unavailable("nobody is answering admissions".into()))?;
+				let consumer = tokio::time::timeout(ADMIT_TIMEOUT, answer)
+					.await
+					.map_err(|_| Error::Unavailable("the admission timed out".into()))?
+					.map_err(|_| Error::Unavailable("the admission went unanswered".into()))??;
+				// Held to what a server's answer is held to: a grant that admits nothing
+				// or asks for a re-check without a bound is the decider's bug, not a refusal.
+				consumer.grant().validate()?;
+				consumer
+			}
+			Mode::Refuse => return Err(Error::Refused),
 		};
-		let token = AuthToken::new(&path, &lease.grant())?;
-		Ok(Admitted { lease, token })
+		Lease::new(&path, consumer)
 	}
 
 	/// Admit a session on a grant decided locally, bypassing the server: the LAN
 	/// mesh credential, which the relay minted for itself.
-	pub(crate) fn admit_fixed(&self, path: &str, grant: Grant) -> Result<Admitted, AuthError> {
-		let lease = Lease::fixed(grant);
-		let token = AuthToken::new(path, &lease.grant())?;
-		Ok(Admitted { lease, token })
+	pub(crate) fn admit_fixed(&self, path: &str, grant: Grant) -> Result<Lease, Error> {
+		Lease::new(path, lease::Consumer::fixed(grant))
 	}
 }
 
-/// An admitted session: its lease and the scope it was admitted under.
-pub struct Admitted {
-	/// The lease the session holds for as long as it runs.
-	pub lease: Lease,
-	/// The grant reduced to what the origin scopes by.
-	pub token: AuthToken,
+/// The sessions an embedded [`Auth`] is waiting to admit, in arrival order.
+///
+/// The transport has already accepted each one; it waits for its answer, so a
+/// slow decider holds connects the way a slow auth server would, and one that
+/// takes longer than a server may (ten seconds) is refused as unavailable.
+/// Answer in place or hand each [`Admission`] to its own task; nothing here
+/// serializes them.
+pub struct Admissions(mpsc::UnboundedReceiver<Admission>);
+
+impl Admissions {
+	/// The next session to decide, or `None` once every clone of the [`Auth`] is gone.
+	pub async fn next(&mut self) -> Option<Admission> {
+		self.0.recv().await
+	}
+}
+
+/// One session waiting to be admitted: what the relay knows, and the two answers.
+///
+/// Dropping it unanswered fails the session as unavailable.
+pub struct Admission {
+	/// The `connect` request the relay built: every fact the transport knows.
+	pub request: Request,
+	reply: oneshot::Sender<Result<lease::Consumer, Error>>,
+}
+
+impl Admission {
+	/// Admit the session on `lease`: [`lease::Consumer::fixed`] for a grant that
+	/// never changes, or the consumer of a [`lease::Producer`] the decider keeps to
+	/// re-check, update, revoke, and learn when the session ends.
+	pub fn grant(self, lease: lease::Consumer) {
+		// The session may have given up waiting; nothing to tell it then.
+		let _ = self.reply.send(Ok(lease));
+	}
+
+	/// Refuse the session, with the reason its transport reports.
+	pub fn refuse(self, err: Error) {
+		let _ = self.reply.send(Err(err));
+	}
 }
 
 /// The `moq_auth::Request` for an accepted transport request: every fact the
@@ -378,8 +495,8 @@ mod tests {
 		texts.iter().map(|text| text.parse().unwrap()).collect()
 	}
 
-	fn config(url: Option<&str>, public: &[&str]) -> AuthConfig {
-		AuthConfig {
+	fn config(url: Option<&str>, public: &[&str]) -> Config {
+		Config {
 			url: url.map(|url| url.parse().unwrap()),
 			public: public.iter().map(|p| p.parse().unwrap()).collect(),
 			..Default::default()
@@ -393,7 +510,7 @@ mod tests {
 		assert!(config(Some("http://127.0.0.1:4440/"), &[]).validate().is_ok());
 		assert!(config(None, &["anon/**"]).validate().is_ok());
 
-		let split = AuthConfig {
+		let split = Config {
 			public_subscribe: patterns(&["anon/**"]).into_iter().collect(),
 			..Default::default()
 		};
@@ -409,10 +526,44 @@ mod tests {
 			.init("relay-1", &moq_tokio::tls::Connect::default())
 			.unwrap();
 		let request = auth.request(moq_auth::Transport::Quic, "/anon/room");
-		let admitted = futures::executor::block_on(auth.admit(request, Counters::default())).unwrap();
-		assert_eq!(admitted.token.root, Path::new("anon/room").to_owned());
-		assert_eq!(admitted.token.subscribe, patterns(&["anon/**"]));
-		assert_eq!(admitted.token.tier, Tier::default());
+		let lease = futures::executor::block_on(auth.admit(request)).unwrap();
+		assert_eq!(lease.token().root, Path::new("anon/room").to_owned());
+		assert_eq!(lease.token().subscribe, patterns(&["anon/**"]));
+		assert_eq!(lease.token().tier, Tier::default());
+	}
+
+	/// The embedder's answer is the session's verdict; an answer that never comes,
+	/// or a decider that is gone, is an outage rather than a refusal.
+	#[tokio::test]
+	async fn an_embedded_auth_admits_what_the_embedder_answers() {
+		let (auth, mut admissions) = Auth::embedded("relay-1");
+		let request = || auth.request(moq_auth::Transport::Quic, "/anon/room");
+
+		let decide = async {
+			let admission = admissions.next().await.expect("an admission");
+			assert_eq!(admission.request.path, "/anon/room");
+			admission.grant(lease::Consumer::fixed(Grant::new(patterns(&["**"]), patterns(&["**"]))));
+			let admission = admissions.next().await.expect("an admission");
+			admission.refuse(Error::Refused);
+			// A grant that admits nothing is the decider's mistake, refused like a server's.
+			let admission = admissions.next().await.expect("an admission");
+			admission.grant(lease::Consumer::fixed(Grant::new(Patterns::new(), Patterns::new())));
+			// Dropped without an answer.
+			drop(admissions.next().await.expect("an admission"));
+			admissions
+		};
+		let admit = async {
+			let lease = auth.admit(request()).await.expect("granted");
+			assert_eq!(lease.token().root, Path::new("anon/room").to_owned());
+			assert!(matches!(auth.admit(request()).await, Err(Error::Refused)));
+			for _ in 0..2 {
+				assert!(matches!(auth.admit(request()).await, Err(Error::Unavailable(_))));
+			}
+		};
+		let (admissions, ()) = tokio::join!(decide, admit);
+
+		drop(admissions);
+		assert!(matches!(auth.admit(request()).await, Err(Error::Unavailable(_))));
 	}
 
 	#[test]
@@ -420,7 +571,7 @@ mod tests {
 		let mut grant = Grant::new(patterns(&["alice/**"]), patterns(&["**"]));
 		grant.root = Some("pid/room".into());
 		grant.tier = Some("gold".into());
-		let token = AuthToken::new("/vanity/room", &grant).unwrap();
+		let token = Token::new("/vanity/room", &grant).unwrap();
 		assert_eq!(token.root, Path::new("pid/room").to_owned());
 		assert_eq!(token.publish, patterns(&["alice/**"]));
 		assert_eq!(token.subscribe, patterns(&["**"]));
@@ -428,9 +579,9 @@ mod tests {
 
 		for pattern in ["*/chat", "alice", ""] {
 			let grant = Grant::new(patterns(&[pattern]), Patterns::new());
-			let err = AuthToken::new("/", &grant).unwrap_err();
+			let err = Token::new("/", &grant).unwrap_err();
 			assert!(
-				matches!(&err, AuthError::UnsupportedPattern(p) if p == pattern),
+				matches!(&err, Error::UnsupportedPattern(p) if p == pattern),
 				"{pattern}: {err}"
 			);
 		}
@@ -438,9 +589,9 @@ mod tests {
 
 	#[test]
 	fn a_narrower_recheck_is_not_covered() {
-		let wide = AuthToken::new("/room", &Grant::new(patterns(&["**"]), patterns(&["**"]))).unwrap();
-		let narrow = AuthToken::new("/room", &Grant::new(patterns(&["alice/**"]), patterns(&["**"]))).unwrap();
-		let moved = AuthToken::new("/other", &Grant::new(patterns(&["**"]), patterns(&["**"]))).unwrap();
+		let wide = Token::new("/room", &Grant::new(patterns(&["**"]), patterns(&["**"]))).unwrap();
+		let narrow = Token::new("/room", &Grant::new(patterns(&["alice/**"]), patterns(&["**"]))).unwrap();
+		let moved = Token::new("/other", &Grant::new(patterns(&["**"]), patterns(&["**"]))).unwrap();
 		assert!(wide.covered_by(&wide));
 		assert!(narrow.covered_by(&wide));
 		assert!(!wide.covered_by(&narrow));
@@ -452,7 +603,7 @@ mod tests {
 		let everything = || Grant::new(patterns(&["**"]), patterns(&["**"]));
 		let mut aliased = everything();
 		aliased.root = Some("pid/room".into());
-		let token = AuthToken::new("/vanity/room", &aliased).unwrap();
+		let token = Token::new("/vanity/room", &aliased).unwrap();
 		assert_eq!(token.root, Path::new("pid/room").to_owned());
 
 		// The same alias still names the same root.

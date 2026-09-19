@@ -5,7 +5,10 @@
 //! `parse()` is expected to take them first. A binary that parses more than once
 //! never reaches that code, so it has to answer them itself. Both shapes exist here:
 //! a TOML merge that layers CLI, env, and file with recorded provenance, and
-//! moq-cli's repeated `--` stage grammar.
+//! moq-cli's repeated `--` stage grammar. [`Duration`] is the human-readable
+//! duration those flags and TOML keys parse.
+
+mod duration;
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -17,6 +20,8 @@ use usage::config::{
 	CliLayer, EnvLayer, FileScope, Layer, LayerCtx, LayerError, LayerOutput, Layers, Origin, Registry, Resolved,
 	SourceKind, Value, resolve,
 };
+
+pub use duration::Duration;
 
 /// What a Usage parse result asks the process to do.
 #[non_exhaustive]
@@ -102,14 +107,17 @@ pub fn answer(
 ///
 /// `parsed` is the struct Usage filled from argv+env+defaults. File keys that
 /// neither the command line nor the environment set replace those defaults.
-/// `keep` copies fields a TOML round-trip would drop (hidden CLI-only legacy).
+///
+/// The merge is a TOML round-trip, so a `#[serde(skip)]` field comes back as its
+/// default. The released CLI spellings live on such fields: collect
+/// [`Deprecated`](crate::Deprecated) from `parsed` before calling this, and from
+/// the result for the file's own released keys.
 pub fn merge<T>(
 	registry: Registry,
 	parsed: T,
 	cli: &CliLayer,
 	env: &EnvLayer,
 	file: Option<FileSource<'_>>,
-	keep: impl Fn(&mut T, &T),
 ) -> Result<(T, Resolved), String>
 where
 	T: Serialize + DeserializeOwned,
@@ -125,13 +133,11 @@ where
 	let resolved = resolve(registry, layers).map_err(|err| err.to_string())?;
 
 	let occupied = occupied_keys(registry, &resolved);
-	let original = parsed;
-	let mut merged = toml::Value::try_from(&original).map_err(|err| err.to_string())?;
+	let mut merged = toml::Value::try_from(&parsed).map_err(|err| err.to_string())?;
 	if let Some(source) = file {
 		overlay_unoccupied(&mut merged, source.value, "", &occupied);
 	}
-	let mut config: T = merged.try_into().map_err(|err: toml::de::Error| err.to_string())?;
-	keep(&mut config, &original);
+	let config: T = merged.try_into().map_err(|err: toml::de::Error| err.to_string())?;
 	Ok((config, resolved))
 }
 

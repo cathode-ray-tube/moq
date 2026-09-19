@@ -16,7 +16,7 @@ use tokio::task::AbortHandle;
 use tracing::Instrument as _;
 use url::Url;
 
-use crate::{AuthToken, nodes::MESH_PREFIX};
+use crate::{auth, nodes::MESH_PREFIX};
 
 /// The request path prefix a LAN mesh dial presents, marking it as a peer rather
 /// than an ordinary publisher or viewer on the same listener.
@@ -48,9 +48,187 @@ fn should_dial(self_url: &str, peer: &str) -> bool {
 	peer > self_url
 }
 
+/// One cluster peer to dial, as listed in [`Config::connect`] or returned
+/// by a `connect_api` endpoint.
+///
+/// Accepts a URL string or an object with `url` plus
+/// policy: `cost` prices the link, `egress` declares this relay's own price to
+/// the peer, and `token` carries the peer's credential. `egress` defaults to
+/// `cost`; a different effective value is rejected until asymmetric routing
+/// lands. An object `token` behaves exactly like an inline `?jwt=` and is
+/// redacted the same way. Unknown object fields are rejected, as is an object
+/// that sets policy while its `url` still carries `?cost=` or `?jwt=`.
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Peer {
+	url: String,
+	cost: Option<u64>,
+	egress: Option<u64>,
+	token: Option<String>,
+}
+
+impl std::fmt::Debug for Peer {
+	/// Redact `token`: [`crate::Config::load`] traces the whole resolved config,
+	/// so a derived `Debug` would print cluster credentials into logs.
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Peer")
+			.field("url", &self.url)
+			.field("cost", &self.cost)
+			.field("egress", &self.egress)
+			.field("token", &self.token.as_ref().map(|_| "..."))
+			.finish()
+	}
+}
+
+impl Peer {
+	/// Dial this URL, with no policy.
+	pub fn new(url: impl Into<String>) -> Self {
+		Self {
+			url: url.into(),
+			cost: None,
+			egress: None,
+			token: None,
+		}
+	}
+
+	/// The peer address, as configured. May carry `?cost=` / `?jwt=` in the
+	/// legacy string form.
+	pub fn url(&self) -> &str {
+		&self.url
+	}
+
+	/// What this relay charges to pull from the peer. None prices the link at 1.
+	pub fn cost(&self) -> Option<u64> {
+		self.cost
+	}
+
+	/// What this relay declares in SETUP as its own price toward the peer.
+	/// Defaults to [`Self::cost`]; anything else is rejected until m2.
+	pub fn egress(&self) -> Option<u64> {
+		self.egress
+	}
+
+	/// The peer's credential, replacing an inline `?jwt=`.
+	pub fn token(&self) -> Option<&str> {
+		self.token.as_deref()
+	}
+
+	/// Price the link this peer is dialed on.
+	pub fn with_cost(mut self, cost: u64) -> Self {
+		self.cost = Some(cost);
+		self
+	}
+
+	/// Declare this relay's own price toward the peer. Must match the cost.
+	pub fn with_egress(mut self, egress: u64) -> Self {
+		self.egress = Some(egress);
+		self
+	}
+
+	/// Present this credential instead of an inline `?jwt=`.
+	pub fn with_token(mut self, token: impl Into<String>) -> Self {
+		self.token = Some(token.into());
+		self
+	}
+}
+
+impl std::str::FromStr for Peer {
+	type Err = anyhow::Error;
+
+	/// Parse a bare peer URL, preserving CLI input. Fails on an invalid URL
+	/// without echoing any inline credential.
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		peer_url(s)?;
+		Ok(Self::new(s))
+	}
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeerObject {
+	url: String,
+	#[serde(default)]
+	cost: Option<u64>,
+	#[serde(default)]
+	egress: Option<u64>,
+	#[serde(default)]
+	token: Option<String>,
+}
+
+/// A bare string is the URL form; a map is the object form. Dispatching on the
+/// shape ourselves (rather than an untagged enum) keeps serde's real error, so a
+/// typo'd field names itself instead of "did not match any variant".
+impl<'de> serde::Deserialize<'de> for Peer {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		struct Visitor;
+
+		impl<'de> serde::de::Visitor<'de> for Visitor {
+			type Value = Peer;
+
+			fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+				f.write_str("a peer URL string or an object with url, cost, egress, token")
+			}
+
+			fn visit_str<E: serde::de::Error>(self, url: &str) -> Result<Peer, E> {
+				Ok(Peer::new(url))
+			}
+
+			fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Peer, A::Error> {
+				let object: PeerObject =
+					serde::Deserialize::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+				Ok(Peer {
+					url: object.url,
+					cost: object.cost,
+					egress: object.egress,
+					token: object.token,
+				})
+			}
+		}
+
+		deserializer.deserialize_any(Visitor)
+	}
+}
+
+impl serde::Serialize for Peer {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		if self.cost.is_none() && self.egress.is_none() && self.token.is_none() {
+			return serializer.serialize_str(&self.url);
+		}
+		use serde::ser::SerializeStruct as _;
+		let mut len = 1;
+		if self.cost.is_some() {
+			len += 1;
+		}
+		if self.egress.is_some() {
+			len += 1;
+		}
+		if self.token.is_some() {
+			len += 1;
+		}
+		let mut state = serializer.serialize_struct("Peer", len)?;
+		state.serialize_field("url", &self.url)?;
+		if let Some(cost) = &self.cost {
+			state.serialize_field("cost", cost)?;
+		}
+		if let Some(egress) = &self.egress {
+			state.serialize_field("egress", egress)?;
+		}
+		if let Some(token) = &self.token {
+			state.serialize_field("token", token)?;
+		}
+		state.end()
+	}
+}
+
 /// One peer's stable identity and the dial-affecting configuration currently
 /// supplied by a discovery source.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct DialTarget {
 	key: String,
 	url: Url,
@@ -61,19 +239,54 @@ struct DialTarget {
 	/// Advertised certificate fingerprint to pin. LAN only.
 	fingerprint: Option<String>,
 	/// Present the mDNS credential on `/.cluster/<credential>` and skip
-	/// [`ClusterConfig::token`]. LAN only.
+	/// [`Config::token`]. LAN only.
 	lan: bool,
 }
 
 impl DialTarget {
+	/// Parse a bare peer URL, keeping its inline `?cost=` / `?jwt=`.
 	fn parse(peer: &str) -> anyhow::Result<Self> {
-		let mut url = peer_url(peer)?;
+		Self::from_peer(&Peer::new(peer))
+	}
+
+	/// Normalize a configured [`Peer`] into dial state. A bare URL keeps its
+	/// inline `?cost=` / `?jwt=`; an object carries policy in its fields instead.
+	/// Mixing the two (object policy plus URL params) is rejected rather than
+	/// given a precedence a migration could silently get wrong. `egress`
+	/// defaults to `cost`; anything else is rejected, never ignored.
+	fn from_peer(peer: &Peer) -> anyhow::Result<Self> {
+		let mut url = peer_url(&peer.url)?;
+		let has_cost = url.query_pairs().any(|(key, _)| key == "cost");
+		let has_jwt = url.query_pairs().any(|(key, value)| key == "jwt" && !value.is_empty());
+		if peer.cost.is_some() || peer.egress.is_some() {
+			anyhow::ensure!(
+				!has_cost,
+				"cluster peer sets cost/egress alongside a URL ?cost=; use one or the other"
+			);
+		}
+		let token = peer.token.as_deref().filter(|token| !token.is_empty());
+		if token.is_some() {
+			anyhow::ensure!(
+				!has_jwt,
+				"cluster peer sets token alongside a URL ?jwt=; use one or the other"
+			);
+		}
+		let cost = peer.cost.or(take_cost(&mut url)?);
+		// An unpriced link costs 1 (see `moq_net::Client::with_cost`), so `egress`
+		// alone is symmetric only at that price.
+		let charged = cost.unwrap_or(1);
+		anyhow::ensure!(
+			peer.egress.unwrap_or(charged) == charged,
+			"cluster peer sets egress different from cost; asymmetric costs are not supported yet"
+		);
+		if let Some(token) = token {
+			url.query_pairs_mut().append_pair("jwt", token);
+		}
 		let key = {
 			let mut identity = url.clone();
 			identity.set_query(None);
 			identity.into()
 		};
-		let cost = take_cost(&mut url)?;
 		Ok(Self {
 			key,
 			url,
@@ -168,11 +381,11 @@ impl GossipTargets {
 /// Parse a complete dynamic peer list before mutating the live dial set. A bad
 /// entry or conflicting duplicate rejects the whole update, preserving the
 /// last-known-good topology.
-fn parse_peer_list(list: Vec<String>, node: Option<&str>) -> anyhow::Result<HashMap<String, DialTarget>> {
+fn parse_peer_list(list: Vec<Peer>, node: Option<&str>) -> anyhow::Result<HashMap<String, DialTarget>> {
 	let self_key = node.map(canonicalize_peer_key);
 	let mut desired = HashMap::new();
 	for (index, peer) in list.into_iter().enumerate() {
-		let target = DialTarget::parse(&peer).with_context(|| format!("invalid peer at index {index}"))?;
+		let target = DialTarget::from_peer(&peer).with_context(|| format!("invalid peer at index {index}"))?;
 		if Some(&target.key) == self_key.as_ref() {
 			continue;
 		}
@@ -438,7 +651,7 @@ impl DialMap {
 #[serde_with::skip_serializing_none]
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
-pub struct ClusterConfig {
+pub struct Config {
 	/// Fixed origin (hop) id for this relay, identifying it in the hop chains
 	/// carried on each broadcast for loop detection and shortest-path routing.
 	///
@@ -455,17 +668,19 @@ pub struct ClusterConfig {
 	)]
 	pub id: Option<u64>,
 
-	/// Connect to one or more other cluster nodes. Each peer is a full URL, e.g.
-	/// `https://host/?jwt=TOKEN`. A bare host or `host:port` is refused; pass the
+	/// Connect to one or more other cluster nodes. Each entry is a full URL, e.g.
+	/// `https://host/?jwt=TOKEN`, or an object with `url`, `cost`, `egress`,
+	/// and `token`; see [`Peer`]. A bare host or `host:port` is refused; pass the
 	/// full URL instead. Accepts a comma-separated list on the CLI or repeat the
-	/// flag; in config files use a TOML array.
+	/// flag; in config files use a TOML array of URLs and/or objects.
 	///
-	/// A `?cost=N` query param prices the link (moq-lite-06+): every
-	/// announcement crossing it adds `N` to its route cost, so routing prefers
-	/// cheap paths over short ones. Use `0` for a same-datacenter sibling and
-	/// something large for a metered backbone; an unpriced link costs 1, which
-	/// reproduces plain hop counting. The param is consumed by this relay, not
-	/// sent to the peer.
+	/// A `?cost=N` query param (or object `cost`) prices the link (moq-lite-06+):
+	/// every announcement crossing it adds `N` to its route cost, so routing
+	/// prefers cheap paths over short ones. Use `0` for a same-datacenter sibling
+	/// and something large for a metered backbone; an unpriced link costs 1,
+	/// which reproduces plain hop counting. The param is consumed by this relay,
+	/// not sent to the peer. Object `egress` defaults to `cost`; anything else is
+	/// rejected until asymmetric routing lands.
 	#[usage(
 		name = "cluster-connect",
 		long = "cluster-connect",
@@ -474,12 +689,14 @@ pub struct ClusterConfig {
 		setting = "cluster.connect"
 	)]
 	#[serde_as(as = "serde_with::OneOrMany<_>")]
-	pub connect: Vec<String>,
+	pub connect: Vec<Peer>,
 
 	/// Fetch the list of peers to dial from an HTTP(S) URL or a local file,
 	/// reloading at runtime without a restart. The source returns a JSON array
-	/// of peer URLs: `["https://a.pop.example/?cost=1", "b.pop.example"]`. An http(s) URL is
-	/// re-checked on a fixed cadence, with caching, conditional revalidation
+	/// of peers: bare URL strings and/or objects with `url`, `cost`, `egress`,
+	/// and `token`, exactly as [`Self::connect`] accepts, e.g.
+	/// `["https://a.pop.example/?cost=1", {"url": "https://b.pop.example/", "cost": 2}]`.
+	/// An http(s) URL is re-checked on a fixed cadence, with caching, conditional revalidation
 	/// (`ETag` / `Last-Modified`), and stale-if-error handled by the shared HTTP
 	/// cache client, so the response's `Cache-Control` controls how often a real
 	/// fetch hits the endpoint; a local path is watched via OS filesystem
@@ -536,8 +753,9 @@ pub struct ClusterConfig {
 
 	/// JWT presented on outbound cluster dials, read from this file. Applied to
 	/// any static, API, or gossip peer whose URL doesn't already carry a
-	/// `?jwt=`. An inline `?jwt=` can provide a per-peer credential for static
-	/// or `connect_api` peers. Gossip should use this shared token or mTLS
+	/// `?jwt=` and whose object entry sets no `token`. An inline `?jwt=` or
+	/// object `token` provides a per-peer credential for static or `connect_api`
+	/// peers. Gossip should use this shared token or mTLS
 	/// because the advertised node URL is public. LAN peers never receive it;
 	/// they authenticate with their mDNS credential.
 	#[usage(
@@ -566,10 +784,10 @@ pub struct ClusterConfig {
 		setting = "cluster.linger",
 		hide = true
 	)]
-	pub linger: Option<moq_tokio::Duration>,
+	pub linger: Option<moq_tokio::cli::Duration>,
 }
 
-impl ClusterConfig {
+impl Config {
 	/// Released spellings this config was parsed from, each paired with what replaced it.
 	pub fn deprecated(&self) -> moq_tokio::Deprecated {
 		let mut found = moq_tokio::Deprecated::default();
@@ -581,7 +799,7 @@ impl ClusterConfig {
 				"a broadcast closes as soon as its last publisher is lost",
 			);
 		}
-		if self.connect.iter().any(|peer| is_legacy_peer(peer)) {
+		if self.connect.iter().any(|peer| is_legacy_peer(peer.url())) {
 			found.changed(
 				"--cluster-connect",
 				Some("MOQ_CLUSTER_CONNECT"),
@@ -598,7 +816,7 @@ impl ClusterConfig {
 /// Advertises this process over mDNS and dials the peers that advertise back,
 /// so a rack or a home lab meshes with no seed list and no shared rendezvous.
 /// A LAN peer authenticates with its mDNS credential on `/.cluster/<credential>`
-/// and is never handed [`ClusterConfig::token`].
+/// and is never handed [`Config::token`].
 #[derive(usage::Args, Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
 #[usage(unknown_flags = "error", args_override_self = false)]
 #[serde_with::skip_serializing_none]
@@ -608,7 +826,7 @@ impl ClusterConfig {
 pub struct LanConfig {
 	/// Enable mDNS discovery. Boolean flag: pass `--cluster-lan` (or `=true` /
 	/// `=false`). Advertises the listener fingerprint when the certificate was
-	/// generated or supplied in-memory, the [`ClusterConfig::node`] URL when one
+	/// generated or supplied in-memory, the [`Config::node`] URL when one
 	/// is configured, and needs at least one of them.
 	#[usage(
 		name = "cluster-lan",
@@ -668,7 +886,7 @@ impl LanConfig {
 ///
 /// Pass to [`Cluster::with_advertise`] after the QUIC listener is bound. The
 /// fingerprint is the generated or in-memory certificate's, when there is one;
-/// a loaded certificate is dialed by name via [`ClusterConfig::node`] instead.
+/// a loaded certificate is dialed by name via [`Config::node`] instead.
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct LanAdvertise {
@@ -709,20 +927,20 @@ struct LanAuth {
 /// [`Cluster::with_stats`]) attach afterwards without rebuilding it.
 #[derive(Default)]
 #[non_exhaustive]
-pub struct ClusterOptions {
+pub struct Options {
 	/// Cluster identity, peers, and discovery.
-	pub config: ClusterConfig,
+	pub config: Config,
 
 	/// Shared group pool and per-track retention ceiling.
 	///
 	/// `None` uses an unbounded pool with the standard LRU window and no
 	/// media-timestamp ceiling.
-	pub cache: Option<crate::Cache>,
+	pub cache: Option<crate::cache::Cache>,
 }
 
-impl ClusterOptions {
+impl Options {
 	/// Construct from cluster config, leaving the origin cache at its defaults.
-	pub fn new(config: ClusterConfig) -> Self {
+	pub fn new(config: Config) -> Self {
 		Self {
 			config,
 			..Default::default()
@@ -730,7 +948,7 @@ impl ClusterOptions {
 	}
 
 	/// Use this resolved cache when constructing the origin.
-	pub fn with_cache(mut self, cache: crate::Cache) -> Self {
+	pub fn with_cache(mut self, cache: crate::cache::Cache) -> Self {
 		self.cache = Some(cache);
 		self
 	}
@@ -804,7 +1022,7 @@ struct Work {
 /// client can serve local sessions but cannot dial remote peers.
 #[derive(Clone)]
 pub struct Cluster {
-	config: ClusterConfig,
+	config: Config,
 	client: Option<moq_tokio::Client>,
 	/// Dial template for LAN peers that pin a fingerprint; static and gossip
 	/// dials keep [`Self::client`].
@@ -848,7 +1066,7 @@ pub struct Cluster {
 }
 
 impl Cluster {
-	/// Creates a cluster with one origin, using [`ClusterOptions`] for identity
+	/// Creates a cluster with one origin, using [`Options`] for identity
 	/// and cache.
 	///
 	/// Use [`with_client`](Self::with_client) to enable dialing remote peers
@@ -862,8 +1080,8 @@ impl Cluster {
 	///
 	/// Errors if `config.id` is set but invalid: it must be non-zero and below
 	/// 2^62 (the wire varint limit). An unset id picks a fresh random origin.
-	pub fn new(options: ClusterOptions) -> anyhow::Result<Self> {
-		let ClusterOptions { config, cache } = options;
+	pub fn new(options: Options) -> anyhow::Result<Self> {
+		let Options { config, cache } = options;
 		let id = match config.id {
 			Some(0) => anyhow::bail!("--cluster-id must be non-zero"),
 			Some(id) if id >= 1 << 62 => {
@@ -874,6 +1092,10 @@ impl Cluster {
 		};
 		let deprecated = config.deprecated();
 		anyhow::ensure!(deprecated.is_empty(), "{deprecated}");
+		// Reject a repeated static identity with conflicting policy up front,
+		// matching the `--cluster-connect-api` validation, instead of silently
+		// keeping the first entry when dials spawn.
+		parse_peer_list(config.connect.clone(), None).context("invalid --cluster-connect peer list")?;
 		let mut origin_config = origin::Config::new(id);
 		if let Some(cache) = cache {
 			origin_config.pool = cache.pool;
@@ -951,7 +1173,7 @@ impl Cluster {
 	/// Attach a stats producer, replacing the default disabled registry with its
 	/// registry and taking over keeping its publish task alive.
 	///
-	/// Build one with [`StatsConfig::build`](crate::StatsConfig::build), passing
+	/// Build one with [`stats::Config::build`](crate::stats::Config::build), passing
 	/// [`Self::origin`] so it publishes through the same origin cluster peers read
 	/// from. The cluster holds the producer from here on, so the caller may drop
 	/// its own handle: publishing lasts exactly as long as the cluster does.
@@ -971,12 +1193,12 @@ impl Cluster {
 	///
 	/// Passed by reference to [`moq_net::Server::with_publisher`] (or the
 	/// equivalent per-request setter), which derives the read handle.
-	pub fn subscriber(&self, token: &AuthToken) -> Option<origin::Producer> {
+	pub fn subscriber(&self, token: &auth::Token) -> Option<origin::Producer> {
 		self.origin.with_root(&token.root)?.scope(&token.subscribe)
 	}
 
 	/// Returns an [`origin::Producer`] scoped to this session's publish permissions.
-	pub fn publisher(&self, token: &AuthToken) -> Option<origin::Producer> {
+	pub fn publisher(&self, token: &auth::Token) -> Option<origin::Producer> {
 		self.origin.with_root(&token.root)?.scope(&token.publish)
 	}
 
@@ -1237,7 +1459,7 @@ impl Cluster {
 		let mut supervised: tokio::task::JoinSet<anyhow::Result<()>> = tokio::task::JoinSet::new();
 
 		for peer in &self.config.connect {
-			let target = DialTarget::parse(peer).context("invalid --cluster-connect peer URL")?;
+			let target = DialTarget::from_peer(peer).context("invalid --cluster-connect peer URL")?;
 			if dialed.contains(&target.key) {
 				continue;
 			}
@@ -1350,8 +1572,7 @@ impl Cluster {
 			tokio::select! {
 				ann = announced.next() => {
 					let Some(update) = ann else { return; };
-					let Some(prefix) = update.pattern.as_prefix() else { continue; };
-					let relative = moq_net::Path::new(prefix);
+					let relative = update.path;
 					// The address to dial, which keeps its query: `run_remote` reads
 					// `?cost=` and `?jwt=` off it. The key is only its identity.
 					let peer = advertised_node_url(relative.as_str());
@@ -1368,7 +1589,7 @@ impl Cluster {
 						continue;
 					}
 					let advertisement = relative.as_str().to_owned();
-					match update.active {
+					match update.kind.is_active() {
 						true => {
 							let target = live.announce(advertisement, target);
 							let mut spawn = |target: DialTarget| {
@@ -1409,7 +1630,7 @@ impl Cluster {
 	/// Each candidate is [`Peer::urls`](moq_tokio::mdns::Peer::urls) in order
 	/// (node first) on `/.cluster/<credential>`, with the advertised fingerprint
 	/// pinned. The lower discovery id dials; the other waits inbound. A LAN dial
-	/// never carries `?jwt=` — [`ClusterConfig::token`] is for static and gossip
+	/// never carries `?jwt=` — [`Config::token`] is for static and gossip
 	/// peers only.
 	#[cfg(feature = "cluster-lan")]
 	async fn run_mdns(self, dialed: DialMap, mut discovery: moq_tokio::mdns::Discovery) -> anyhow::Result<()> {
@@ -1451,7 +1672,7 @@ impl Cluster {
 
 	/// Drive `--cluster-connect-api`: an http(s) URL is polled, a local path (or
 	/// `file://` URL) is watched for changes. Either way the source yields a JSON
-	/// array of peer URLs that's reconciled into the shared dial map.
+	/// array of peers that's reconciled into the shared dial map.
 	async fn run_connect_api(self, source: String, node: Option<String>, token: String, dialed: DialMap) {
 		match Url::parse(&source) {
 			Ok(url) if matches!(url.scheme(), "http" | "https") => {
@@ -1516,13 +1737,13 @@ impl Cluster {
 	}
 
 	/// Watch a local peer-list file, reconciling whenever it changes. Backed by
-	/// [`moq_tokio::watch::FileWatcher`] (OS notifications with a polling fallback).
+	/// [`moq_tokio::watch::Files`] (OS notifications with a polling fallback).
 	/// Fails static: a missing or malformed file keeps the current dials, and the
 	/// next change triggers a fresh attempt.
 	async fn run_connect_api_file(&self, path: PathBuf, node: Option<String>, token: String, dialed: DialMap) {
 		self.reload_connect_api_file(&path, &node, &token, &dialed);
 
-		let mut watcher = match moq_tokio::watch::FileWatcher::new(std::slice::from_ref(&path)) {
+		let mut watcher = match moq_tokio::watch::Files::new(std::slice::from_ref(&path)) {
 			Ok(watcher) => watcher,
 			Err(err) => {
 				tracing::error!(%err, ?path, "failed to watch cluster.connect_api file; updates disabled");
@@ -1537,15 +1758,15 @@ impl Cluster {
 	}
 
 	/// Re-read the peer-list file and reconcile. Any read/parse error keeps the
-	/// current dials; the [`FileWatcher`](moq_tokio::watch::FileWatcher) only
+	/// current dials; the [`Files`](moq_tokio::watch::Files) only
 	/// re-invokes this on a real change, so a malformed file isn't re-warned on a
 	/// loop.
 	fn reload_connect_api_file(&self, path: &std::path::Path, node: &Option<String>, token: &str, dialed: &DialMap) {
 		match std::fs::read_to_string(path) {
-			Ok(body) => match serde_json::from_str::<Vec<String>>(&body) {
+			Ok(body) => match serde_json::from_str::<Vec<Peer>>(&body) {
 				Ok(list) => self.apply_peer_list(list, node, token, dialed),
 				Err(err) => {
-					tracing::warn!(%err, ?path, "cluster.connect_api file is not a JSON array; keeping current peers")
+					tracing::warn!(%err, ?path, "cluster.connect_api file is not a JSON array of peers; keeping current peers")
 				}
 			},
 			Err(err) => tracing::warn!(%err, ?path, "failed to read cluster.connect_api file; keeping current peers"),
@@ -1555,7 +1776,7 @@ impl Cluster {
 	/// Fetch and parse the peer list. Caching, conditional revalidation, and
 	/// stale-if-error are handled by the HTTP cache middleware on `http`, so this
 	/// just issues the request and parses the (possibly cache-served) body.
-	async fn fetch_peer_list(http: &ClientWithMiddleware, url: Url) -> anyhow::Result<Vec<String>> {
+	async fn fetch_peer_list(http: &ClientWithMiddleware, url: Url) -> anyhow::Result<Vec<Peer>> {
 		let body = http
 			.get(url)
 			.send()
@@ -1567,13 +1788,13 @@ impl Cluster {
 			.await
 			.context("failed to read cluster.connect_api body")?;
 
-		serde_json::from_str(&body).context("cluster.connect_api response is not a JSON array of peer URLs")
+		serde_json::from_str(&body).context("cluster.connect_api response is not a JSON array of peers")
 	}
 
 	/// Reconcile a freshly fetched peer list into the dial map: dial peers that
 	/// are new and drop API peers that disappeared. The relay's own [`node`] URL
 	/// is filtered out so it never dials itself.
-	fn apply_peer_list(&self, list: Vec<String>, node: &Option<String>, token: &str, dialed: &DialMap) {
+	fn apply_peer_list(&self, list: Vec<Peer>, node: &Option<String>, token: &str, dialed: &DialMap) {
 		// Dedupe against the shared dial map (and filter out self) on stable identity,
 		// while retaining the full dial configuration so a cost or credential update
 		// replaces the existing session.
@@ -1604,8 +1825,8 @@ impl Cluster {
 		let mut urls = target.addrs();
 		let cost = target.cost;
 		// Apply the shared cluster token unless the URL already carries its own
-		// non-empty `?jwt=` (a per-peer inline token wins; the shared token still
-		// covers peers that have none). An empty
+		// non-empty `?jwt=` (a per-peer inline token or object `token` wins; the
+		// shared token still covers peers that have none). An empty
 		// `?jwt=` counts as absent, as `moq auth serve` reads it.
 		// LAN dials never get the token: they authenticate with the mDNS credential.
 		if !target.lan && !token.is_empty() {
@@ -1732,7 +1953,7 @@ impl Cluster {
 			.context("internal: LAN dial without Cluster::with_connect")?;
 		connect.backoff.timeout = std::time::Duration::ZERO.into();
 		connect.once = Some(false);
-		let mut bind = connect.resolved_bind();
+		let mut bind = connect.resolve().bind;
 		bind.set_port(0);
 		connect.bind = Some(bind);
 		connect.version = connect
@@ -1848,7 +2069,7 @@ fn take_cost(url: &mut Url) -> anyhow::Result<Option<u64>> {
 	Ok(Some(cost))
 }
 
-/// Drop `?jwt=` so a LAN dial never presents [`ClusterConfig::token`].
+/// Drop `?jwt=` so a LAN dial never presents [`Config::token`].
 #[cfg(feature = "cluster-lan")]
 fn strip_jwt(url: &mut Url) {
 	let remaining: Vec<(String, String)> = url
@@ -1876,7 +2097,7 @@ fn connect_api_is_http(source: &str) -> bool {
 /// The modern form is a full URL, e.g. `https://host/?jwt=TOKEN`, which is used
 /// verbatim. A bare host or `host:port` is wrapped in `https://.../` for
 /// gossip and `--cluster-connect-api` lists; user-supplied `--cluster-connect`
-/// entries refuse that form through [`ClusterConfig::deprecated`].
+/// entries refuse that form through [`Config::deprecated`].
 fn peer_url(peer: &str) -> anyhow::Result<Url> {
 	// A full URL has a scheme separator; a bare host or `host:port` does not
 	// (and `Url::parse` would otherwise mis-read `host:port` as scheme `host`).
@@ -1915,7 +2136,7 @@ pub(crate) fn advertised_node_url(advertised: &str) -> String {
 }
 
 /// Whether a peer string uses the released bare-host / `host:port` form rather
-/// than a full URL. Used so [`ClusterConfig::deprecated`] can refuse
+/// than a full URL. Used so [`Config::deprecated`] can refuse
 /// `--cluster-connect` entries that still use it.
 fn is_legacy_peer(peer: &str) -> bool {
 	!peer.contains("://")
@@ -1982,10 +2203,10 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::Config;
+	use crate::Config as RelayConfig;
 
-	fn new_cluster(config: ClusterConfig) -> anyhow::Result<Cluster> {
-		Cluster::new(ClusterOptions::new(config))
+	fn new_cluster(config: Config) -> anyhow::Result<Cluster> {
+		Cluster::new(Options::new(config))
 	}
 
 	/// The publish task holds only a `Weak` to its producer, so it stops when the
@@ -2001,13 +2222,13 @@ mod tests {
 	/// proves nothing.
 	#[tokio::test]
 	async fn stats_publishing_outlives_the_producer_handle() {
-		let config = crate::StatsConfig {
+		let config = crate::stats::Config {
 			enabled: true,
 			node: Some("test".to_string()),
 			..Default::default()
 		};
 
-		let cluster = new_cluster(ClusterConfig::default()).expect("cluster");
+		let cluster = new_cluster(Config::default()).expect("cluster");
 		let stats = config.build(cluster.origin.clone());
 		let cluster = cluster.with_stats(stats);
 
@@ -2056,10 +2277,10 @@ mod tests {
 
 	#[tokio::test]
 	async fn cluster_tier_defaults_to_unprefixed() {
-		let cluster = new_cluster(ClusterConfig::default()).expect("cluster");
+		let cluster = new_cluster(Config::default()).expect("cluster");
 		assert_eq!(cluster.cluster_tier(), Tier::default());
 
-		let cluster = new_cluster(ClusterConfig {
+		let cluster = new_cluster(Config {
 			tier: Some("region/sjc".to_string()),
 			..Default::default()
 		})
@@ -2395,14 +2616,14 @@ mod tests {
 	/// tear down or reconfigure the last-known-good dial set.
 	#[tokio::test]
 	async fn malformed_peer_list_preserves_current_dial() {
-		let cluster = new_cluster(ClusterConfig::default()).expect("cluster");
+		let cluster = new_cluster(Config::default()).expect("cluster");
 		let dialed = DialMap::default();
 		let current = DialTarget::parse("https://peer.example/?cost=1").unwrap();
 		let task = tokio::spawn(std::future::pending::<()>());
 		dialed.insert(current.clone(), task.abort_handle(), DialSource::Api);
 
 		cluster.apply_peer_list(
-			vec!["https://peer.example/?cost=invalid".to_string()],
+			vec![Peer::new("https://peer.example/?cost=invalid")],
 			&None,
 			"",
 			&dialed,
@@ -2421,8 +2642,8 @@ mod tests {
 	fn peer_list_rejects_conflicting_duplicate() {
 		let Err(err) = parse_peer_list(
 			vec![
-				"https://peer.example/?cost=1".to_string(),
-				"https://peer.example/?cost=2".to_string(),
+				Peer::new("https://peer.example/?cost=1"),
+				Peer::new("https://peer.example/?cost=2"),
 			],
 			None,
 		) else {
@@ -2431,15 +2652,197 @@ mod tests {
 		assert!(format!("{err:#}").contains("conflicting configurations"));
 	}
 
-	/// The peer-list wire format is a JSON array of URL strings.
+	/// The peer-list wire format is a JSON array of bare URL strings and/or
+	/// objects, parsed by the same type static config uses.
 	#[test]
 	fn peer_list_parses_as_string_array() {
 		let body = r#"["a.pop.example", "b.pop.example:4443"]"#;
-		let list: Vec<String> = serde_json::from_str(body).expect("parse peer list");
-		assert_eq!(
-			list,
-			vec!["a.pop.example".to_string(), "b.pop.example:4443".to_string()]
+		let list: Vec<Peer> = serde_json::from_str(body).expect("parse peer list");
+		assert_eq!(list, vec![Peer::new("a.pop.example"), Peer::new("b.pop.example:4443")]);
+	}
+
+	/// A bare URL keeps working, and an equivalent object normalizes to the same
+	/// dial target, so the two forms dedupe instead of conflicting.
+	#[test]
+	fn peer_object_form_matches_bare_url() {
+		let from_url = DialTarget::from_peer(&Peer::new("https://peer.example/?cost=2")).unwrap();
+		let object: Peer =
+			serde_json::from_str(r#"{"url": "https://peer.example/", "cost": 2}"#).expect("parse object peer");
+		let from_object = DialTarget::from_peer(&object).unwrap();
+		assert_eq!(from_url, from_object);
+
+		let desired = parse_peer_list(vec![Peer::new("https://peer.example/?cost=2"), object], None)
+			.expect("equivalent forms dedupe");
+		assert_eq!(desired.len(), 1);
+		assert_eq!(desired.values().next().expect("one peer"), &from_url);
+	}
+
+	/// An object `token` rides the same inline credential path: the dial URL
+	/// carries `?jwt=`, the identity drops it, and the shared token does not
+	/// override it.
+	#[test]
+	fn peer_object_token_matches_inline_credential() {
+		let inline = DialTarget::from_peer(&Peer::new("https://peer.example/?jwt=secret")).unwrap();
+		let object: Peer =
+			serde_json::from_str(r#"{"url": "https://peer.example/", "token": "secret"}"#).expect("parse object peer");
+		let from_object = DialTarget::from_peer(&object).unwrap();
+		assert_eq!(inline, from_object);
+		assert_eq!(inline.key, "https://peer.example/");
+		assert!(
+			inline
+				.url
+				.query_pairs()
+				.any(|(key, value)| key == "jwt" && value == "secret"),
+			"the credential must reach the dial URL: {}",
+			inline.url
 		);
+	}
+
+	/// `egress` defaults to `cost`, so a matching value is accepted and prices
+	/// the link exactly like the bare URL form. An unpriced link costs 1, so
+	/// `egress = 1` alone is symmetric too.
+	#[test]
+	fn peer_symmetric_egress_is_supported() {
+		let cost_only = DialTarget::from_peer(&Peer::new("https://peer.example/?cost=2")).unwrap();
+		let symmetric: Peer = serde_json::from_str(r#"{"url": "https://peer.example/", "cost": 2, "egress": 2}"#)
+			.expect("parse symmetric peer");
+		assert_eq!(DialTarget::from_peer(&symmetric).unwrap(), cost_only);
+
+		let unpriced = DialTarget::from_peer(&Peer::new("https://peer.example/")).unwrap();
+		let default_egress = DialTarget::from_peer(&Peer::new("https://peer.example/").with_egress(1)).unwrap();
+		assert_eq!(default_egress, unpriced);
+	}
+
+	/// An `egress` that differs from the effective cost is refused, never
+	/// silently ignored. That includes an egress with no cost at all.
+	#[test]
+	fn peer_asymmetric_egress_is_rejected() {
+		for peer in [
+			Peer::new("https://peer.example/").with_cost(1).with_egress(2),
+			Peer::new("https://peer.example/").with_egress(2),
+		] {
+			let err = DialTarget::from_peer(&peer).expect_err("asymmetric egress must fail");
+			assert!(
+				format!("{err:#}").contains("not supported"),
+				"egress refusal must say so: {err:#}"
+			);
+		}
+
+		let Err(err) = parse_peer_list(
+			vec![Peer::new("https://peer.example/").with_cost(1).with_egress(2)],
+			None,
+		) else {
+			panic!("asymmetric egress must reject the list");
+		};
+		assert!(format!("{err:#}").contains("not supported"));
+	}
+
+	/// Object policy and URL params each get one home. Setting both is rejected
+	/// rather than given a precedence a migration could silently get wrong.
+	#[test]
+	fn peer_mixed_policy_is_rejected() {
+		let cost_mix: Peer =
+			serde_json::from_str(r#"{"url": "https://peer.example/?cost=1", "cost": 1}"#).expect("parse mixed peer");
+		assert!(DialTarget::from_peer(&cost_mix).is_err());
+
+		let token_mix: Peer = serde_json::from_str(r#"{"url": "https://peer.example/?jwt=secret", "token": "secret"}"#)
+			.expect("parse mixed peer");
+		assert!(DialTarget::from_peer(&token_mix).is_err());
+	}
+
+	/// Unknown object fields reject the entry, so a typo keeps the last-good
+	/// topology instead of dialing with a silently dropped policy. The error
+	/// names the field rather than a generic shape mismatch.
+	#[test]
+	fn peer_unknown_field_is_rejected() {
+		let err = serde_json::from_str::<Vec<Peer>>(r#"[{"url": "https://peer.example/", "cosst": 1}]"#)
+			.expect_err("unknown field must fail");
+		assert!(err.to_string().contains("cosst"), "error must name the field: {err}");
+
+		#[derive(Debug, serde::Deserialize)]
+		struct Doc {
+			#[allow(dead_code)]
+			connect: Vec<Peer>,
+		}
+		let err = toml::from_str::<Doc>("connect = [{ url = \"https://peer.example/\", cost = \"cheap\" }]")
+			.expect_err("wrong type must fail");
+		assert!(err.to_string().contains("cost"), "error must name the field: {err}");
+	}
+
+	/// Equivalent URL and object forms of one peer dedupe, while differing
+	/// policies for one identity conflict, whatever their forms.
+	#[test]
+	fn peer_list_mixed_forms_conflict_on_policy() {
+		let object: Peer =
+			serde_json::from_str(r#"{"url": "https://peer.example/", "cost": 3}"#).expect("parse object peer");
+		let Err(err) = parse_peer_list(vec![Peer::new("https://peer.example/?cost=1"), object], None) else {
+			panic!("differing policies must conflict");
+		};
+		assert!(format!("{err:#}").contains("conflicting configurations"));
+	}
+
+	/// `Config::load` traces the whole resolved config, so `Peer` redacts its
+	/// credential from `Debug` instead of printing it into logs.
+	#[test]
+	fn peer_debug_redacts_token() {
+		let peer = Peer::new("https://peer.example/").with_cost(2).with_token("secret");
+		let debug = format!("{peer:?}");
+		assert!(!debug.contains("secret"), "Debug must not leak the credential: {debug}");
+		assert!(
+			debug.contains("https://peer.example/"),
+			"Debug keeps the address: {debug}"
+		);
+	}
+
+	/// Static `--cluster-connect` entries get the same all-or-nothing
+	/// validation as `--cluster-connect-api` lists: a repeated identity with
+	/// conflicting policy fails construction instead of silently keeping the
+	/// first entry, while equivalent entries dedupe.
+	#[tokio::test]
+	async fn static_conflicting_peers_fail_at_construction() {
+		let conflicting = Config {
+			connect: vec![
+				Peer::new("https://peer.example/?cost=1"),
+				Peer::new("https://peer.example/?cost=2"),
+			],
+			..Default::default()
+		};
+		let Err(err) = new_cluster(conflicting) else {
+			panic!("conflicting static peers must fail");
+		};
+		assert!(
+			format!("{err:#}").contains("conflicting configurations"),
+			"refusal must say so: {err:#}"
+		);
+
+		let equivalent = Config {
+			connect: vec![
+				Peer::new("https://peer.example/?cost=2"),
+				serde_json::from_str(r#"{"url": "https://peer.example/", "cost": 2}"#).expect("parse object peer"),
+			],
+			..Default::default()
+		};
+		new_cluster(equivalent).expect("equivalent static peers dedupe");
+	}
+
+	/// A malformed object entry keeps the last-good dials, exactly like a
+	/// malformed URL does.
+	#[tokio::test]
+	async fn malformed_object_peer_list_preserves_current_dial() {
+		let cluster = new_cluster(Config::default()).expect("cluster");
+		let dialed = DialMap::default();
+		let current = DialTarget::from_peer(&Peer::new("https://peer.example/?cost=1")).unwrap();
+		let task = tokio::spawn(std::future::pending::<()>());
+		dialed.insert(current.clone(), task.abort_handle(), DialSource::Api);
+
+		let asymmetric = Peer::new("https://peer.example/").with_cost(1).with_egress(2);
+		cluster.apply_peer_list(vec![asymmetric], &None, "", &dialed);
+
+		assert!(!task.is_finished(), "last-known-good dial must stay active");
+		let map = dialed.inner.lock().expect("dial map");
+		let entry = map.get(&current.key).expect("current dial");
+		assert!(entry.sources.get(entry.active) == Some(&current));
+		task.abort();
 	}
 
 	/// The mesh tiebreaker only dials peers that sort after us, so exactly one
@@ -2458,7 +2861,7 @@ mod tests {
 	/// advertise, so it must fail fast with a message naming the missing flag.
 	#[tokio::test]
 	async fn gossip_without_node_errors() {
-		let config = ClusterConfig {
+		let config = Config {
 			mesh: Some("true".to_string()),
 			..Default::default()
 		};
@@ -2472,7 +2875,7 @@ mod tests {
 	/// node a stable identity across restarts.
 	#[tokio::test]
 	async fn cluster_id_sets_origin() {
-		let cluster = new_cluster(ClusterConfig {
+		let cluster = new_cluster(Config {
 			id: Some(42),
 			..Default::default()
 		})
@@ -2485,7 +2888,7 @@ mod tests {
 	#[tokio::test]
 	async fn constructed_origin_keeps_cache_and_handles() {
 		let duration = Duration::from_secs(5);
-		let cache = crate::CacheConfig {
+		let cache = crate::cache::Config {
 			duration: Some(duration.into()),
 			..Default::default()
 		}
@@ -2494,7 +2897,7 @@ mod tests {
 		let pool = cache.pool.clone();
 
 		let cluster = Cluster::new(
-			ClusterOptions::new(ClusterConfig {
+			Options::new(Config {
 				id: Some(42),
 				..Default::default()
 			})
@@ -2507,7 +2910,7 @@ mod tests {
 		assert_eq!(origin.config().cache_duration, duration);
 		assert_eq!(origin.config().pool.expiry(), Some(duration));
 
-		let stats = crate::StatsConfig {
+		let stats = crate::stats::Config {
 			enabled: true,
 			node: Some("test".to_string()),
 			..Default::default()
@@ -2519,7 +2922,7 @@ mod tests {
 		assert_eq!(cluster.origin.config().cache_duration, duration);
 		assert_eq!(cluster.origin.config().pool.expiry(), Some(duration));
 
-		let mut broadcast = origin.create_broadcast("cam").expect("create");
+		let broadcast = origin.create_broadcast("cam").expect("create");
 		broadcast.announce(Default::default()).expect("announce");
 		let mut track = broadcast.create_track("data", None).expect("track");
 		track.write_frame(moq_net::Timestamp::ZERO, b"hello").expect("write");
@@ -2543,7 +2946,7 @@ mod tests {
 			.await
 			.expect("node advertised")
 			.expect("announce");
-		assert!(update.active);
+		assert!(update.kind.is_active());
 		let snapshot = cluster.nodes.snapshot();
 		assert!(
 			snapshot.nodes.iter().any(|node| node.node.contains("peer.example")),
@@ -2562,7 +2965,7 @@ mod tests {
 	#[test]
 	fn cluster_id_out_of_range_errors() {
 		for bad in [0, 1u64 << 62] {
-			let err = new_cluster(ClusterConfig {
+			let err = new_cluster(Config {
 				id: Some(bad),
 				..Default::default()
 			})
@@ -2578,7 +2981,7 @@ mod tests {
 	/// (i.e. not exit and drop the broadcast).
 	#[tokio::test(start_paused = true)]
 	async fn passive_rendezvous_runs_without_client_and_advertises_self() {
-		let cluster = new_cluster(ClusterConfig {
+		let cluster = new_cluster(Config {
 			node: Some("rendezvous.example.com:4443".to_string()),
 			mesh: Some("true".to_string()),
 			..Default::default()
@@ -2597,11 +3000,8 @@ mod tests {
 
 		// The self-registration route must be visible on the origin.
 		let update = watcher.try_next().expect("self-registration must be published");
-		assert_eq!(
-			update.pattern.as_prefix().expect("prefix announcement"),
-			".internal/origins/rendezvous.example.com:4443"
-		);
-		assert!(update.active);
+		assert_eq!(update.path.as_str(), ".internal/origins/rendezvous.example.com:4443");
+		assert!(update.kind.is_active());
 
 		// run() must NOT have returned: dropping the broadcast (via run returning)
 		// would unannounce the registration immediately. Use a short timeout to
@@ -2630,21 +3030,52 @@ mod tests {
 		std::fs::write(&path, toml).unwrap();
 
 		let args = vec![std::ffi::OsString::from("moq-relay"), std::ffi::OsString::from(&path)];
-		let config = Config::parse_and_merge(args).expect("config load");
+		let config = RelayConfig::parse_and_merge(args).expect("config load");
 		assert_eq!(config.cluster.node.as_deref(), Some("us-east.example.com:4443"));
 		// A TOML boolean deserializes into the string form.
 		assert_eq!(config.cluster.mesh.as_deref(), Some("true"));
 		assert_eq!(
 			config.cluster.connect,
-			vec!["https://root.example.com:4443/".to_string()]
+			vec![Peer::new("https://root.example.com:4443/")]
 		);
+	}
+
+	/// Static config accepts the object form beside bare URLs, through the same
+	/// type the connect API parses.
+	#[test]
+	fn cluster_connect_object_form_round_trip() {
+		// Usage reads the environment while parsing, so serialize with the tests
+		// that mutate it.
+		let _env = crate::test_env::EnvGuard::lock();
+
+		let toml = "[cluster]\nconnect = [\"https://a.example/?cost=1\", { url = \"https://b.example/\", cost = 2, egress = 2, token = \"secret\" }]\n";
+		let dir = std::env::temp_dir().join("moq-relay-cluster-test");
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("cluster-connect-object-toml.toml");
+		std::fs::write(&path, toml).unwrap();
+
+		let args = vec![std::ffi::OsString::from("moq-relay"), std::ffi::OsString::from(&path)];
+		let config = RelayConfig::parse_and_merge(args).expect("config load");
+		assert_eq!(
+			config.cluster.connect,
+			vec![
+				Peer::new("https://a.example/?cost=1"),
+				Peer::new("https://b.example/")
+					.with_cost(2)
+					.with_egress(2)
+					.with_token("secret"),
+			]
+		);
+		// The object normalizes exactly like its URL spellings.
+		let desired = parse_peer_list(config.cluster.connect, None).expect("static peers parse");
+		assert_eq!(desired.len(), 2);
 	}
 
 	/// The legacy `--cluster-mesh <url>` form (now a boolean) is honored for
 	/// backwards compatibility: it enables gossip and supplies the node URL.
 	#[tokio::test]
 	async fn legacy_mesh_url_enables_gossip_as_node() {
-		let cluster = new_cluster(ClusterConfig {
+		let cluster = new_cluster(Config {
 			mesh: Some("rendezvous.example.com:4443".to_string()),
 			..Default::default()
 		})
@@ -2680,9 +3111,9 @@ mod tests {
 	/// name what replaced them, but they configure nothing and must stop a run.
 	#[test]
 	fn released_cluster_spellings_are_reported_not_applied() {
-		let config = ClusterConfig {
+		let config = Config {
 			linger: Some(std::time::Duration::from_secs(5).into()),
-			connect: vec!["root.example.com:4443".into()],
+			connect: vec![Peer::new("root.example.com:4443")],
 			..Default::default()
 		};
 		let reported = config.deprecated().to_string();
@@ -2839,7 +3270,7 @@ mod tests {
 	/// conflict, not a silent pick.
 	#[tokio::test]
 	async fn legacy_mesh_url_conflicting_with_node_errors() {
-		let cluster = new_cluster(ClusterConfig {
+		let cluster = new_cluster(Config {
 			mesh: Some("a.example.com:4443".to_string()),
 			node: Some("b.example.com:4443".to_string()),
 			..Default::default()
@@ -2865,7 +3296,7 @@ mod tests {
 		std::fs::write(&path, toml).unwrap();
 
 		let args = vec![std::ffi::OsString::from("moq-relay"), std::ffi::OsString::from(&path)];
-		let config = Config::parse_and_merge(args).expect("config load");
+		let config = RelayConfig::parse_and_merge(args).expect("config load");
 		assert!(config.cluster.lan.enabled);
 		assert_eq!(config.cluster.lan.secret.as_deref(), Some("cluster.key"));
 		assert_eq!(
@@ -2897,7 +3328,7 @@ mod tests {
 			std::ffi::OsString::from("--cluster-lan-app"),
 			std::ffi::OsString::from("from-cli"),
 		];
-		let config = Config::parse_and_merge(args).expect("config load");
+		let config = RelayConfig::parse_and_merge(args).expect("config load");
 		assert_eq!(config.cluster.lan.secret.as_deref(), Some("from-cli.key"));
 		assert_eq!(
 			config.cluster.lan.app.as_ref().map(ToString::to_string).as_deref(),
@@ -2935,7 +3366,7 @@ mod tests {
 	#[cfg(feature = "cluster-lan")]
 	#[tokio::test]
 	async fn lan_without_node_needs_a_fingerprint() {
-		let config = ClusterConfig {
+		let config = Config {
 			lan: LanConfig {
 				enabled: true,
 				..Default::default()
@@ -2967,7 +3398,7 @@ mod tests {
 	#[cfg(feature = "cluster-lan")]
 	#[tokio::test]
 	async fn lan_without_a_secret_is_open() {
-		let config = ClusterConfig {
+		let config = Config {
 			node: Some("https://us-west.example.com".to_string()),
 			lan: LanConfig {
 				enabled: true,
@@ -3080,7 +3511,7 @@ mod tests {
 		std::fs::write(&path, toml).unwrap();
 
 		let args = vec![std::ffi::OsString::from("moq-relay"), std::ffi::OsString::from(&path)];
-		let config = Config::parse_and_merge(args).expect("config load");
+		let config = RelayConfig::parse_and_merge(args).expect("config load");
 		assert_eq!(
 			config.cluster.connect_api.as_deref(),
 			Some("https://api.example.com/cluster/connect")
@@ -3099,8 +3530,8 @@ mod tests {
 		const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 		let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-		let node = new_cluster(ClusterConfig::default()).expect("node cluster");
-		let fingerprint = new_cluster(ClusterConfig::default()).expect("fingerprint cluster");
+		let node = new_cluster(Config::default()).expect("node cluster");
+		let fingerprint = new_cluster(Config::default()).expect("fingerprint cluster");
 
 		let _from_node = node.origin.create_broadcast("from-node").expect("create");
 		_from_node.announce(Default::default()).expect("announce");
@@ -3123,7 +3554,7 @@ mod tests {
 		tokio::spawn(async move {
 			let mut listener = listener;
 			while let Some(request) = listener.accept().await {
-				let conn = crate::Connection::new(request, accept.clone(), crate::Auth::refuse("test"));
+				let conn = crate::Connection::new(request, accept.clone(), crate::auth::Auth::refuse("test"));
 				tokio::spawn(async move {
 					let _ = conn.run().await;
 				});
@@ -3153,7 +3584,7 @@ mod tests {
 			.await
 			.expect("timed out waiting for from-node")
 			.expect("origin closed");
-		assert_eq!(update.pattern.as_prefix().expect("prefix announcement"), "from-node");
+		assert_eq!(update.path.as_str(), "from-node");
 
 		let _from_fp = fingerprint.origin.create_broadcast("from-fingerprint").expect("create");
 		_from_fp.announce(Default::default()).expect("announce");
@@ -3163,7 +3594,7 @@ mod tests {
 				.await
 				.expect("timed out waiting for from-fingerprint")
 				.expect("origin closed");
-			if update.pattern.as_prefix().expect("prefix announcement") == "from-fingerprint" {
+			if update.path.as_str() == "from-fingerprint" {
 				break;
 			}
 		}
@@ -3174,7 +3605,7 @@ mod tests {
 	#[tokio::test]
 	async fn lan_path_without_discovery_is_refused() {
 		assert_eq!(
-			new_cluster(ClusterConfig::default())
+			new_cluster(Config::default())
 				.expect("cluster")
 				.verify_lan_credential("anything"),
 			None

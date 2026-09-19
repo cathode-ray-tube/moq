@@ -2,10 +2,10 @@
 name = "moq-gst"
 description = "Media over QUIC - GStreamer plugin"
 authors = ["Luke Curley"]
-repository = "https://github.com/kixelated/moq"
+repository = "https://github.com/moq-dev/moq"
 license = "MIT OR Apache-2.0"
 
-version = "0.3.11"
+version = "0.3.12"
 edition = "2024"
 rust-version.workspace = true
 publish = true

@@ -37,12 +37,6 @@ pub enum MoqProtocolKind {
 	Timeout,
 	/// No version could be negotiated.
 	Version,
-	/// A required extension was not offered by the peer.
-	RequiredExtension,
-	/// The peer acted against the role it advertised at SETUP.
-	InvalidRole,
-	/// A stream was opened with an unknown or disallowed type.
-	UnexpectedStream,
 	/// The content missed its delivery deadline.
 	DeliveryTimeout,
 	/// The session ended, taking this stream with it.
@@ -80,7 +74,7 @@ pub struct MoqProtocolError {
 	/// Whether this code is from the session or stream registry.
 	pub scope: MoqErrorScope,
 	/// The integer on the wire, kept verbatim. Do not re-derive this from [`Self::kind`]:
-	/// `to_code` is not injective for the reserved 32-63 range.
+	/// App and Unknown each cover many codes, and the same kind is a different integer in each scope.
 	pub code: u32,
 	/// The known kind when the code is recognized, otherwise [`MoqProtocolKind::App`] or
 	/// [`MoqProtocolKind::Unknown`].
@@ -127,9 +121,6 @@ fn session_kind(err: &moq_net::SessionError) -> MoqProtocolKind {
 		moq_net::SessionError::GoawayTimeout => MoqProtocolKind::GoawayTimeout,
 		moq_net::SessionError::Timeout => MoqProtocolKind::Timeout,
 		moq_net::SessionError::Version => MoqProtocolKind::Version,
-		moq_net::SessionError::RequiredExtension => MoqProtocolKind::RequiredExtension,
-		moq_net::SessionError::InvalidRole => MoqProtocolKind::InvalidRole,
-		moq_net::SessionError::UnexpectedStream => MoqProtocolKind::UnexpectedStream,
 		moq_net::SessionError::App(_) => MoqProtocolKind::App,
 		moq_net::SessionError::Unknown(_) => MoqProtocolKind::Unknown,
 		_ => MoqProtocolKind::Unknown,
@@ -491,8 +482,7 @@ mod tests {
 
 	#[test]
 	fn reserved_range_received_stays_unknown() {
-		// 0x20 is what we send for RequiredExtension, but a received 0x20 is not read back
-		// as that placeholder.
+		// 0x20 sits in the draft's reserved range, so it is never given a kind.
 		let err = MoqError::from(moq_net::Error::from(moq_net::SessionError::from_code(0x20)));
 		match err {
 			MoqError::Protocol { details: protocol } => {

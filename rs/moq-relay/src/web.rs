@@ -25,23 +25,23 @@ use tokio_rustls::server::TlsStream;
 use tower_http::cors::{Any, CorsLayer};
 use tower_service::Service;
 
-use crate::{Admitted, Auth, AuthError, AuthToken, Cluster, Lease, Recheck};
+use crate::{auth, cluster};
 
 /// Configuration for the HTTP/HTTPS web server.
 #[derive(usage::Args, Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[usage(unknown_flags = "error", args_override_self = false)]
 #[serde(deny_unknown_fields, default)]
 #[non_exhaustive]
-pub struct WebConfig {
+pub struct Config {
 	/// Plain HTTP listener settings.
 	#[usage(flatten)]
 	#[serde(default)]
-	pub http: HttpConfig,
+	pub http: Http,
 
 	/// HTTPS listener settings with TLS.
 	#[usage(flatten)]
 	#[serde(default)]
-	pub https: HttpsConfig,
+	pub https: Https,
 
 	/// If true (default), expose a WebTransport compatible WebSocket polyfill.
 	#[usage(
@@ -54,17 +54,17 @@ pub struct WebConfig {
 	pub ws: bool,
 }
 
-impl Default for WebConfig {
+impl Default for Config {
 	fn default() -> Self {
 		Self {
-			http: HttpConfig::default(),
-			https: HttpsConfig::default(),
+			http: Http::default(),
+			https: Https::default(),
 			ws: true,
 		}
 	}
 }
 
-impl WebConfig {
+impl Config {
 	/// Whether the WebSocket polyfill is served.
 	pub fn resolved_ws(&self) -> bool {
 		self.ws
@@ -76,7 +76,7 @@ impl WebConfig {
 #[usage(unknown_flags = "error", args_override_self = false)]
 #[serde(deny_unknown_fields, default)]
 #[non_exhaustive]
-pub struct HttpConfig {
+pub struct Http {
 	/// Socket address to bind the HTTP listener to.
 	#[usage(
 		long = "web-http-listen",
@@ -93,7 +93,7 @@ pub struct HttpConfig {
 #[usage(unknown_flags = "error", args_override_self = false)]
 #[serde(deny_unknown_fields, default)]
 #[non_exhaustive]
-pub struct HttpsConfig {
+pub struct Https {
 	/// Socket address to bind the HTTPS listener to.
 	#[usage(
 		long = "web-https-listen",
@@ -158,9 +158,9 @@ pub struct HttpsConfig {
 /// build a [`Web`] from its parts via [`Web::new`] rather than constructing this.
 pub(crate) struct WebState {
 	/// The authenticator for verifying incoming requests.
-	pub(crate) auth: Auth,
+	pub(crate) auth: auth::Auth,
 	/// The cluster state for resolving origins.
-	pub(crate) cluster: Cluster,
+	pub(crate) cluster: cluster::Cluster,
 	/// TLS certificate information served at `/certificate.sha256`.
 	pub(crate) certificates: moq_tokio::tls::Certificates,
 	/// Monotonically increasing connection counter for WebSocket sessions.
@@ -169,13 +169,17 @@ pub(crate) struct WebState {
 	/// Relay-wide shutdown broadcast; WebSocket sessions drain with a GOAWAY
 	/// when it fires. Defaults to a handle that never fires.
 	#[cfg_attr(not(feature = "websocket"), allow(dead_code))]
-	pub(crate) shutdown: crate::Shutdown,
+	pub(crate) shutdown: crate::shutdown::Observer,
+	/// Live sessions on this node, so a WebSocket session is listed and nudged
+	/// like a QUIC one.
+	#[cfg_attr(not(feature = "websocket"), allow(dead_code))]
+	pub(crate) sessions: crate::session::Registry,
 }
 
 /// Run a HTTP server using Axum
 pub struct Web {
 	state: Arc<WebState>,
-	config: WebConfig,
+	config: Config,
 	versions: moq_net::Versions,
 	health: moq_tokio::accept::Health,
 }
@@ -184,13 +188,19 @@ impl Web {
 	/// Build a web server from its parts. `certificates` is the relay's TLS
 	/// certificate handle (e.g. `server.certificates()`), whose fingerprints are
 	/// served at `/certificate.sha256`.
-	pub fn new(auth: Auth, cluster: Cluster, certificates: moq_tokio::tls::Certificates, config: WebConfig) -> Self {
+	pub fn new(
+		auth: auth::Auth,
+		cluster: cluster::Cluster,
+		certificates: moq_tokio::tls::Certificates,
+		config: Config,
+	) -> Self {
 		let state = Arc::new(WebState {
 			auth,
 			cluster,
 			certificates,
 			conn_id: AtomicU64::new(0),
-			shutdown: crate::Shutdown::disabled(),
+			shutdown: crate::shutdown::Observer::disabled(),
+			sessions: crate::session::Registry::new(),
 		});
 		Self {
 			state,
@@ -229,9 +239,17 @@ impl Web {
 
 	/// Attach the relay-wide shutdown broadcast so WebSocket sessions drain with
 	/// a GOAWAY when it fires. Without it they are cut off on process exit.
-	pub fn with_shutdown(mut self, shutdown: crate::Shutdown) -> Self {
+	pub fn with_shutdown(mut self, shutdown: crate::shutdown::Observer) -> Self {
 		let state = Arc::get_mut(&mut self.state).expect("with_shutdown called after routes were built");
 		state.shutdown = shutdown;
+		self
+	}
+
+	/// Register WebSocket sessions in the node's live table so they can be listed
+	/// and nudged. Without it they are served but do not appear.
+	pub fn with_sessions(mut self, sessions: crate::session::Registry) -> Self {
+		let state = Arc::get_mut(&mut self.state).expect("with_sessions called after routes were built");
+		state.sessions = sessions;
 		self
 	}
 
@@ -242,7 +260,7 @@ impl Web {
 	///
 	/// This is the public-facing router (customer media routes plus a liveness
 	/// probe). `/metrics` is deliberately NOT here: node traffic counters ride
-	/// the separate internal listener ([`Internal`](crate::Internal)) so they're
+	/// the separate internal listener ([`internal::Internal`](crate::internal::Internal)) so they're
 	/// never exposed on the public listener.
 	///
 	/// Includes the WebSocket polyfill catch-all (`/{*path}`, when
@@ -398,7 +416,7 @@ fn https_watch_paths(cert: &[PathBuf], key: &[PathBuf], root: &[PathBuf]) -> Vec
 async fn reload_https_config(config: RustlsConfig, cert: Vec<PathBuf>, key: Vec<PathBuf>, root: Vec<PathBuf>) {
 	let paths = https_watch_paths(&cert, &key, &root);
 
-	let mut watcher = match moq_tokio::watch::FileWatcher::new(&paths) {
+	let mut watcher = match moq_tokio::watch::Files::new(&paths) {
 		Ok(watcher) => watcher,
 		Err(err) => {
 			tracing::error!(%err, "failed to watch web certificate files; hot reload disabled");
@@ -728,7 +746,7 @@ async fn admit_http(
 	headers: &http::HeaderMap,
 	remote: crate::listener::Peer,
 	mtls: Option<Extension<MtlsPeer>>,
-) -> Result<Admitted, AuthError> {
+) -> Result<auth::Lease, auth::Error> {
 	// The public request API represents a missing or root path as empty; the
 	// contract says what was dialed, and a URL always starts with `/`.
 	let mut request = state
@@ -740,8 +758,8 @@ async fn admit_http(
 		.or_else(|| query.jwt.map(|jwt| format!("jwt={jwt}")));
 	request.server_name = request_host(uri, headers);
 	request.remote = Some(remote.0);
-	request.tls = mtls.and_then(|Extension(MtlsPeer(identity))| crate::peer(&identity));
-	state.auth.admit(request, moq_auth::Counters::default()).await
+	request.tls = mtls.and_then(|Extension(MtlsPeer(identity))| auth::peer(&identity));
+	state.auth.admit(request).await
 }
 
 /// Serve the announced broadcasts for a given prefix.
@@ -759,8 +777,8 @@ async fn serve_announced(
 		None => String::new(),
 	};
 
-	let Admitted { lease, token } = admit_http(&state, prefix, query, &uri, &headers, remote, mtls).await?;
-	let Some(origin) = state.cluster.subscriber(&token) else {
+	let lease = admit_http(&state, prefix, query, &uri, &headers, remote, mtls).await?;
+	let Some(origin) = state.cluster.subscriber(lease.token()) else {
 		return Err(StatusCode::UNAUTHORIZED.into());
 	};
 
@@ -768,14 +786,12 @@ async fn serve_announced(
 	let mut broadcasts = Vec::new();
 
 	while let Some(update) = announced.try_next() {
-		if update.active
-			&& let Some(prefix) = update.pattern.as_prefix()
-		{
-			broadcasts.push(prefix.to_owned());
+		if update.kind.is_active() {
+			broadcasts.push(update.path);
 		}
 	}
 
-	lease.close("done");
+	lease.close("done", moq_auth::Bytes::default());
 	Ok(broadcasts
 		.iter()
 		.map(ToString::to_string)
@@ -802,12 +818,11 @@ async fn serve_fetch(
 		return Err(StatusCode::BAD_REQUEST.into());
 	}
 
-	let Admitted { lease, token } =
-		admit_http(&state, path.join("/"), params.auth, &uri, &headers, remote, mtls).await?;
+	let lease = admit_http(&state, path.join("/"), params.auth, &uri, &headers, remote, mtls).await?;
 	// The token's root is the canonical (alias-resolved) broadcast path.
-	let broadcast = token.root.to_string();
+	let broadcast = lease.token().root.to_string();
 
-	let Some(origin) = state.cluster.subscriber(&token) else {
+	let Some(origin) = state.cluster.subscriber(lease.token()) else {
 		return Err(StatusCode::UNAUTHORIZED.into());
 	};
 
@@ -862,14 +877,13 @@ async fn serve_fetch(
 			group,
 			deadline,
 			lease: Some(lease),
-			token,
 		}),
 		Ok(Err(status)) => {
-			lease.close(status.to_string());
+			lease.close(status.to_string(), moq_auth::Bytes::default());
 			Err(status.into())
 		}
 		Err(_) => {
-			lease.close("timeout");
+			lease.close("timeout", moq_auth::Bytes::default());
 			Err(StatusCode::GATEWAY_TIMEOUT.into())
 		}
 	}
@@ -882,8 +896,7 @@ struct ServeGroup {
 	group: moq_net::group::Consumer,
 	deadline: tokio::time::Instant,
 	/// Taken when the body ends, so the reason is reported once.
-	lease: Option<Lease>,
-	token: AuthToken,
+	lease: Option<auth::Lease>,
 }
 
 impl ServeGroup {
@@ -891,27 +904,14 @@ impl ServeGroup {
 		let Some(lease) = self.lease.as_mut() else {
 			return Ok(None);
 		};
-		loop {
-			tokio::select! {
-				res = tokio::time::timeout_at(self.deadline, self.group.read_frame()) => {
-					return match res {
-						Ok(res) => Ok(res?.map(|frame| frame.payload)),
-						Err(_) => Err(moq_net::Error::Timeout),
-					};
-				}
-				changed = lease.changed() => match changed {
-					Ok(grant) => match crate::recheck(&self.token, &grant) {
-						Recheck::Covered => continue,
-						Recheck::Closed(why) => {
-							tracing::info!(%why, "grant no longer covers the fetch, closing");
-							return Err(moq_net::Error::Unauthorized);
-						}
-					},
-					Err(reason) => {
-						tracing::info!(%reason, "lease ended, closing fetch");
-						return Err(moq_net::Error::Unauthorized);
-					}
-				},
+		tokio::select! {
+			res = tokio::time::timeout_at(self.deadline, self.group.read_frame()) => match res {
+				Ok(res) => Ok(res?.map(|frame| frame.payload)),
+				Err(_) => Err(moq_net::Error::Timeout),
+			},
+			why = lease.ended() => {
+				tracing::info!(%why, "lease ended, closing fetch");
+				Err(moq_net::Error::Unauthorized)
 			}
 		}
 	}
@@ -919,7 +919,7 @@ impl ServeGroup {
 	/// End the lease with the body's outcome.
 	fn end(&mut self, reason: &str) {
 		if let Some(lease) = self.lease.take() {
-			lease.close(reason);
+			lease.close(reason, moq_auth::Bytes::default());
 		}
 	}
 }
@@ -1300,7 +1300,7 @@ mod tests {
 		let (ca, cert, key) = make_certs(&dir);
 		let (http, https) = free_ports();
 
-		let mut config = WebConfig::default();
+		let mut config = Config::default();
 		config.http.listen = Some(format!("127.0.0.1:{http}").parse().unwrap());
 		config.https.listen = Some(format!("127.0.0.1:{https}").parse().unwrap());
 		config.https.cert = vec![cert.clone()];
@@ -1308,12 +1308,12 @@ mod tests {
 
 		// The probed route is the test's own, so auth never runs; it just has to be
 		// configured with something for `Web` to build.
-		let auth_config = crate::AuthConfig {
+		let auth_config = crate::auth::Config {
 			public_subscribe: vec![moq_auth::Pattern::all()],
 			..Default::default()
 		};
 		let auth = auth_config.init("test", &moq_tokio::tls::Connect::default()).unwrap();
-		let cluster = Cluster::new(crate::ClusterOptions::default()).unwrap();
+		let cluster = cluster::Cluster::new(crate::cluster::Options::default()).unwrap();
 		let certificates = moq_tokio::tls::Certificates::from_pem(&std::fs::read(&cert).unwrap()).unwrap();
 
 		let web = Web::new(auth, cluster, certificates, config);

@@ -23,7 +23,9 @@ export type Role = z.infer<typeof RoleSchema>;
  * decide on. Presenting one admits nothing by itself.
  */
 export const PeerSchema = z.object({
-	/** The first SAN DNS name, else the CN, else the fingerprint, so it is never empty. */
+	/** The first SAN DNS name, else the CN, else the fingerprint, so it is never empty.
+	 * Those three sources fold into one string a server cannot tell apart; match on
+	 * `fingerprint` when identity must be exact. */
 	name: z.string(),
 	/** SHA-256 of the leaf certificate, hex. */
 	fingerprint: z.string(),
@@ -87,7 +89,7 @@ export const RequestSchema = z.discriminatedUnion("event", [
 	z.extend(BaseRequestSchema, {
 		/** The session closed. */
 		event: z.literal("end"),
-		/** Why it closed: `dropped`, `expired`, `refused`, or the session's own classification. */
+		/** Why it closed: `dropped`, `expired`, `refused`, `invalid`, or the session's own classification. */
 		reason: z.string(),
 		/** How long it was admitted, in seconds. */
 		duration: z.number(),

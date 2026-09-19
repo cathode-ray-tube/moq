@@ -3274,7 +3274,7 @@ dependencies = [
 
 [[package]]
 name = "hang"
-version = "0.20.12"
+version = "0.20.13"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4470,7 +4470,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libmoq"
-version = "0.5.15"
+version = "0.5.16"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4774,7 +4774,7 @@ dependencies = [
 
 [[package]]
 name = "moq-audio"
-version = "0.0.24"
+version = "0.0.25"
 dependencies = [
  "block2 0.6.2",
  "bytes",
@@ -4811,7 +4811,6 @@ dependencies = [
  "aws-lc-rs",
  "axum",
  "base64 0.23.1",
- "hex",
  "jsonwebtoken",
  "kio",
  "moq-auth",
@@ -4866,7 +4865,7 @@ dependencies = [
 
 [[package]]
 name = "moq-boy"
-version = "0.4.15"
+version = "0.4.16"
 dependencies = [
  "anyhow",
  "boytacean",
@@ -4886,7 +4885,7 @@ dependencies = [
 
 [[package]]
 name = "moq-cli"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -4906,8 +4905,10 @@ dependencies = [
  "moq-transcode",
  "moq-video",
  "pollster",
+ "reqwest",
  "rustls",
  "sd-notify",
+ "serde_json",
  "tempfile",
  "tokio",
  "tower-http 0.7.0",
@@ -4938,7 +4939,7 @@ dependencies = [
 
 [[package]]
 name = "moq-ffi"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
@@ -4972,7 +4973,7 @@ dependencies = [
 
 [[package]]
 name = "moq-gst"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4990,7 +4991,7 @@ dependencies = [
 
 [[package]]
 name = "moq-hls"
-version = "0.4.15"
+version = "0.4.16"
 dependencies = [
  "anyhow",
  "axum",
@@ -5014,7 +5015,7 @@ dependencies = [
 
 [[package]]
 name = "moq-json"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "bytes",
  "criterion",
@@ -5031,7 +5032,7 @@ dependencies = [
 
 [[package]]
 name = "moq-loc"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "bytes",
  "moq-net",
@@ -5049,7 +5050,7 @@ dependencies = [
 
 [[package]]
 name = "moq-mux"
-version = "0.9.15"
+version = "0.9.16"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -5086,11 +5087,11 @@ dependencies = [
 
 [[package]]
 name = "moq-native"
-version = "0.19.18"
+version = "0.19.19"
 
 [[package]]
 name = "moq-net"
-version = "0.2.21"
+version = "0.2.22"
 dependencies = [
  "arrayvec",
  "bytes",
@@ -5142,7 +5143,7 @@ dependencies = [
 
 [[package]]
 name = "moq-relay"
-version = "0.14.17"
+version = "0.14.18"
 dependencies = [
  "anyhow",
  "axum",
@@ -5183,7 +5184,7 @@ dependencies = [
 
 [[package]]
 name = "moq-room"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "kio",
  "moq-auth",
@@ -5197,7 +5198,7 @@ dependencies = [
 
 [[package]]
 name = "moq-rtc"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -5218,7 +5219,7 @@ dependencies = [
 
 [[package]]
 name = "moq-rtmp"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -5272,7 +5273,7 @@ dependencies = [
 
 [[package]]
 name = "moq-srt"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5289,7 +5290,7 @@ dependencies = [
 
 [[package]]
 name = "moq-stats"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "futures",
  "moq-json",
@@ -5362,7 +5363,7 @@ dependencies = [
 
 [[package]]
 name = "moq-transcode"
-version = "0.0.18"
+version = "0.0.19"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5433,7 +5434,7 @@ dependencies = [
 
 [[package]]
 name = "moq-video"
-version = "0.0.24"
+version = "0.0.25"
 dependencies = [
  "anyhow",
  "ashpd",

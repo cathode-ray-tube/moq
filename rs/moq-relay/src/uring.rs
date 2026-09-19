@@ -21,7 +21,7 @@ use std::task::Poll;
 
 use anyhow::Context as _;
 
-use crate::{Admitted, Auth, Cluster, Shutdown};
+use crate::{auth, cluster, shutdown};
 
 /// One member's bound socket and its slot in the steered group.
 struct Member {
@@ -62,9 +62,10 @@ impl Stop {
 /// Everything a worker needs to serve a connection, cloned per thread.
 #[derive(Clone)]
 struct Serve {
-	cluster: Cluster,
-	auth: Auth,
-	shutdown: Shutdown,
+	cluster: cluster::Cluster,
+	auth: auth::Auth,
+	shutdown: shutdown::Observer,
+	sessions: crate::session::Registry,
 	/// The shared runtime, which owns authentication (the auth API's HTTP
 	/// client needs its reactor) and session supervision.
 	tokio: tokio::runtime::Handle,
@@ -293,11 +294,18 @@ impl Workers {
 	/// authentication and session supervision. Returns once every worker is
 	/// serving; a worker that cannot start (an old kernel, a ring failure) is
 	/// an error here rather than a thread that quietly died.
-	pub fn serve(&mut self, cluster: Cluster, auth: Auth, shutdown: Shutdown) -> anyhow::Result<()> {
+	pub fn serve(
+		&mut self,
+		cluster: cluster::Cluster,
+		auth: auth::Auth,
+		shutdown: shutdown::Observer,
+		sessions: crate::session::Registry,
+	) -> anyhow::Result<()> {
 		let serve = Serve {
 			cluster,
 			auth,
 			shutdown,
+			sessions,
 			tokio: tokio::runtime::Handle::current(),
 			alpns: self.alpns.clone(),
 			versions: self.versions.clone(),
@@ -665,9 +673,9 @@ async fn serve_connection(
 		}
 	};
 	let path = if path.is_empty() { "/".to_string() } else { path };
-	let bytes = moq_auth::Counters::default();
-	let Admitted { lease, token } = if Cluster::is_lan_path(&path) {
-		match Cluster::lan_credential(&path) {
+	let mut registration = None;
+	let lease = if cluster::Cluster::is_lan_path(&path) {
+		match cluster::Cluster::lan_credential(&path) {
 			Some(presented) => match serve.cluster.verify_lan_credential(presented) {
 				Some(true) => serve
 					.auth
@@ -697,20 +705,26 @@ async fn serve_connection(
 			moq_net::Role::Publisher => moq_auth::Role::Publisher,
 			_ => moq_auth::Role::Subscriber,
 		});
-		auth_request.tls = identity.as_ref().and_then(crate::peer);
+		auth_request.tls = identity.as_ref().and_then(crate::auth::peer);
 		if identity.is_some() {
 			tracing::debug!(id, "client certificate verified; reported to the auth server");
 		}
 
 		let auth = serve.auth.clone();
-		let counters = bytes.clone();
+		let sessions = serve.sessions.clone();
 		match serve
 			.tokio
-			.spawn(async move { auth.admit(auth_request, counters).await })
+			.spawn(async move {
+				let lease = auth.admit(auth_request.clone()).await?;
+				Ok::<_, crate::auth::Error>((lease, sessions.register(auth_request)))
+			})
 			.await
 			.context("auth task failed")?
 		{
-			Ok(admitted) => admitted,
+			Ok((admitted, registered)) => {
+				registration = Some(registered);
+				admitted
+			}
 			Err(err) => {
 				// The status is what separates "your credential is bad" from "the
 				// auth server is down". Collapsing both into Unauthorized tells a
@@ -729,7 +743,7 @@ async fn serve_connection(
 	};
 
 	let role = request.role();
-	let grants = match crate::connection::authorize(&serve.cluster, &token, role, &moq_tokio::Transport::Quic) {
+	let grants = match crate::connection::authorize(&serve.cluster, lease.token(), role, &moq_tokio::Transport::Quic) {
 		Ok(grants) => grants,
 		Err(err) => {
 			request.close(moq_net::Error::Unauthorized);
@@ -756,7 +770,7 @@ async fn serve_connection(
 	let shutdown = serve.shutdown.clone();
 	serve.tokio.spawn(async move {
 		let _node_connection = node_connection;
-		if let Err(err) = crate::connection::supervise(session, lease, token, bytes, shutdown).await {
+		if let Err(err) = crate::connection::supervise(session, lease, shutdown, registration).await {
 			tracing::warn!(id, %err, "connection closed");
 		}
 	});
@@ -773,7 +787,8 @@ mod tests {
 	/// force. Each is named separately so the message points at the right line.
 	#[test]
 	fn windows_are_refused() {
-		let cases: [(&str, fn(&mut moq_tokio::quic::Config)); 3] = [
+		type Set = fn(&mut moq_tokio::quic::Config);
+		let cases: [(&str, Set); 3] = [
 			("quic.receive_window", |quic| quic.receive_window = Some(64 << 20)),
 			("quic.stream_receive_window", |quic| {
 				quic.stream_receive_window = Some(8 << 20)

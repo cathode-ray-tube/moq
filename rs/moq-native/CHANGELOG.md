@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Rename the crate to `moq-tokio`. This release intentionally produces a compile error with migration instructions.
 
+## [0.19.19](https://github.com/moq-dev/moq/compare/moq-native-v0.19.18...moq-native-v0.19.19) - 2026-09-17
+
+### Added
+
+- *(moq-gst)* expose connection statistics ([#3679](https://github.com/moq-dev/moq/pull/3679))
+
 ## [0.19.18](https://github.com/moq-dev/moq/compare/moq-native-v0.19.17...moq-native-v0.19.18) - 2026-09-13
 
 ### Added

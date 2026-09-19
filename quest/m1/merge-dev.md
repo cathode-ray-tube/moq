@@ -29,8 +29,7 @@ hit, so the merge PR re-checks each on the combined tree:
   (#3531), bounded `moq_json::window` timeline (#3240), and duration marker
   (#3575) keep their regressions; main's draft-21 (#3574) is in every
   per-version list, including the stream and request registries.
-- The hop-0 ban is abandoned (#3623); anonymous routes rank last instead
-  ([Anonymous rank](/quest/m1/anonymous-route-rank.md)).
+- The hop-0 ban is abandoned (#3623); anonymous routes rank last instead.
 - Auto-merged files hide breakage: `just check` and `just test` run before
   the merge commit, not after.
 
@@ -45,13 +44,14 @@ merge for it. The rest of the archive line, wildcard resolution, and every
 additive quest that builds on dev-only code start on main afterwards from
 [m2](/quest/m2/README.md).
 
+The `api-*` quests beside this one in [m1](/quest/m1/README.md) are the
+2026-09-18 review's breaking follow-ups; [API review gate](/quest/m1/api-review-gate.md)
+records, per quest, whether it landed or was deferred with the semver bump
+accepted.
+
 ## Required
 
-- [Reserved codes](/quest/m1/lite-reserved-codes.md) - nothing provisional ships on the released wire
-- [Rate estimate names](/quest/m1/api-rate-estimate-names.md) - the estimates carry one name on the C ABI and every binding
-- [moq-tokio names](/quest/m1/api-tokio-names.md) - moq-tokio's first release under this name has settled names
-- [Cluster peer API](/quest/m1/api-cluster-peer-config.md) - typed peer configuration supports current symmetric policy
-- [m0](/quest/m0/README.md) - every release blocker lands or is punted before the merge
+- [API review gate](/quest/m1/api-review-gate.md) - every breaking review quest is landed or explicitly deferred
 
 ## Closes
 

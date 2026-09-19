@@ -1,8 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use url::Url;
 
@@ -15,46 +13,12 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// The longest a failed re-check waits before trying again.
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
-/// Two shared byte totals a session adds to as it sends and receives.
-///
-/// Cheap to clone; every clone reads and writes the same counters. The client reads
-/// them for the `end` event, so it never reaches into a session, and a caller with no
-/// meter passes `Counters::default()`.
-#[derive(Clone, Default, Debug)]
-pub struct Counters(Arc<Totals>);
-
-#[derive(Default, Debug)]
-struct Totals {
-	sent: AtomicU64,
-	received: AtomicU64,
-}
-
-impl Counters {
-	/// Count bytes sent to the peer.
-	pub fn add_sent(&self, bytes: u64) {
-		self.0.sent.fetch_add(bytes, Ordering::Relaxed);
-	}
-
-	/// Count bytes received from the peer.
-	pub fn add_received(&self, bytes: u64) {
-		self.0.received.fetch_add(bytes, Ordering::Relaxed);
-	}
-
-	/// The totals so far.
-	pub fn bytes(&self) -> Bytes {
-		Bytes {
-			sent: self.0.sent.load(Ordering::Relaxed),
-			received: self.0.received.load(Ordering::Relaxed),
-		}
-	}
-}
-
 /// The HTTP side of the contract: one JSON POST per event to an auth server.
 ///
 /// `connect` admits a session and hands back the [`lease::Consumer`] it holds; a task
 /// behind it re-POSTs `revalidate` on the grant's cadence, applies each reply, revokes
-/// when the server refuses or the grant expires, and POSTs `end` when the session
-/// closes.
+/// when the server refuses, answers an invalid grant, or the grant expires, and POSTs
+/// `end` when the session closes.
 #[derive(Clone)]
 pub struct Client {
 	http: reqwest::Client,
@@ -104,8 +68,8 @@ impl Client {
 	}
 
 	/// Admit a session: POST `connect`, validate the reply, and return the lease the
-	/// session holds. `bytes` is read for the `end` event; pass what the session meters.
-	pub async fn connect(&self, request: Request, bytes: Counters) -> crate::Result<lease::Consumer> {
+	/// session holds. The session reports totals through [`lease::Consumer::close`].
+	pub async fn connect(&self, request: Request) -> crate::Result<lease::Consumer> {
 		let mut request = request;
 		request.event = Event::Connect;
 
@@ -116,7 +80,6 @@ impl Client {
 			client: self.clone(),
 			request,
 			producer: Some(producer),
-			bytes,
 			started: Instant::now(),
 		};
 		tokio::spawn(driver.run(grant));
@@ -124,19 +87,24 @@ impl Client {
 		Ok(consumer)
 	}
 
-	/// One POST: a 2xx with a valid grant admits, a 403 refuses, and everything else is
-	/// an outage the caller decides about.
+	/// One POST: a 2xx with a valid grant admits, a 401 or 403 refuses, a 2xx
+	/// whose grant fails validation is that error, and everything else is an
+	/// outage the caller decides about.
 	async fn post(&self, request: &Request) -> crate::Result<Grant> {
 		let response = self.http.post(self.url.clone()).json(request).send().await?;
 		let status = response.status();
-		if status == reqwest::StatusCode::FORBIDDEN {
+		if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
 			return Err(Error::Refused);
 		}
 		if !status.is_success() {
 			return Err(Error::Unavailable(format!("auth server answered {status}")));
 		}
 		let grant: Grant = response.json().await?;
-		grant.validate()?;
+		grant.validate().map_err(|err| match err {
+			// An empty grant is a refusal, not a malformed answer.
+			Error::UselessGrant => Error::Refused,
+			other => other,
+		})?;
 		Ok(grant)
 	}
 }
@@ -146,19 +114,18 @@ struct Driver {
 	client: Client,
 	request: Request,
 	producer: Option<lease::Producer>,
-	bytes: Counters,
 	started: Instant,
 }
 
 impl Driver {
 	async fn run(mut self, grant: Grant) {
-		let reason = self.drive(grant).await;
+		let (reason, bytes) = self.drive(grant).await;
 
 		let mut request = self.request.clone();
 		request.event = Event::End {
 			reason,
 			duration: self.started.elapsed(),
-			bytes: self.bytes.bytes(),
+			bytes,
 		};
 		// The session is already gone; nothing to do with a failure but say so.
 		if let Err(err) = self.client.post_end(&request).await {
@@ -166,8 +133,8 @@ impl Driver {
 		}
 	}
 
-	/// Re-check until the lease ends, returning why it did.
-	async fn drive(&mut self, mut grant: Grant) -> Reason {
+	/// Re-check until the lease ends, returning why it did and the totals the session reported.
+	async fn drive(&mut self, mut grant: Grant) -> (Reason, Bytes) {
 		let producer = self
 			.producer
 			.take()
@@ -177,9 +144,12 @@ impl Driver {
 		// The re-check in flight, kept out of the select so expiry and the session's
 		// close are still polled while a stalled server holds the reply.
 		let mut inflight: Option<Pin<Box<dyn Future<Output = crate::Result<Grant>> + Send>>> = None;
+		// A nudge while a re-check is in flight: POST once more when the reply lands,
+		// so a ban set after this request left is not missed until the next cadence.
+		let mut pending = false;
 
 		loop {
-			let expires = grant.expires.map(until);
+			let expires = grant.expires.map(crate::grant::until);
 			let revalidate = async {
 				match next {
 					Some(at) => tokio::time::sleep_until(at.into()).await,
@@ -200,11 +170,8 @@ impl Driver {
 			};
 
 			tokio::select! {
-				reason = producer.closed() => return reason,
-				() = expire => {
-					producer.revoke(Reason::Expired);
-					return Reason::Expired;
-				}
+				ended = producer.closed() => return ended,
+				() = expire => return producer.finish(Reason::Expired, Bytes::default()),
 				result = reply => {
 					inflight = None;
 					match result {
@@ -214,9 +181,9 @@ impl Driver {
 							producer.update(fresh.clone());
 							grant = fresh;
 						}
-						Err(Error::Refused) => {
-							producer.revoke(Reason::Refused);
-							return Reason::Refused;
+						Err(Error::Refused) => return producer.finish(Reason::Refused, Bytes::default()),
+						Err(Error::GrantExpired | Error::UnboundedRevalidate | Error::ZeroRevalidate) => {
+							return producer.finish(Reason::Invalid, Bytes::default());
 						}
 						Err(err) => {
 							// Evidence of nothing: the grant stands until `expires`.
@@ -226,17 +193,34 @@ impl Driver {
 							next = Some(Instant::now() + delay);
 						}
 					}
+					if pending {
+						pending = false;
+						next = None;
+						inflight = Some(self.post_revalidate());
+					}
 				}
 				() = revalidate => {
 					// One re-check at a time; the reply schedules the next.
 					next = None;
-					let client = self.client.clone();
-					let mut request = self.request.clone();
-					request.event = Event::Revalidate;
-					inflight = Some(Box::pin(async move { client.post(&request).await }));
+					inflight = Some(self.post_revalidate());
+				}
+				() = producer.revalidate_requested() => {
+					if inflight.is_some() {
+						pending = true;
+					} else {
+						next = None;
+						inflight = Some(self.post_revalidate());
+					}
 				}
 			}
 		}
+	}
+
+	fn post_revalidate(&self) -> Pin<Box<dyn Future<Output = crate::Result<Grant>> + Send>> {
+		let client = self.client.clone();
+		let mut request = self.request.clone();
+		request.event = Event::Revalidate;
+		Box::pin(async move { client.post(&request).await })
 	}
 }
 
@@ -250,11 +234,6 @@ impl Client {
 			.error_for_status()?;
 		Ok(())
 	}
-}
-
-/// How long until `at`, or zero when it has passed.
-fn until(at: SystemTime) -> Duration {
-	at.duration_since(SystemTime::now()).unwrap_or_default()
 }
 
 /// Exponential backoff from one second, capped by the cadence and [`BACKOFF_MAX`],
@@ -271,7 +250,8 @@ fn backoff(failures: u32, cadence: Duration) -> Duration {
 mod tests {
 	use super::*;
 	use moq_pattern::Patterns;
-	use std::sync::Mutex;
+	use std::sync::{Arc, Mutex};
+	use std::time::SystemTime;
 	use wiremock::matchers::{method, path};
 	use wiremock::{Mock, MockServer, Request as Received, ResponseTemplate};
 
@@ -280,7 +260,9 @@ mod tests {
 	}
 
 	fn request() -> Request {
-		Request::new("0123", "relay-1", crate::Transport::Quic, "/demo/room")
+		let mut request = Request::new("relay-1", crate::Transport::Quic, "/demo/room");
+		request.id = "0123".into();
+		request
 	}
 
 	/// Records every request body the server saw, in order.
@@ -340,14 +322,11 @@ mod tests {
 		})
 		.await;
 
-		let bytes = Counters::default();
-		let consumer = client(&server).connect(request(), bytes.clone()).await.unwrap();
+		let consumer = client(&server).connect(request()).await.unwrap();
 		assert_eq!(consumer.grant().publish, patterns(&["**"]));
 		assert_eq!(log.events(), [Event::Connect]);
 
-		bytes.add_sent(7);
-		bytes.add_received(11);
-		consumer.close("disconnected");
+		consumer.close("disconnected", Bytes { sent: 7, received: 11 });
 		settle().await;
 
 		let end = log.last();
@@ -369,49 +348,41 @@ mod tests {
 		})
 		.await;
 
-		let consumer = client(&server).connect(request(), Counters::default()).await.unwrap();
+		let consumer = client(&server).connect(request()).await.unwrap();
 		drop(consumer);
 		settle().await;
 
-		assert!(matches!(
-			log.last().event,
+		match log.last().event {
 			Event::End {
 				reason: Reason::Dropped,
+				bytes,
 				..
-			}
-		));
+			} => assert_eq!(bytes, Bytes::default()),
+			other => panic!("expected a dropped end, got {other:?}"),
+		}
 	}
 
 	#[tokio::test]
 	async fn refusals_and_outages_refuse_at_connect() {
-		for status in [403, 404, 500, 503] {
+		for status in [401, 403, 400, 404, 408, 429, 500, 503] {
 			let server = server(Log::default(), move |_| ResponseTemplate::new(status)).await;
-			let err = client(&server)
-				.connect(request(), Counters::default())
-				.await
-				.unwrap_err();
+			let err = client(&server).connect(request()).await.unwrap_err();
 			match status {
-				403 => assert!(matches!(err, Error::Refused), "{status}: {err}"),
+				401 | 403 => assert!(matches!(err, Error::Refused), "{status}: {err}"),
 				_ => assert!(matches!(err, Error::Unavailable(_)), "{status}: {err}"),
 			}
 		}
 
 		let garbage = server(Log::default(), |_| ResponseTemplate::new(200).set_body_string("nope")).await;
-		let err = client(&garbage)
-			.connect(request(), Counters::default())
-			.await
-			.unwrap_err();
+		let err = client(&garbage).connect(request()).await.unwrap_err();
 		assert!(matches!(err, Error::Unavailable(_)), "{err}");
 
 		let nothing = server(Log::default(), |_| {
 			ResponseTemplate::new(200).set_body_json(Grant::default())
 		})
 		.await;
-		let err = client(&nothing)
-			.connect(request(), Counters::default())
-			.await
-			.unwrap_err();
-		assert!(matches!(err, Error::UselessGrant), "{err}");
+		let err = client(&nothing).connect(request()).await.unwrap_err();
+		assert!(matches!(err, Error::Refused), "{err}");
 	}
 
 	#[tokio::test]
@@ -426,7 +397,7 @@ mod tests {
 		})
 		.await;
 
-		let mut consumer = client(&server).connect(request(), Counters::default()).await.unwrap();
+		let mut consumer = client(&server).connect(request()).await.unwrap();
 		let fresh = tokio::time::timeout(Duration::from_secs(3), consumer.changed())
 			.await
 			.expect("a re-check within the cadence")
@@ -437,18 +408,68 @@ mod tests {
 
 	#[tokio::test]
 	async fn a_refusal_on_recheck_revokes() {
-		let server = server(Log::default(), |request| match request.event {
+		for answer in [
+			ResponseTemplate::new(401),
+			ResponseTemplate::new(403),
+			ResponseTemplate::new(200).set_body_json(Grant::default()),
+		] {
+			let server = server(Log::default(), {
+				let answer = answer.clone();
+				move |request| match request.event {
+					Event::Connect => ResponseTemplate::new(200)
+						.set_body_json(grant(Some(Duration::from_secs(3600)), Some(Duration::from_secs(1)))),
+					_ => answer.clone(),
+				}
+			})
+			.await;
+
+			let consumer = client(&server).connect(request()).await.unwrap();
+			let reason = tokio::time::timeout(Duration::from_secs(3), consumer.closed())
+				.await
+				.expect("revoked within the cadence");
+			assert_eq!(reason, Reason::Refused);
+		}
+	}
+
+	#[tokio::test]
+	async fn an_invalid_grant_on_recheck_revokes() {
+		let unbounded = grant(None, Some(Duration::from_secs(1)));
+		let server = server(Log::default(), move |request| match request.event {
 			Event::Connect => ResponseTemplate::new(200)
 				.set_body_json(grant(Some(Duration::from_secs(3600)), Some(Duration::from_secs(1)))),
-			_ => ResponseTemplate::new(403),
+			_ => ResponseTemplate::new(200).set_body_json(unbounded.clone()),
 		})
 		.await;
 
-		let consumer = client(&server).connect(request(), Counters::default()).await.unwrap();
+		let consumer = client(&server).connect(request()).await.unwrap();
 		let reason = tokio::time::timeout(Duration::from_secs(3), consumer.closed())
 			.await
 			.expect("revoked within the cadence");
-		assert_eq!(reason, Reason::Refused);
+		assert_eq!(reason, Reason::Invalid);
+	}
+
+	#[tokio::test]
+	async fn a_grant_within_clock_skew_stays_live() {
+		let server = server(Log::default(), |_| {
+			let mut grant = Grant::new(patterns(&["**"]), Patterns::new());
+			grant.expires = Some(SystemTime::now() - Duration::from_secs(1));
+			ResponseTemplate::new(200).set_body_json(grant)
+		})
+		.await;
+
+		let consumer = client(&server).connect(request()).await.unwrap();
+		tokio::time::sleep(Duration::from_millis(500)).await;
+		assert!(
+			tokio::time::timeout(Duration::from_millis(100), consumer.closed())
+				.await
+				.is_err(),
+			"still live inside the skew window"
+		);
+
+		let reason = tokio::time::timeout(crate::grant::CLOCK_SKEW + Duration::from_secs(1), consumer.closed())
+			.await
+			.expect("expired once the skew window ended");
+		assert_eq!(reason, Reason::Expired);
 	}
 
 	#[tokio::test]
@@ -461,7 +482,7 @@ mod tests {
 		})
 		.await;
 
-		let consumer = client(&server).connect(request(), Counters::default()).await.unwrap();
+		let consumer = client(&server).connect(request()).await.unwrap();
 		tokio::time::sleep(Duration::from_millis(1500)).await;
 		assert!(
 			log.events().iter().filter(|e| **e == Event::Revalidate).count() >= 1,
@@ -498,7 +519,7 @@ mod tests {
 		})
 		.await;
 
-		let consumer = client(&server).connect(request(), Counters::default()).await.unwrap();
+		let consumer = client(&server).connect(request()).await.unwrap();
 		let reason = tokio::time::timeout(Duration::from_secs(5), consumer.closed())
 			.await
 			.expect("expired while the re-check was in flight");
@@ -518,10 +539,10 @@ mod tests {
 		})
 		.await;
 
-		let consumer = client(&server).connect(request(), Counters::default()).await.unwrap();
+		let consumer = client(&server).connect(request()).await.unwrap();
 		tokio::time::sleep(Duration::from_millis(1500)).await;
 		assert!(log.events().contains(&Event::Revalidate), "the re-check is in flight");
-		consumer.close("disconnected");
+		consumer.close("disconnected", Bytes::default());
 		settle().await;
 		assert!(matches!(
 			log.last().event,
@@ -548,6 +569,114 @@ mod tests {
 		));
 		#[cfg(unix)]
 		assert!(Client::new("unix:///run/moq-auth.sock".parse().unwrap(), None).is_ok());
+	}
+
+	#[tokio::test]
+	async fn a_nudge_while_idle_posts_at_once() {
+		let log = Log::default();
+		let server = server(log.clone(), |_| {
+			ResponseTemplate::new(200)
+				.set_body_json(grant(Some(Duration::from_secs(3600)), Some(Duration::from_secs(3600))))
+		})
+		.await;
+
+		let consumer = client(&server).connect(request()).await.unwrap();
+		assert_eq!(log.events(), [Event::Connect]);
+		consumer.revalidate();
+		tokio::time::timeout(Duration::from_secs(2), async {
+			loop {
+				if log.events().contains(&Event::Revalidate) {
+					break;
+				}
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("a nudge while idle POSTs at once");
+	}
+
+	#[tokio::test]
+	async fn a_nudge_during_backoff_posts_at_once() {
+		let log = Log::default();
+		let server = server(log.clone(), |request| match request.event {
+			Event::Connect => ResponseTemplate::new(200)
+				.set_body_json(grant(Some(Duration::from_secs(3600)), Some(Duration::from_secs(3600)))),
+			_ => ResponseTemplate::new(503),
+		})
+		.await;
+
+		let consumer = client(&server).connect(request()).await.unwrap();
+		consumer.revalidate();
+		tokio::time::timeout(Duration::from_secs(2), async {
+			loop {
+				if log.events().contains(&Event::Revalidate) {
+					break;
+				}
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("the first re-check ran");
+		settle().await;
+		let before = log.events().iter().filter(|event| **event == Event::Revalidate).count();
+
+		consumer.revalidate();
+		tokio::time::timeout(Duration::from_secs(2), async {
+			loop {
+				if log.events().iter().filter(|event| **event == Event::Revalidate).count() > before {
+					break;
+				}
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("a nudge during backoff POSTs at once");
+	}
+
+	#[tokio::test]
+	async fn a_nudge_during_inflight_posts_once_more_when_the_reply_lands() {
+		let log = Log::default();
+		let server = server(log.clone(), |request| match request.event {
+			Event::Connect => ResponseTemplate::new(200)
+				.set_body_json(grant(Some(Duration::from_secs(3600)), Some(Duration::from_secs(3600)))),
+			Event::Revalidate => ResponseTemplate::new(200)
+				.set_body_json(grant(Some(Duration::from_secs(3600)), Some(Duration::from_secs(3600))))
+				.set_delay(Duration::from_millis(400)),
+			Event::End { .. } => ResponseTemplate::new(200),
+		})
+		.await;
+
+		let consumer = client(&server).connect(request()).await.unwrap();
+		consumer.revalidate();
+		tokio::time::timeout(Duration::from_secs(2), async {
+			loop {
+				if log.events().contains(&Event::Revalidate) {
+					break;
+				}
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("the first re-check is in flight");
+
+		consumer.revalidate();
+		consumer.revalidate();
+		tokio::time::timeout(Duration::from_secs(3), async {
+			loop {
+				if log.events().iter().filter(|event| **event == Event::Revalidate).count() >= 2 {
+					break;
+				}
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("the in-flight nudge POSTs once more when the reply lands");
+		settle().await;
+		assert_eq!(
+			log.events().iter().filter(|event| **event == Event::Revalidate).count(),
+			2,
+			"a burst during an in-flight re-check is one extra POST"
+		);
 	}
 
 	#[test]

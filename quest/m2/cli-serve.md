@@ -20,7 +20,7 @@ the listener directly.
 
 - Replace the CLI's three server helpers with `moq_relay::serve` over the
   cluster, the auth, and the shutdown handle. `MoqSide` nests
-  `moq_relay::AuthConfig` and `StatsConfig`, so `--auth-*` and `--stats-*`
+  `moq_relay::auth::Config` and `stats::Config`, so `--auth-*` and `--stats-*`
   read the same on both binaries.
 - Default grant: the CLI and the relay both refuse a listener with neither
   `--auth-url` nor `--auth-public` since the auth server line, so there is no

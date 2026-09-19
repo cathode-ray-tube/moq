@@ -16,7 +16,9 @@ This questline adds an AUTH exchange to both wires: one stream per token, a
 grant per token, the union of every accepted token as the session's scope,
 and a loud failure when a publish can never be honored. It ends with the
 credential able to travel in band, while the URL keeps working for every peer
-that predates the stream.
+that predates the stream. Direct peer sessions need a second credential: a
+relay-signed, hop-bound grant that a browser can verify without a signing
+key, which HMAC relay keys cannot provide.
 
 ## Plan
 
@@ -37,7 +39,7 @@ Decisions settled while planning, recorded so review does not relitigate them:
   the union and cancels publications and subscriptions that lose authorization.
   Other authorized work continues on the same session. An empty union leaves
   the session connected with no access, so it can accept a fresh token.
-  [Origin scopes](/quest/m1/api-origin-scopes.md) owns the common resize
+  [Origin narrowing](/quest/m2/origin-narrowing.md) owns the common resize
   operation; relay token handling requires it rather than shipping a temporary
   close-on-shrink policy.
 - **A public grant contains publish patterns, subscribe patterns, and an
@@ -100,13 +102,14 @@ ALPN.
 - [Token in band](/quest/m2/auth/token-in-band.md) - the credential can leave
   the URL: a session starts on what the URL carried and its AUTH streams add
   the rest, with the URL kept for peers below lite-06
+- [Peer grants](/quest/m2/auth/peer-grant.md) - the relay issues a hop-bound,
+  asymmetrically signed grant a browser can verify; HS256 keys issue none
 
 ## Related
 
-- [Origin scopes](/quest/m1/api-origin-scopes.md) - resizes a live session
+- [Origin narrowing](/quest/m2/origin-narrowing.md) - resizes a live session
   when the union shrinks, for revalidation and token expiry alike
 - [Pattern interest](/quest/m2/path-patterns/interest.md) - moves AUTH's legacy wire prefixes to patterns along with ANNOUNCE_REQUEST
 - [Expiring media grants](/quest/m2/processor/grant-lease.md) - a worker's
   lease renewal is a new in-band token
-- [Connect auth race](/quest/m0/3532-connect-auth-race.md) - the connect-time
-  auth error this questline does not change
+- [P2P](/quest/m2/p2p/README.md) - the first consumer of hop-bound peer grants

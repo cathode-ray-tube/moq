@@ -8,7 +8,9 @@ import "dart:ffi";
 import "dart:io" show Platform, File, Directory;
 import "dart:isolate";
 import "dart:typed_data";
+
 import "package:ffi/ffi.dart";
+
 import "uniffi_runtime.dart";
 export "uniffi_runtime.dart";
 
@@ -1514,7 +1516,13 @@ class MoqRoute {
   final List<int> hops;
   final int cost;
   final int? cold;
-  MoqRoute({this.hops = const [], this.cost = 0, this.cold = null});
+  final bool anonymous;
+  MoqRoute({
+    this.hops = const [],
+    this.cost = 0,
+    this.cold = null,
+    this.anonymous = false,
+  });
 }
 
 class FfiConverterMoqRoute {
@@ -1539,8 +1547,13 @@ class FfiConverterMoqRoute {
     );
     final cold = cold_lifted.value;
     new_offset += cold_lifted.bytesRead;
+    final anonymous_lifted = FfiConverterBool.read(
+      Uint8List.view(buf.buffer, new_offset),
+    );
+    final anonymous = anonymous_lifted.value;
+    new_offset += anonymous_lifted.bytesRead;
     return LiftRetVal(
-      MoqRoute(hops: hops, cost: cost, cold: cold),
+      MoqRoute(hops: hops, cost: cost, cold: cold, anonymous: anonymous),
       new_offset - buf.offsetInBytes,
     );
   }
@@ -1550,6 +1563,7 @@ class FfiConverterMoqRoute {
         FfiConverterSequenceUInt64.allocationSize(value.hops) +
         FfiConverterUInt64.allocationSize(value.cost) +
         FfiConverterOptionalUInt64.allocationSize(value.cold) +
+        FfiConverterBool.allocationSize(value.anonymous) +
         0;
     final buf = Uint8List(total_length);
     write(value, buf);
@@ -1570,6 +1584,10 @@ class FfiConverterMoqRoute {
       value.cold,
       Uint8List.view(buf.buffer, new_offset),
     );
+    new_offset += FfiConverterBool.write(
+      value.anonymous,
+      Uint8List.view(buf.buffer, new_offset),
+    );
     return new_offset - buf.offsetInBytes;
   }
 
@@ -1577,6 +1595,7 @@ class FfiConverterMoqRoute {
     return FfiConverterSequenceUInt64.allocationSize(value.hops) +
         FfiConverterUInt64.allocationSize(value.cost) +
         FfiConverterOptionalUInt64.allocationSize(value.cold) +
+        FfiConverterBool.allocationSize(value.anonymous) +
         0;
   }
 }
@@ -1755,8 +1774,8 @@ class FfiConverterMoqBackoff {
 
 class MoqConnectionStats {
   final int? rttUs;
-  final int? sendRateBps;
-  final int? recvRateBps;
+  final int? estimatedSendRateBps;
+  final int? estimatedRecvRateBps;
   final int? bytesSent;
   final int? bytesReceived;
   final int? bytesLost;
@@ -1765,8 +1784,8 @@ class MoqConnectionStats {
   final int? packetsLost;
   MoqConnectionStats({
     this.rttUs,
-    this.sendRateBps,
-    this.recvRateBps,
+    this.estimatedSendRateBps,
+    this.estimatedRecvRateBps,
     this.bytesSent,
     this.bytesReceived,
     this.bytesLost,
@@ -1788,16 +1807,16 @@ class FfiConverterMoqConnectionStats {
     );
     final rttUs = rttUs_lifted.value;
     new_offset += rttUs_lifted.bytesRead;
-    final sendRateBps_lifted = FfiConverterOptionalUInt64.read(
+    final estimatedSendRateBps_lifted = FfiConverterOptionalUInt64.read(
       Uint8List.view(buf.buffer, new_offset),
     );
-    final sendRateBps = sendRateBps_lifted.value;
-    new_offset += sendRateBps_lifted.bytesRead;
-    final recvRateBps_lifted = FfiConverterOptionalUInt64.read(
+    final estimatedSendRateBps = estimatedSendRateBps_lifted.value;
+    new_offset += estimatedSendRateBps_lifted.bytesRead;
+    final estimatedRecvRateBps_lifted = FfiConverterOptionalUInt64.read(
       Uint8List.view(buf.buffer, new_offset),
     );
-    final recvRateBps = recvRateBps_lifted.value;
-    new_offset += recvRateBps_lifted.bytesRead;
+    final estimatedRecvRateBps = estimatedRecvRateBps_lifted.value;
+    new_offset += estimatedRecvRateBps_lifted.bytesRead;
     final bytesSent_lifted = FfiConverterOptionalUInt64.read(
       Uint8List.view(buf.buffer, new_offset),
     );
@@ -1831,8 +1850,8 @@ class FfiConverterMoqConnectionStats {
     return LiftRetVal(
       MoqConnectionStats(
         rttUs: rttUs,
-        sendRateBps: sendRateBps,
-        recvRateBps: recvRateBps,
+        estimatedSendRateBps: estimatedSendRateBps,
+        estimatedRecvRateBps: estimatedRecvRateBps,
         bytesSent: bytesSent,
         bytesReceived: bytesReceived,
         bytesLost: bytesLost,
@@ -1847,8 +1866,8 @@ class FfiConverterMoqConnectionStats {
   static RustBuffer lower(MoqConnectionStats value) {
     final total_length =
         FfiConverterOptionalUInt64.allocationSize(value.rttUs) +
-        FfiConverterOptionalUInt64.allocationSize(value.sendRateBps) +
-        FfiConverterOptionalUInt64.allocationSize(value.recvRateBps) +
+        FfiConverterOptionalUInt64.allocationSize(value.estimatedSendRateBps) +
+        FfiConverterOptionalUInt64.allocationSize(value.estimatedRecvRateBps) +
         FfiConverterOptionalUInt64.allocationSize(value.bytesSent) +
         FfiConverterOptionalUInt64.allocationSize(value.bytesReceived) +
         FfiConverterOptionalUInt64.allocationSize(value.bytesLost) +
@@ -1868,11 +1887,11 @@ class FfiConverterMoqConnectionStats {
       Uint8List.view(buf.buffer, new_offset),
     );
     new_offset += FfiConverterOptionalUInt64.write(
-      value.sendRateBps,
+      value.estimatedSendRateBps,
       Uint8List.view(buf.buffer, new_offset),
     );
     new_offset += FfiConverterOptionalUInt64.write(
-      value.recvRateBps,
+      value.estimatedRecvRateBps,
       Uint8List.view(buf.buffer, new_offset),
     );
     new_offset += FfiConverterOptionalUInt64.write(
@@ -1904,8 +1923,8 @@ class FfiConverterMoqConnectionStats {
 
   static int allocationSize(MoqConnectionStats value) {
     return FfiConverterOptionalUInt64.allocationSize(value.rttUs) +
-        FfiConverterOptionalUInt64.allocationSize(value.sendRateBps) +
-        FfiConverterOptionalUInt64.allocationSize(value.recvRateBps) +
+        FfiConverterOptionalUInt64.allocationSize(value.estimatedSendRateBps) +
+        FfiConverterOptionalUInt64.allocationSize(value.estimatedRecvRateBps) +
         FfiConverterOptionalUInt64.allocationSize(value.bytesSent) +
         FfiConverterOptionalUInt64.allocationSize(value.bytesReceived) +
         FfiConverterOptionalUInt64.allocationSize(value.bytesLost) +
@@ -3279,9 +3298,6 @@ enum MoqProtocolKind {
   goawayTimeout,
   timeout,
   version,
-  requiredExtension,
-  invalidRole,
-  unexpectedStream,
   deliveryTimeout,
   sessionClosed,
   goingAway,
@@ -3319,38 +3335,32 @@ class FfiConverterMoqProtocolKind {
       case 8:
         return LiftRetVal(MoqProtocolKind.version, 4);
       case 9:
-        return LiftRetVal(MoqProtocolKind.requiredExtension, 4);
-      case 10:
-        return LiftRetVal(MoqProtocolKind.invalidRole, 4);
-      case 11:
-        return LiftRetVal(MoqProtocolKind.unexpectedStream, 4);
-      case 12:
         return LiftRetVal(MoqProtocolKind.deliveryTimeout, 4);
-      case 13:
+      case 10:
         return LiftRetVal(MoqProtocolKind.sessionClosed, 4);
-      case 14:
+      case 11:
         return LiftRetVal(MoqProtocolKind.goingAway, 4);
-      case 15:
+      case 12:
         return LiftRetVal(MoqProtocolKind.tooFarBehind, 4);
-      case 16:
+      case 13:
         return LiftRetVal(MoqProtocolKind.malformedTrack, 4);
-      case 17:
+      case 14:
         return LiftRetVal(MoqProtocolKind.notFound, 4);
-      case 18:
+      case 15:
         return LiftRetVal(MoqProtocolKind.unroutable, 4);
-      case 19:
+      case 16:
         return LiftRetVal(MoqProtocolKind.old, 4);
-      case 20:
+      case 17:
         return LiftRetVal(MoqProtocolKind.evicted, 4);
-      case 21:
+      case 18:
         return LiftRetVal(MoqProtocolKind.wrongSize, 4);
-      case 22:
+      case 19:
         return LiftRetVal(MoqProtocolKind.frameTooLarge, 4);
-      case 23:
+      case 20:
         return LiftRetVal(MoqProtocolKind.timestampMismatch, 4);
-      case 24:
+      case 21:
         return LiftRetVal(MoqProtocolKind.app, 4);
-      case 25:
+      case 22:
         return LiftRetVal(MoqProtocolKind.unknown, 4);
       default:
         throw UniffiInternalError(
@@ -4959,7 +4969,7 @@ class FfiConverterMoqAnnounceConsumer {
 
 abstract class MoqAnnounceUpdateInterface {
   bool active();
-  String pattern();
+  String path();
   MoqRoute route();
 }
 
@@ -4999,9 +5009,9 @@ class MoqAnnounceUpdate implements MoqAnnounceUpdateInterface {
     );
   }
 
-  String pattern() {
+  String path() {
     return rustCallWithLifter(
-      (status) => uniffi_moq_ffi_fn_method_moqannounceupdate_pattern(
+      (status) => uniffi_moq_ffi_fn_method_moqannounceupdate_path(
         uniffiClonePointer(),
         status,
       ),
@@ -5409,7 +5419,7 @@ class FfiConverterMoqOriginDynamic {
 abstract class MoqOriginProducerInterface {
   MoqOriginConsumer consume();
   MoqBroadcastProducer createBroadcast({required String path});
-  MoqOriginDynamic dynamic_({required String pattern, required MoqRoute route});
+  MoqOriginDynamic dynamic_({required String prefix, required MoqRoute route});
 }
 
 final _MoqOriginProducerFinalizer = Finalizer<Pointer<Void>>((ptr) {
@@ -5470,14 +5480,11 @@ class MoqOriginProducer implements MoqOriginProducerInterface {
     );
   }
 
-  MoqOriginDynamic dynamic_({
-    required String pattern,
-    required MoqRoute route,
-  }) {
+  MoqOriginDynamic dynamic_({required String prefix, required MoqRoute route}) {
     return rustCallWithLifter(
       (status) => uniffi_moq_ffi_fn_method_moqoriginproducer_dynamic(
         uniffiClonePointer(),
-        FfiConverterString.lower(pattern),
+        FfiConverterString.lower(prefix),
         FfiConverterMoqRoute.lower(route),
         status,
       ),
@@ -9461,7 +9468,7 @@ external int uniffi_moq_ffi_fn_method_moqannounceupdate_active(
 @Native<RustBuffer Function(Pointer<Void>, Pointer<RustCallStatus>)>(
   assetId: _uniffiAssetId,
 )
-external RustBuffer uniffi_moq_ffi_fn_method_moqannounceupdate_pattern(
+external RustBuffer uniffi_moq_ffi_fn_method_moqannounceupdate_path(
   Pointer<Void> ptr,
   Pointer<RustCallStatus> uniffiStatus,
 );
@@ -9680,7 +9687,7 @@ uniffi_moq_ffi_fn_method_moqoriginproducer_create_broadcast(
 >(assetId: _uniffiAssetId)
 external Pointer<Void> uniffi_moq_ffi_fn_method_moqoriginproducer_dynamic(
   Pointer<Void> ptr,
-  RustBuffer pattern,
+  RustBuffer prefix,
   RustBuffer route,
   Pointer<RustCallStatus> uniffiStatus,
 );
@@ -11296,7 +11303,7 @@ external int uniffi_moq_ffi_checksum_method_moqannounceconsumer_next();
 external int uniffi_moq_ffi_checksum_method_moqannounceupdate_active();
 
 @Native<Uint16 Function()>(assetId: _uniffiAssetId)
-external int uniffi_moq_ffi_checksum_method_moqannounceupdate_pattern();
+external int uniffi_moq_ffi_checksum_method_moqannounceupdate_path();
 
 @Native<Uint16 Function()>(assetId: _uniffiAssetId)
 external int uniffi_moq_ffi_checksum_method_moqannounceupdate_route();
@@ -11831,7 +11838,7 @@ void _checkApiChecksums() {
   if (uniffi_moq_ffi_checksum_method_moqannounceupdate_active() != 49521) {
     throw UniffiInternalError.panicked("UniFFI API checksum mismatch");
   }
-  if (uniffi_moq_ffi_checksum_method_moqannounceupdate_pattern() != 19804) {
+  if (uniffi_moq_ffi_checksum_method_moqannounceupdate_path() != 7124) {
     throw UniffiInternalError.panicked("UniFFI API checksum mismatch");
   }
   if (uniffi_moq_ffi_checksum_method_moqannounceupdate_route() != 8074) {
@@ -11868,10 +11875,10 @@ void _checkApiChecksums() {
     throw UniffiInternalError.panicked("UniFFI API checksum mismatch");
   }
   if (uniffi_moq_ffi_checksum_method_moqorigindynamic_requested_broadcast() !=
-      55161) {
+      53391) {
     throw UniffiInternalError.panicked("UniFFI API checksum mismatch");
   }
-  if (uniffi_moq_ffi_checksum_method_moqorigindynamic_update() != 52212) {
+  if (uniffi_moq_ffi_checksum_method_moqorigindynamic_update() != 27700) {
     throw UniffiInternalError.panicked("UniFFI API checksum mismatch");
   }
   if (uniffi_moq_ffi_checksum_method_moqoriginproducer_consume() != 52357) {
@@ -11881,7 +11888,7 @@ void _checkApiChecksums() {
       11806) {
     throw UniffiInternalError.panicked("UniFFI API checksum mismatch");
   }
-  if (uniffi_moq_ffi_checksum_method_moqoriginproducer_dynamic() != 51595) {
+  if (uniffi_moq_ffi_checksum_method_moqoriginproducer_dynamic() != 56233) {
     throw UniffiInternalError.panicked("UniFFI API checksum mismatch");
   }
   if (uniffi_moq_ffi_checksum_method_moqbroadcastdynamic_cancel() != 25875) {

@@ -597,16 +597,16 @@ impl MoqClient {
 ///
 /// Each field is `None` when the transport backend doesn't report that metric (native QUIC
 /// reports all of them; the browser WebTransport reports few or none), or when it isn't yet
-/// available (e.g. `send_rate_bps` before the congestion controller has a window). A `None` is
+/// available (e.g. `estimated_send_rate_bps` before the congestion controller has a window). A `None` is
 /// not the same as a zero value.
 #[derive(uniffi::Record)]
 pub struct MoqConnectionStats {
 	/// Smoothed round-trip time, in microseconds.
 	pub rtt_us: Option<u64>,
 	/// Estimated send bandwidth from the congestion controller, in bits per second.
-	pub send_rate_bps: Option<u64>,
+	pub estimated_send_rate_bps: Option<u64>,
 	/// Estimated receive bandwidth from MoQ PROBE, in bits per second.
-	pub recv_rate_bps: Option<u64>,
+	pub estimated_recv_rate_bps: Option<u64>,
 	/// Total bytes sent, including retransmissions and overhead.
 	pub bytes_sent: Option<u64>,
 	/// Total bytes received, including duplicates and overhead.
@@ -621,12 +621,12 @@ pub struct MoqConnectionStats {
 	pub packets_lost: Option<u64>,
 }
 
-impl From<moq_net::ConnectionStats> for MoqConnectionStats {
-	fn from(stats: moq_net::ConnectionStats) -> Self {
+impl From<moq_net::session::Stats> for MoqConnectionStats {
+	fn from(stats: moq_net::session::Stats) -> Self {
 		Self {
 			rtt_us: stats.rtt.map(|d| d.as_micros() as u64),
-			send_rate_bps: stats.estimated_send_rate,
-			recv_rate_bps: stats.estimated_recv_rate,
+			estimated_send_rate_bps: stats.estimated_send_rate.map(moq_net::bandwidth::Rate::as_bps),
+			estimated_recv_rate_bps: stats.estimated_recv_rate.map(moq_net::bandwidth::Rate::as_bps),
 			bytes_sent: stats.bytes_sent,
 			bytes_received: stats.bytes_received,
 			bytes_lost: stats.bytes_lost,

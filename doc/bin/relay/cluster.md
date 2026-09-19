@@ -48,15 +48,37 @@ route: each hop appends its identity, adds the link price, and passes the
 claim on. An advertisement must be contained by one of the publisher's granted
 prefixes (`grant/**`); an over-wide pattern is refused rather than clamped.
 
-Routing prefers the most specific pattern, then the lowest cost, then the
-shortest hop list, breaking any remaining tie toward the newest announcement
-so a reconnecting publisher isn't outranked by the session it replaced.
-Resolving a non-prefix pattern into a subscription is not implemented yet.
+Routing prefers the most specific pattern, then a fully identified hop list
+over one that holds a 0 (an anonymous hop) at any depth, then the lowest cost,
+then the shortest hop list, breaking any remaining tie toward the newest
+announcement so a reconnecting publisher isn't outranked by the session it
+replaced. An assigned identity for an anonymous peer is local selection state
+and is never written into the hop list. Resolving a non-prefix pattern into a
+subscription is not implemented yet.
 
 ```toml
 [cluster]
 connect = ["https://sibling.same-dc/?cost=0", "https://us-east.example.com/?cost=10"]
 ```
+
+The same policy reads as an object, which is the only form that accepts
+`egress` and `token`. A bare URL stays valid, and an object whose `url` still
+carries `?cost=` or `?jwt=` alongside those fields is rejected rather than
+given a precedence a migration could silently get wrong.
+
+```toml
+[cluster]
+connect = [
+  { url = "https://sibling.same-dc/", cost = 0 },
+  { url = "https://us-east.example.com/", cost = 10, egress = 10, token = "PEER_JWT" },
+]
+```
+
+`cost` is what this relay charges to pull from the peer. `egress` is what it
+declares in SETUP as its own price toward the peer and defaults to `cost`;
+anything else is refused until asymmetric routing lands, so the two are always
+equal today. `token` replaces an inline `?jwt=` with identical authorization
+and redaction.
 
 Price is per direction: pulling from a metered origin can cost far more than
 pushing to it, so each end declares its own and the two need not match. Prices
@@ -122,9 +144,14 @@ reports itself ready.
 ## Dynamic peer lists
 
 Point `connect_api` at an HTTP(S) endpoint or local file returning a JSON
-array of peer URLs. The relay re-checks it (honoring `Cache-Control`, or
+array of peers: bare URL strings and/or the same objects `connect` accepts.
+The relay re-checks it (honoring `Cache-Control`, or
 watching the file) and reconciles: new peers are dialed, missing ones dropped,
 changed URLs redialed. A bad fetch keeps the last good list.
+
+```json
+["https://a.pop.example/?cost=1", {"url": "https://b.pop.example/", "cost": 2}]
+```
 
 ```toml
 [cluster]
@@ -144,7 +171,8 @@ clients decode it.
 
 Peers dial with **mTLS** (recommended: `listen.tls.root` on the listener,
 `connect.tls.cert`/`key` on the dialer) or a **JWT** (inline `?jwt=` on a peer
-URL, or a shared `cluster.token` file for static and gossip peers). The
+URL, `token` on a peer object, or a shared `cluster.token` file for static and
+gossip peers). The
 accepting relay admits a peer through the same lease as any client: its
 certificate is reported to the auth server, which grants it, so a mesh needs
 `moq auth serve --mtls-publish '**' --mtls-subscribe '**'` (or a server of

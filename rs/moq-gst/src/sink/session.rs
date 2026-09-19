@@ -91,14 +91,20 @@ impl Status {
 }
 
 /// Convert only transport metrics actually supplied by the active backend into the public property.
-fn connection_stats_structure(stats: moq_net::ConnectionStats) -> gst::Structure {
+fn connection_stats_structure(stats: moq_net::session::Stats) -> gst::Structure {
 	let mut structure = gst::Structure::new_empty("moq-connection-stats");
 	if let Some(rtt) = stats.rtt {
 		structure.set("rtt-us", u64::try_from(rtt.as_micros()).unwrap_or(u64::MAX));
 	}
 	for (name, value) in [
-		("estimated-send-rate-bps", stats.estimated_send_rate),
-		("estimated-recv-rate-bps", stats.estimated_recv_rate),
+		(
+			"estimated-send-rate-bps",
+			stats.estimated_send_rate.map(moq_net::bandwidth::Rate::as_bps),
+		),
+		(
+			"estimated-recv-rate-bps",
+			stats.estimated_recv_rate.map(moq_net::bandwidth::Rate::as_bps),
+		),
 		("bytes-sent", stats.bytes_sent),
 		("bytes-received", stats.bytes_received),
 		("bytes-lost", stats.bytes_lost),
@@ -247,10 +253,10 @@ pub(crate) struct Session {
 	join: tokio::task::JoinHandle<()>,
 	status: Arc<Status>,
 	/// The live send-bitrate estimate, tracked across reconnects by the reconnect loop. Read directly
-	/// by the `estimated-send-bitrate` getter.
+	/// by the `estimated-send-rate` getter.
 	send_bandwidth: moq_net::bandwidth::Consumer,
 	/// The live recv-bitrate estimate, tracked across reconnects by the reconnect loop. Read directly
-	/// by the `estimated-recv-bitrate` getter.
+	/// by the `estimated-recv-rate` getter.
 	recv_bandwidth: moq_net::bandwidth::Consumer,
 	connection_stats: moq_tokio::connection::Monitor,
 	/// This publication's completion. The task moves it to `Failed` on a fatal transport error, so the
@@ -331,12 +337,12 @@ impl Session {
 	}
 
 	/// The congestion controller's send estimate in bits per second, 0 when disconnected or unavailable.
-	pub fn send_bitrate(&self) -> u64 {
+	pub fn estimated_send_rate(&self) -> u64 {
 		self.send_bandwidth.peek().map_or(0, moq_net::bandwidth::Rate::as_bps)
 	}
 
 	/// The estimated receive bitrate in bits per second, 0 when disconnected or unavailable.
-	pub fn recv_bitrate(&self) -> u64 {
+	pub fn estimated_recv_rate(&self) -> u64 {
 		self.recv_bandwidth.peek().map_or(0, moq_net::bandwidth::Rate::as_bps)
 	}
 
@@ -453,11 +459,11 @@ async fn forward_registered(
 				// a channel that is now always ready. The biased status arm above wins when it has the
 				// reason, which is the usual way this loop ends.
 				result = send_bandwidth.changed() => match result {
-					Ok(_) => notify(&element, &["estimated-send-bitrate"]),
+					Ok(_) => notify(&element, &["estimated-send-rate"]),
 					Err(_) => return,
 				},
 				result = recv_bandwidth.changed() => match result {
-					Ok(_) => notify(&element, &["estimated-recv-bitrate"]),
+					Ok(_) => notify(&element, &["estimated-recv-rate"]),
 					Err(_) => return,
 				},
 			result = connection_stats.presence_changed() => match result {
@@ -491,7 +497,7 @@ mod tests {
 	#[test]
 	fn connection_stats_preserve_unavailable_separately_from_zero() {
 		gst::init().unwrap();
-		let mut stats = moq_net::ConnectionStats::default();
+		let mut stats = moq_net::session::Stats::default();
 		stats.rtt = Some(std::time::Duration::ZERO);
 		stats.bytes_sent = Some(0);
 		stats.packets_lost = Some(7);

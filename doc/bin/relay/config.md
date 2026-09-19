@@ -111,7 +111,7 @@ cert = "cert.pem"
 key = "key.pem"
 
 [internal]
-listen = "127.0.0.1:9101"            # Unauthenticated /health, /metrics, /nodes. Keep private.
+listen = "127.0.0.1:9101"            # Unauthenticated /health, /metrics, /nodes, /sessions, POST /sessions/revalidate. Keep private.
 ```
 
 See [HTTP endpoints](/bin/relay/http).
@@ -134,10 +134,10 @@ See [Authentication](/bin/relay/auth).
 
 ```toml
 [cluster]
-connect = ["https://us-east.example.com/?cost=10"]   # Peers to dial. ?cost prices the link.
+connect = ["https://us-east.example.com/?cost=10"]   # Peers to dial. ?cost prices the link, or use {url, cost, egress, token} objects.
 node = "https://us-west.example.com/"                 # This relay's own URL.
 mesh = true                                           # Gossip: peers discover and dial `node`.
-connect_api = "https://api.example.com/peers"        # Or fetch the peer list (JSON array) live.
+connect_api = "https://api.example.com/peers"        # Or fetch the peer list (JSON array of URLs and/or objects) live.
 token = "cluster.jwt"                                 # JWT for dials without an inline ?jwt=.
 id = 12345                                            # Stable Hop ID across restarts.
 
@@ -190,10 +190,10 @@ publisher that stalls but stays connected still has its idle groups reclaimed
 waiting forever).
 
 `headroom` starts a background task that re-samples system memory every few
-seconds and resizes the pool. Embedders calling `CacheConfig::init` directly
+seconds and resizes the pool. Embedders calling `cache::Config::init` directly
 should know that the task is owned by the `cache::Pool` it resizes, not by the
-`Cache` struct or the `Relay`: it stops on its next tick once the last `Pool`
-clone drops. Handing the `Cache` to `Cluster::new` therefore moves the
+`cache::Cache` struct or the `Relay`: it stops on its next tick once the last `Pool`
+clone drops. Handing the `cache::Cache` to `cluster::Cluster::new` therefore moves the
 task's lifetime onto the cluster, and keeping a `Pool` clone of your own keeps
 the task running for as long as you hold it.
 

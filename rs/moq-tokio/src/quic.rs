@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::Duration as CliDuration;
+use crate::cli::Duration as CliDuration;
 
 /// The routable server ID a QUIC-LB load balancer encodes into connection IDs.
 ///
@@ -221,13 +221,6 @@ pub struct Config {
 	#[usage(flatten)]
 	#[serde(skip)]
 	pub(crate) legacy: Legacy,
-}
-
-impl Config {
-	/// Hidden CLI-only fields a TOML round-trip would drop.
-	pub fn keep_parse_only(&mut self, from: &Self) {
-		self.legacy = from.legacy.clone();
-	}
 }
 
 impl Default for Config {

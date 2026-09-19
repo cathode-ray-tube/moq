@@ -20,6 +20,7 @@
 #include <QVBoxLayout>
 #include <QLineEdit>
 #include <QPushButton>
+#include <QScrollArea>
 #include <QLabel>
 #include <QGroupBox>
 #include <QFont>
@@ -377,6 +378,23 @@ private:
 	MoQSparkData data_;
 };
 
+// Each tab scrolls on its own. A QTabWidget's minimum height is its tallest page,
+// and the Encoding page alone (mode, note, latency, and a five-row group box) is
+// taller than a typical dock slot, so OBS refused to shrink the dock below it.
+// Behind a scroll area the tab's minimum is a few rows and the rest scrolls.
+static QScrollArea *Scrollable(QWidget *page)
+{
+	auto *area = new QScrollArea();
+	area->setWidget(page);
+	area->setWidgetResizable(true);
+	area->setFrameShape(QFrame::NoFrame);
+	area->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+	// Keep the dock's own background rather than the scroll area's base color.
+	area->viewport()->setAutoFillBackground(false);
+	page->setAutoFillBackground(false);
+	return area;
+}
+
 MoQDock::MoQDock(QWidget *parent) : QWidget(parent)
 {
 	tabs = new QTabWidget(this);
@@ -574,10 +592,10 @@ MoQDock::MoQDock(QWidget *parent) : QWidget(parent)
 	verForm->addRow("moq.pro", moqProLink);
 	verForm->addRow("Available video encoders", detectedLabel);
 
-	tabs->addTab(streamPage, "Stream");
-	tabs->addTab(encodingPage, "Encoding");
-	tabs->addTab(statsPage, "Stats");
-	tabs->addTab(aboutPage, "About");
+	tabs->addTab(Scrollable(streamPage), "Stream");
+	tabs->addTab(Scrollable(encodingPage), "Encoding");
+	tabs->addTab(Scrollable(statsPage), "Stats");
+	tabs->addTab(Scrollable(aboutPage), "About");
 
 	auto *layout = new QVBoxLayout(this);
 	layout->setContentsMargins(8, 8, 8, 8);
@@ -1250,8 +1268,8 @@ void MoQDock::UpdateStatus()
 
 	{
 		rttSpark->Push(stats.rtt_valid, stats.rtt_ms);
-		sendSpark->Push(stats.send_rate_valid, stats.send_rate_bps);
-		recvSpark->Push(stats.recv_rate_valid, stats.recv_rate_bps);
+		sendSpark->Push(stats.estimated_send_rate_valid, stats.estimated_send_rate_bps);
+		recvSpark->Push(stats.estimated_recv_rate_valid, stats.estimated_recv_rate_bps);
 		lossSpark->Push(stats.loss_valid, stats.loss_pct);
 		sentSpark->Push(stats.bytes_sent_valid, static_cast<double>(stats.bytes_sent));
 	}

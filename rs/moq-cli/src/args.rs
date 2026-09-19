@@ -350,19 +350,19 @@ pub struct MoqSide {
 	/// Iroh transport config (`--iroh-*`), used by both the client and server.
 	#[cfg(feature = "iroh")]
 	#[usage(flatten)]
-	pub iroh: moq_tokio::iroh::EndpointConfig,
+	pub iroh: moq_tokio::iroh::Config,
 
 	/// Clustering config (`--cluster-*`, including LAN). The same flags as
 	/// `moq-relay`, so a CLI process and a relay on the same network mesh
 	/// through one implementation.
 	#[usage(flatten)]
-	pub cluster: moq_relay::ClusterConfig,
+	pub cluster: moq_relay::cluster::Config,
 
 	/// Who a `--listen` endpoint admits: `--auth-url` asks an auth server per
 	/// session, `--auth-public` grants anonymous patterns. The same flags as
 	/// `moq-relay`; a listener needs exactly one.
 	#[usage(flatten)]
-	pub auth: moq_relay::AuthConfig,
+	pub auth: moq_relay::auth::Config,
 }
 
 impl MoqSide {
@@ -384,7 +384,7 @@ impl MoqSide {
 	/// The cluster this process publishes and subscribes on. Built once; the
 	/// origin is its origin. `--hop` fills `--cluster-id` when the latter is
 	/// unset; they must agree when both are set.
-	pub fn cluster(&self) -> anyhow::Result<moq_relay::Cluster> {
+	pub fn cluster(&self) -> anyhow::Result<moq_relay::cluster::Cluster> {
 		let mut config = self.cluster.clone();
 		match (config.id, self.hop) {
 			(None, Some(hop)) => config.id = Some(hop),
@@ -393,7 +393,7 @@ impl MoqSide {
 			}
 			_ => {}
 		}
-		moq_relay::Cluster::new(moq_relay::ClusterOptions::new(config))
+		moq_relay::cluster::Cluster::new(moq_relay::cluster::Options::new(config))
 	}
 
 	/// Whether `--cluster-lan` asked this process to mesh over the LAN.
@@ -444,7 +444,7 @@ impl MoqSide {
 		{
 			self.cluster.lan.validate()?;
 			if self.lan() {
-				moq_relay::Cluster::validate_lan_versions(&self.client, &self.server_config())?;
+				moq_relay::cluster::Cluster::validate_lan_versions(&self.client, &self.server_config())?;
 			}
 		}
 		// A listener for ordinary clients admits nobody without a decision; a mesh
@@ -689,11 +689,11 @@ pub struct Import {
 	/// memory matters. Media tracks only -- the catalog and timeline are read at the live edge,
 	/// which is retained unconditionally.
 	#[usage(long)]
-	pub max_age: Option<moq_tokio::Duration>,
+	pub max_age: Option<moq_tokio::cli::Duration>,
 
 	/// The released spelling of [`Self::max_age`].
 	#[usage(long = "latency-max", hide = true)]
-	latency_max: Option<moq_tokio::Duration>,
+	latency_max: Option<moq_tokio::cli::Duration>,
 
 	/// The single source feeding the Origin.
 	#[usage(subcommand)]
@@ -838,12 +838,12 @@ impl ExportSink {
 			Self::Fmp4(args) => (
 				SubscribeFormat::Fmp4,
 				args.container.max_age.into_std(),
-				args.fragment_duration.map(moq_tokio::Duration::into_std),
+				args.fragment_duration.map(moq_tokio::cli::Duration::into_std),
 			),
 			Self::Mkv(args) => (
 				SubscribeFormat::Mkv,
 				args.container.max_age.into_std(),
-				args.fragment_duration.map(moq_tokio::Duration::into_std),
+				args.fragment_duration.map(moq_tokio::cli::Duration::into_std),
 			),
 			Self::Ts(args) => (SubscribeFormat::Ts, args.max_age.into_std(), None),
 			Self::Flv(args) => (SubscribeFormat::Flv, args.max_age.into_std(), None),
@@ -860,11 +860,11 @@ impl ExportSink {
 pub struct Container {
 	/// How stale a group may get before it is skipped (e.g. `500ms`, `1s`).
 	#[usage(long, default = "500ms")]
-	pub max_age: moq_tokio::Duration,
+	pub max_age: moq_tokio::cli::Duration,
 
 	/// The released spelling of [`Self::max_age`].
 	#[usage(long = "latency-max", hide = true)]
-	latency_max: Option<moq_tokio::Duration>,
+	latency_max: Option<moq_tokio::cli::Duration>,
 }
 
 impl Container {
@@ -887,7 +887,7 @@ pub struct Fragmented {
 	/// Cap the output fragment/cluster duration (e.g. `2s`).
 	/// Defaults to publisher groups for fMP4 and video GOPs for MKV.
 	#[usage(long)]
-	pub fragment_duration: Option<moq_tokio::Duration>,
+	pub fragment_duration: Option<moq_tokio::cli::Duration>,
 }
 
 #[cfg(test)]

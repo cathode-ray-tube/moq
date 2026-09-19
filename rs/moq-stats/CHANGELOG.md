@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - [**breaking**] Traffic and presence frames use `*_started` / `*_ended` (re-exported from moq-net) and still emit the previous `announced` / `*_closed` names for one release.
 
+## [0.1.11](https://github.com/moq-dev/moq/compare/moq-stats-v0.1.10...moq-stats-v0.1.11) - 2026-09-17
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
 ## [0.1.10](https://github.com/moq-dev/moq/compare/moq-stats-v0.1.9...moq-stats-v0.1.10) - 2026-09-13
 
 ### Other

@@ -126,7 +126,7 @@ impl Nodes {
 	/// Record a dial this relay initiated, keyed by the URL it dialed.
 	///
 	/// `id` is the session's `conn` id from
-	/// [`Cluster::next_connection_id`](crate::Cluster::next_connection_id).
+	/// [`Cluster::next_connection_id`](crate::cluster::Cluster::next_connection_id).
 	pub(crate) fn connect_outbound(&self, id: u64, node: impl Into<String>) -> ConnectionGuard {
 		self.connect(id, Direction::Outbound, ConnectionTarget::Node(node.into()))
 	}
@@ -134,7 +134,7 @@ impl Nodes {
 	/// Record a session this relay accepted, keyed by the origin the peer declared.
 	///
 	/// `id` is the session's `conn` id from
-	/// [`Cluster::next_connection_id`](crate::Cluster::next_connection_id).
+	/// [`Cluster::next_connection_id`](crate::cluster::Cluster::next_connection_id).
 	pub(crate) fn connect_inbound(&self, id: u64, origin: Hop) -> ConnectionGuard {
 		self.connect(id, Direction::Inbound, ConnectionTarget::Hop(origin))
 	}
@@ -167,14 +167,11 @@ impl Nodes {
 			// A retraction can land mid-drain (a re-announce is a metadata update,
 			// not a retract-and-announce). Skip it rather than end the scan, which
 			// would drop every node still queued behind it.
-			if !update.active {
+			if !update.kind.is_active() {
 				continue;
 			}
 
-			let Some(prefix) = update.pattern.as_prefix() else {
-				continue;
-			};
-			let key = canonical_announced_node(prefix);
+			let key = canonical_announced_node(update.path.as_str());
 			let route = update.route;
 			let hop_ids = route.hops.iter().map(|origin| origin.id()).collect::<Vec<_>>();
 			// An advertisement with no hops never crossed a link, so it is our own.
@@ -291,10 +288,7 @@ mod tests {
 		.unwrap();
 		let path = moq_net::Path::new(MESH_PREFIX).join(node);
 		let announcement = origin
-			.dynamic(
-				moq_net::Pattern::subtree(path.as_str()).unwrap(),
-				moq_net::origin::Route::default().with_hops(hops).with_cost(cost),
-			)
+			.dynamic(&path, moq_net::origin::Route::default().with_hops(hops).with_cost(cost))
 			.unwrap();
 		origin.consume().routed(&path).await.expect("test node announced");
 		announcement
@@ -385,7 +379,7 @@ mod tests {
 		// bare unannounce ahead of relay-b's still-pending announce.
 		let first_update = announced.try_next().expect("replayed announce");
 		assert_eq!(
-			canonical_announced_node(first_update.pattern.as_prefix().expect("prefix announcement")),
+			canonical_announced_node(first_update.path.as_str()),
 			"https://relay-a.example/"
 		);
 		drop(first);

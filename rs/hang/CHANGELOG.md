@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Human-readable labels for audio and video renditions.
 - Shared `catalog::stalled::Detector` for publishers to set the per-rendition `stalled` catalog flag.
 
+## [0.20.13](https://github.com/moq-dev/moq/compare/hang-v0.20.12...hang-v0.20.13) - 2026-09-17
+
+### Other
+
+- updated the following local packages: moq-net
+
 ## [0.20.12](https://github.com/moq-dev/moq/compare/hang-v0.20.11...hang-v0.20.12) - 2026-09-13
 
 ### Other

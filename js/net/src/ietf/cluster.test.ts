@@ -1,11 +1,11 @@
 import { expect, test } from "bun:test";
-import { ProtocolViolation } from "../error.ts";
+import { ProtocolViolation, StreamCode, StreamError } from "../error.ts";
 import { type Hop, HopSchema, UNKNOWN_HOP } from "../hop.ts";
 import * as Path from "../path.ts";
 import { Reader, Writer } from "../stream.ts";
 import * as Cluster from "./cluster.ts";
 import { Parameters, SetupOption, SetupOptions } from "./parameters.ts";
-import { PublishNamespace } from "./publish_namespace.ts";
+import { PublishNamespace, PublishNamespaceUpdate } from "./publish_namespace.ts";
 import { SubscribeNamespaceEntry } from "./subscribe_namespace.ts";
 import { type IetfVersion, Version } from "./version.ts";
 
@@ -53,9 +53,9 @@ test("Cluster: the registry code points and their parity", () => {
 	// Other implementations key on these, so a typo is invisible against ourselves and
 	// fatal against anyone else. The parity is load-bearing too: odd values are
 	// length-prefixed byte strings, even ones bare varints.
-	expect(SetupOption.RelayHops).toBe(0x40b55n);
+	expect(SetupOption.HopId).toBe(0x40b54n);
 	expect(SetupOption.RelayCost).toBe(0x40b56n);
-	expect(SetupOption.RelayHops % 2n).toBe(1n);
+	expect(SetupOption.HopId % 2n).toBe(0n);
 	expect(SetupOption.RelayCost % 2n).toBe(0n);
 });
 
@@ -148,6 +148,30 @@ test("Cluster: the setup options round trip", async () => {
 	expect(Cluster.fromSetup(new SetupOptions(), VERSION)).toBeUndefined();
 });
 
+test("Cluster: HOP_ID is a bare varint", async () => {
+	// The key sits at delta 0x40b54 from the start of the block and the value follows it
+	// directly: a length byte here would make us unreadable to every -01 peer.
+	const params = new SetupOptions();
+	Cluster.intoSetup(params, origin(42n), VERSION);
+	expect(Array.from(await encode(params))).toEqual([
+		0xc4,
+		0x0b,
+		0x54, // HOP_ID (0x40b54), delta encoded from 0
+		0x2a, // the hop id, with no length prefix
+	]);
+});
+
+test("Cluster: a peer declaring only RELAY_HOPS is not negotiated", async () => {
+	// A -00 peer declares its Hop ID under the odd key 0x40b55 as a length-prefixed
+	// varint. That key is unknown now, so the session runs as plain moq-transport rather
+	// than misreading the value.
+	const params = new SetupOptions();
+	params.setBytes(0x40b55n, new Uint8Array([0x2a]));
+
+	const decoded = await SetupOptions.decode(reader(await encode(params)), VERSION);
+	expect(Cluster.fromSetup(decoded, VERSION)).toBeUndefined();
+});
+
 test("Cluster: the setup options are skipped before draft-17", () => {
 	// Draft-14..16 exchange SETUP over the legacy control stream, which this extension
 	// does not cover; we neither send nor read the options there.
@@ -156,7 +180,7 @@ test("Cluster: the setup options are skipped before draft-17", () => {
 
 		const params = new SetupOptions();
 		Cluster.intoSetup(params, origin(42n), version);
-		expect(params.getBytes(SetupOption.RelayHops)).toBeUndefined();
+		expect(params.getVarint(SetupOption.HopId)).toBeUndefined();
 
 		// Even one that arrived anyway reads as "not negotiated" there.
 		Cluster.intoSetup(params, origin(42n), Version.DRAFT_19);
@@ -203,6 +227,64 @@ test("Cluster: PUBLISH_NAMESPACE carries the parameters only once negotiated", a
 	// dispatch closes over rather than losing only the stream.
 	const bare = new PublishNamespace({ requestId: 1n, trackNamespace: Path.from("alice.hang") });
 	await expect(PublishNamespace.decode(reader(await encode(bare)), VERSION, true)).rejects.toThrow(ProtocolViolation);
+});
+
+test("Cluster: every malformed PUBLISH_NAMESPACE update is a protocol violation", async () => {
+	const valid = await encode(new PublishNamespaceUpdate({ requestId: 1n, update: { cost: 2n } }));
+	const trailing = new Uint8Array(valid.byteLength + 1);
+	trailing.set(valid);
+	trailing[1] += 1; // Include the extra byte in the message body's declared size.
+
+	const malformed = [
+		valid.slice(0, 1), // Truncated size prefix.
+		valid.slice(0, -1), // Truncated body.
+		new Uint8Array([0, 1, 0xff]), // Truncated request ID.
+		trailing,
+	];
+
+	for (const bytes of malformed) {
+		await expect(PublishNamespaceUpdate.decode(reader(bytes), VERSION)).rejects.toThrow(ProtocolViolation);
+	}
+
+	// The message did not exist before draft-17.
+	await expect(
+		PublishNamespaceUpdate.decode(reader(new Uint8Array([0, 0]), Version.DRAFT_16), Version.DRAFT_16),
+	).rejects.toThrow(ProtocolViolation);
+});
+
+test("Cluster: a reset while decoding an update stays stream-local", async () => {
+	const reset = Object.assign(new Error("reset"), {
+		source: "stream" as const,
+		streamErrorCode: StreamCode.Cancel,
+	});
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.error(reset);
+		},
+	});
+
+	const err = await PublishNamespaceUpdate.decode(new Reader(stream, undefined, VERSION), VERSION).catch(
+		(err: unknown) => err,
+	);
+	expect(err).toBeInstanceOf(StreamError);
+	expect((err as StreamError).code).toBe(StreamCode.Cancel);
+});
+
+test("Cluster: a transport ending while decoding an update stays transport-local", async () => {
+	const ended = Object.assign(new Error("session ended"), {
+		source: "session" as const,
+		streamErrorCode: null,
+	});
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.error(ended);
+		},
+	});
+
+	const err = await PublishNamespaceUpdate.decode(new Reader(stream, undefined, VERSION), VERSION).catch(
+		(err: unknown) => err,
+	);
+	expect(err).toBe(ended);
 });
 
 test("Cluster: NAMESPACE grows a parameters field only once negotiated", async () => {

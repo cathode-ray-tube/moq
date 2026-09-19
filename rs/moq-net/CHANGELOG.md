@@ -11,8 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `group::Producer::used` waits until the group has a consumer, matching `unused`.
 
+### Fixed
+
+- An origin front drops the source track when its last reader leaves, instead of holding the upstream copy for `TRACK_IDLE_LINGER`.
+
 ### Changed
 
+- [**breaking**] Dead exports removed: `Hops::replace_first`, `origin::Dynamic::{hop, root}`, `DRAIN_COST` / `MAX_COST` (use `Cost::{DRAIN, MAX}`), `broadcast::Producer::remove_track`, `track::Producer::start_sequence`, `Subscriber::with_groups`, `Ordered::with_groups`, `group::Consumer::with_frames`, `cache::Pool::same_pool`, `Timestamp::new_const`, `Error::to_code`. `Route::with_hop` and `Cost: From<(u64, u64)>` stay; libmoq and moq-ffi still call them.
+- [**breaking**] `track::SubscriberControl` is `track::Control`, `track::GroupRequest` is `group::Request`, `ConnectionStats` is `session::Stats` with `estimated_send_rate` / `estimated_recv_rate` as `Option<bandwidth::Rate>`, and the paused handshake `Request<S, R>` is `server::Handshake`.
+- [**breaking**] `create_track`, `reserve_track`, `unique_track`, `finish`, `create_group`, and `append_group` take `&self`. `track::Consumer::info()` is `query()`. `track::Demand` gains `is_used` / `poll_used` / `poll_unused`. `track::Producer::poll_unused` returns `Poll<Result<()>>`. `bandwidth::Producer::closed()` returns the cause.
 - [**breaking**] `stats::Presence` and `stats::Traffic` name both edges of each cumulative pair `*_started` / `*_ended` (`sessions_started` / `sessions_ended`, `announces_started` / `announces_ended`, `broadcasts_*`, `subscriptions_*`). Serialize still writes the previous `announced` / `*_closed` names beside the new ones; deserialize accepts either spelling, with the canonical name winning.
 - `origin::Info` is `origin::Config` with public fields and no `with_*` builders. `Producer::info()` is `config()`.
 - `origin::Requesting` is `origin::Pending`, the consumer-side wait for a request to resolve.
@@ -21,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Register moq-lite stream codes NOT_FOUND 0x33, OLD 0x34, and EVICTED 0x35 so a cache miss round-trips as the named variant instead of an opaque reserved-range placeholder.
 - Every received protocol code is `Error::Session` / `Error::Stream`, preserving
   its registry and numeric value, including cancellation and internal-error codes.
+
+## [0.2.22](https://github.com/moq-dev/moq/compare/moq-net-v0.2.21...moq-net-v0.2.22) - 2026-09-17
+
+### Fixed
+
+- *(moq-net)* a remote source never displaces a local publisher ([#3694](https://github.com/moq-dev/moq/pull/3694))
 
 ## [0.2.21](https://github.com/moq-dev/moq/compare/moq-net-v0.2.20...moq-net-v0.2.21) - 2026-09-13
 

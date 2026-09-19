@@ -15,7 +15,7 @@ use axum::{
 use moq_net::origin;
 use moq_net::stats::Session;
 
-use crate::{Admitted, AuthToken, Lease, web::MtlsPeer, web::WebState, web::landing_response};
+use crate::{auth, web::MtlsPeer, web::WebState, web::landing_response};
 
 // One axum extractor per fact the upgrade needs; there is no struct to fold them into.
 #[allow(clippy::too_many_arguments)]
@@ -55,12 +55,12 @@ pub(crate) async fn serve_ws(
 		.map(|a| a.host().to_ascii_lowercase());
 	request.remote = Some(remote.0);
 	request.alpn = ws.selected_protocol().and_then(|p| p.to_str().ok()).map(str::to_owned);
-	request.tls = mtls.and_then(|Extension(MtlsPeer(identity))| crate::peer(&identity));
-	let bytes = moq_auth::Counters::default();
+	request.tls = mtls.and_then(|Extension(MtlsPeer(identity))| auth::peer(&identity));
 	let session_id = request.id.clone();
-	let Admitted { lease, token } = state.auth.admit(request, bytes.clone()).await?;
-	let publish = state.cluster.publisher(&token);
-	let subscribe = state.cluster.subscriber(&token);
+	let lease = state.auth.admit(request.clone()).await?;
+	let token = lease.token();
+	let publish = state.cluster.publisher(token);
+	let subscribe = state.cluster.subscriber(token);
 	let stats = state.cluster.stats.tier(token.tier.clone()).session(&token.root);
 
 	if publish.is_none() && subscribe.is_none() {
@@ -90,7 +90,7 @@ pub(crate) async fn serve_ws(
 			shutdown: state.shutdown.clone(),
 			socket_stats: socket_stats.map(|Extension(s)| s),
 		};
-		let _ = handle_socket(socket, session, lease, token, bytes).await;
+		let _ = handle_socket(socket, session, lease, Some((state.sessions.clone(), request))).await;
 	}))
 }
 
@@ -104,19 +104,23 @@ struct SessionInputs {
 	publish: Option<origin::Producer>,
 	subscribe: Option<origin::Producer>,
 	stats: Session,
-	shutdown: crate::Shutdown,
+	shutdown: crate::shutdown::Observer,
 	/// The kernel's view of the socket under the upgrade, captured at accept time.
 	socket_stats: Option<crate::web::SocketStats>,
 }
 
 /// Serve one upgraded WebSocket until it closes or its lease ends.
+///
+/// The session registers in the live table only once the MoQ handshake
+/// completes: listing it earlier would answer 202 for a push this handler
+/// cannot service until SETUP. `pending` carries what to register with, or
+/// `None` for a session that is served but not listed.
 #[tracing::instrument("ws", err, skip_all, fields(id = session.id, remote = %session.remote, session = %session.session))]
 async fn handle_socket<T>(
 	socket: T,
 	session: SessionInputs,
-	mut lease: Lease,
-	token: AuthToken,
-	bytes: moq_auth::Counters,
+	mut lease: auth::Lease,
+	pending: Option<(crate::session::Registry, moq_auth::Request)>,
 ) -> anyhow::Result<()>
 where
 	T: futures::Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
@@ -176,46 +180,38 @@ where
 	// teardown stay tied to this handler task.
 	let runtime = moq_tokio::runtime::Inline::new();
 	let session = server
-		.accept(runtime.clone(), moq_tokio::transport::Async::new(ws))
+		.accept(runtime.clone(), moq_tokio::transport::Session::new(ws))
 		.await?;
 	let mut driver = runtime.take().expect("accept hands the machine to its runtime");
 
-	let meter = |session: &moq_net::Session| {
-		let stats = session.stats();
-		bytes.add_sent(stats.bytes_sent.unwrap_or_default());
-		bytes.add_received(stats.bytes_received.unwrap_or_default());
-	};
+	// The handshake is done, so this is a MoQ session now: only now can a push
+	// be serviced, and only now does the session appear in the live table.
+	let registration = pending.map(|(sessions, request)| sessions.register(request));
+
 	loop {
+		let nudged = async {
+			match &registration {
+				Some(registration) => registration.nudged().await,
+				None => std::future::pending().await,
+			}
+		};
 		tokio::select! {
 			res = &mut driver => {
-				meter(&session);
-				lease.close(match &res {
-					Ok(()) => "closed".to_string(),
-					Err(err) => err.to_string(),
-				});
+				lease.close(
+					match &res {
+						Ok(()) => "closed".to_string(),
+						Err(err) => err.to_string(),
+					},
+					crate::connection::session_bytes(&session),
+				);
 				return res.map_err(Into::into);
 			}
-			changed = lease.changed() => {
-				let why = match changed {
-					Ok(grant) => match crate::recheck(&token, &grant) {
-						crate::Recheck::Covered => continue,
-						crate::Recheck::Closed(why) => {
-							tracing::info!(%why, "grant no longer covers the session, closing");
-							Some(why)
-						}
-					},
-					Err(reason) => {
-						tracing::info!(%reason, "lease ended, closing session");
-						None
-					}
-				};
+			why = lease.ended() => {
+				tracing::info!(%why, "lease ended, closing session");
 				session.abort(moq_net::Error::Unauthorized);
 				// Drive the teardown so the close reaches the peer.
 				let res = driver.await.map_err(Into::into);
-				meter(&session);
-				if let Some(why) = why {
-					lease.close(why);
-				}
+				lease.close(why, crate::connection::session_bytes(&session));
 				return res;
 			}
 			_ = shutdown.started() => {
@@ -229,10 +225,10 @@ where
 					res = &mut driver => res.map_err(Into::into),
 					_ = &mut drain => driver.await.map_err(Into::into),
 				};
-				meter(&session);
-				lease.close("shutdown");
+				lease.close("shutdown", crate::connection::session_bytes(&session));
 				return res;
 			}
+			() = nudged => lease.revalidate(),
 		}
 	}
 }
@@ -942,22 +938,21 @@ mod tests {
 			publish: None,
 			subscribe: None,
 			stats: Session::default(),
-			shutdown: crate::Shutdown::disabled(),
+			shutdown: crate::shutdown::Observer::disabled(),
 			// No descriptor to hand over: this drives the transport directly rather
 			// than through an accepted socket.
 			socket_stats: None,
 		};
-		let lease = crate::Lease::fixed(moq_auth::Grant::new(
+		let grant = moq_auth::Grant::new(
 			[moq_auth::Pattern::all()].into_iter().collect(),
 			[moq_auth::Pattern::all()].into_iter().collect(),
-		));
-		let token = crate::AuthToken::new("/", &lease.grant()).expect("token");
+		);
+		let lease = crate::auth::Lease::new("/", moq_auth::lease::Consumer::fixed(grant)).expect("lease");
 		let server = tokio::spawn(handle_socket(
 			Pipe::new(server_incoming, server_to_client, frozen.clone()),
 			session,
 			lease,
-			token,
-			moq_auth::Counters::default(),
+			None,
 		));
 
 		// A real qmux peer, so the transport handshake completes and its 10s
