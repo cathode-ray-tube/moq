@@ -42,9 +42,11 @@ void main() {
     final consumer = await requested
         .subscribeTrack(name: 'events', subscription: null)
         .timeout(timeout);
+
+    // Routed subscriptions pull their source lazily when the consumer is first read.
+    final nextGroup = consumer.nextGroup();
     await track.used().timeout(timeout);
 
-    final nextGroup = consumer.nextGroup();
     final producer = track.appendGroup();
     producer.writeFrame(
       frame: MoqFrame(payload: utf8.encode('dart round trip')),
