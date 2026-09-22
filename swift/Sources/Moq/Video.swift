@@ -1,7 +1,8 @@
 import MoqFFI
 
 /// Read side of a video track decoded inside the bindings. Iterating yields
-/// tightly-packed I420 frames, each carrying the size it actually decoded to.
+/// tightly-packed frames, each carrying the pixel layout and the size it
+/// actually decoded to.
 public final class VideoConsumer: AsyncSequence, Sendable {
     /// The decoded video frame emitted by this sequence.
     public typealias Element = VideoDecodedFrame
@@ -68,7 +69,9 @@ public final class VideoProducer: Sendable {
     /// Optional: the encoder keyframes every `gop` frames on its own, and each
     /// of those cuts a group, so a subscriber can always join without this.
     /// Reach for it only to place the boundaries yourself, aligning groups with
-    /// something the encoder can't see such as a scene change.
+    /// something the encoder can't see such as a scene change. Throws if the
+    /// selected encoder cannot force a keyframe; nothing is queued then and
+    /// groups keep their interval.
     public func cut() throws {
         try ffi.cut()
     }

@@ -43,7 +43,6 @@ raises loss or latency under any profile stays off by default.
 
 ## Required
 
-- [Fork noq](/quest/next/quic/fork.md) - the change lives there
 - [Hierarchical stream scheduling](/quest/next/quic/scheduler.md) - the
   scheduler decides which stream's data a probe carries
 
@@ -51,5 +50,5 @@ raises loss or latency under any profile stays off by default.
 
 - [Receive timestamps](/quest/future/quic-receive-ts.md) - a measured forward
   delay replaces the half-RTT estimate
-- [Discover media headroom](/quest/next/quic/probe.md) - can reuse
+- [Discover media headroom](/quest/future/quic-probe.md) - can reuse
   retransmission machinery if redundant capacity probes prove worthwhile

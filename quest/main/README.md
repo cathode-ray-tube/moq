@@ -2,7 +2,8 @@
 
 ## Goal
 
-Settle the public contracts of `moq-archive`, `moq-e2ee`, `moq-sock`,
+Make the origin's failover a state machine with a runtime-free test per
+transition, the correctness core of the relay. Alongside it, settle the public contracts of `moq-archive`, `moq-e2ee`, `moq-sock`,
 `moq-uring`, `moq-audio`, `moq-video`, `moq-transcode`, and `moq-nvenc`
 before the imminent release, while supplying the reusable GPU media support
 needed to remove raw-pixel CPU transfers from the Pronto CARLA demo. These are
@@ -41,14 +42,14 @@ Their package boundaries are explicit:
 
 The media crates are also 0.0.x, so their changes target main. Adapt callers in
 other packages without breaking their published APIs, C layouts, or wire
-formats. Do not bump versions as part of these quests. The media review records
-when the four crates are ready for a separately requested 0.1 release.
+formats. Do not bump versions as part of these quests. The media review
+found the four crates ready for a separately requested 0.1 release.
 
 Their package boundaries are explicit:
 
 - `moq-audio` owns the PCM/layout and codec configuration split, decoder entry
-  point, publication authority, AEC attachment, playback outcome, and
-  extensible audio frame and packet construction.
+  point, publication authority, and extensible audio frame and packet
+  construction.
 - `moq-video` owns frame conversion and construction, decoder output policy,
   synchronous codec thread confinement, capture timestamps and rational rates,
   extensible group configuration and `cut` naming, and its feature defaults.
@@ -88,13 +89,9 @@ do not add another media abstraction or a renderer crate during stabilization.
 
 ## Quests
 
-- [GPU conversion and NVENC](/quest/main/video-gpu-encode.md) - convert, resize and
-  encode imported frames without CPU pixel transfers or fallback
-- [AEC ownership](/quest/main/audio-aec.md) - one microphone owns an adaptive canceller and controls remain shareable
-- [Playback outcome](/quest/main/audio-playback.md) - nonblocking writes report accepted and dropped audio
-- [Video output](/quest/main/video-output.md) - codec output and subscription policy are separate, with native or CPU frames
-- [Video GOP](/quest/main/video-gop.md) - the group contract is extensible before intra-refresh implementation
-- [Media release review](/quest/main/media-release-review.md) - verify the settled contracts before separately authorizing 0.1 releases
+- [Origin failover machine](/quest/main/origin-failover-machine.md) - a front's
+  source selection and track splicing become a pure step function with a
+  runtime-free test per transition
 
 ## Related
 

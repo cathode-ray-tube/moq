@@ -154,7 +154,7 @@ impl MediaCodec {
 	///
 	/// `config` is accepted for signature parity: MediaCodec decodes at the
 	/// stream's native size and has no scaler to point
-	/// [`Config::resize`](crate::decode::Config) at.
+	/// [`Config::scale_hint`](crate::decode::Config) at.
 	pub(crate) fn open(codec: Codec, _config: &Config) -> Result<Box<dyn Backend>, Error> {
 		let mime = match codec {
 			Codec::H264 => MIME_H264,
@@ -550,7 +550,7 @@ mod tests {
 		for index in 0..30u64 {
 			let timestamp = Timestamp::from_micros(index * 33_333).unwrap();
 			let frame = Frame::new(Surface::I420(i420.clone()), timestamp);
-			encoder.keyframe();
+			encoder.cut().unwrap();
 			for encoded in encoder.encode(&frame).unwrap() {
 				frames.extend(decoder.decode(encoded.payload, encoded.timestamp, true).unwrap());
 			}
@@ -563,7 +563,7 @@ mod tests {
 		// A flush drains the previous stream and leaves the same decoder reusable.
 		let timestamp = Timestamp::from_micros(1_000_000).unwrap();
 		let frame = Frame::new(Surface::I420(i420.clone()), timestamp);
-		encoder.keyframe();
+		encoder.cut().unwrap();
 		for encoded in encoder.encode(&frame).unwrap() {
 			frames.extend(decoder.decode(encoded.payload, encoded.timestamp, true).unwrap());
 		}

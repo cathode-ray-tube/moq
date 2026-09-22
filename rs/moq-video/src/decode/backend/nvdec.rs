@@ -11,7 +11,7 @@
 //! (surfaces come from a small fixed pool, so holding them across calls would
 //! stall the decoder), which the NVENC encode backend then registers directly:
 //! the decode -> scale -> encode transcode path never touches the CPU. Scaling
-//! rides the decoder itself: [`Config::resize`] maps to cuvid's target size, so
+//! rides the decoder itself: [`Config::scale_hint`] maps to cuvid's target size, so
 //! the hardware emits frames already at the output resolution.
 //!
 //! The cuvid parser is driven synchronously: callbacks (sequence / decode /
@@ -106,11 +106,6 @@ impl Nvdec {
 		}
 		let api = cuvid::Api::get().map_err(|e| codec_err(format!("NVDEC unavailable: {e}")))?;
 
-		// NV12 output: chroma is 2x2 subsampled, so the target must be even.
-		if let Some(size) = config.resize {
-			size.validate("NVDEC resize to")?;
-		}
-
 		let cuda_codec = match codec {
 			Codec::H264 => cudaVideoCodec::cudaVideoCodec_H264,
 			Codec::H265 => cudaVideoCodec::cudaVideoCodec_HEVC,
@@ -124,7 +119,7 @@ impl Nvdec {
 		let mut state = Box::new(State {
 			api,
 			ctx,
-			resize: config.resize,
+			resize: config.scale_hint,
 			decoder: None,
 			ready: Vec::new(),
 			error: None,
@@ -154,7 +149,7 @@ impl Nvdec {
 			return Err(codec_err(format!("cuvidCreateVideoParser: {result:?}")));
 		}
 
-		tracing::info!(decoder = NAME, codec = ?codec, resize = ?config.resize, "opened video decoder");
+		tracing::info!(decoder = NAME, codec = ?codec, resize = ?config.scale_hint, "opened video decoder");
 		Ok(Box::new(Self {
 			parser,
 			state,
@@ -503,10 +498,10 @@ mod tests {
 		assert!(Nvdec::open(Codec::H264, &decode_config(None)).is_err());
 	}
 
-	fn decode_config(resize: Option<crate::Size>) -> DecodeConfig {
+	fn decode_config(scale_hint: Option<crate::Size>) -> DecodeConfig {
 		DecodeConfig {
 			kind: DecodeKind::Named(NAME.into()),
-			resize,
+			scale_hint,
 			..DecodeConfig::new()
 		}
 	}
@@ -547,7 +542,7 @@ mod tests {
 		let mut out = Vec::new();
 		for i in 0..10u64 {
 			if i == 0 {
-				encoder.keyframe();
+				encoder.cut().unwrap();
 			}
 			for encoded in encoder.encode(&gradient_frame(&rgba, w, h, i)).unwrap() {
 				for decoded in decoder.decode(encoded.payload, encoded.timestamp, i == 0).unwrap() {
@@ -690,7 +685,7 @@ mod tests {
 			let mut frames = Vec::new();
 			for i in 0..10u64 {
 				if i == 0 {
-					source.keyframe();
+					source.cut().unwrap();
 				}
 				for encoded in source.encode(&gradient_frame(&rgba, w, h, i)).unwrap() {
 					frames.extend(decoder.decode(encoded.payload, encoded.timestamp, i == 0).unwrap());
@@ -707,7 +702,7 @@ mod tests {
 				"NVDEC produced a non-CUDA frame; the zero-copy path is not exercised"
 			);
 			if i == 0 {
-				nvenc.keyframe();
+				nvenc.cut().unwrap();
 			}
 			packets.extend(nvenc.encode(&out).unwrap());
 		}

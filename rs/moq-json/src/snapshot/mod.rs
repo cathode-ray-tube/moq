@@ -326,6 +326,37 @@ mod test {
 	}
 
 	#[test]
+	fn modify_refuses_a_value_of_another_shape() {
+		// A published value that does not deserialize as `T` fails the edit instead of seeding a
+		// default and publishing a value with every other field dropped.
+		#[derive(serde::Deserialize, Default, PartialEq, Debug)]
+		struct Doc {
+			count: u32,
+		}
+
+		// Serializes to a shape its own `Deserialize` refuses, the way a schema drift does.
+		impl serde::Serialize for Doc {
+			fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+				json!({ "count": self.count.to_string(), "other": 1 }).serialize(serializer)
+			}
+		}
+
+		let track = moq_net::broadcast::Info::new()
+			.produce()
+			.create_track("test", None)
+			.unwrap();
+		let consumer = track.subscribe(None);
+		let mut producer = Producer::<Doc>::new(track, Config::default());
+		producer.update(&Doc { count: 1 }).unwrap();
+
+		assert!(matches!(producer.modify(), Err(crate::Error::Json(_))));
+
+		// The refused edit published nothing after the original value.
+		producer.finish().unwrap();
+		assert_eq!(drain(consumer), vec![json!({ "count": "1", "other": 1 })]);
+	}
+
+	#[test]
 	fn modify_composes_independent_owners() {
 		// Mirrors the catalog use case: separate owners each edit their own field through the guard.
 		#[derive(serde::Serialize, serde::Deserialize, Default, PartialEq, Debug)]
@@ -367,6 +398,65 @@ mod test {
 				scte35: Some(42),
 			}
 		);
+	}
+
+	#[test]
+	fn mutate_composes_independent_owners() {
+		// The closure form of the guard: the JS `Producer.mutate` rules, in Rust.
+		#[derive(serde::Serialize, serde::Deserialize, Default, PartialEq, Debug)]
+		struct Doc {
+			#[serde(skip_serializing_if = "Option::is_none")]
+			video: Option<String>,
+			#[serde(skip_serializing_if = "Option::is_none")]
+			scte35: Option<u32>,
+		}
+
+		let track = moq_net::broadcast::Info::new()
+			.produce()
+			.create_track("test", None)
+			.unwrap();
+		let consumer = track.subscribe(None);
+		let mut producer = Producer::<Doc>::new(track, cfg(0));
+
+		producer.mutate(|doc| doc.video = Some("v1".to_string())).unwrap();
+
+		// The second owner starts from the latest value and adds its own field without clobbering.
+		producer.mutate(|doc| doc.scte35 = Some(42)).unwrap();
+
+		// A closure that changes nothing publishes nothing: deltas are off, so each publish would
+		// otherwise open a group of its own.
+		producer.mutate(|_| {}).unwrap();
+		assert_eq!(consumer.latest(), Some(1));
+
+		producer.finish().unwrap();
+
+		let mut consumer = Consumer::<Doc>::new(consumer, consumer::Config::default());
+		let waiter = kio::Waiter::noop();
+		let mut last = None;
+		while let Poll::Ready(Ok(Some(value))) = consumer.poll_next(&waiter) {
+			last = Some(value);
+		}
+		assert_eq!(
+			last.unwrap(),
+			Doc {
+				video: Some("v1".to_string()),
+				scte35: Some(42),
+			}
+		);
+	}
+
+	#[test]
+	fn mutate_returns_the_publish_error() {
+		// Unlike a dropped guard, the closure form hands the failure back to the caller.
+		let (mut producer, _track) = producer(cfg(0));
+		producer.update(&json!({ "keep": true })).unwrap();
+
+		assert!(matches!(
+			producer.mutate(|value| {
+				*value = json!({ "big": "x".repeat(moq_net::group::MAX_CACHE_BYTES as usize + 1) });
+			}),
+			Err(crate::Error::Net(moq_net::Error::FrameTooLarge))
+		));
 	}
 
 	#[test]

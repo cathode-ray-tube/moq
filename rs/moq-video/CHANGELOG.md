@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Import retained Vulkan RGBA8 slots into CUDA with explicit timeline synchronization.
+- `frame::cuda::Converter` converts imported Vulkan RGBA8/BGRA8 frames to NV12 on the GPU from a
+  bounded buffer pool, and `cuda::Frame::resize` scales them there; `vulkan::Image::bgra8` declares
+  the other channel order.
 
 ### Changed
 
@@ -23,6 +26,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   color, and allocation. Use `I420::into_data` to extract packed bytes.
 - [**breaking**] `I420::new` and `I420::len` take `Size`; `Frame` and
   `encode::Encoded` are non-exhaustive and remain constructible through `new`.
+- [**breaking**] `decode::Config` describes only the decoder: `kind`, a
+  native-or-CPU `output`, and a best-effort `scale_hint`. `decode::Consumer`
+  takes `decode::Options`, which carries the subscription's `start` and
+  `max_age` beside the decoder config. `gpu_frames` and
+  `resize::Acceleration` are replaced by `moq_video::Output`, which
+  `resize::Config::output` shares.
+- [**breaking**] `encode::Config::gop` is the non-exhaustive `encode::Gop`
+  enum (`Gop::Keyframe { interval }`, `Gop::keyframe_every(duration, rate)`)
+  instead of a bare `u32`; an interval of 0 is refused with `Error::InvalidGop`.
+- [**breaking**] `Encoder::keyframe` and `Sink::keyframe` are `cut()` and
+  return `Result`; a backend that cannot force a group boundary refuses at
+  open with `Error::CutUnsupported`.
+- [**breaking**] Frame rates are the reduced rational `moq_video::Rate`
+  (`encode::Config::new(width, height, rate)`, `capture::Config::framerate`),
+  and capture reads return timestamped `Frame`s stamped before queue
+  replacement rather than bare `Surface`s.
+- [**breaking**] `encode::rate::{Policy, Control}` moved to `moq_mux::rate`.
+- [**breaking**] The synchronous `encode::Encoder` and `decode::Decoder` are
+  `!Send` and `!Sync`; the async `Sink` and `Consumer` stay `Send` and own
+  codec execution.
+- [**breaking**] `RateError` is non-exhaustive.
 
 ## [0.0.25](https://github.com/moq-dev/moq/compare/moq-video-v0.0.24...moq-video-v0.0.25) - 2026-09-17
 

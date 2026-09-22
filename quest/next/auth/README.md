@@ -47,7 +47,7 @@ Decisions settled while planning, recorded so review does not relitigate them:
   root, and every token in a union shares the connection's root. Unscoped
   permission is `**`; an empty union grants nothing. Legacy AUTH wire codecs
   explicitly convert representable prefix unions, where `[""]` means all,
-  and refuse patterns they cannot represent. [Pattern interest](/quest/next/path-patterns/interest.md)
+  and refuse patterns they cannot represent. [Pattern interest](/quest/next/path-patterns.md)
   upgrades AUTH and ANNOUNCE_REQUEST wire fields together without changing
   the public pattern-valued grant type.
 - **Fail loud by aborting the session.** A publisher whose origin announces a
@@ -72,8 +72,8 @@ Decisions settled while planning, recorded so review does not relitigate them:
   direction. The next mTLS scope quest can restrict or refuse it. A v1 endpoint
   must explicitly grant `**` for unrestricted access; AUTH does not widen a
   scoped grant because the caller is another relay.
-- **Client API.** Tokens live on `moq_tokio::connect::Config`, the dial-side
-  config, and `Connection` exposes the live session's auth handle.
+- **Client API.** Tokens live on `moq_tokio::connect::Config`, the
+  dial-side config, and `Connection` exposes the live session's auth handle.
 - **Spec home.** The AUTH stream is lite-06 core in
   `drafts/draft-lcurley-moq-lite.md`, the way routing is. moq-transport gets
   `drafts/draft-lcurley-moq-auth.md`, a setup-option-negotiated extension with
@@ -108,7 +108,7 @@ ALPN.
 
 - [Origin narrowing](/quest/next/origin-narrowing.md) - resizes a live session
   when the union shrinks, for revalidation and token expiry alike
-- [Pattern interest](/quest/next/path-patterns/interest.md) - moves AUTH's legacy wire prefixes to patterns along with ANNOUNCE_REQUEST
+- [Pattern interest](/quest/next/path-patterns.md) - moves AUTH's legacy wire prefixes to patterns along with ANNOUNCE_REQUEST
 - [Expiring media grants](/quest/next/processor/grant-lease.md) - a worker's
   lease renewal is a new in-band token
 - [P2P](/quest/next/p2p/README.md) - the first consumer of hop-bound peer grants

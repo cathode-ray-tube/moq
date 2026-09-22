@@ -21,7 +21,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_with::base64::Base64;
-use serde_with::{DisplayFromStr, DurationMilliSeconds, serde_as};
+use serde_with::{DurationMilliSeconds, serde_as};
 
 use crate::catalog::hang::CatalogExt;
 
@@ -115,8 +115,19 @@ pub struct Mpegts {
 	/// JSON object keys are strings, so both keys are written in decimal (`"17"`)
 	/// rather than as numbers. The catalog is parsed via `serde_json::Value`, which
 	/// will not coerce a string key back to an integer on its own.
-	#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-	#[serde_as(as = "BTreeMap<DisplayFromStr, BTreeMap<DisplayFromStr, _>>")]
+	///
+	/// Reading also accepts the form every published moq-cli through 0.11 wrote,
+	/// `{"17": {"interval": 2000, "sections": ["<base64>"]}}`: the sections inline
+	/// under the PID with no `table_id` level. Those decode into one entry per
+	/// `table_id` (byte 0 of each section) carrying its sections in
+	/// `SiEntry::sections` and naming no track. Nothing writes that form:
+	/// serializing such an entry fails rather than emit a dangling track reference.
+	#[serde(
+		default,
+		skip_serializing_if = "BTreeMap::is_empty",
+		serialize_with = "serialize_si",
+		deserialize_with = "deserialize_si"
+	)]
 	pub si: BTreeMap<u16, BTreeMap<u8, SiEntry>>,
 
 	/// The rate the PCR clock paces the whole multiplex at, in bits per second:
@@ -189,6 +200,93 @@ pub struct SiEntry {
 	#[serde_as(as = "Option<DurationMilliSeconds<u64>>")]
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub interval: Option<Duration>,
+
+	/// The sections themselves, only for an entry read from the pre-`table_id`
+	/// catalog form (see [`Mpegts::si`]): that form carried them inline, so there
+	/// is no track to subscribe to and export re-emits these instead. Empty for an
+	/// entry that names a track. Serializing an entry that carries them fails.
+	#[serde(skip)]
+	pub(crate) sections: Vec<Bytes>,
+}
+
+/// Encode [`Mpegts::si`] with both integer keys as decimal strings.
+///
+/// An entry carrying inline sections (see [`Mpegts::si`]) names no track, so
+/// there is nothing faithful to write for it: serialization fails rather than
+/// emit a dangling empty track reference.
+fn serialize_si<S: serde::Serializer>(
+	si: &BTreeMap<u16, BTreeMap<u8, SiEntry>>,
+	serializer: S,
+) -> Result<S::Ok, S::Error> {
+	use serde::ser::{Error, SerializeMap};
+	let mut map = serializer.serialize_map(Some(si.len()))?;
+	for (pid, tables) in si {
+		for entry in tables.values() {
+			if !entry.sections.is_empty() {
+				return Err(S::Error::custom(format!(
+					"inline SI sections on PID {pid} name no track and cannot be serialized"
+				)));
+			}
+		}
+		let tables: BTreeMap<String, &SiEntry> = tables.iter().map(|(id, entry)| (id.to_string(), entry)).collect();
+		map.serialize_entry(&pid.to_string(), &tables)?;
+	}
+	map.end()
+}
+
+/// Decode [`Mpegts::si`] in either form: the `table_id`-keyed map of track
+/// references, or the pre-`table_id` inline form under the same PID keys.
+fn deserialize_si<'de, D>(deserializer: D) -> Result<BTreeMap<u16, BTreeMap<u8, SiEntry>>, D::Error>
+where
+	D: serde::Deserializer<'de>,
+{
+	use serde::de::Error;
+
+	/// The pre-`table_id` form of one PID's entry.
+	#[serde_as]
+	#[derive(Deserialize)]
+	#[serde(rename_all = "camelCase", deny_unknown_fields)]
+	struct Inline {
+		#[serde_as(as = "Vec<Base64>")]
+		sections: Vec<Bytes>,
+		#[serde_as(as = "Option<DurationMilliSeconds<u64>>")]
+		#[serde(default)]
+		interval: Option<Duration>,
+	}
+
+	let raw: BTreeMap<String, serde_json::Value> = Deserialize::deserialize(deserializer)?;
+	let mut si = BTreeMap::new();
+	for (pid, value) in raw {
+		let pid: u16 = pid.parse().map_err(D::Error::custom)?;
+		let tables = if value.get("sections").is_some() {
+			let inline: Inline = serde_json::from_value(value).map_err(D::Error::custom)?;
+			let mut tables: BTreeMap<u8, SiEntry> = BTreeMap::new();
+			for section in inline.sections {
+				let Some(&table_id) = section.first() else {
+					return Err(D::Error::custom(format!("empty SI section on PID {pid}")));
+				};
+				tables
+					.entry(table_id)
+					.or_insert_with(|| SiEntry {
+						// The inline form's interval covered the whole PID; a table it
+						// left unbounded gets the DVB maximum export would use anyway.
+						interval: inline.interval.or_else(|| si_interval(table_id)),
+						..Default::default()
+					})
+					.sections
+					.push(section);
+			}
+			tables
+		} else {
+			let tables: BTreeMap<String, SiEntry> = serde_json::from_value(value).map_err(D::Error::custom)?;
+			tables
+				.into_iter()
+				.map(|(table_id, entry)| Ok((table_id.parse().map_err(D::Error::custom)?, entry)))
+				.collect::<Result<_, D::Error>>()?
+		};
+		si.insert(pid, tables);
+	}
+	Ok(si)
 }
 
 /// One track's MPEG-TS identity and signaling.
@@ -434,6 +532,66 @@ mod test {
 	}
 
 	#[test]
+	fn inline_si_form_is_read() {
+		// The `mpegts` section moq-cli 0.11.0 publishes for an ffmpeg TS with an SDT:
+		// the sections inline under the PID, no `table_id` level. Every published CLI
+		// through 0.11 writes this, so a consumer that refuses it drops SRT/TS export
+		// for every one of them.
+		let json = r#"{
+			"program": {"pmtPid": 4096, "programNumber": 1, "transportStreamId": 1},
+			"si": {
+				"17": {
+					"interval": 2000,
+					"sections": ["QvAlAAHBAAD/Af8AAfyAFEgSAQZGRm1wZWcJU2VydmljZTAxd3xDyg=="]
+				}
+			},
+			"tracks": {"0.avc3": {"pid": 256}}
+		}"#;
+		let mpegts: Mpegts = serde_json::from_str(json).expect("the 0.11.0 form must decode");
+
+		// The one SDT section keys itself by its table_id (0x42), carries its bytes
+		// inline, keeps the PID's interval, and names no track.
+		let sdt = &mpegts.si[&0x0011][&0x42];
+		assert_eq!(sdt.track, "");
+		assert_eq!(sdt.interval, Some(Duration::from_secs(2)));
+		assert_eq!(sdt.sections.len(), 1);
+		assert_eq!(sdt.sections[0][0], 0x42);
+		assert_eq!(mpegts.si[&0x0011].len(), 1);
+
+		// Two tables on one PID split into two entries, and a PID without an
+		// interval falls back to the DVB maximum for each table it carries.
+		let json = r#"{"si": {"18": {"sections": ["TgAB", "UAAB", "TgAC"]}}}"#;
+		let mpegts: Mpegts = serde_json::from_str(json).unwrap();
+		let eit = &mpegts.si[&0x0012];
+		assert_eq!(eit.len(), 2);
+		assert_eq!(eit[&0x4e].sections.len(), 2);
+		assert_eq!(eit[&0x4e].interval, Some(Duration::from_secs(2)));
+		assert_eq!(eit[&0x50].sections.len(), 1);
+		assert_eq!(eit[&0x50].interval, Some(Duration::from_secs(10)));
+
+		// The inline form never comes back out: an entry carrying sections names
+		// no track, so serialization fails rather than emit a dangling reference.
+		serde_json::to_string(&mpegts).expect_err("inline sections must not serialize");
+	}
+
+	#[test]
+	fn track_backed_si_roundtrip_after_legacy_read() {
+		// A catalog mixing the legacy inline form with a track-backed entry still
+		// writes the track-backed half; only the entry naming no track is refused.
+		let json = r#"{"si": {
+			"17": {"sections": ["QvAlAAHBAAD/Af8AAfyAFEgSAQZGRm1wZWcJU2VydmljZTAxd3xDyg=="]},
+			"18": {"78": {"track": "si/18/78", "interval": 2000}}
+		}}"#;
+		let mut mpegts: Mpegts = serde_json::from_str(json).unwrap();
+		serde_json::to_string(&mpegts).expect_err("the inline entry must not serialize");
+		mpegts.si.remove(&0x0011);
+		let json = serde_json::to_string(&mpegts).unwrap();
+		assert!(json.contains("\"si/18/78\""), "track-backed entry still writes: {json}");
+		let parsed: Mpegts = serde_json::from_str(&json).unwrap();
+		assert_eq!(parsed, mpegts);
+	}
+
+	#[test]
 	fn unknown_framing_is_refused() {
 		let json = r#"{
 			"tracks": {
@@ -454,6 +612,17 @@ mod test {
 	fn invalid_si_pid_key_is_refused() {
 		let json = r#"{ "si": { "not-a-pid": { "66": { "track": "si" } } } }"#;
 		serde_json::from_str::<Mpegts>(json).expect_err("a non-integer SI PID key must fail");
+	}
+
+	#[test]
+	fn mixed_si_forms_are_refused() {
+		// `sections` alongside any other key would silently drop the new-form
+		// entries: the inline reader ignores unknown keys without this.
+		let json = r#"{ "si": { "17": {
+			"sections": ["QvAlAAHBAAD/Af8AAfyAFEgSAQZGRm1wZWcJU2VydmljZTAxd3xDyg=="],
+			"66": { "track": "si/17/66" }
+		} } }"#;
+		serde_json::from_str::<Mpegts>(json).expect_err("sections with a table_id entry must fail");
 	}
 
 	/// The `mpegts` section is not hang-only: the same JSON rides the MSF catalog track, so a

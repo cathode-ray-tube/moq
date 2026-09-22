@@ -16,9 +16,10 @@
 //! - `Surface::DmaBuf` is a Linux DRM allocation, produced by PipeWire capture.
 //!   The Vulkan renderer imports supported packed formats directly, while CPU
 //!   consumers map linear allocations only.
-//! - `Surface::Vulkan` is a Linux/NVIDIA Vulkan RGBA image imported into CUDA
-//!   with an explicit timeline semaphore. It deliberately has no CPU download
-//!   fallback; GPU consumers return its producer slot after CUDA completion.
+//! - `Surface::Vulkan` is a Linux/NVIDIA Vulkan RGBA or BGRA image imported into
+//!   CUDA with an explicit timeline semaphore. It deliberately has no CPU
+//!   download fallback: a `cuda::Converter` turns it into a `Surface::Cuda` on
+//!   the GPU, and consumers return its producer slot after CUDA completion.
 //! - `Surface::HardwareBuffer` is an Android `AHardwareBuffer`, produced by the
 //!   MediaCodec decoder rendering into an `ImageReader`. A GPU consumer imports
 //!   it as a GL or Vulkan image; `into_i420` reads the planes back instead.
@@ -70,12 +71,11 @@ impl Frame {
 		Size::new(self.surface.width(), self.surface.height())
 	}
 
-	/// A copy of this frame scaled to `size` (both dimensions even and non-zero),
-	/// preserving the timestamp. GPU-backed surfaces scale on the GPU and stay
-	/// there. When one output size is enough, prefer decoding straight to it
-	/// ([`decode::Config::resize`](crate::decode::Config)), which is free on
-	/// decoders with a hardware scaler; this method is for fanning one decoded
-	/// stream out to several sizes.
+	/// A copy of this frame scaled to exactly `size` (both dimensions even and
+	/// non-zero), preserving the timestamp. GPU-backed surfaces scale on the GPU
+	/// and stay there unless `config` says otherwise. The exact-size operation;
+	/// [`decode::Config::scale_hint`](crate::decode::Config::scale_hint) is the
+	/// best-effort request that lets a decoder with a hardware scaler skip it.
 	pub fn resize(&self, size: Size, config: &crate::resize::Config) -> Result<Frame, Error> {
 		Ok(Frame {
 			timestamp: self.timestamp,
@@ -393,11 +393,12 @@ pub enum Surface {
 	/// Zero-copy GPU texture (Windows Direct3D11 NV12).
 	#[cfg(target_os = "windows")]
 	Texture(d3d11::Texture),
-	/// Zero-copy GPU buffer (Linux CUDA NV12). Produced only by the NVDEC
-	/// decoder, consumed in place by the NVENC encoder.
+	/// Zero-copy GPU buffer (Linux CUDA NV12). Produced by the NVDEC decoder or
+	/// a [`cuda::Converter`], consumed in place by the NVENC encoder.
 	#[cfg(all(target_os = "linux", feature = "nvidia"))]
 	Cuda(cuda::Frame),
-	/// Vulkan RGBA8 image imported into CUDA with explicit GPU synchronization.
+	/// Vulkan RGBA8 / BGRA8 image imported into CUDA with explicit GPU
+	/// synchronization. A [`cuda::Converter`] turns it into `Cuda` on the GPU.
 	#[cfg(all(target_os = "linux", feature = "nvidia"))]
 	Vulkan(vulkan::Frame),
 	/// Linux DMA-BUF, exported on access and retained until the last clone drops.
@@ -493,7 +494,7 @@ impl Surface {
 		Ok(match self {
 			Surface::I420(i420) => Surface::I420(i420.resize(size)?),
 			#[cfg(target_os = "macos")]
-			Surface::PixelBuffer(pixels) if config.acceleration == crate::resize::Acceleration::Cpu => {
+			Surface::PixelBuffer(pixels) if config.output == crate::Output::Cpu => {
 				Surface::I420(pixels.download_i420()?.resize(size)?)
 			}
 			#[cfg(target_os = "macos")]
@@ -508,11 +509,9 @@ impl Surface {
 				}
 			},
 			#[cfg(all(target_os = "linux", feature = "nvidia"))]
-			Surface::Cuda(cuda) if config.acceleration == crate::resize::Acceleration::Cpu => {
-				Surface::I420(cuda.download_i420()?.resize(size)?)
-			}
+			Surface::Cuda(cuda) if config.output == crate::Output::Cpu => Surface::I420(cuda.download_i420()?.resize(size)?),
 			#[cfg(all(target_os = "linux", feature = "nvidia"))]
-			Surface::Cuda(cuda) => match cuda.resize(size.width, size.height) {
+			Surface::Cuda(cuda) => match cuda.resize(size) {
 				Ok(scaled) => Surface::Cuda(scaled),
 				// E.g. the driver rejected the vendored PTX: degrade to a CPU
 				// resize (download once) instead of killing the stream.
@@ -529,7 +528,7 @@ impl Surface {
 				));
 			}
 			#[cfg(target_os = "windows")]
-			Surface::Texture(texture) if config.acceleration == crate::resize::Acceleration::Cpu => {
+			Surface::Texture(texture) if config.output == crate::Output::Cpu => {
 				Surface::I420(texture.download_i420()?.resize(size)?)
 			}
 			#[cfg(target_os = "windows")]
@@ -624,7 +623,7 @@ impl Surface {
 			#[cfg(target_os = "windows")]
 			Surface::Texture(_) => None,
 			#[cfg(all(target_os = "linux", feature = "nvidia"))]
-			Surface::Cuda(_) => None,
+			Surface::Cuda(c) => c.color(),
 			#[cfg(all(target_os = "linux", feature = "nvidia"))]
 			Surface::Vulkan(_) => None,
 			#[cfg(all(target_os = "linux", feature = "dmabuf"))]
@@ -1772,6 +1771,63 @@ pub mod macos {
 		}
 	}
 
+	/// Upload a packed I420 test picture as NV12, including CoreVideo row
+	/// padding, so a test starts from the decoder's surface format rather than
+	/// the planar layout [`upload_i420`] produces.
+	#[cfg(test)]
+	pub(crate) fn nv12_surface(frame: &I420) -> PixelBuffer {
+		use std::ptr::{self, NonNull};
+
+		use objc2_core_foundation::CFRetained;
+		use objc2_core_video::{
+			CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane,
+			CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+			kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+		};
+
+		let mut raw: *mut CVPixelBuffer = ptr::null_mut();
+		let status = unsafe {
+			CVPixelBufferCreate(
+				None,
+				frame.width as usize,
+				frame.height as usize,
+				kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+				None,
+				NonNull::new(&mut raw).expect("stack pointer is non-null"),
+			)
+		};
+		assert_eq!(status, 0, "CVPixelBufferCreate failed");
+		let buffer = unsafe { CFRetained::from_raw(NonNull::new(raw).expect("CoreVideo returned a buffer")) };
+
+		let flags = CVPixelBufferLockFlags(0);
+		assert_eq!(unsafe { CVPixelBufferLockBaseAddress(&buffer, flags) }, 0);
+		let width = frame.width as usize;
+		let height = frame.height as usize;
+		let y_base = CVPixelBufferGetBaseAddressOfPlane(&buffer, 0) as *mut u8;
+		let y_stride = CVPixelBufferGetBytesPerRowOfPlane(&buffer, 0);
+		for row in 0..height {
+			unsafe {
+				ptr::copy_nonoverlapping(frame.y()[row * width..].as_ptr(), y_base.add(row * y_stride), width);
+			}
+		}
+
+		let (chroma_width, chroma_height) = (width / 2, height / 2);
+		let uv_base = CVPixelBufferGetBaseAddressOfPlane(&buffer, 1) as *mut u8;
+		let uv_stride = CVPixelBufferGetBytesPerRowOfPlane(&buffer, 1);
+		for row in 0..chroma_height {
+			let output = unsafe { uv_base.add(row * uv_stride) };
+			for col in 0..chroma_width {
+				unsafe {
+					*output.add(col * 2) = frame.u()[row * chroma_width + col];
+					*output.add(col * 2 + 1) = frame.v()[row * chroma_width + col];
+				}
+			}
+		}
+		unsafe { CVPixelBufferUnlockBaseAddress(&buffer, flags) };
+
+		PixelBuffer::new(buffer, frame.width, frame.height)
+	}
+
 	/// Allocate a planar I420 `CVPixelBuffer` and copy the frame into it: the
 	/// upload half of [`Surface::into_i420`], for when the pixels are on the
 	/// CPU but a CoreVideo consumer (the VideoToolbox encoder, a renderer) needs a
@@ -1832,233 +1888,13 @@ pub mod macos {
 pub mod vulkan;
 
 #[cfg(all(target_os = "linux", feature = "nvidia"))]
-pub mod cuda {
-	//! Linux CUDA device memory: the NV12 [`Frame`] behind `Surface::Cuda`, which
-	//! NVDEC produces and NVENC consumes in place.
+#[path = "frame/cuda.rs"]
+pub mod cuda;
 
-	use std::sync::{Arc, OnceLock};
-
-	use cudarc::driver::{CudaContext, CudaFunction, LaunchConfig, PushKernelArg, result};
-
-	use super::I420;
-	use crate::{Error, Size};
-
-	/// The NV12 box-filter resize kernels, vendored as PTX (see nv12_resize.cu)
-	/// and JIT-compiled by the driver, so building needs no CUDA toolkit.
-	const RESIZE_PTX: &str = include_str!("frame/nv12_resize.ptx");
-
-	/// The loaded resize kernels, one per process (everything runs in the
-	/// device's primary context, so one module serves every frame).
-	struct Kernels {
-		luma: CudaFunction,
-		chroma: CudaFunction,
-	}
-
-	fn kernels(ctx: &Arc<CudaContext>) -> Result<&'static Kernels, Error> {
-		static KERNELS: OnceLock<Result<Kernels, String>> = OnceLock::new();
-		KERNELS
-			.get_or_init(|| {
-				let module = ctx
-					.load_module(cudarc::nvrtc::Ptx::from_src(RESIZE_PTX))
-					.map_err(|e| format!("load nv12_resize PTX: {e:?}"))?;
-				Ok(Kernels {
-					luma: module
-						.load_function("resize_luma")
-						.map_err(|e| format!("load resize_luma: {e:?}"))?,
-					chroma: module
-						.load_function("resize_chroma")
-						.map_err(|e| format!("load resize_chroma: {e:?}"))?,
-				})
-			})
-			.as_ref()
-			.map_err(|e| Error::Codec(anyhow::anyhow!("CUDA resize unavailable: {e}")))
-	}
-
-	/// An owned device allocation. Plain `cuMemAlloc` on purpose: NVENC's
-	/// resource registration rejects stream-ordered pool memory
-	/// (`cuMemAllocAsync`), which is what cudarc's `CudaSlice` uses on any GPU
-	/// with memory-pool support.
-	struct Buffer {
-		ctx: Arc<CudaContext>,
-		ptr: cudarc::driver::sys::CUdeviceptr,
-		len: usize,
-	}
-
-	impl Drop for Buffer {
-		fn drop(&mut self) {
-			// Drop may run on any thread; freeing needs the context current.
-			if self.ctx.bind_to_thread().is_ok() {
-				// SAFETY: the pointer came from `malloc_sync` and is freed once.
-				let _ = unsafe { result::free_sync(self.ptr) };
-			}
-		}
-	}
-
-	/// A GPU NV12 frame in CUDA device memory: NVDEC's output and NVENC's
-	/// zero-copy input. One buffer holds both planes at a shared row `pitch`:
-	/// `height` luma rows, then `height / 2` interleaved-UV rows. Cloning bumps
-	/// refcounts (no pixel copy), which keeps decode -> encode on the GPU.
-	///
-	/// Both codecs use the device's primary CUDA context (`CudaContext::new`
-	/// retains it), so a frame decoded by NVDEC is directly addressable by NVENC.
-	#[derive(Clone)]
-	pub struct Frame {
-		buf: Arc<Buffer>,
-		pub(crate) width: u32,
-		pub(crate) height: u32,
-		/// Row pitch in bytes of both planes (>= `width`).
-		pub(crate) pitch: u32,
-	}
-
-	impl Frame {
-		/// Allocate an NV12 buffer for `width` x `height` (both even) at row
-		/// pitch `pitch`. Uninitialized: the caller copies the full extent in.
-		pub(crate) fn alloc(ctx: &Arc<CudaContext>, width: u32, height: u32, pitch: u32) -> Result<Self, Error> {
-			debug_assert!(pitch >= width && width.is_multiple_of(2) && height.is_multiple_of(2));
-			let len = pitch as usize * height as usize * 3 / 2;
-			ctx.bind_to_thread()
-				.map_err(|e| Error::Codec(anyhow::anyhow!("CUDA bind: {e:?}")))?;
-			// SAFETY: a plain device allocation; ownership lands in `Buffer`,
-			// whose Drop frees it exactly once.
-			let ptr = unsafe { result::malloc_sync(len) }
-				.map_err(|e| Error::Codec(anyhow::anyhow!("CUDA alloc of {len} bytes: {e:?}")))?;
-			Ok(Self {
-				buf: Arc::new(Buffer {
-					ctx: ctx.clone(),
-					ptr,
-					len,
-				}),
-				width,
-				height,
-				pitch,
-			})
-		}
-
-		/// The raw device pointer, for FFI (the NVDEC copy destination, the
-		/// NVENC resource registration). Valid while `self` is alive.
-		pub(crate) fn device_ptr(&self) -> u64 {
-			self.buf.ptr
-		}
-
-		/// Download and de-pitch to packed I420 (the CPU fallback: a software
-		/// encoder, or a caller that wants bytes).
-		pub(crate) fn download_i420(&self) -> Result<I420, Error> {
-			self.buf
-				.ctx
-				.bind_to_thread()
-				.map_err(|e| Error::Codec(anyhow::anyhow!("CUDA bind: {e:?}")))?;
-			let mut host = vec![0u8; self.buf.len];
-			// SAFETY: the buffer is `len` bytes of device memory and stays alive
-			// for the synchronous copy.
-			unsafe { result::memcpy_dtoh_sync(&mut host, self.buf.ptr) }
-				.map_err(|e| Error::Codec(anyhow::anyhow!("CUDA download: {e:?}")))?;
-
-			let (w, h) = (self.width as usize, self.height as usize);
-			let (cw, ch) = (w / 2, h / 2);
-			let pitch = self.pitch as usize;
-
-			let mut data = vec![0u8; I420::len(Size::new(self.width, self.height))?];
-			let (luma, chroma) = data.split_at_mut(w * h);
-			let (u_dst, v_dst) = chroma.split_at_mut(cw * ch);
-
-			for row in 0..h {
-				luma[row * w..row * w + w].copy_from_slice(&host[row * pitch..row * pitch + w]);
-			}
-			let uv_base = pitch * h;
-			for row in 0..ch {
-				let src = &host[uv_base + row * pitch..uv_base + row * pitch + w];
-				for col in 0..cw {
-					u_dst[row * cw + col] = src[col * 2];
-					v_dst[row * cw + col] = src[col * 2 + 1];
-				}
-			}
-
-			Ok(I420 {
-				width: self.width,
-				height: self.height,
-				data,
-				// A deinterleave, not a color conversion, and nothing here names
-				// the space these samples are in. Left unknown to be inferred.
-				color: None,
-			})
-		}
-
-		/// Resize to `width` x `height` (both even) with the box-filter kernel,
-		/// staying in device memory. The GPU half of
-		/// [`Frame::resize`].
-		pub(crate) fn resize(&self, width: u32, height: u32) -> Result<Self, Error> {
-			let ctx = &self.buf.ctx;
-			let kernels = kernels(ctx)?;
-
-			// Destination row pitch aligned to 256 bytes: comfortable coalescing
-			// and a multiple of 4 as NVENC registration requires.
-			let pitch = width.next_multiple_of(256);
-			let dst = Self::alloc(ctx, width, height, pitch)?;
-
-			let stream = ctx.default_stream();
-			let block = (16u32, 16, 1);
-			let grid = |w: u32, h: u32| (w.div_ceil(16), h.div_ceil(16), 1);
-			let launch_err = |plane: &str, e| Error::Codec(anyhow::anyhow!("CUDA resize {plane}: {e:?}"));
-
-			// Luma plane: one thread per destination pixel.
-			//
-			// SAFETY: both buffers are live NV12 allocations of pitch * height *
-			// 3 / 2 bytes, and the kernels bound every access by the dimensions
-			// passed alongside the pointers.
-			unsafe {
-				stream
-					.launch_builder(&kernels.luma)
-					.arg(&self.buf.ptr)
-					.arg(&self.pitch)
-					.arg(&self.width)
-					.arg(&self.height)
-					.arg(&dst.buf.ptr)
-					.arg(&pitch)
-					.arg(&width)
-					.arg(&height)
-					.launch(LaunchConfig {
-						grid_dim: grid(width, height),
-						block_dim: block,
-						shared_mem_bytes: 0,
-					})
-			}
-			.map_err(|e| launch_err("luma", e))?;
-
-			// Chroma plane: one thread per destination UV pair, offset past the
-			// luma rows in both buffers.
-			let src_uv = self.buf.ptr + u64::from(self.pitch) * u64::from(self.height);
-			let dst_uv = dst.buf.ptr + u64::from(pitch) * u64::from(height);
-			let (src_pw, src_ph) = (self.width / 2, self.height / 2);
-			let (dst_pw, dst_ph) = (width / 2, height / 2);
-			// SAFETY: as above; the UV offsets stay inside the same allocations.
-			unsafe {
-				stream
-					.launch_builder(&kernels.chroma)
-					.arg(&src_uv)
-					.arg(&self.pitch)
-					.arg(&src_pw)
-					.arg(&src_ph)
-					.arg(&dst_uv)
-					.arg(&pitch)
-					.arg(&dst_pw)
-					.arg(&dst_ph)
-					.launch(LaunchConfig {
-						grid_dim: grid(dst_pw, dst_ph),
-						block_dim: block,
-						shared_mem_bytes: 0,
-					})
-			}
-			.map_err(|e| launch_err("chroma", e))?;
-
-			// The frame may head straight to NVENC (which does not order against
-			// our stream), so wait for the kernels rather than queueing.
-			stream
-				.synchronize()
-				.map_err(|e| Error::Codec(anyhow::anyhow!("CUDA resize sync: {e:?}")))?;
-			Ok(dst)
-		}
-	}
-}
+// Compiled for every test build so its policy tests run without a GPU.
+#[cfg(any(test, all(target_os = "linux", feature = "nvidia")))]
+#[path = "frame/pool.rs"]
+mod pool;
 
 #[cfg(target_os = "windows")]
 pub mod d3d11 {
@@ -3050,12 +2886,12 @@ mod tests {
 		assert!(mae(gpu.v(), cpu.v()) < 4, "GPU and CPU v disagree");
 	}
 
-	/// Explicit CPU acceleration downloads a macOS pixel buffer before scaling.
+	/// CPU output downloads a macOS pixel buffer before scaling.
 	#[cfg(target_os = "macos")]
 	#[test]
 	fn pixel_buffer_resize_can_force_the_cpu() {
 		let config = crate::resize::Config {
-			acceleration: crate::resize::Acceleration::Cpu,
+			output: crate::Output::Cpu,
 			..Default::default()
 		};
 		let source = Surface::PixelBuffer(nv12_surface(&gradient_i420(320, 240)));
@@ -3083,61 +2919,8 @@ mod tests {
 		assert_eq!(actual.data(), expected.data());
 	}
 
-	/// Upload a packed I420 test picture as NV12, including CoreVideo row
-	/// padding, so the transfer test starts from the decoder's surface format.
 	#[cfg(target_os = "macos")]
-	fn nv12_surface(frame: &I420) -> super::macos::PixelBuffer {
-		use std::ptr::{self, NonNull};
-
-		use objc2_core_foundation::CFRetained;
-		use objc2_core_video::{
-			CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane,
-			CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
-			kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-		};
-
-		let mut raw: *mut CVPixelBuffer = ptr::null_mut();
-		let status = unsafe {
-			CVPixelBufferCreate(
-				None,
-				frame.width as usize,
-				frame.height as usize,
-				kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-				None,
-				NonNull::new(&mut raw).expect("stack pointer is non-null"),
-			)
-		};
-		assert_eq!(status, 0, "CVPixelBufferCreate failed");
-		let buffer = unsafe { CFRetained::from_raw(NonNull::new(raw).expect("CoreVideo returned a buffer")) };
-
-		let flags = CVPixelBufferLockFlags(0);
-		assert_eq!(unsafe { CVPixelBufferLockBaseAddress(&buffer, flags) }, 0);
-		let width = frame.width as usize;
-		let height = frame.height as usize;
-		let y_base = CVPixelBufferGetBaseAddressOfPlane(&buffer, 0) as *mut u8;
-		let y_stride = CVPixelBufferGetBytesPerRowOfPlane(&buffer, 0);
-		for row in 0..height {
-			unsafe {
-				ptr::copy_nonoverlapping(frame.y()[row * width..].as_ptr(), y_base.add(row * y_stride), width);
-			}
-		}
-
-		let (chroma_width, chroma_height) = (width / 2, height / 2);
-		let uv_base = CVPixelBufferGetBaseAddressOfPlane(&buffer, 1) as *mut u8;
-		let uv_stride = CVPixelBufferGetBytesPerRowOfPlane(&buffer, 1);
-		for row in 0..chroma_height {
-			let output = unsafe { uv_base.add(row * uv_stride) };
-			for col in 0..chroma_width {
-				unsafe {
-					*output.add(col * 2) = frame.u()[row * chroma_width + col];
-					*output.add(col * 2 + 1) = frame.v()[row * chroma_width + col];
-				}
-			}
-		}
-		unsafe { CVPixelBufferUnlockBaseAddress(&buffer, flags) };
-
-		super::macos::PixelBuffer::new(buffer, frame.width, frame.height)
-	}
+	use super::macos::nv12_surface;
 
 	/// A Direct3D11 texture stays on the GPU by default.
 	#[cfg(target_os = "windows")]
@@ -3181,7 +2964,7 @@ mod tests {
 		};
 
 		let config = crate::resize::Config {
-			acceleration: crate::resize::Acceleration::Cpu,
+			output: crate::Output::Cpu,
 			..Default::default()
 		};
 		let scaled = Surface::Texture(texture)
@@ -3261,7 +3044,7 @@ mod tests {
 		// SAFETY: the frame's buffer is exactly host.len() bytes.
 		unsafe { result::memcpy_htod_sync(frame.device_ptr(), &host) }.unwrap();
 
-		let scaled = frame.resize(160, 120).unwrap();
+		let scaled = frame.resize(Size::new(160, 120)).unwrap();
 		let gpu = scaled.download_i420().unwrap();
 		let cpu = src_i420.resize(crate::Size::new(160, 120)).unwrap();
 

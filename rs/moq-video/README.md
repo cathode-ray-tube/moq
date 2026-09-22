@@ -45,8 +45,9 @@ let mut config = moq_video::capture::Config::default();
 config.source = moq_video::capture::Source::Display(None);
 
 let mut capture = moq_video::capture::open(&config).await?;
-while let Some(surface) = capture.read().await? {
-    // Encode, render, or inspect the newest captured surface.
+while let Some(frame) = capture.read().await? {
+    // Encode, render, or inspect the newest captured frame; `frame.surface`
+    // holds the pixels and `frame.timestamp` the capture time.
 }
 ```
 
@@ -78,11 +79,17 @@ backend that buffers, which hands back an earlier frame's access unit while a
 later one goes in, and for the tail `finish()` drains. Bring your own pixels with
 `Surface::rgba(...)`, or feed a frame straight from capture or `decode`.
 
-Keyframes are automatic, at the `Config::gop` interval, so an application never
-has to think about them. `Encoder::keyframe()` asks for one at the next frame when
-something outside the encoder needs a decodable starting point there: opening a
-new group, or resuming after an idle gap. The request is held until a frame
-arrives, so it is safe to call before you have one.
+Group boundaries are automatic: `Config::gop` says how the stream is divided
+(`Gop::Keyframe { interval }` places a keyframe every so many frames, and an
+interval of zero is refused at open), so an application never has to think
+about them. `Encoder::cut()` opens a group at the next frame when something
+outside the encoder needs a decodable starting point there: a source group
+boundary, a scene change, a source switch. The request is held until a frame
+arrives, so it is safe to call before you have one. It fails with
+`Error::CutUnsupported` on a backend that cannot force a boundary (a V4L2
+driver without the force-keyframe control), and queues nothing then: groups
+keep falling where `Config::gop` puts them. `encode::Sink` answers the same
+way, awaited.
 
 Two public entry points:
 
@@ -103,7 +110,8 @@ compile wgpu.
 ### Vulkan producers on NVIDIA
 
 `frame::vulkan::Importer` accepts dedicated optimal-tiling
-`VK_FORMAT_R8G8B8A8_UNORM` images exported as opaque memory FDs. The producer
+`VK_FORMAT_R8G8B8A8_UNORM` (`Image::rgba8`) or `VK_FORMAT_B8G8R8A8_UNORM`
+(`Image::bgra8`) images exported as opaque memory FDs. The producer
 also exports a timeline semaphore and supplies the Vulkan physical-device UUID;
 imports with another CUDA device, format, layout, allocation shape, or sync
 mechanism are refused. Vulkan signals `Timeline::ready` after writes and the
@@ -119,9 +127,26 @@ image is not exportable, copy it on Vulkan into a dedicated exportable slot;
 that is one GPU image copy, not zero-copy. There is no CPU mapping, download, or
 staging fallback for `Surface::Vulkan`.
 
+`frame::cuda::Converter` turns a published Vulkan frame into the NV12
+`Surface::Cuda` that NVENC encodes in place. It runs on the GPU in one declared
+color space (matrix and range), averages 4:2:0 chroma per 2x2 block, applies no
+transfer function, and draws every buffer from a pool sized at construction;
+`cuda::Frame::resize` scales a converted frame for a smaller rendition from the
+same pool. One captured frame feeding HD and SD therefore holds a fixed number
+of buffers, and a producer that outruns its encoder gets an error rather than
+unbounded device memory. Open the encoder with `encode::Kind::Named("nvenc")`
+and the same `encode::Config::color`: `Kind::Auto` could fall back to a software
+encoder that reads the frame back, and the portable `Surface::resize` downloads
+when the GPU scaler fails. Everything under `frame::cuda` and `frame::vulkan`
+runs on the device or returns an error.
+
 Run `just rs vulkan-cuda` for the opt-in native hardware exercise. It creates a
 Vulkan image independently of Unreal, imports it once into CUDA, checks repeated
-slot reuse and held-reader ordering, and tears down through cancellation.
+slot reuse and held-reader ordering, and tears down through cancellation; a
+second test converts RGBA and BGRA uploads to NV12, scales them, fills the pool,
+and encodes both renditions through NVENC. A third runs the target workload,
+three 1280x720 views at 30 fps, and prints per-stage latency and CPU time
+instead of asserting a threshold.
 
 ## Decode
 
@@ -163,10 +188,18 @@ Direct3D11 device bound to it, so the decode happens on the GPU through DXVA
 no software decoder, so it needs the GPU path (on Windows, an HEVC decoder MFT:
 the inbox HEVC Video Extensions or a vendor one). On Linux, NVDEC decodes H.264,
 H.265, and 8-bit 4:2:0 AV1 to CUDA NV12 frames; AV1 is decode-only and is useful
-for AV1 source to H.264/H.265 transcode rungs. VAAPI decodes H.264 to CPU I420 by
-default; set `decode::Config::gpu_frames` to receive DMA-BUF surfaces that the
-renderer can import without a download. A non-H.264/H.265/AV1 rendition yields
-`Error::UnsupportedCodec`.
+for AV1 source to H.264/H.265 transcode rungs. VAAPI decodes H.264 to DMA-BUF
+surfaces the renderer imports without a download. A non-H.264/H.265/AV1
+rendition yields `Error::UnsupportedCodec`.
+
+`decode::Config::output` says where decoded pictures live: `Output::Native`
+(the default) hands back whatever the backend decoded into, a GPU surface or
+CPU pixels, and `Output::Cpu` delivers every picture as `Surface::I420`,
+decoded straight to system memory where the backend can and downloaded where it
+cannot. `decode::Config::scale_hint` asks a decoder with a hardware scaler
+(NVDEC) to emit that size; it is a hint, so check `Frame::size` and use
+`Frame::resize` for the exact size. `decode::Consumer` takes `decode::Options`,
+which pairs that config with the subscription's `start` and `max_age`.
 
 Common feature sets:
 

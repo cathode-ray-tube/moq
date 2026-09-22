@@ -34,7 +34,7 @@ asked for; the scope and match half already landed in #3672 and #3746.
   while a sibling path under the same prefix keeps flowing.
 
 Public API: additive on moq-net (one method) and on moq-relay's revalidate
-path; starts on main after the merge. Wire: none.
+path. Wire: none.
 
 ## Closes
 

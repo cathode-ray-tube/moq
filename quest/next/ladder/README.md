@@ -22,20 +22,19 @@ and `moq_consume_video_stalled`; `@moq/watch` filters stalled renditions with
 the all-stalled lowest fallback; and routing, decoder, and presentation
 identities are split so a metadata-only change cannot rebuild WebCodecs.
 
-What remains is the publisher side. The allocator on `dev`
+What remains is the publisher side. The allocator
 ([moq#2854](https://github.com/moq-dev/moq/pull/2854)) divides a connection's
 estimate by `track::Info::priority`, filling a tier before the next sees a
 bit and splitting max-min fair within one. A controller that assigns
 descending priorities down the ladder gets correct allocation from that
 alone. Send order is the same number, not a separate question:
-`track::Info::priority` is documented as the tie-break between subscriptions
-of equal subscriber priority (`rs/moq-net/src/model/track.rs:100-102`), but
-`Priority::cmp` never reads it (`rs/moq-net/src/lite/priority.rs:48-62`), so
-today a congested uplink sheds every rung alike. The controller honors it
-there too, so one priority decides what to produce and what to send first.
+`Priority::cmp` (`rs/moq-net/src/lite/priority.rs`) ranks by track priority
+first, so the same number decides what to produce and what to send first;
+[Scope track priority](/quest/next/track-priority-scope.md) settles what that
+ranking means on the first mile versus a cluster session before the
+controller depends on it.
 
-This line is next: `moq-transcode` is 0.0.17, and it needs the allocator on
-main, which arrives with the dev merge.
+`moq-transcode` is 0.0.x, so this line lands on main.
 
 ### Adaptive bands
 

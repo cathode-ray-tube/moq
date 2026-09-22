@@ -407,7 +407,7 @@ class JsonStreamProducer:
 class AudioProducer:
     """Publish raw PCM and let libopus encode it on the way out.
 
-    Built via :meth:`BroadcastProducer.publish_audio`. PCM layout
+    Built via :meth:`BroadcastProducer.encode_audio`. PCM layout
     (format / sample rate / channels / bitrate / frame duration) is
     fixed at construction; each :meth:`write` call passes only bytes
     and a presentation timestamp.
@@ -488,7 +488,9 @@ class VideoProducer:
 
         Optional: the encoder keyframes every ``gop`` frames on its own, and
         each of those cuts a group, so a subscriber can always join without
-        this. Reach for it only to place the boundaries yourself.
+        this. Reach for it only to place the boundaries yourself. Raises if
+        the selected encoder cannot force a keyframe; nothing is queued then
+        and groups keep their interval.
         """
         self._inner.cut()
 

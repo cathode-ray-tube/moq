@@ -15,7 +15,7 @@ Boundaries: convergence still uses skip-ahead and silence, so playing slightly
 faster or slower to converge stays [Time
 stretch](/quest/next/watch-audio-time-stretch.md). No packet loss concealment.
 Video keeps its own target; making the audio playhead the clock is [Plan: A/V
-clock](/quest/next/plan-av-clock.md).
+clock](/quest/dev/plan-av-clock.md).
 
 ## Plan
 
@@ -48,8 +48,8 @@ the branch still gets wrong is recorded in
 the first gap between observed timestamps and the rise is immediate and
 unclamped, so a tune-in across a stale group sets the target to seconds.
 
-Native has no jitter buffer at all. `rs/moq-audio`'s decode `Config`
-(`rs/moq-audio/src/decode/decoder.rs:60-80`) carries `max_age`, how far
+Native has no jitter buffer at all. `rs/moq-audio`'s `decode::Options`
+(`rs/moq-audio/src/decode/consumer.rs`) carries `max_age`, how far
 playback may drift from the live edge before skipping a stalled group, and
 `start`, where to begin on a track that already holds groups. Nothing pads the
 buffer against uneven arrivals.
@@ -69,4 +69,4 @@ buffer against uneven arrivals.
 - [Jitter clock](/quest/next/jitter-flush-clock.md) - the advertised jitter (#3513 landed the flush span), whose relationship to the measured target the spec settles
 - [Audio quality harness](/quest/next/audio-quality-harness/README.md) - the automated proof, built on its own schedule
 - [Time stretch](/quest/next/watch-audio-time-stretch.md) - inaudible convergence, on top of this
-- [Plan: A/V clock](/quest/next/plan-av-clock.md) - the clock this target eventually feeds
+- [Plan: A/V clock](/quest/dev/plan-av-clock.md) - the clock this target eventually feeds

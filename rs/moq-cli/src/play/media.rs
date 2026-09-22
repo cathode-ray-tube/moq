@@ -142,7 +142,7 @@ impl Media {
 							continue;
 						}
 					};
-					let mut decode = moq_video::decode::Config::new();
+					let mut decode = moq_video::decode::Options::new();
 					decode.start = moq_video::decode::Start::Latest;
 					// Nothing older than the playhead is worth presenting, so the delay
 					// doubles as the staleness budget on the wire.
@@ -350,7 +350,9 @@ async fn play_audio(mut consumer: moq_audio::decode::Consumer, playback: AudioPl
 					tokio::time::sleep(excess).await;
 				}
 				let part = remaining.min(silence.len());
-				sink.write(&silence[..part])?;
+				// Playback drops stay on the live timeline; retrying them would add
+				// latency, and the sink already reports them in its logs.
+				let _ = sink.write(&silence[..part])?;
 				remaining -= part;
 			}
 		}
@@ -362,7 +364,7 @@ async fn play_audio(mut consumer: moq_audio::decode::Consumer, playback: AudioPl
 			if let Some(excess) = sink.buffered().checked_sub(depth) {
 				tokio::time::sleep(excess).await;
 			}
-			sink.write(part)?;
+			let _ = sink.write(part)?;
 		}
 
 		// Anchor the playout clock on where the speaker has actually reached, which
