@@ -6,8 +6,12 @@ Idiomatic Dart and Flutter bindings for Media over QUIC.
 import 'package:moq/moq.dart';
 
 final connection = await Moq.connect('https://relay.example.com');
-await for (final announcement in connection.announcements()) {
-  print(announcement.path());
+await for (final announcement in connection.announcements(
+  options: const AnnounceOptions(prefix: 'live/', filter: '*/camera'),
+)) {
+  // Prefix stays origin-relative; captures reports wildcard matches.
+  print(announcement.prefix());
+  print(announcement.captures());
 }
 ```
 

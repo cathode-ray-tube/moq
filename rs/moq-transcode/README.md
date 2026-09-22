@@ -28,6 +28,10 @@ uses the Direct3D11 video processor by default; set
 `Config::resize.acceleration` to `resize::Acceleration::Cpu` to force a download
 and CPU resize.
 
+The default `openh264` and `nvidia` features mirror `moq-video`. A hardware-only
+Linux build can use `--no-default-features --features nvidia`; a software-only
+build can use `--no-default-features --features openh264`.
+
 ## Library
 
 One entry point: `run(source, output, config)`. The caller owns session setup
@@ -38,7 +42,7 @@ broadcast.
 let mut config = moq_transcode::Config::default();
 // The derivative is announced at `<source>/transcode.hang`, so the source
 // renditions are referenced through its parent.
-config.source = Some(moq_net::PathRelativeOwned::from(".".to_string()));
+config.source = Some(moq_net::path::RelativeOwned::from(".".to_string()));
 
 let output = origin.create_broadcast(
     format!("{path}/transcode.hang"),

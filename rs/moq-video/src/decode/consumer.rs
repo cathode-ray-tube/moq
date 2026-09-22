@@ -92,6 +92,12 @@ impl Consumer {
 
 	/// Read the next decoded I420 frame, or `None` after the track ends and the
 	/// decoder's buffered tail has been drained.
+	///
+	/// This inherits [`Sink`]'s cancellation contract. If a queued codec
+	/// operation is cancelled, the next read returns a codec error: a cancelled
+	/// mid-stream decode poisons the sink so every later read keeps returning
+	/// that error, while a cancelled tail flush reports the error once and then
+	/// `None`. Drop the consumer instead of continuing to read it.
 	pub async fn read(&mut self) -> Result<Option<Frame>, Error> {
 		loop {
 			if let Some(frame) = self.pending.pop_front() {
@@ -138,14 +144,16 @@ impl Consumer {
 
 #[cfg(test)]
 mod tests {
+	#![cfg_attr(not(feature = "openh264"), allow(dead_code, unused_imports))]
+
 	use bytes::Bytes;
 	use moq_net::Timestamp;
 
 	/// Build an origin producer, spawning its driver on the ambient runtime.
 	fn produce_origin() -> moq_net::origin::Producer {
-		let (producer, driver) = moq_net::origin::Producer::new(moq_net::Hop::random().into());
+		let (producer, driver) = moq_net::origin::Producer::new(moq_net::origin::Config::default());
 		if tokio::runtime::Handle::try_current().is_ok() {
-			tokio::spawn(driver.run(moq_tokio::runtime::Runtime::<()>::new()));
+			tokio::spawn(moq_net::time::run(driver));
 		} else {
 			// A sync test: nothing polls the driver, and dropping it would tear
 			// the origin down, so leak it and rely on the synchronous half.
@@ -159,13 +167,15 @@ mod tests {
 	use crate::encode::{Config as EncodeConfig, Encoder, Kind as EncodeKind, Producer as EncodeProducer};
 
 	#[tokio::test]
+	#[cfg(feature = "openh264")]
 	async fn reads_cmaf_container_declared_by_catalog() {
 		let mut source_broadcast = moq_net::broadcast::Info::new().produce();
 		let source_subscriber = source_broadcast.consume();
-		let source_catalog = moq_mux::catalog::Producer::new(&mut source_broadcast).unwrap();
+		let source_catalog =
+			moq_mux::catalog::Producer::new(&mut source_broadcast, moq_mux::catalog::Config::default()).unwrap();
 		let config = EncodeConfig {
 			kind: EncodeKind::Software,
-			..EncodeConfig::new(320, 240, 30)
+			..EncodeConfig::new(320, 240, crate::Rate::new(30, 1).unwrap())
 		};
 		let rendition = config.probe().await.unwrap();
 		let mut producer = EncodeProducer::new(source_broadcast, source_catalog, rendition).unwrap();
@@ -201,7 +211,7 @@ mod tests {
 
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let subscriber = broadcast.consume();
-		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 		let mut import = moq_mux::container::fmp4::Import::new(broadcast, catalog.reserve());
 		import.decode(&init).unwrap();
 		import.decode(&fragment).unwrap();
@@ -557,7 +567,7 @@ mod tests {
 		const FRAMES: u64 = 5;
 		let config = EncodeConfig {
 			kind: EncodeKind::Software,
-			..EncodeConfig::new(320, 240, 30)
+			..EncodeConfig::new(320, 240, crate::Rate::new(30, 1).unwrap())
 		};
 		let catalog = config.probe().await.expect("probe the software encoder");
 

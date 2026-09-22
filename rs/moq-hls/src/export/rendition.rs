@@ -6,7 +6,7 @@ use std::task::Poll;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use hang::catalog::{AudioConfig, Clock, Timeline, VideoConfig};
+use hang::catalog::{Archive, AudioConfig, Clock, VideoConfig};
 use moq_mux::container::fmp4::Muxer;
 use moq_mux::timeline::Entry;
 
@@ -44,23 +44,20 @@ pub enum Kind {
 }
 
 impl Kind {
+	/// Parse a rendition URL path component.
+	pub fn parse(value: &str) -> Option<Self> {
+		match value {
+			"video" => Some(Self::Video),
+			"audio" => Some(Self::Audio),
+			_ => None,
+		}
+	}
+
 	/// The URL path component for this kind (`"video"` / `"audio"`).
 	pub fn as_str(self) -> &'static str {
 		match self {
 			Kind::Video => "video",
 			Kind::Audio => "audio",
-		}
-	}
-}
-
-impl std::str::FromStr for Kind {
-	type Err = ();
-
-	fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-		match s {
-			"video" => Ok(Kind::Video),
-			"audio" => Ok(Kind::Audio),
-			_ => Err(()),
 		}
 	}
 }
@@ -76,7 +73,7 @@ struct Media {
 	handle: Mutex<Handle>,
 	/// When set, a Dropped sibling is rebound through this source rather than keeping the
 	/// replaced publisher's rows listed.
-	sibling: Option<(moq_mux::Source, moq_net::PathRelativeOwned)>,
+	sibling: Option<(moq_mux::Source, moq_net::path::RelativeOwned)>,
 }
 
 struct Handle {
@@ -86,7 +83,7 @@ struct Handle {
 }
 
 impl Media {
-	fn bind(upstream: &Upstream, rel: Option<&moq_net::PathRelativeOwned>) -> moq_mux::Result<Self> {
+	fn bind(upstream: &Upstream, rel: Option<&moq_net::path::RelativeOwned>) -> moq_mux::Result<Self> {
 		Ok(Self {
 			handle: Mutex::new(Handle {
 				binding: Arc::new(upstream.bind(rel)?),
@@ -142,15 +139,15 @@ impl Media {
 /// A catalog `broadcast` reference that names a different path than the catalog itself.
 fn sibling(
 	upstream: &Upstream,
-	rel: Option<&moq_net::PathRelativeOwned>,
-) -> Option<(moq_mux::Source, moq_net::PathRelativeOwned)> {
+	rel: Option<&moq_net::path::RelativeOwned>,
+) -> Option<(moq_mux::Source, moq_net::path::RelativeOwned)> {
 	let target = upstream.source.resolve_reference(rel)?;
 	if upstream.source.resolve_reference(None).as_ref() == Some(&target) {
 		return None;
 	}
 	Some((
 		upstream.source.clone(),
-		rel.cloned().unwrap_or_else(moq_net::PathRelative::empty),
+		rel.cloned().unwrap_or_else(moq_net::path::Relative::empty),
 	))
 }
 
@@ -200,7 +197,7 @@ pub struct Rendition {
 
 	config: Config,
 	/// The catalog's root archive timeline: the timescale timings decode with.
-	section: Timeline,
+	section: Archive,
 	/// The catalog's root broadcast clock: the wall anchor timings map through, after
 	/// timescale conversion. Absent when the publisher exposes none.
 	clock: Option<Clock>,
@@ -264,7 +261,7 @@ impl Rendition {
 		name: String,
 		config: &VideoConfig,
 		upstream: &Upstream,
-		section: Timeline,
+		section: Archive,
 		clock: Option<Clock>,
 	) -> moq_mux::Result<Self> {
 		Ok(Self {
@@ -289,7 +286,7 @@ impl Rendition {
 		name: String,
 		config: &AudioConfig,
 		upstream: &Upstream,
-		section: Timeline,
+		section: Archive,
 		clock: Option<Clock>,
 	) -> moq_mux::Result<Self> {
 		Ok(Self {
@@ -318,7 +315,7 @@ impl Rendition {
 			index,
 			segment: entry.segment,
 			ranges: entry.tracks.get(&self.name).cloned().unwrap_or_default(),
-			duration: entry.duration.as_secs_f64(),
+			duration: entry.duration,
 			pts: entry.pts,
 			end: Duration::from(entry.pts) + entry.duration,
 		};
@@ -359,8 +356,13 @@ impl Rendition {
 	/// would return `Some`. Bounding the wait is the caller's policy (the serve path wraps this
 	/// in its own timeout).
 	pub async fn playable(&self) {
+		kio::wait(|waiter| self.poll_playable(waiter)).await;
+	}
+
+	/// Poll until this rendition has a renderable media playlist.
+	pub(crate) fn poll_playable(&self, waiter: &kio::Waiter) -> Poll<()> {
 		self.media.sync(&self.live);
-		kio::wait(|waiter| self.live.poll_playable(waiter)).await;
+		self.live.poll_playable(waiter)
 	}
 
 	/// Render this rendition's media playlist from the current timeline window, or `None` when
@@ -398,7 +400,7 @@ impl Rendition {
 		let observed = window
 			.segments
 			.iter()
-			.map(|s| s.duration.ceil().max(0.0) as u64)
+			.map(|s| s.duration.as_secs_f64().ceil() as u64)
 			.max()
 			.unwrap_or(0);
 		let target_duration = declared.max(observed).max(1);
@@ -508,8 +510,7 @@ impl Rendition {
 	/// the root mapping; an unrepresentable result maps to no time rather than a truncated one.
 	pub(crate) fn wall_clock(&self, pts: moq_net::Timestamp) -> Option<SystemTime> {
 		let clock = self.clock.as_ref()?;
-		let scale = u32::try_from(pts.scale().as_u64()).ok()?;
-		clock.wall_clock(pts.value(), scale).ok()
+		clock.wall_clock(pts).ok()
 	}
 
 	fn muxer(&self) -> Result<Muxer> {
@@ -753,7 +754,7 @@ mod tests {
 	}
 
 	fn produce_origin() -> moq_net::origin::Producer {
-		let (producer, driver) = moq_net::origin::Producer::new(moq_net::Hop::random().into());
+		let (producer, driver) = moq_net::origin::Producer::new(moq_net::origin::Config::default());
 		std::mem::forget(driver);
 		producer
 	}

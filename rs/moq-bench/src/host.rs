@@ -15,6 +15,9 @@
 //! per connection and CPU per message (see the README).
 
 #[cfg(target_os = "linux")]
+mod duration;
+
+#[cfg(target_os = "linux")]
 mod linux {
 	use std::collections::HashMap;
 	use std::io::Write;
@@ -61,7 +64,7 @@ mod linux {
 
 		/// Stop after this duration. Runs until interrupted (or the targets exit) otherwise.
 		#[usage(long)]
-		pub duration: Option<moq_tokio::cli::Duration>,
+		duration: Option<crate::duration::Duration>,
 
 		/// Write JSON lines to this file instead of stdout. Truncates on start.
 		#[usage(long, value_hint = usage::ValueHint::FilePath, extensions("jsonl", "json"))]
@@ -305,7 +308,7 @@ mod linux {
 			anyhow::ensure!(!targets.is_empty(), "all target processes exited");
 			let Some(delay) = next_delay(
 				args.interval.0,
-				args.duration.map(moq_tokio::cli::Duration::into_std),
+				args.duration.map(crate::duration::Duration::into_std),
 				start.elapsed(),
 			) else {
 				return Ok(());

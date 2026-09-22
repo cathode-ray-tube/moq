@@ -12,7 +12,7 @@ function publish(origin: Origin.Producer, path: Path.Valid) {
 }
 
 // A real origin with local broadcasts at the given paths. Resolution is proven by
-// discrimination: `relativeBroadcast` resolves blind against the table (reload: false), so
+// discrimination: `relativeBroadcast` resolves blind against the table (announced: false), so
 // a defined result means the reference resolved to a published path and nothing else.
 function origin(paths: string[]): Origin.Producer {
 	const producer = new Origin.Producer();
@@ -26,7 +26,7 @@ function broadcast(name: string, paths: string[] = [name]): { source: Broadcast;
 		origin: owner,
 		name: Path.from(name),
 		enabled: true,
-		reload: false,
+		announced: false,
 		catalogFormat: "manual",
 	});
 	return { source, owner };
@@ -52,15 +52,19 @@ const videoRenditions = (source: Broadcast): string[] =>
 const video = (codec: string, broadcast?: string): Catalog.VideoConfig =>
 	({ codec, container: { kind: "legacy" }, broadcast }) as Catalog.VideoConfig;
 
+it("refuses the released reload input", () => {
+	expect(() => new Broadcast({ reload: true } as never)).toThrow("renamed to `announced`");
+});
+
 describe("relativeBroadcast", () => {
 	it("resolves a legal reference against the origin", () => {
 		const { source, owner } = broadcast("a/b", ["a/b", "a/source", "a/sub"]);
 		const effect = new Effect();
 		try {
-			expect(source.relativeBroadcast(effect, "./source")).toBeDefined();
-			expect(source.relativeBroadcast(effect, "sub")).toBeDefined();
+			expect(source.relativeBroadcast(effect, Path.normalizeRelative("./source"))).toBeDefined();
+			expect(source.relativeBroadcast(effect, Path.normalizeRelative("sub"))).toBeDefined();
 			// Nothing routes an unpublished sibling, so the reference stays pending.
-			expect(source.relativeBroadcast(effect, "./missing")).toBeUndefined();
+			expect(source.relativeBroadcast(effect, Path.normalizeRelative("./missing"))).toBeUndefined();
 		} finally {
 			effect.close();
 			source.close();
@@ -75,11 +79,11 @@ describe("relativeBroadcast", () => {
 			// Clamping would subscribe to an unrelated `x` instead of dropping the rendition;
 			// `x` is published, so a defined result here would prove the clamp bug.
 			withoutWarnings(() => {
-				expect(source.relativeBroadcast(effect, "../../x")).toBeUndefined();
-				expect(source.relativeBroadcast(effect, "../..")).toBeUndefined();
+				expect(source.relativeBroadcast(effect, Path.normalizeRelative("../../x"))).toBeUndefined();
+				expect(source.relativeBroadcast(effect, Path.normalizeRelative("../.."))).toBeUndefined();
 			});
 			// Popping to exactly the root stops at it, and the root still names a broadcast.
-			expect(source.relativeBroadcast(effect, "..")).toBeDefined();
+			expect(source.relativeBroadcast(effect, Path.normalizeRelative(".."))).toBeDefined();
 		} finally {
 			effect.close();
 			source.close();
@@ -96,7 +100,7 @@ describe("relativeBroadcast", () => {
 			origin: owner,
 			name: Path.from("a/b"),
 			enabled: true,
-			reload: false,
+			announced: false,
 			catalogFormat: "manual",
 			catalog,
 		});
@@ -181,8 +185,8 @@ describe("relativeBroadcast", () => {
 			const own = source.out.active.peek();
 			expect(own).toBeDefined();
 			expect(source.relativeBroadcast(effect, undefined)).toBe(own);
-			expect(source.relativeBroadcast(effect, "")).toBe(own);
-			expect(source.relativeBroadcast(effect, "./b")).toBe(own);
+			expect(source.relativeBroadcast(effect, Path.normalizeRelative(""))).toBe(own);
+			expect(source.relativeBroadcast(effect, Path.normalizeRelative("./b"))).toBe(own);
 		} finally {
 			effect.close();
 			source.close();
@@ -193,7 +197,7 @@ describe("relativeBroadcast", () => {
 
 describe("blind resolution", () => {
 	it("holds a resolved request steady instead of flapping", async () => {
-		// reload: false with nothing routed stands a request; when a session answers, the
+		// announced: false with nothing routed stands a request; when a session answers, the
 		// effect that read `request.active` reruns. That rerun must re-acquire the same
 		// answer, not close the request and re-dial forever.
 		const owner = new Origin.Producer();
@@ -201,16 +205,19 @@ describe("blind resolution", () => {
 			origin: owner,
 			name: Path.from("blind.hang"),
 			enabled: true,
-			reload: false,
+			announced: false,
 			catalogFormat: "manual",
 		});
 
 		await settle();
 
-		// Stand in for a session's serving loop answering the request.
+		// Stand in for a dynamic route answering the request.
 		const upstream = new Moq.Broadcast.Producer();
-		const withdraw = owner.answer(Path.from("blind.hang"), upstream.consume());
-		expect(withdraw).toBeDefined();
+		const route = owner.dynamic(Path.from("blind.hang"));
+		const requests = route.requested();
+		const next = await requests.next();
+		expect(next.done).toBe(false);
+		next.value?.accept(upstream);
 
 		await settle();
 		const active = source.out.active.peek();
@@ -223,6 +230,7 @@ describe("blind resolution", () => {
 		expect(upstream.closed.peek()).toBeUndefined();
 
 		source.close();
+		route.close();
 		owner.close();
 		await settle();
 	});

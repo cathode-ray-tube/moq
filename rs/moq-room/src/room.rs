@@ -4,7 +4,7 @@ use std::task::{Poll, ready};
 
 use moq_net::{
 	PathOwned, announce, broadcast,
-	origin::{self, Pending},
+	origin::{self, Requesting},
 };
 
 use crate::path::{Kind, parse};
@@ -38,7 +38,7 @@ struct Inflight {
 	identity: PathOwned,
 	kind: Kind,
 	path: PathOwned,
-	request: Pending,
+	request: Requesting,
 }
 
 /// Runs the announce loop and yields remote participant broadcasts.
@@ -81,7 +81,7 @@ impl Room {
 			let Some(update) = ready!(self.announced.poll_next(waiter)) else {
 				return Poll::Ready(None);
 			};
-			let path = update.path;
+			let path = update.prefix;
 			let Some(parsed) = parse(&path) else {
 				continue;
 			};
@@ -151,10 +151,10 @@ impl Room {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use moq_net::{Hop, Path, origin::Route};
+	use moq_net::{Path, origin::Route};
 
 	fn origin() -> origin::Producer {
-		moq_tokio::origin::spawn(Hop::random())
+		moq_tokio::origin::spawn()
 	}
 
 	fn publish(origin: &origin::Producer, path: &str) -> broadcast::Producer {

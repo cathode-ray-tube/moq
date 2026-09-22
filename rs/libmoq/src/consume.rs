@@ -55,7 +55,7 @@ struct ConsumeBroadcast {
 async fn resolve(
 	broadcast: moq_net::broadcast::Consumer,
 	origin: Option<moq_net::origin::Consumer>,
-	reference: Option<moq_net::PathRelativeOwned>,
+	reference: Option<moq_net::path::RelativeOwned>,
 ) -> Result<moq_net::broadcast::Consumer, Error> {
 	let Some(reference) = reference.filter(|reference| !reference.is_empty()) else {
 		return Ok(broadcast);
@@ -213,7 +213,8 @@ impl Consume {
 			// Serialize the untyped application sections to owned strings so the
 			// C section APIs can borrow stable pointers from the snapshot.
 			let sections = update
-				.sections()
+				.ext
+				.iter()
 				.map(|(name, value)| (name.clone(), value.to_string()))
 				.collect();
 

@@ -1,7 +1,7 @@
 //! The PR-4 ablation matrix at session level: a full moq-lite session pair on
 //! one worker, publisher to subscriber over loopback QUIC, toggling receive
 //! batching, GRO, and GSO exactly like the raw echo. Each iteration delivers
-//! one group of 32 x 32 KiB frames (1 MiB, matching `echo_quiche`'s unit), so
+//! one group of 32 x 32 KiB frames (1 MiB, matching `echo_noq`'s unit), so
 //! the two matrices are directly comparable: the difference is the moq-net
 //! machine and container framing on top of the same wire path.
 //!
@@ -9,15 +9,13 @@
 
 use criterion::{criterion_group, criterion_main};
 
-#[cfg(all(target_os = "linux", any(feature = "noq", feature = "quiche", feature = "quinn")))]
-#[path = "../tests/support/quiche.rs"]
+#[cfg(all(target_os = "linux", feature = "noq"))]
+#[path = "../tests/support.rs"]
 mod support;
 
-#[cfg(all(target_os = "linux", any(feature = "noq", feature = "quiche", feature = "quinn")))]
+#[cfg(all(target_os = "linux", feature = "noq"))]
 mod linux {
 	use std::net::UdpSocket;
-	use std::pin::Pin;
-	use std::task::Poll;
 	use std::time::Instant;
 
 	use criterion::{BenchmarkId, Criterion, Throughput};
@@ -32,48 +30,6 @@ mod linux {
 	const FRAME_SIZE: usize = 32 * 1024;
 
 	const ALPN: &str = "moq-lite-05";
-
-	/// A `Send` timers impl over tokio for the origin drivers, which cannot
-	/// take the worker's `!Send` handle (see `tests/session.rs`).
-	#[derive(Clone, Default)]
-	struct TokioTimers;
-
-	impl moq_net::runtime::Timers for TokioTimers {
-		type Timer = TokioTimer;
-
-		fn timer(&self) -> Self::Timer {
-			TokioTimer { at: None, sleep: None }
-		}
-
-		fn now(&self) -> moq_net::runtime::Instant {
-			tokio::time::Instant::now().into_std()
-		}
-	}
-
-	struct TokioTimer {
-		at: Option<moq_net::runtime::Instant>,
-		sleep: Option<Pin<Box<tokio::time::Sleep>>>,
-	}
-
-	impl moq_net::runtime::Timer for TokioTimer {
-		fn set(&mut self, at: Option<moq_net::runtime::Instant>) {
-			self.at = at;
-			if let (Some(at), Some(sleep)) = (at, &mut self.sleep) {
-				sleep.as_mut().reset(tokio::time::Instant::from_std(at));
-			}
-		}
-
-		fn poll(&mut self, waiter: &kio::Waiter) -> Poll<()> {
-			let Some(at) = self.at else { return Poll::Pending };
-			let sleep = self
-				.sleep
-				.get_or_insert_with(|| Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(at))));
-			if sleep.is_elapsed() {
-				return Poll::Ready(());
-			}
-			waiter.poll_future(sleep.as_mut())
-		}
-	}
 
 	struct Ablation {
 		name: &'static str,
@@ -135,15 +91,15 @@ mod linux {
 			let mut worker = Worker::new(Config::default()).expect("worker");
 			let handle = worker.handle();
 
-			let (pub_origin, pub_driver) = origin::Producer::new(origin::Config::new(moq_net::Hop::random()));
-			let (sub_origin, sub_driver) = origin::Producer::new(origin::Config::new(moq_net::Hop::random()));
+			let (pub_origin, pub_driver) = origin::Producer::new(origin::Config::default());
+			let (sub_origin, sub_driver) = origin::Producer::new(origin::Config::default());
 			let origins = std::thread::spawn(move || {
 				let rt = tokio::runtime::Builder::new_current_thread()
 					.enable_time()
 					.build()
 					.expect("tokio runtime");
 				rt.block_on(async move {
-					tokio::join!(pub_driver.run(TokioTimers), sub_driver.run(TokioTimers));
+					tokio::join!(moq_net::time::run(pub_driver), moq_net::time::run(sub_driver));
 				});
 			});
 
@@ -172,11 +128,12 @@ mod linux {
 				let conn = quic::server::accept(&server_handle, server_sock, &server_config)
 					.await
 					.expect("quic accept");
-				let session = moq_net::Server::new()
+				let (session, driver) = moq_net::Server::new()
 					.with_publisher(&pub_origin)
-					.accept_lite(server_handle.clone(), quic::web::Session::raw(conn))
+					.accept_lite(std::time::Instant::now(), quic::web::Session::raw(conn))
 					.await
 					.expect("accept_lite");
+				let _ = server_handle.run(driver).await;
 				session.closed().await;
 			});
 
@@ -186,11 +143,15 @@ mod linux {
 					let conn = quic::client::connect(&handle, client_sock, &dial)
 						.await
 						.expect("quic connect");
-					let session = moq_net::Client::new()
+					let (session, driver) = moq_net::Client::new()
 						.with_subscriber(sub_origin.clone())
-						.connect_lite(handle.clone(), quic::web::Session::raw(conn))
+						.connect_lite(std::time::Instant::now(), quic::web::Session::raw(conn))
 						.await
 						.expect("connect_lite");
+					let task_handle = handle.clone();
+					handle.spawn(async move {
+						let _ = task_handle.run(driver).await;
+					});
 					let bc = {
 						let consumer = sub_origin.consume();
 						consumer.routed("bench").await.expect("broadcast announced");
@@ -253,10 +214,10 @@ mod linux {
 	}
 }
 
-#[cfg(all(target_os = "linux", any(feature = "noq", feature = "quiche", feature = "quinn")))]
+#[cfg(all(target_os = "linux", feature = "noq"))]
 use linux::benchmark;
 
-#[cfg(not(all(target_os = "linux", any(feature = "noq", feature = "quiche", feature = "quinn"))))]
+#[cfg(not(all(target_os = "linux", feature = "noq")))]
 fn benchmark(_: &mut criterion::Criterion) {}
 
 criterion_group!(benches, benchmark);

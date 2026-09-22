@@ -9,7 +9,7 @@ use std::{net, path::PathBuf, str::FromStr, sync::Arc};
 use crate::quic::CongestionControl;
 use url::Url;
 use web_transport_iroh::iroh::{self, SecretKey};
-// NOTE: web-transport-iroh should re-export proto like web-transport-quinn does.
+// NOTE: web-transport-iroh should re-export proto like web-transport-noq does.
 use web_transport_proto::{ConnectRequest, ConnectResponse};
 
 pub use iroh::Endpoint;
@@ -41,7 +41,7 @@ pub enum Error {
 	/// The QUIC config was parsed from released spellings that no longer work. The
 	/// payload is the migration to print.
 	#[error("{0}")]
-	Deprecated(crate::Deprecated),
+	Deprecated(crate::cli::Deprecated),
 
 	/// The configured secret was neither a valid hex key nor a readable key file.
 	#[error("invalid iroh secret key: {0}")]
@@ -108,7 +108,7 @@ pub enum Error {
 	RecvRequest(String),
 
 	/// GSO is always on for iroh, so `--quic-gso=false` cannot be honored.
-	#[error("the iroh backend cannot disable GSO; drop --quic-gso=false or use the quinn backend")]
+	#[error("the iroh backend cannot disable GSO; drop --quic-gso=false or use the noq backend")]
 	GsoUnsupported,
 }
 

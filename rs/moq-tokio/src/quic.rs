@@ -43,11 +43,19 @@ impl std::str::FromStr for ServerId {
 	}
 }
 
+/// QUIC-LB connection-ID encoding.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct LoadBalancer {
+	/// The routable server identifier encoded into each connection ID.
+	pub id: ServerId,
+	/// Number of random nonce bytes appended to each connection ID.
+	pub nonce: usize,
+}
+
 /// The congestion control family for a QUIC connection.
 ///
-/// This selects a family rather than a named algorithm because each backend ships a
-/// different generation: BBRv1 on quinn, BBRv2 on quiche, BBRv3 on noq and iroh. A
-/// `Bbr` variant would promise more than any one backend delivers.
+/// Noq uses CUBIC for loss-based control and BBRv3 for delay-based control.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, usage::ValueEnum, serde::Serialize, serde::Deserialize)]
 #[usage(ignore_case)]
 #[serde(rename_all = "kebab-case")]
@@ -115,25 +123,37 @@ pub struct Config {
 	pub gso: Option<bool>,
 
 	/// Idle timeout before an inactive connection is dropped. Defaults to 30s.
+	#[usage(skip)]
+	#[serde(with = "crate::cli::duration::serde_duration")]
+	pub idle_timeout: Duration,
+
 	#[usage(
 		name = "quic-idle-timeout",
 		long = "quic-idle-timeout",
 		env = "MOQ_QUIC_IDLE_TIMEOUT",
+		default_value_t = CliDuration::fallback(DEFAULT_IDLE_TIMEOUT),
 		default = "30s",
 		setting = "quic.idle_timeout"
 	)]
-	pub idle_timeout: CliDuration,
+	#[serde(default, rename = "__cli_idle_timeout", skip_serializing_if = "Option::is_none")]
+	idle_timeout_arg: Option<CliDuration>,
 
 	/// Keep-alive ping interval. Defaults to 5s; set `0s` to disable.
 	/// Ignored by the iroh backend, which has no keep-alive knob.
+	#[usage(skip)]
+	#[serde(with = "crate::cli::duration::serde_duration")]
+	pub keep_alive: Duration,
+
 	#[usage(
 		name = "quic-keep-alive",
 		long = "quic-keep-alive",
 		env = "MOQ_QUIC_KEEP_ALIVE",
+		default_value_t = CliDuration::fallback(DEFAULT_KEEP_ALIVE),
 		default = "5s",
 		setting = "quic.keep_alive"
 	)]
-	pub keep_alive: CliDuration,
+	#[serde(default, rename = "__cli_keep_alive", skip_serializing_if = "Option::is_none")]
+	keep_alive_arg: Option<CliDuration>,
 
 	/// Enable path MTU discovery. Defaults to off.
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -148,8 +168,7 @@ pub struct Config {
 	)]
 	pub mtu_discovery: Option<bool>,
 
-	/// Congestion control family. Defaults to `delay` on quinn and quiche, and to
-	/// `loss` on noq and iroh. Selecting `delay` there uses BBRv3.
+	/// Congestion control family. Defaults to `delay`, which uses BBRv3.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[usage(
 		name = "quic-congestion-control",
@@ -191,8 +210,7 @@ pub struct Config {
 	/// Cap on unacknowledged outgoing data, in bytes, regardless of what the peer
 	/// allows. Unset leaves the backend default.
 	///
-	/// This bounds the transport send buffer. The quiche backend has no local send
-	/// cap and refuses this rather than dropping it.
+	/// This bounds the transport send buffer.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[usage(
 		name = "quic-send-window",
@@ -204,9 +222,7 @@ pub struct Config {
 
 	/// Write qlog traces into this directory, which must already exist.
 	///
-	/// The layout is backend-specific: quiche and noq write one file per connection,
-	/// while quinn writes one file per endpoint and tags each event with the qlog
-	/// `group_id` of the connection it belongs to.
+	/// Noq writes one file per connection.
 	///
 	/// Requires the `qlog` feature; setting it errors at init otherwise.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -228,8 +244,10 @@ impl Default for Config {
 		Self {
 			max_streams: None,
 			gso: None,
-			idle_timeout: DEFAULT_IDLE_TIMEOUT.into(),
-			keep_alive: DEFAULT_KEEP_ALIVE.into(),
+			idle_timeout: DEFAULT_IDLE_TIMEOUT,
+			idle_timeout_arg: None,
+			keep_alive: DEFAULT_KEEP_ALIVE,
+			keep_alive_arg: None,
 			mtu_discovery: None,
 			congestion_control: None,
 			receive_window: None,
@@ -381,10 +399,10 @@ impl Legacy {
 	/// The note is the same on every line and is the point of the message: these
 	/// knobs used to bound one direction, so a deployment moving to the shared
 	/// section is also widening what the value applies to.
-	fn deprecated(&self) -> crate::Deprecated {
+	fn deprecated(&self) -> crate::cli::Deprecated {
 		const SHARED: &str = "now applies to dialed and accepted connections alike";
 
-		let mut found = crate::Deprecated::default();
+		let mut found = crate::cli::Deprecated::default();
 		for (used, old, env) in [
 			(
 				self.client_max_streams.is_some(),
@@ -459,7 +477,7 @@ impl Config {
 	/// A binary checks this before anything else and exits when it isn't empty. The
 	/// old spellings are parsed so the process can name their replacement, not so it
 	/// can honor them.
-	pub fn deprecated(&self) -> crate::Deprecated {
+	pub fn deprecated(&self) -> crate::cli::Deprecated {
 		self.legacy.deprecated()
 	}
 
@@ -472,7 +490,7 @@ impl Config {
 			Some(_) if cfg!(not(feature = "qlog")) => Err(crate::Error::QlogUnsupported),
 			_ => Ok(()),
 		}?;
-		validate_idle_timeout(Some(self.idle_timeout.into_std()))?;
+		validate_idle_timeout(Some(CliDuration::resolve(self.idle_timeout_arg, self.idle_timeout)))?;
 		validate_windows(self)
 	}
 
@@ -484,12 +502,14 @@ impl Config {
 	pub fn resolve(&self) -> Resolved {
 		// A zero keep-alive means "disabled"; anything else (including unset) keeps
 		// the connection warm, defaulting to 5s.
-		let keep_alive = (!self.keep_alive.is_zero()).then(|| self.keep_alive.into_std());
+		let idle_timeout = CliDuration::resolve(self.idle_timeout_arg, self.idle_timeout);
+		let keep_alive = CliDuration::resolve(self.keep_alive_arg, self.keep_alive);
+		let keep_alive = (!keep_alive.is_zero()).then_some(keep_alive);
 
 		Resolved {
 			max_streams: self.max_streams.unwrap_or(DEFAULT_MAX_STREAMS),
 			gso: self.gso,
-			idle_timeout: self.idle_timeout.into_std(),
+			idle_timeout,
 			keep_alive,
 			mtu_discovery: self.mtu_discovery.unwrap_or(false),
 			congestion_control: self.congestion_control,
@@ -574,8 +594,7 @@ pub struct Resolved {
 	pub keep_alive: Option<Duration>,
 	/// Whether to run path MTU discovery.
 	pub mtu_discovery: bool,
-	/// Congestion control override, or `None` for the backend's own default. Each
-	/// backend picks that default itself, since they don't all agree.
+	/// Congestion control override, or `None` for the default.
 	pub congestion_control: Option<CongestionControl>,
 	/// Connection-wide receive window in bytes, or `None` for the backend default.
 	pub receive_window: Option<u64>,
@@ -592,12 +611,8 @@ impl Resolved {
 	///
 	/// Delay-based unless the operator says otherwise: BBR keeps queues short and the
 	/// send rate steady enough for a live encoder to track, which is what this stack
-	/// carries. Every backend resolves the default here rather than each picking its
-	/// own, so the answer can't drift between them.
-	#[cfg_attr(
-		not(any(feature = "quinn", feature = "noq", feature = "quiche", feature = "iroh")),
-		allow(dead_code)
-	)]
+	/// carries.
+	#[cfg_attr(not(any(feature = "noq", feature = "iroh")), allow(dead_code))]
 	pub(crate) fn congestion(&self) -> CongestionControl {
 		self.congestion_control.unwrap_or(CongestionControl::Delay)
 	}
@@ -606,7 +621,7 @@ impl Resolved {
 	///
 	/// Only meaningful once [`Config::validate`] has passed; a build without the
 	/// `qlog` feature never gets here with a directory set.
-	#[cfg_attr(not(any(feature = "quinn", feature = "noq", feature = "quiche")), allow(dead_code))]
+	#[cfg_attr(not(feature = "noq"), allow(dead_code))]
 	pub(crate) fn qlog_dir(&self) -> Option<&std::path::Path> {
 		self.qlog.as_deref()
 	}
@@ -655,13 +670,13 @@ mod tests {
 	#[test]
 	fn zero_keep_alive_disables_it() {
 		let disabled = Config {
-			keep_alive: Duration::ZERO.into(),
+			keep_alive: Duration::ZERO,
 			..Default::default()
 		};
 		assert_eq!(disabled.resolve().keep_alive, None);
 
 		let explicit = Config {
-			keep_alive: Duration::from_secs(2).into(),
+			keep_alive: Duration::from_secs(2),
 			..Default::default()
 		};
 		assert_eq!(explicit.resolve().keep_alive, Some(Duration::from_secs(2)));
@@ -803,19 +818,19 @@ mod tests {
 	#[test]
 	fn idle_timeout_beyond_the_varint_is_rejected() {
 		let over = Config {
-			idle_timeout: (MAX_IDLE_TIMEOUT + Duration::from_millis(1)).into(),
+			idle_timeout: (MAX_IDLE_TIMEOUT + Duration::from_millis(1)),
 			..Default::default()
 		};
 		assert!(matches!(over.validate(), Err(crate::Error::IdleTimeoutRange)));
 
 		let saturated = Config {
-			idle_timeout: Duration::from_millis(u64::MAX).into(),
+			idle_timeout: Duration::from_millis(u64::MAX),
 			..Default::default()
 		};
 		assert!(matches!(saturated.validate(), Err(crate::Error::IdleTimeoutRange)));
 
 		let at_limit = Config {
-			idle_timeout: MAX_IDLE_TIMEOUT.into(),
+			idle_timeout: MAX_IDLE_TIMEOUT,
 			..Default::default()
 		};
 		assert!(at_limit.validate().is_ok());

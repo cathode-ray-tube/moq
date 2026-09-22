@@ -42,7 +42,7 @@ impl ServerState {
 		let publish = self.publish.clone();
 		let consume = self.consume.clone();
 		match server.accept().await {
-			Some(request) => Ok(Some(MoqRequest::new(request, publish, consume))),
+			Some(request) => Ok(Some(MoqRequest::new(request, publish, consume)?)),
 			None => Ok(None),
 		}
 	}
@@ -94,19 +94,11 @@ impl MoqServer {
 	/// Validated syntactically up-front. DNS hostnames are accepted and resolved
 	/// at `listen()` time. Captured at [`listen`](Self::listen); fails afterwards.
 	pub fn set_bind(&self, addr: String) -> Result<(), MoqError> {
-		// Mirrors `MoqClient::set_bind` by surfacing parse errors here rather
-		// than at listen() time. The server takes a String (not SocketAddr) so
-		// DNS hostnames are allowed; we only check syntactic structure here.
-		if addr.parse::<std::net::SocketAddr>().is_err() {
-			let port_ok = addr
-				.rsplit_once(':')
-				.is_some_and(|(_, port)| port.parse::<u16>().is_ok());
-			if !port_ok {
-				return Err(MoqError::Bind(format!("invalid bind address: {addr}")));
-			}
-		}
+		let bind = addr
+			.parse()
+			.map_err(|_| MoqError::Bind(format!("invalid bind address: {addr}")))?;
 		self.configure_listen(|state| {
-			state.config.bind = Some(addr);
+			state.config.bind = Some(bind);
 		})
 	}
 
@@ -194,9 +186,57 @@ impl MoqServer {
 }
 
 struct RequestState {
-	request: Option<moq_tokio::Request>,
+	request: Option<moq_tokio::server::Request>,
 	publish: Option<Arc<MoqOriginProducer>>,
 	consume: Option<Arc<MoqOriginProducer>>,
+}
+
+/// The network transport carrying an incoming session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum MoqTransport {
+	/// QUIC, either directly or through WebTransport over HTTP/3.
+	Quic,
+	/// An Iroh QUIC connection.
+	Iroh,
+	/// A WebSocket connection using qmux framing.
+	WebSocket,
+	/// A plaintext TCP connection using qmux framing.
+	Tcp,
+	/// A Unix domain socket using qmux framing.
+	Unix,
+}
+
+impl TryFrom<moq_tokio::server::Transport> for MoqTransport {
+	type Error = MoqError;
+
+	fn try_from(value: moq_tokio::server::Transport) -> Result<Self, Self::Error> {
+		Ok(match value {
+			moq_tokio::server::Transport::Quic => Self::Quic,
+			moq_tokio::server::Transport::Iroh => Self::Iroh,
+			moq_tokio::server::Transport::WebSocket => Self::WebSocket,
+			moq_tokio::server::Transport::Tcp => Self::Tcp,
+			moq_tokio::server::Transport::Unix => Self::Unix,
+			_ => return Err(MoqError::Unsupported),
+		})
+	}
+}
+
+#[cfg(test)]
+mod transport_tests {
+	use super::MoqTransport;
+	use moq_tokio::server::Transport;
+
+	#[test]
+	fn converts_supported_transports() {
+		assert_eq!(MoqTransport::try_from(Transport::Quic).unwrap(), MoqTransport::Quic);
+		assert_eq!(MoqTransport::try_from(Transport::Iroh).unwrap(), MoqTransport::Iroh);
+		assert_eq!(
+			MoqTransport::try_from(Transport::WebSocket).unwrap(),
+			MoqTransport::WebSocket
+		);
+		assert_eq!(MoqTransport::try_from(Transport::Tcp).unwrap(), MoqTransport::Tcp);
+		assert_eq!(MoqTransport::try_from(Transport::Unix).unwrap(), MoqTransport::Unix);
+	}
 }
 
 /// An incoming MoQ session that can be accepted or rejected.
@@ -207,7 +247,7 @@ struct RequestState {
 #[derive(uniffi::Object)]
 pub struct MoqRequest {
 	task: Task<RequestState>,
-	transport: String,
+	transport: MoqTransport,
 	url: Option<String>,
 	path: String,
 	query: Option<String>,
@@ -215,15 +255,15 @@ pub struct MoqRequest {
 
 impl MoqRequest {
 	fn new(
-		request: moq_tokio::Request,
+		request: moq_tokio::server::Request,
 		publish: Option<Arc<MoqOriginProducer>>,
 		consume: Option<Arc<MoqOriginProducer>>,
-	) -> Arc<Self> {
-		let transport = request.transport().to_string();
+	) -> Result<Arc<Self>, MoqError> {
+		let transport = request.transport().try_into()?;
 		let url = request.url().map(|u| u.to_string());
 		let path = request.path().to_string();
 		let query = request.query().map(str::to_string);
-		Arc::new(Self {
+		Ok(Arc::new(Self {
 			task: Task::new(RequestState {
 				request: Some(request),
 				publish,
@@ -233,7 +273,7 @@ impl MoqRequest {
 			url,
 			path,
 			query,
-		})
+		}))
 	}
 
 	fn configure_origin(&self, f: impl FnOnce(&mut RequestState)) -> Result<(), MoqError> {
@@ -284,9 +324,9 @@ impl MoqRequest {
 		self.query.clone()
 	}
 
-	/// The transport type, e.g. `"quic"`, `"iroh"`, or `"websocket"`.
-	pub fn transport(&self) -> String {
-		self.transport.clone()
+	/// The network transport carrying this session.
+	pub fn transport(&self) -> MoqTransport {
+		self.transport
 	}
 
 	/// Override the publish origin for this session. Falls back to the server's
@@ -326,15 +366,23 @@ impl MoqRequest {
 			.await
 	}
 
-	/// Reject the session with the given HTTP status code.
+	/// Reject the established MoQ session with an application error code.
+	///
+	/// Codes 401 and 403 map to the protocol's unauthorized error; every other
+	/// code is sent as an application error.
 	///
 	/// Returns `AlreadyResponded` if `accept()` or `reject()` has already been called.
 	pub async fn reject(&self, code: u16) -> Result<(), MoqError> {
 		self.task
 			.run(move |mut state| async move {
 				let request = state.request.take().ok_or(MoqError::AlreadyResponded)?;
+				let reject = match code {
+					401 => moq_tokio::server::Reject::Unauthorized,
+					403 => moq_tokio::server::Reject::Forbidden,
+					code => moq_tokio::server::Reject::App(code),
+				};
 				request
-					.close(code)
+					.reject(reject)
 					.await
 					.map_err(|err| MoqError::Reject(format!("{err}")))?;
 				Ok(())

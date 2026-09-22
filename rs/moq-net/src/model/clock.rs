@@ -1,17 +1,8 @@
-//! The model's clock: the real monotonic clock in production, paused and
-//! manually advanced under `cfg(test)`.
+//! Clock access for the explicit `Timestamp::now` convenience API and model tests.
 //!
-//! Model time is passive measurement against the model's own stamps (arrival
-//! ordering vs a latency budget, cache access ticks, datagram age). Nothing
-//! here arms a wakeup, so the model needs no runtime handle, and instants
-//! minted here never cross into runtime-armed deadlines (durations may). The
-//! test clock exists purely so timing tests are deterministic: it starts
-//! frozen and only [`advance`] moves it, minting real `Instant`s as base plus
-//! offset. (Crates like `mock_instant` do this by substituting the `Instant`
-//! type; keeping std's type is the point, so this stays hand-rolled.)
-//!
-//! The paused state is thread-local so the standard test harness can run tests
-//! concurrently in one process without one test aging another's model.
+//! Production cache maintenance uses caller-supplied instants at the GC boundary. Tests share a frozen thread-local clock so advancing one test never
+//! affects another. Advancing it also dates pending cache activity; expiration
+//! remains a separate operation, driven by writes or an explicit cleanup call.
 
 /// The current instant on the model's clock.
 #[cfg(not(test))]
@@ -29,6 +20,7 @@ pub(crate) fn now() -> crate::runtime::Instant {
 /// Move the model's clock forward. Test-only; production time moves itself.
 #[cfg(test)]
 pub(crate) fn advance(duration: std::time::Duration) {
+	poll_pools();
 	OFFSET.with(|offset| {
 		offset.set(
 			offset
@@ -37,6 +29,7 @@ pub(crate) fn advance(duration: std::time::Duration) {
 				.expect("advance overflows the test clock"),
 		);
 	});
+	poll_pools();
 }
 
 #[cfg(test)]
@@ -71,5 +64,28 @@ mod tests {
 		.unwrap();
 
 		assert_eq!(super::now(), before, "another test thread advanced this clock");
+	}
+}
+
+#[cfg(test)]
+thread_local! {
+	static POOLS: std::cell::RefCell<Vec<crate::cache::PoolWeak>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn register(pool: &crate::cache::Pool) {
+	pool.advance_test(now());
+	POOLS.with(|pools| pools.borrow_mut().push(pool.downgrade()));
+}
+
+#[cfg(test)]
+fn poll_pools() {
+	let pools: Vec<_> = POOLS.with(|pools| {
+		let mut pools = pools.borrow_mut();
+		pools.retain(|pool| pool.upgrade().is_some());
+		pools.iter().filter_map(|pool| pool.upgrade()).collect()
+	});
+	for pool in pools {
+		pool.advance_test(now());
 	}
 }

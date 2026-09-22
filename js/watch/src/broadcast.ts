@@ -2,7 +2,7 @@ import * as Catalog from "@moq/hang/catalog";
 import * as Json from "@moq/json";
 import * as Msf from "@moq/msf";
 import type * as Moq from "@moq/net";
-import { Announce, Path, StreamError } from "@moq/net";
+import { Announce, Error as NetError, Path } from "@moq/net";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 
 import { toHang } from "./msf";
@@ -41,7 +41,7 @@ function assertResolvable(base: Moq.Path.Valid, catalog: Catalog.Root): Catalog.
 }
 
 type ReferencedRendition = {
-	broadcast?: string;
+	broadcast?: Path.Relative;
 };
 
 // Either the catalog's own broadcast, or a sibling to consume by path.
@@ -49,14 +49,14 @@ type RelativeTarget = { local: true } | { local: false; path: Moq.Path.Valid };
 
 function filterRenditions<T extends ReferencedRendition>(
 	renditions: Record<string, T>,
-	usable: (rel: string | undefined) => boolean,
+	usable: (rel: Path.Relative | undefined) => boolean,
 ): Record<string, T> {
 	return Object.fromEntries(Object.entries(renditions).filter(([, config]) => usable(config.broadcast)));
 }
 
 // Every section carrying renditions must be listed here, same as `findEscaping`; one left
 // out silently exempts its renditions from the reachability filter.
-function filterCatalog(catalog: Catalog.Root, usable: (rel: string | undefined) => boolean): Catalog.Root {
+function filterCatalog(catalog: Catalog.Root, usable: (rel: Path.Relative | undefined) => boolean): Catalog.Root {
 	return {
 		...catalog,
 		video: catalog.video
@@ -78,11 +78,6 @@ function filterCatalog(catalog: Catalog.Root, usable: (rel: string | undefined) 
 export const CATALOG_FORMATS = [...Catalog.FORMATS, "hangz", "manual"] as const;
 export type CatalogFormat = (typeof CATALOG_FORMATS)[number];
 
-export function parseCatalogFormat(value: string | null): CatalogFormat | undefined {
-	if (value === null) return undefined;
-	return CATALOG_FORMATS.find((f) => f === value);
-}
-
 type Status = "offline" | "loading" | "live";
 
 // Signals the component reads. Whoever owns the backing Signal (the caller, or
@@ -98,9 +93,9 @@ export type BroadcastInput = {
 	// The broadcast name.
 	name: Getter<Moq.Path.Valid>;
 
-	// Whether to reload the broadcast when it goes offline.
+	// Whether to wait for the broadcast to be announced before subscribing.
 	// Defaults to true; pass false to subscribe immediately without waiting for an announcement.
-	reload: Getter<boolean>;
+	announced: Getter<boolean>;
 
 	// Which catalog format to use. When `undefined` (the default), the format is
 	// auto-detected from the broadcast name extension (`.hang`, `.msf`), falling
@@ -124,7 +119,7 @@ type BroadcastOutput = {
 	catalog: Signal<Catalog.Root | undefined>;
 };
 
-// A catalog source that (optionally) reloads automatically when live/offline.
+// A catalog source that can wait for announcement before subscribing.
 export class Broadcast {
 	readonly in: Readonlys<BroadcastInput>;
 
@@ -153,14 +148,18 @@ export class Broadcast {
 	// strands the filtered copy on the previous contents.
 	readonly #raw = new Signal<Catalog.Root | undefined>(undefined);
 
-	#signals = new Effect();
+	#signals: Effect;
 
 	constructor(props?: Inputs<BroadcastInput>) {
+		if (props && "reload" in props) {
+			throw new Error("Watch.Broadcast: `reload` was renamed to `announced`");
+		}
+		this.#signals = new Effect();
 		this.in = {
 			origin: getter(props?.origin),
 			name: getter(props?.name ?? Path.empty()),
 			enabled: getter(props?.enabled ?? true),
-			reload: getter(props?.reload ?? true),
+			announced: getter(props?.announced ?? true),
 			catalogFormat: getter<CatalogFormat | undefined>(props?.catalogFormat),
 			catalog: getter(props?.catalog),
 		};
@@ -177,7 +176,7 @@ export class Broadcast {
 		this.#announced.set(undefined);
 
 		if (!effect.get(this.#wantAnnounced)) return;
-		if (!effect.get(this.in.reload)) return;
+		if (!effect.get(this.in.announced)) return;
 
 		const origin = effect.get(this.in.origin);
 		if (!origin) return;
@@ -192,8 +191,8 @@ export class Broadcast {
 				if (!entry) break;
 				this.#announced.mutate((active) => {
 					if (!active) return;
-					if (Announce.isActive(entry.kind)) active.add(entry.path);
-					else active.delete(entry.path);
+					if (Announce.isActive(entry.kind)) active.add(entry.prefix);
+					else active.delete(entry.prefix);
 				});
 			}
 		});
@@ -205,14 +204,14 @@ export class Broadcast {
 	// arrive, so a rendition appears once its broadcast does.
 	#runFiltered(effect: Effect): void {
 		const raw = effect.get(this.#raw);
-		const usable = (rel: string | undefined) => this.#relativeTarget(effect, rel) !== undefined;
+		const usable = (rel: Path.Relative | undefined) => this.#relativeTarget(effect, rel) !== undefined;
 		effect.set(this.#out.catalog, raw ? filterCatalog(raw, usable) : undefined);
 	}
 
 	// Whether `path` is covered by an announced route, for `relativeBroadcast`'s
 	// cross-broadcast refs. Announcements are prefix routes, so a route at "room/" covers
 	// "room/alice/cam.hang" without naming it. Opens the announcement stream on first use.
-	// The blind cases (reload off, no discovery) never reach here; see `#relativeTarget`.
+	// The blind cases (announcement gate off, no discovery) never reach here; see `#relativeTarget`.
 	#isPathAnnounced(effect: Effect, path: Moq.Path.Valid): boolean {
 		this.#wantAnnounced.set(true);
 
@@ -251,12 +250,12 @@ export class Broadcast {
 		const name = effect.get(this.in.name);
 
 		// No announcement gate: subscribe immediately.
-		if (!effect.get(this.in.reload)) {
+		if (!effect.get(this.in.announced)) {
 			effect.set(this.#out.active, this.#requestBroadcast(effect, origin, name), undefined);
 			return;
 		}
 
-		const announced = new Announce.Broadcast({ origin: this.in.origin, path: name });
+		const announced = origin.request(name, { announced: true });
 		effect.cleanup(() => announced.close());
 
 		effect.run((nested) => {
@@ -332,7 +331,8 @@ export class Broadcast {
 					this.#out.status.set("live");
 				}
 			} catch (err) {
-				if (err instanceof StreamError) console.debug("catalog subscription ended", this.in.name.peek(), err);
+				if (err instanceof NetError.Stream)
+					console.debug("catalog subscription ended", this.in.name.peek(), err);
 				else console.error("error fetching catalog", this.in.name.peek(), err);
 			} finally {
 				this.#raw.set(undefined);
@@ -344,7 +344,7 @@ export class Broadcast {
 	// Where a rendition's `broadcast` reference points once resolved and gated on the announcement
 	// stream, or `undefined` when it names nothing consumable right now. Playback and rendition
 	// selection both go through this so they cannot disagree about what is reachable.
-	#relativeTarget(effect: Effect, rel: string | undefined): RelativeTarget | undefined {
+	#relativeTarget(effect: Effect, rel: Path.Relative | undefined): RelativeTarget | undefined {
 		if (!rel) return { local: true };
 
 		const base = effect.get(this.in.name);
@@ -363,11 +363,11 @@ export class Broadcast {
 		// keeps a reconnect from briefly hiding every cross-broadcast rendition from selection.
 		if (!origin) return { local: false, path: resolved };
 
-		// Without an announcement gate (reload off, or no session supports discovery),
+		// Without an announcement gate (disabled, or no session supports discovery),
 		// resolve blind rather than waiting for an announcement that never comes. With the
 		// gate, only report the path usable once it is announced: the request then resolves
 		// from the table, never blind.
-		if (effect.get(this.in.reload) && effect.get(origin.discovery) !== false) {
+		if (effect.get(this.in.announced) && effect.get(origin.discovery) !== false) {
 			if (!this.#isPathAnnounced(effect, resolved)) return undefined;
 		}
 
@@ -389,7 +389,7 @@ export class Broadcast {
 	 * reference resolves lazily and reacts to `enabled` / connection / announcement
 	 * changes exactly like the catalog broadcast.
 	 */
-	relativeBroadcast(effect: Effect, rel: string | undefined): Moq.Broadcast.Consumer | undefined {
+	relativeBroadcast(effect: Effect, rel: Path.Relative | undefined): Moq.Broadcast.Consumer | undefined {
 		const target = this.#relativeTarget(effect, rel);
 		if (!target) return undefined;
 		if (target.local) return effect.get(this.out.active);

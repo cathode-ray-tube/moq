@@ -13,6 +13,17 @@ pub struct MoqOriginConfig {
 	pub cache_capacity_bytes: Option<u64>,
 }
 
+/// Scope for an announcement stream.
+#[derive(Clone, Debug, Default, uniffi::Record)]
+pub struct MoqAnnounceConfig {
+	/// Literal path prefix beneath the origin.
+	#[uniffi(default = "")]
+	pub prefix: String,
+	/// Pattern relative to `prefix`, or `None` for every path beneath it.
+	#[uniffi(default = None)]
+	pub filter: Option<String>,
+}
+
 /// A path-prefix route: hops and costs for an advertisement.
 ///
 /// Pair one with `MoqBroadcastProducer::announce` for an exact path, or with
@@ -59,18 +70,18 @@ impl TryFrom<MoqRoute> for moq_net::origin::Route {
 
 	fn try_from(route: MoqRoute) -> Result<Self, MoqError> {
 		let cold = route.cold.unwrap_or(route.cost);
-		let mut out = moq_net::origin::Route::default().with_cost((route.cost, cold));
+		let mut hops = moq_net::Hops::new();
 		for id in route.hops {
 			let origin = if id == 0 {
 				moq_net::Hop::UNKNOWN
 			} else {
 				moq_net::Hop::new(id).map_err(|e| MoqError::InvalidRoute(e.to_string()))?
 			};
-			out = out
-				.with_hop(origin)
-				.map_err(|e| MoqError::InvalidRoute(e.to_string()))?;
+			hops.push(origin).map_err(|e| MoqError::InvalidRoute(e.to_string()))?;
 		}
-		Ok(out)
+		Ok(moq_net::origin::Route::default()
+			.with_cost(moq_net::origin::Cost { warm: route.cost, cold })
+			.with_hops(hops))
 	}
 }
 
@@ -135,7 +146,10 @@ impl Announced {
 	async fn next(&mut self) -> Result<Option<Arc<MoqAnnounceUpdate>>, MoqError> {
 		match self.inner.next().await {
 			Some(update) => Ok(Some(Arc::new(MoqAnnounceUpdate {
-				path: update.path.to_string(),
+				prefix: update.prefix.to_string(),
+				captures: update
+					.captures
+					.map(|captures| captures.into_iter().map(|capture| capture.to_string()).collect()),
 				route: update.route.into(),
 				active: update.kind.is_active(),
 			}))),
@@ -164,10 +178,12 @@ impl AnnouncedBroadcast {
 ///
 /// Carries no broadcast: resolve a specific path with
 /// `MoqOriginConsumer::request_broadcast` (after this update proves it is
-/// covered). The application decides which paths name broadcasts.
+/// covered). Its prefix is relative to the origin. The application decides
+/// which paths name broadcasts.
 #[derive(uniffi::Object)]
 pub struct MoqAnnounceUpdate {
-	path: String,
+	prefix: String,
+	captures: Option<Vec<String>>,
 	route: MoqRoute,
 	active: bool,
 }
@@ -190,7 +206,7 @@ impl MoqOriginProducer {
 	}
 
 	fn from_config(config: MoqOriginConfig) -> Self {
-		let mut origin = moq_net::origin::Config::new(moq_net::Hop::random());
+		let mut origin = moq_net::origin::Config::default();
 		if let Some(capacity) = config.cache_capacity_bytes {
 			let cache = moq_net::cache::Config::default()
 				.with_capacity(capacity)
@@ -205,10 +221,9 @@ impl MoqOriginProducer {
 /// Build an origin producer, spawning its driver on the FFI runtime.
 pub(crate) fn spawn(config: moq_net::origin::Config) -> moq_net::origin::Producer {
 	let (producer, driver) = moq_net::origin::Producer::new(config);
-	#[cfg(not(target_arch = "wasm32"))]
-	crate::ffi::spawn(driver.run(moq_tokio::runtime::Runtime::<()>::new()));
-	#[cfg(target_arch = "wasm32")]
-	crate::ffi::spawn(driver.run(crate::runtime::Runtime));
+	crate::ffi::spawn(async move {
+		moq_net::time::run(driver).await;
+	});
 	producer
 }
 
@@ -229,14 +244,14 @@ pub(crate) fn resolve_pair(
 ) -> (moq_net::origin::Producer, moq_net::origin::Producer) {
 	if publish.is_none() && consume.is_none() {
 		// Clones of a Producer share the underlying origin, so this is one origin, not two.
-		let shared = spawn(moq_net::Hop::random().into());
+		let shared = spawn(moq_net::origin::Config::default());
 		return (shared.clone(), shared);
 	}
 
 	let resolve = |origin: Option<&Arc<MoqOriginProducer>>| {
 		origin
 			.map(|o| o.inner().clone())
-			.unwrap_or_else(|| spawn(moq_net::Hop::random().into()))
+			.unwrap_or_else(|| spawn(moq_net::origin::Config::default()))
 	};
 	(resolve(publish), resolve(consume))
 }
@@ -298,10 +313,15 @@ impl MoqOriginProducer {
 
 #[uniffi::export]
 impl MoqOriginConsumer {
-	/// Subscribe to all route announcements under a prefix.
-	pub fn announced(&self, prefix: String) -> Result<Arc<MoqAnnounceConsumer>, MoqError> {
+	/// Subscribe to routes matching a pattern scope; updates stay relative to the origin.
+	pub fn announced(&self, config: MoqAnnounceConfig) -> Result<Arc<MoqAnnounceConsumer>, MoqError> {
 		let _guard = crate::ffi::enter();
-		let origin = self.inner.with_root(prefix).ok_or(MoqError::Unauthorized)?;
+		let filter = match config.filter {
+			Some(filter) => filter.parse::<moq_net::Pattern>()?,
+			None => moq_net::Pattern::all(),
+		};
+		let filter = filter.rooted(&config.prefix)?;
+		let origin = self.inner.scope("", &moq_net::Patterns::from(filter))?;
 		Ok(Arc::new(MoqAnnounceConsumer {
 			task: Task::new(Announced {
 				inner: origin.announced(),
@@ -319,7 +339,8 @@ impl MoqOriginConsumer {
 
 		// Probe the permission eagerly so an unreachable path fails here, rather than
 		// surfacing later as a `Closed` the caller can't tell from the origin ending.
-		self.inner.with_root(&path).ok_or(MoqError::Unauthorized)?;
+		self.inner
+			.scope(&path, &moq_net::Patterns::from(moq_net::Pattern::all()))?;
 
 		Ok(Arc::new(MoqAnnouncedBroadcast {
 			task: Task::new(AnnouncedBroadcast {
@@ -447,9 +468,14 @@ impl MoqAnnounceConsumer {
 
 #[uniffi::export]
 impl MoqAnnounceUpdate {
-	/// The covered prefix, relative to the `announced` call's prefix.
-	pub fn path(&self) -> String {
-		self.path.clone()
+	/// The covered prefix, relative to the origin.
+	pub fn prefix(&self) -> String {
+		self.prefix.clone()
+	}
+
+	/// What each wildcard matched, or `None` when the route only overlaps the scope.
+	pub fn captures(&self) -> Option<Vec<String>> {
+		self.captures.clone()
 	}
 
 	/// The route serving the prefix: its hops and costs.

@@ -60,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
 
 	let track = config.track;
 
-	let origin = moq_tokio::origin::spawn(moq_net::Hop::random());
+	let origin = moq_tokio::origin::spawn();
 
 	match config.role {
 		Command::Publish => {
@@ -101,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
 			let scope =
 				moq_net::Patterns::from(moq_net::Pattern::subtree(path.as_str()).context("invalid broadcast name")?);
 			let consumer = origin
-				.scope(&scope)
+				.scope("", &scope)
 				.context("not allowed to consume broadcast")?
 				.consume();
 			let mut announced = consumer.announced();
@@ -112,14 +112,14 @@ async fn main() -> anyhow::Result<()> {
 				tokio::select! {
 					Some(update) = announced.next() => match update.kind.is_active() {
 						true => {
-							tracing::info!(broadcast = %update.path, "broadcast is online, subscribing to track");
-							let broadcast = consumer.request_broadcast(&update.path).await?;
+							tracing::info!(broadcast = %update.prefix, "broadcast is online, subscribing to track");
+							let broadcast = consumer.request_broadcast(&update.prefix).await?;
 							let track = broadcast
 								.track(&track)?.subscribe(None).await?;
 							clock = Some(Subscriber::new(track));
 						}
 						false => {
-							tracing::warn!(broadcast = %update.path, "broadcast is offline, waiting...");
+							tracing::warn!(broadcast = %update.prefix, "broadcast is offline, waiting...");
 						}
 					},
 					res = reconnect.closed() => return Ok(res?),

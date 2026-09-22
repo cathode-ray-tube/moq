@@ -29,7 +29,7 @@ implement in an afternoon. The wire spec is
 The ALPN picks the protocol family, and a single `SETUP` message from each side
 negotiates the version and capabilities. Neither side waits for the other. The
 Rust and TypeScript stacks currently speak moq-lite 01 through 05 (06 is in
-progress) and moq-transport drafts 14 through 21, and a client offers all of
+progress) and moq-transport drafts 14 through 22, and a client offers all of
 them by default.
 
 ## Discovery
@@ -79,7 +79,7 @@ Patterns never travel as announcements. `origin.dynamic(prefix, route)`
 advertises a prefix: the call claims that `prefix` and every path beneath it
 *can* be served, not that any exist. A route is a capability, not an inventory:
 a subscriber must not treat a prefix as a concrete broadcast name. Use
-`create_broadcast(path)` and `announce(route)` when the path is known; use
+`publish(path, route)` when the path is known; use
 `dynamic` when the set of paths is not, and refuse the requests you will not
 serve. A pattern lives in two places: the token, which scopes what a session
 may publish and subscribe to, and a local filter a consumer applies to the

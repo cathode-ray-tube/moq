@@ -15,12 +15,12 @@
 //! See `test/drill/README.md` for the recipe, the sensitivity proof that each
 //! drill fails when its recovery behavior is removed, and the loom/fuzz cases
 //! covering the primitives underneath.
-#![cfg(all(any(feature = "noq", feature = "quinn"), feature = "websocket"))]
+#![cfg(all(feature = "noq", feature = "websocket"))]
 
 use std::time::Duration;
 
 use moq_relay::{Config, Relay};
-use moq_tokio::moq_net::{self, Hop};
+use moq_tokio::moq_net;
 
 /// Ceiling for anything a drill waits on. Every wait is bounded, so a broken
 /// handoff fails as a timeout with a message instead of hanging the suite.
@@ -54,7 +54,11 @@ impl RelayHost {
 		let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
 		let mut config = Config::default();
-		config.listen.bind = Some(format!("127.0.0.1:{}", requested_port.unwrap_or_default()));
+		config.listen.bind = Some(
+			format!("127.0.0.1:{}", requested_port.unwrap_or_default())
+				.parse()
+				.unwrap(),
+		);
 		config.listen.tls.generate = vec!["localhost".into()];
 		config.auth.public = vec![moq_auth::Pattern::all()];
 
@@ -141,15 +145,15 @@ fn client(url: &url::Url) -> moq_tokio::Client {
 	// busy runner has to stall eight times over before a live session is mistaken
 	// for a dead one.
 	let mut quic = moq_tokio::quic::Config::default();
-	quic.idle_timeout = Duration::from_secs(2).into();
-	quic.keep_alive = Duration::from_millis(250).into();
+	quic.idle_timeout = Duration::from_secs(2);
+	quic.keep_alive = Duration::from_millis(250);
 
 	// Fast enough to keep a relay bounce inside the drill's budget, paced enough
 	// that the loop is still a backoff. `linger` is derived from `timeout`, so
 	// the give-up budget also sets how long a broadcast survives the gap.
-	config.backoff.initial = Duration::from_millis(50).into();
-	config.backoff.max = Duration::from_millis(200).into();
-	config.backoff.timeout = Duration::from_secs(5).into();
+	config.backoff.initial = Duration::from_millis(50);
+	config.backoff.max = Duration::from_millis(200);
+	config.backoff.timeout = Duration::from_secs(5);
 
 	config.init(quic).expect("client init")
 }
@@ -259,7 +263,7 @@ async fn cancel_under_backpressure_releases_the_reader() {
 	let relay = RelayHost::start(None).await;
 	let url = relay.url();
 
-	let publisher = moq_tokio::origin::spawn(Hop::random());
+	let publisher = moq_tokio::origin::spawn();
 	let broadcast = publisher.create_broadcast("live").expect("create broadcast");
 	broadcast.announce(Default::default()).expect("announce broadcast");
 	let mut track = broadcast.create_track(TRACK, None).expect("create track");
@@ -275,7 +279,7 @@ async fn cancel_under_backpressure_releases_the_reader() {
 	.expect("publisher connect timed out")
 	.expect("publisher connect failed");
 
-	let subscriber = moq_tokio::origin::spawn(Hop::random());
+	let subscriber = moq_tokio::origin::spawn();
 	let subscribed = subscriber.consume();
 	let subscribe_session = tokio::time::timeout(
 		TIMEOUT,
@@ -344,7 +348,7 @@ async fn cancel_under_backpressure_releases_the_reader() {
 
 	// ...and the relay survived it: a fresh subscriber still gets served, off the
 	// upstream subscription the cancel left in place.
-	let rejoin = moq_tokio::origin::spawn(Hop::random());
+	let rejoin = moq_tokio::origin::spawn();
 	let rejoined = rejoin.consume();
 	let rejoin_session = tokio::time::timeout(
 		TIMEOUT,
@@ -379,13 +383,13 @@ async fn relay_killed_mid_group_aborts_then_resumes() {
 	let port = relay.port;
 	let url = relay.url();
 
-	let publisher = moq_tokio::origin::spawn(Hop::random());
+	let publisher = moq_tokio::origin::spawn();
 	let broadcast = publisher.create_broadcast("live").expect("create broadcast");
 	broadcast.announce(Default::default()).expect("announce broadcast");
 	let mut track = broadcast.create_track(TRACK, None).expect("create track");
 	let mut publish_loop = client(&url).publish(publisher.consume()).expect("no connect url");
 
-	let subscriber = moq_tokio::origin::spawn(Hop::random());
+	let subscriber = moq_tokio::origin::spawn();
 	let subscribed = subscriber.consume();
 	let mut subscribe_loop = client(&url).consume(subscriber).expect("no connect url");
 
@@ -480,7 +484,7 @@ async fn interrupted_publisher_republishes_new_content() {
 	let relay = RelayHost::start(None).await;
 	let url = relay.url();
 
-	let subscriber = moq_tokio::origin::spawn(Hop::random());
+	let subscriber = moq_tokio::origin::spawn();
 	let subscribed = subscriber.consume();
 	let subscribe_session = tokio::time::timeout(
 		TIMEOUT,
@@ -495,7 +499,7 @@ async fn interrupted_publisher_republishes_new_content() {
 	.expect("subscriber connect failed");
 	let mut announced = subscribed.announced();
 
-	let first = moq_tokio::origin::spawn(Hop::random());
+	let first = moq_tokio::origin::spawn();
 	let broadcast = first.create_broadcast("live").expect("create broadcast");
 	broadcast.announce(Default::default()).expect("announce broadcast");
 	let mut track = broadcast.create_track(TRACK, None).expect("create track");
@@ -534,7 +538,7 @@ async fn interrupted_publisher_republishes_new_content() {
 	println!("fault activated: the interrupted publisher's broadcast was withdrawn");
 
 	// Restore: the same name, a new publisher, different content.
-	let second = moq_tokio::origin::spawn(Hop::random());
+	let second = moq_tokio::origin::spawn();
 	let broadcast = second.create_broadcast("live").expect("re-create broadcast");
 	broadcast.announce(Default::default()).expect("announce broadcast");
 	let mut track = broadcast.create_track(TRACK, None).expect("re-create track");
@@ -574,7 +578,7 @@ async fn expect_announce(announced: &mut moq_net::announce::Consumer, path: &str
 			.await
 			.unwrap_or_else(|_| panic!("{who}: no announcement change within {TIMEOUT:?}"))
 			.unwrap_or_else(|| panic!("{who}: the announcement stream closed"));
-		if update.path.as_str() == path && update.kind.is_active() == want {
+		if update.prefix.as_str() == path && update.kind.is_active() == want {
 			return;
 		}
 	}
@@ -591,7 +595,7 @@ async fn no_publisher_never_delivers() {
 	let relay = RelayHost::start(None).await;
 	let url = relay.url();
 
-	let subscriber = moq_tokio::origin::spawn(Hop::random());
+	let subscriber = moq_tokio::origin::spawn();
 	let subscribed = subscriber.consume();
 	let session = tokio::time::timeout(
 		TIMEOUT,
@@ -611,7 +615,7 @@ async fn no_publisher_never_delivers() {
 
 	let mut announced = subscribed.announced();
 	if let Ok(update) = tokio::time::timeout(quiet, announced.next()).await {
-		let path = update.map(|update| update.path.to_string());
+		let path = update.map(|update| update.prefix.to_string());
 		panic!("the announcement stream reported {path:?} with no publisher");
 	}
 

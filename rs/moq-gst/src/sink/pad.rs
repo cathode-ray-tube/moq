@@ -82,9 +82,7 @@ impl<'a> ProducerOptions<'a> {
 /// would inflate every consumer's playback buffer by an arbitrary amount. Each cue is written and
 /// cut immediately, so the absent field says what is true: flushed as produced.
 struct Text {
-	producer: moq_mux::container::Producer<moq_mux::catalog::hang::Container>,
-	#[allow(dead_code, reason = "held so dropping the pad retires the catalog rendition")]
-	rendition: moq_mux::catalog::TextTrack,
+	producer: moq_mux::container::Producer<moq_mux::catalog::hang::Container, hang::catalog::TextConfig>,
 }
 
 impl Text {
@@ -460,16 +458,13 @@ impl Pad {
 
 		// Go through the reservation like every codec pad, so the first catalog snapshot waits for
 		// this track and dropping the rendition removes it again.
-		let mut rendition = catalog.reserve().text(name)?;
-		rendition.set(config)?;
+		let producer = catalog.reserve().text(
+			producer,
+			moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Data),
+			config,
+		)?;
 
-		Ok(Text {
-			producer: moq_mux::container::Producer::new(
-				producer,
-				moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Data),
-			),
-			rendition,
-		})
+		Ok(Text { producer })
 	}
 
 	/// Reserve a uniquely named track and hand it to the single-codec importer, which accepts the
@@ -775,7 +770,7 @@ mod tests {
 	/// Local producers, no network: a broadcast plus its catalog, exactly what the element holds.
 	fn producers() -> (moq_net::broadcast::Producer, moq_mux::catalog::Producer) {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 		(broadcast, catalog)
 	}
 

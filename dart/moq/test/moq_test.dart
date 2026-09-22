@@ -34,10 +34,10 @@ void main() {
     final track = broadcast.publishTrack(name: 'events', info: null);
     broadcast.announce(route: MoqRoute());
     final announced = await announcement.timeout(timeout);
-    expect(announced.path(), 'live');
+    expect(announced.prefix(), 'live');
 
     final requested = await client
-        .requestBroadcast(announced.path())
+        .requestBroadcast(announced.prefix())
         .timeout(timeout);
     final consumer = await requested
         .subscribeTrack(name: 'events', subscription: null)
@@ -69,18 +69,31 @@ void main() {
     broadcast.publishTrack(name: 'events', info: null);
     broadcast.announce(route: MoqRoute());
 
-    final announced = origin.consume().announced(prefix: '');
+    final announced = origin.consume().announced(config: MoqAnnounceConfig());
     final first = await announced.next().timeout(timeout);
-    expect(first?.path(), 'live');
+    expect(first?.prefix(), 'live');
     expect(first?.active(), isTrue);
 
     broadcast.unannounce();
     final retracted = await announced.next().timeout(timeout);
-    expect(retracted?.path(), 'live');
+    expect(retracted?.prefix(), 'live');
     expect(retracted?.active(), isFalse);
     await origin.consume().requestBroadcast(path: 'live').timeout(timeout);
     announced.cancel();
     announced.dispose();
+  });
+
+  test('announced pattern reports captures', () async {
+    final origin = MoqOriginProducer(config: MoqOriginConfig());
+    final announced = origin.consume().announced(
+      config: MoqAnnounceConfig(prefix: 'room', filter: '*/chat'),
+    );
+    final broadcast = origin.createBroadcast(path: 'room/alice/chat');
+    broadcast.announce(route: MoqRoute());
+
+    final update = await announced.next().timeout(timeout);
+    expect(update?.prefix(), 'room/alice/chat');
+    expect(update?.captures(), ['alice']);
   });
 
   test('dynamic serves a request under a prefix', () async {

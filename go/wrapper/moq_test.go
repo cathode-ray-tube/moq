@@ -307,7 +307,7 @@ func TestLocalPublishConsumeAudio(t *testing.T) {
 	}
 
 	consumer := origin.Consume()
-	announced, err := consumer.Announced("")
+	announced, err := consumer.Announced(moq.AnnounceOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,8 +320,8 @@ func TestLocalPublishConsumeAudio(t *testing.T) {
 	if ann == nil {
 		t.Fatal("expected an announcement")
 	}
-	if ann.Path() != "live" {
-		t.Fatalf("path = %q, want %q", ann.Path(), "live")
+	if ann.Prefix() != "live" {
+		t.Fatalf("prefix = %q, want %q", ann.Prefix(), "live")
 	}
 	if !ann.Active() {
 		t.Fatal("expected an active announcement")
@@ -330,7 +330,7 @@ func TestLocalPublishConsumeAudio(t *testing.T) {
 		t.Fatalf("route hops = %v, want empty for local origin", route.Hops)
 	}
 
-	bc, err := consumer.RequestBroadcast(ctx, ann.Path())
+	bc, err := consumer.RequestBroadcast(ctx, ann.Prefix())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1080,14 +1080,14 @@ func TestAnnounceThenUnannounceIsVisible(t *testing.T) {
 	}
 
 	consumer := origin.Consume()
-	announced, err := consumer.Announced("")
+	announced, err := consumer.Announced(moq.AnnounceOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer announced.Cancel()
 
 	ann, err := announced.Next(ctx)
-	if err != nil || ann == nil || ann.Path() != "live" || !ann.Active() {
+	if err != nil || ann == nil || ann.Prefix() != "live" || !ann.Active() {
 		t.Fatalf("announce: ann=%+v err=%v", ann, err)
 	}
 
@@ -1095,11 +1095,85 @@ func TestAnnounceThenUnannounceIsVisible(t *testing.T) {
 		t.Fatal(err)
 	}
 	ann, err = announced.Next(ctx)
-	if err != nil || ann == nil || ann.Path() != "live" || ann.Active() {
+	if err != nil || ann == nil || ann.Prefix() != "live" || ann.Active() {
 		t.Fatalf("unannounce: ann=%+v err=%v", ann, err)
 	}
 	if _, err := consumer.RequestBroadcast(ctx, "live"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAnnouncedPatternCaptures(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	origin := moq.NewOriginProducer()
+	filter := "*/chat"
+	announced, err := origin.Consume().Announced(moq.AnnounceOptions{Prefix: "room", Filter: &filter})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer announced.Cancel()
+
+	audio, err := origin.CreateBroadcast("room/alice/audio")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := audio.Announce(moq.Route{}); err != nil {
+		t.Fatal(err)
+	}
+	chat, err := origin.CreateBroadcast("room/alice/chat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := chat.Announce(moq.Route{}); err != nil {
+		t.Fatal(err)
+	}
+
+	update, err := announced.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if update == nil || update.Prefix() != "room/alice/chat" {
+		t.Fatalf("update = %+v, want room/alice/chat", update)
+	}
+	captures := update.Captures()
+	if len(captures) != 1 || captures[0] != "alice" {
+		t.Fatalf("captures = %v, want [alice]", captures)
+	}
+}
+
+// An exact filter with no wildcards still reports a full match: captures is
+// empty but not nil, which is what tells it apart from a partial overlap.
+func TestAnnouncedExactFilterCapturesEmpty(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	origin := moq.NewOriginProducer()
+	filter := ""
+	announced, err := origin.Consume().Announced(moq.AnnounceOptions{Prefix: "room/alice/chat", Filter: &filter})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer announced.Cancel()
+
+	chat, err := origin.CreateBroadcast("room/alice/chat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := chat.Announce(moq.Route{}); err != nil {
+		t.Fatal(err)
+	}
+
+	update, err := announced.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if update == nil || update.Prefix() != "room/alice/chat" {
+		t.Fatalf("update = %+v, want room/alice/chat", update)
+	}
+	if captures := update.Captures(); captures == nil || len(captures) != 0 {
+		t.Fatalf("captures = %#v, want a non-nil empty slice", captures)
 	}
 }
 
@@ -1140,4 +1214,3 @@ func TestDynamicServesARequestUnderAPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 }
-

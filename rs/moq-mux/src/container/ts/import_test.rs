@@ -16,11 +16,28 @@ const RECORDING_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30
 /// Decode a whole TS buffer into a fresh broadcast and return the catalog.
 fn import_ts(data: &[u8]) -> crate::catalog::hang::Catalog {
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
-	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 
 	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
 	let buf = BytesMut::from(data);
 	import.decode(&buf).unwrap();
+	import.finish().unwrap();
+
+	catalog.snapshot()
+}
+
+/// Like [`import_ts`], with a catalog that carries the `mpegts` section.
+fn import_ts_ext(data: &[u8]) -> crate::catalog::hang::Catalog<crate::container::ts::Ext> {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default()
+			.with_catalog(crate::catalog::hang::Catalog::<crate::container::ts::Ext>::default()),
+	)
+	.unwrap();
+
+	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
+	import.decode(data).unwrap();
 	import.finish().unwrap();
 
 	catalog.snapshot()
@@ -58,7 +75,7 @@ async fn public_container_preserves_loc_for_ts() {
 	let data = include_bytes!("test_data/bbb.ts");
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 	let reserved = catalog.reserve();
 	let mut import = super::Import::new(broadcast, reserved).with_container(hang::catalog::Container::Loc);
 	import.decode(data).unwrap();
@@ -165,7 +182,7 @@ async fn import_opus_frames() {
 
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
 	import.decode(&BytesMut::from(&data[..])).unwrap();
 	import.finish().unwrap();
@@ -233,6 +250,51 @@ fn import_eac3_catalog() {
 /// document the capture, the audio path is what's under test) and the PMT,
 /// which evidences that the Kyrion itself pairs stream_type 0x81 with the
 /// 'AC-3' registration descriptor, the same announcement our export writes.
+/// `bbb_cbr.ts` is `scte35/bbb5s.ts` remuxed at a constant 400 kb/s (`ffmpeg -i
+/// scte35/bbb5s.ts -t 2.8 -c copy -muxrate 400000 -f mpegts bbb_cbr.ts`): ffmpeg
+/// byte-locks the PCR to the mux rate and fills the rest with null packets, so the
+/// whole-multiplex rate lands in the catalog exactly.
+#[test]
+fn import_records_the_cbr_mux_rate() {
+	let data = include_bytes!("test_data/bbb_cbr.ts");
+	let catalog = import_ts_ext(data);
+
+	let rate = catalog.ext.mpegts.mux_rate.expect("a CBR source records its mux rate");
+	assert!(
+		rate.abs_diff(400_000) * 1000 <= 400_000,
+		"mux rate {rate} is not within 0.1% of 400 kb/s"
+	);
+	let json = serde_json::to_string(&catalog.ext).unwrap();
+	assert!(
+		json.contains("\"muxRate\":"),
+		"the rate rides the mpegts section: {json}"
+	);
+}
+
+/// The Kyrion stamps its clock at half-millisecond granularity and its rate wanders
+/// a percent between half-second samples, which is what a hardware multiplexer's
+/// "constant" looks like; the window still settles on what `tsanalyze` measures.
+#[test]
+fn import_records_a_hardware_mux_rate() {
+	let data = include_bytes!("test_data/scte35/kyrion_dirtystart.ts");
+	let catalog = import_ts_ext(data);
+
+	let rate = catalog.ext.mpegts.mux_rate.expect("a CBR source records its mux rate");
+	assert!(
+		rate.abs_diff(2_573_445) * 100 <= 2_573_445,
+		"mux rate {rate} is not within 1% of what tsanalyze measured"
+	);
+}
+
+/// ffmpeg without `-muxrate` writes no stuffing and its PCR intervals carry whatever
+/// the frames weighed, so no rate is ever stable enough to record.
+#[test]
+fn import_leaves_a_vbr_mux_rate_absent() {
+	let data = include_bytes!("test_data/scte35/bbb5s.ts");
+	let catalog = import_ts_ext(data);
+	assert_eq!(catalog.ext.mpegts.mux_rate, None, "a VBR source records no mux rate");
+}
+
 #[test]
 fn import_kyrion_ac3_mp2_catalog() {
 	let data = include_bytes!("test_data/kyrion_mpeg2av_ac3.ts");
@@ -292,7 +354,7 @@ fn resyncs_across_chunk_boundaries() {
 	misaligned.extend_from_slice(data);
 
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
-	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
 	for chunk in misaligned.chunks(100) {
 		import.decode(&BytesMut::from(chunk)).unwrap();
@@ -319,7 +381,7 @@ async fn import_export_import_roundtrip() {
 	// Import the fixture into a broadcast.
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
 	let buf = BytesMut::from(&data[..]);
 	import.decode(&buf).unwrap();
@@ -369,7 +431,7 @@ async fn survives_midstream_join() {
 
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
 	import
 		.decode(&BytesMut::from(&buf[..]))
@@ -412,9 +474,10 @@ async fn kyrion_dirtystart_extracts_real_cues() {
 	let data = include_bytes!("test_data/scte35/kyrion_dirtystart.ts");
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let catalog = crate::catalog::Producer::with_catalog(
+	let catalog = crate::catalog::Producer::new(
 		&mut broadcast,
-		crate::catalog::hang::Catalog::<crate::container::ts::catalog::Ext>::default(),
+		crate::catalog::Config::default()
+			.with_catalog(crate::catalog::hang::Catalog::<crate::container::ts::catalog::Ext>::default()),
 	)
 	.unwrap();
 	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
@@ -428,6 +491,7 @@ async fn kyrion_dirtystart_extracts_real_cues() {
 	// Select the SCTE-35 stream by its verbatim stream_type; media tracks also appear
 	// in mpegts.tracks now (with their PID + descriptors).
 	let name = snap
+		.ext
 		.mpegts
 		.tracks
 		.iter()
@@ -472,7 +536,7 @@ fn import_handles_unaligned_chunks() {
 	let data = include_bytes!("test_data/bbb.ts");
 
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
-	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
 
 	for chunk in data.chunks(100) {

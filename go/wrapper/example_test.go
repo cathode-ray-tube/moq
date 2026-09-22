@@ -19,7 +19,7 @@ func ExampleClient_Announced() {
 	}
 	defer client.Close()
 
-	announced, err := client.Announced("demos/")
+	announced, err := client.Announced(moq.AnnounceOptions{Prefix: "demos/"})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -35,7 +35,7 @@ func ExampleClient_Announced() {
 		if !ann.Active() {
 			continue
 		}
-		fmt.Println("broadcast:", ann.Path())
+		fmt.Println("broadcast:", ann.Prefix())
 	}
 }
 

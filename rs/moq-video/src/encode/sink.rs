@@ -271,6 +271,11 @@ mod inline {
 	/// An [`Encoder`] driven inline on the calling thread (see the module docs).
 	pub struct Inner(Encoder);
 
+	// SAFETY: VideoToolbox and Core Foundation handles may move between threads
+	// when calls remain serialized. `Sink` provides that serialization; the
+	// synchronous `Encoder` remains thread-bound.
+	unsafe impl Send for Inner {}
+
 	impl Inner {
 		pub async fn open(config: &Config) -> Result<Self, Error> {
 			Ok(Self(Encoder::new(config)?))
@@ -320,7 +325,8 @@ mod tests {
 	/// A mid-gray frame at the probe backend's resolution, stamped as the
 	/// `index`th frame of a 30fps stream.
 	fn gray(index: u64) -> Frame {
-		let i420 = I420::new(320, 240, vec![0x80u8; I420::len(320, 240)]).unwrap();
+		let size = crate::Size::new(320, 240);
+		let i420 = I420::new(size, vec![0x80u8; I420::len(size).unwrap()]).unwrap();
 		Frame::new(
 			Surface::I420(i420),
 			moq_net::Timestamp::from_micros(index * 33_333).unwrap(),
@@ -328,7 +334,7 @@ mod tests {
 	}
 
 	fn probe_config() -> Config {
-		let mut config = Config::new(320, 240, 30);
+		let mut config = Config::new(320, 240, crate::Rate::new(30, 1).unwrap());
 		config.codec = Codec::H264;
 		config.kind = Kind::Named(probe::NAME.into());
 		config

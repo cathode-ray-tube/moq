@@ -2,10 +2,12 @@
 //! DASH over HTTP from MoQ broadcasts (export), fetching media groups on demand.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use anyhow::Context;
 use axum::http::Method;
 use hang::moq_net;
+use url::Url;
 
 use crate::moq::{ImportTarget, notify_ready};
 
@@ -33,7 +35,7 @@ pub struct ExportArgs {
 	/// Minimum media listed in each rendition's playlist window. Keep it within the
 	/// relay's group-cache retention, since segments are fetched from there on request.
 	#[usage(long, default = "16s")]
-	pub window: moq_tokio::cli::Duration,
+	pub window: crate::duration::Duration,
 
 	/// Browser CORS policy for the HLS listener.
 	#[usage(flatten)]
@@ -55,11 +57,12 @@ pub async fn import(target: ImportTarget, playlist: String) -> anyhow::Result<()
 	let config = moq_mux::catalog::Config::default()
 		.with_max_age(max_age)
 		.with_bandwidth(bandwidth);
-	let catalog = moq_mux::catalog::Producer::with_config(&mut producer, config)?;
+	let catalog = moq_mux::catalog::Producer::new(&mut producer, config)?;
 	producer
 		.announce(Default::default())
 		.context("failed to announce broadcast")?;
 
+	let playlist = playlist_url(&playlist)?;
 	let mut importer = moq_hls::import::Import::new(producer, catalog, moq_hls::import::Config::new(playlist))?;
 
 	tracing::info!(%name, "importing HLS");
@@ -67,6 +70,20 @@ pub async fn import(target: ImportTarget, playlist: String) -> anyhow::Result<()
 	importer.init().await?;
 	notify_ready();
 	Ok(importer.run().await?)
+}
+
+fn playlist_url(playlist: &str) -> anyhow::Result<Url> {
+	if playlist.starts_with("http://") || playlist.starts_with("https://") {
+		return Url::parse(playlist).context("invalid HLS playlist URL");
+	}
+
+	let path = PathBuf::from(playlist);
+	let absolute = if path.is_absolute() {
+		path
+	} else {
+		std::env::current_dir()?.join(path)
+	};
+	Url::from_file_path(&absolute).map_err(|_| anyhow::anyhow!("invalid HLS playlist path: {}", absolute.display()))
 }
 
 /// Serve HLS and DASH over HTTP for the single broadcast `name` (reached at
@@ -77,7 +94,7 @@ pub async fn export(origin: moq_net::origin::Consumer, args: ExportArgs, name: S
 		moq_net::Pattern::subtree(&name).with_context(|| format!("invalid broadcast name `{name}`"))?,
 	);
 	let scoped = origin
-		.scope(&scope)
+		.scope("", &scope)
 		.with_context(|| format!("failed to scope origin to broadcast `{name}`"))?;
 
 	let mut config = moq_hls::export::Config::default();

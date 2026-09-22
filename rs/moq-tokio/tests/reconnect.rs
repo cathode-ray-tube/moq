@@ -9,7 +9,7 @@
 use std::net::TcpListener;
 use std::time::Duration;
 
-use moq_tokio::moq_net::{self, Hop};
+use moq_tokio::moq_net;
 
 /// A client whose reconnect loop escalates fast enough to assert on inside a test.
 fn client(backoff: moq_tokio::Backoff) -> moq_tokio::Client {
@@ -23,9 +23,9 @@ fn client(backoff: moq_tokio::Backoff) -> moq_tokio::Client {
 #[tokio::test]
 async fn a_transient_failure_retries_until_the_budget_runs_out() {
 	let mut backoff = moq_tokio::Backoff::default();
-	backoff.initial = Duration::from_millis(20).into();
-	backoff.max = Duration::from_millis(40).into();
-	backoff.timeout = Duration::from_millis(200).into();
+	backoff.initial = Duration::from_millis(20);
+	backoff.max = Duration::from_millis(40);
+	backoff.timeout = Duration::from_millis(200);
 
 	// Nothing listens on port 1, so every attempt is refused: transient as far as this layer knows.
 	let url: url::Url = "tcp://127.0.0.1:1".parse().expect("failed to parse url");
@@ -129,7 +129,7 @@ async fn spawn_server() -> (
 		let (accepted, sessions) = tokio::sync::mpsc::unbounded_channel();
 		let handle = tokio::spawn(async move {
 			while let Some(request) = server.accept().await {
-				let origin = moq_tokio::origin::spawn(Hop::random());
+				let origin = moq_tokio::origin::spawn();
 				match request.with_publisher(&origin).ok().await {
 					Ok(session) => {
 						let _ = accepted.send(session);
@@ -148,9 +148,9 @@ async fn spawn_server() -> (
 /// server inside the test's patience.
 fn quick_client(redirect: moq_tokio::Redirect) -> moq_tokio::Client {
 	let mut config = moq_tokio::connect::Config::default();
-	config.backoff.initial = Duration::from_millis(20).into();
-	config.backoff.max = Duration::from_millis(40).into();
-	config.backoff.timeout = Duration::ZERO.into();
+	config.backoff.initial = Duration::from_millis(20);
+	config.backoff.max = Duration::from_millis(40);
+	config.backoff.timeout = Duration::ZERO;
 	config.goaway.redirect = redirect;
 	config.init(Default::default()).expect("failed to init client")
 }

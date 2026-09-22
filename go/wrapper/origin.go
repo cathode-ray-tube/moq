@@ -119,9 +119,20 @@ type OriginConsumer struct {
 	inner *ffi.MoqOriginConsumer
 }
 
-// Announced streams route announcements whose prefix starts with prefix.
-func (o *OriginConsumer) Announced(prefix string) (*AnnounceConsumer, error) {
-	inner, err := o.inner.Announced(prefix)
+// AnnounceOptions scopes an announcement stream.
+type AnnounceOptions struct {
+	// Prefix is a literal path root beneath the origin.
+	Prefix string
+	// Filter is a pattern relative to Prefix. Nil matches every path beneath it.
+	Filter *string
+}
+
+// Announced streams routes under a literal prefix matching an optional pattern filter.
+func (o *OriginConsumer) Announced(options AnnounceOptions) (*AnnounceConsumer, error) {
+	inner, err := o.inner.Announced(ffi.MoqAnnounceConfig{
+		Prefix: options.Prefix,
+		Filter: options.Filter,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -152,20 +163,32 @@ func (o *OriginConsumer) RequestBroadcast(ctx context.Context, path string) (*Br
 }
 
 // AnnounceUpdate is a route announcement or retraction. A route claims that
-// Path and every path beneath it can be served; it carries no broadcast. Resolve a specific
+// Prefix and every path beneath it can be served; it carries no broadcast. Resolve a specific
 // path with [OriginConsumer.RequestBroadcast]. By convention a publisher
 // announces each broadcast's exact path.
 type AnnounceUpdate struct {
 	inner *ffi.MoqAnnounceUpdate
 }
 
-// Path is the prefix the route covers, relative to the announced prefix.
-func (a *AnnounceUpdate) Path() string {
-	return a.inner.Path()
+// Prefix is the covered prefix, relative to the origin.
+func (a *AnnounceUpdate) Prefix() string {
+	return a.inner.Prefix()
+}
+
+// Captures reports what each filter wildcard matched. Nil means the route only
+// overlaps the scope without pinning every wildcard.
+func (a *AnnounceUpdate) Captures() []string {
+	captures := a.inner.Captures()
+	if captures == nil {
+		return nil
+	}
+	result := make([]string, len(*captures))
+	copy(result, *captures)
+	return result
 }
 
 // Active reports whether the route is active (true) or was retracted (false).
-// A repeated active announcement for the same path is a metadata update.
+// A repeated active announcement for the same prefix is a metadata update.
 func (a *AnnounceUpdate) Active() bool {
 	return a.inner.Active()
 }

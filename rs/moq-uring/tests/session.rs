@@ -5,18 +5,12 @@
 //! `moq_net::Server::accept_lite` / `Client::connect_lite`, with a broadcast,
 //! a track, and a frame flowing through the model.
 //!
-//! The origin drivers demand `Send` timers (`origin::Driver::run` erases them
-//! into the model's shared state), which the worker's `!Send` handle cannot
-//! provide yet, so they run on a tokio thread here: the model is `Send + Sync`
-//! by design, and this mirrors the relay topology where a main runtime owns
-//! the origins while workers run sessions.
-//!
-//! Kernel-gated: skips loudly below the Linux 6.12 floor (GitHub-hosted CI),
-//! and runs everywhere else.
+//! Origin drivers run through Tokio's explicit-time adapter while session
+//! drivers use the worker's clock and timer.
 
-#![cfg(all(target_os = "linux", any(feature = "noq", feature = "quiche", feature = "quinn")))]
+#![cfg(all(target_os = "linux", feature = "noq"))]
 
-#[path = "support/quiche.rs"]
+#[path = "support.rs"]
 mod support;
 
 use std::net::UdpSocket;
@@ -44,18 +38,15 @@ fn lite_session_over_the_worker() {
 	let handle = worker.handle();
 
 	// The model and its origins, driven on a tokio thread (see module docs).
-	let (pub_origin, pub_driver) = origin::Producer::new(origin::Config::new(moq_net::Hop::random()));
-	let (sub_origin, sub_driver) = origin::Producer::new(origin::Config::new(moq_net::Hop::random()));
+	let (pub_origin, pub_driver) = origin::Producer::new(origin::Config::default());
+	let (sub_origin, sub_driver) = origin::Producer::new(origin::Config::default());
 	let origins = std::thread::spawn(move || {
 		let rt = tokio::runtime::Builder::new_current_thread()
 			.enable_time()
 			.build()
 			.expect("tokio runtime");
 		rt.block_on(async move {
-			tokio::join!(
-				pub_driver.run(support::TokioTimers),
-				sub_driver.run(support::TokioTimers)
-			);
+			tokio::join!(moq_net::time::run(pub_driver), moq_net::time::run(sub_driver));
 		});
 	});
 
@@ -92,11 +83,12 @@ fn lite_session_over_the_worker() {
 		let conn = quic::server::accept(&server_handle, server_sock, &server_config)
 			.await
 			.expect("quic accept");
-		let session = moq_net::Server::new()
+		let (session, driver) = moq_net::Server::new()
 			.with_publisher(&pub_origin)
-			.accept_lite(server_handle.clone(), quic::web::Session::raw(conn))
+			.accept_lite(std::time::Instant::now(), quic::web::Session::raw(conn))
 			.await
 			.expect("accept_lite");
+		let _ = server_handle.run(driver).await;
 		// Serve until the client walks away.
 		session.closed().await;
 	});
@@ -113,11 +105,15 @@ fn lite_session_over_the_worker() {
 				"negotiated ALPN"
 			);
 
-			let session = moq_net::Client::new()
+			let (session, driver) = moq_net::Client::new()
 				.with_subscriber(sub.clone())
-				.connect_lite(handle.clone(), quic::web::Session::raw(conn))
+				.connect_lite(std::time::Instant::now(), quic::web::Session::raw(conn))
 				.await
 				.expect("connect_lite");
+			let task_handle = handle.clone();
+			handle.spawn(async move {
+				let _ = task_handle.run(driver).await;
+			});
 
 			let bc = {
 				let consumer = sub.consume();
@@ -161,9 +157,9 @@ fn two_lite_sessions_share_the_server_socket() {
 	let Some(mut worker) = worker() else { return };
 	let handle = worker.handle();
 
-	let (pub_origin, pub_driver) = origin::Producer::new(origin::Config::new(moq_net::Hop::random()));
-	let (sub_a, sub_a_driver) = origin::Producer::new(origin::Config::new(moq_net::Hop::random()));
-	let (sub_b, sub_b_driver) = origin::Producer::new(origin::Config::new(moq_net::Hop::random()));
+	let (pub_origin, pub_driver) = origin::Producer::new(origin::Config::default());
+	let (sub_a, sub_a_driver) = origin::Producer::new(origin::Config::default());
+	let (sub_b, sub_b_driver) = origin::Producer::new(origin::Config::default());
 	let origins = std::thread::spawn(move || {
 		let rt = tokio::runtime::Builder::new_current_thread()
 			.enable_time()
@@ -171,9 +167,9 @@ fn two_lite_sessions_share_the_server_socket() {
 			.expect("tokio runtime");
 		rt.block_on(async move {
 			tokio::join!(
-				pub_driver.run(support::TokioTimers),
-				sub_a_driver.run(support::TokioTimers),
-				sub_b_driver.run(support::TokioTimers),
+				moq_net::time::run(pub_driver),
+				moq_net::time::run(sub_a_driver),
+				moq_net::time::run(sub_b_driver),
 			);
 		});
 	});
@@ -209,11 +205,12 @@ fn two_lite_sessions_share_the_server_socket() {
 			let pub_origin = pub_origin.clone();
 			let session_handle = server_handle.clone();
 			server_handle.spawn(async move {
-				let session = moq_net::Server::new()
+				let (session, driver) = moq_net::Server::new()
 					.with_publisher(&pub_origin)
-					.accept_lite(session_handle, quic::web::Session::raw(conn))
+					.accept_lite(std::time::Instant::now(), quic::web::Session::raw(conn))
 					.await
 					.expect("accept_lite");
+				let _ = session_handle.run(driver).await;
 				session.closed().await;
 			});
 		}
@@ -233,11 +230,15 @@ fn two_lite_sessions_share_the_server_socket() {
 				let conn = quic::client::connect(&handle, client_sock, &dial)
 					.await
 					.expect("quic connect");
-				let session = moq_net::Client::new()
+				let (session, driver) = moq_net::Client::new()
 					.with_subscriber(sub.clone())
-					.connect_lite(handle.clone(), quic::web::Session::raw(conn))
+					.connect_lite(std::time::Instant::now(), quic::web::Session::raw(conn))
 					.await
 					.expect("connect_lite");
+				let task_handle = handle.clone();
+				handle.spawn(async move {
+					let _ = task_handle.run(driver).await;
+				});
 
 				let bc = {
 					let consumer = sub.consume();
@@ -272,7 +273,7 @@ fn two_lite_sessions_share_the_server_socket() {
 }
 
 /// The client verifies for real, trusting only the certificate the server
-/// presents: nothing handshakes unless the configured roots reach quiche.
+/// presents: nothing handshakes unless the configured roots reach noq.
 #[test]
 fn configured_roots_verify_the_server() {
 	let Some(mut worker) = worker() else { return };

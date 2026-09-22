@@ -46,30 +46,23 @@
 //! gives another writer that contributes to the same shared state. Closing the
 //! last producer signals consumers that no more updates are coming.
 //!
-//! ## Async
-//! This library is async-first, but it never spawns onto a global executor and
-//! never reaches for ambient state. [`Client::connect`] and [`Server::accept`]
-//! take a [`Runtime`], which supplies the two things a session cannot do alone:
-//! run its protocol [`runtime::Machine`] to completion and arm its timers. The
-//! machine holds no session handle, so the transport still closes when the last
-//! [`Session`] clone drops (or on [`Session::abort`]), which in turn finishes
-//! the machine. Each transport ships its runtime (`moq-tokio`, `moq-wasm`, a
-//! thread-per-core io_uring runtime), and `runtime::Test` is the
-//! deterministic one for tests; see the [`runtime`] module.
+//! ## Driving and time
+//! This library never spawns tasks or reads the clock. [`Client::connect`] and
+//! [`Server::accept`] take an initial [`time::Instant`] and return
+//! `(Session, Driver)`. Poll the [`Driver`] with the current instant and a
+//! [`kio::Waiter`], then wake on external activity or at the deadline it
+//! returns; [`time::run`] does exactly that on tokio or the browser. The last
+//! [`Session`] drop requests closure; dropping the driver cancels it.
 //!
-//! Origins follow the caller-driven pattern: [`origin::Producer::new`] returns a
-//! `(Producer, Driver)` pair, [`origin::Driver::run`] takes the [`Timers`] the
-//! origin's deadlines arm against, and the returned [`origin::Run`] future runs
-//! the lifecycle work (route changes, track serving, teardown). Native tokio
-//! applications can use `moq_tokio::origin::spawn` instead of running the
-//! driver by hand.
+//! [`origin::Producer::new`] also returns a producer and driver. Its driver runs
+//! route changes, serving, linger, teardown, and the origin's cache expiration.
+//! Standalone caches expose [`cache::Pool::gc`]. Frame read/write methods
+//! clear their expiration timestamp for the next cleanup pass. Datagrams use a bounded
+//! FIFO; model read/write APIs take no wall-clock time.
 //!
-//! The crate has no tokio dependency: every future is built on [`kio`]
-//! (plain [`std::task::Waker`] plumbing) and `futures`, so any executor can poll
-//! them, and the `poll_xxx` counterparts can be stepped synchronously with a
-//! [`kio::Waiter`]. Purely model-layer methods (tracks, groups, frames,
-//! origins) never arm a timer and need no [`Runtime`] at all; they read the
-//! crate's ambient clock for passive stamps (arrival times, cache ticks).
+//! Both drivers implement [`time::Driver`]. `moq-uring` drives thread-local
+//! transports on its own timer heap. Tests advance time by supplying a later
+//! instant.
 
 #![warn(missing_docs)]
 // The browser transport is `!Send`, so on wasm the shared state behind these `Arc`s is
@@ -79,6 +72,7 @@
 
 mod client;
 mod coding;
+mod driver;
 mod error;
 pub mod goaway;
 // Not part of the public API: compiled only for the crate's own tests and for the
@@ -95,22 +89,21 @@ mod setup;
 mod util;
 mod version;
 
-pub mod runtime;
+mod runtime;
 pub mod server;
 pub mod session;
 pub mod stats;
+pub mod time;
 pub mod transport;
 
 pub use client::*;
 pub use coding::{BoundsExceeded, DecodeError, EncodeError, VarInt};
+pub use driver::Driver;
 pub use error::*;
 /// The session direction a client advertises in its SETUP (moq-lite-05+).
 pub use lite::Role;
 pub use model::*;
-pub use path::{
-	AsPath, InvalidPattern, Path, PathOwned, PathPrefixes, PathRelative, PathRelativeOwned, Pattern, Patterns,
-};
-pub use runtime::{Runtime, Timers};
+pub use path::{AsPath, InvalidPattern, Path, PathOwned, Pattern, Patterns};
 pub use server::Server;
 pub use session::Session;
 pub use version::*;

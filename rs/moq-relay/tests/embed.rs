@@ -15,7 +15,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::time::Duration;
 
 use moq_relay::{Config, Relay};
-use moq_tokio::moq_net::{self, Hop};
+use moq_tokio::moq_net;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -108,12 +108,12 @@ async fn embed_and_stop(mut config: Config) {
 
 	// No drain window: the sessions are already gone by the time the owner
 	// stops, and the test should not wait out the default.
-	config.drain_timeout = Duration::ZERO.into();
+	config.drain_timeout = Duration::ZERO;
 	let http = config.web.http.listen.expect("http listener configured");
 	let relay = Relay::load(config.clone()).await.expect("load relay");
 	let quic = relay.addr().expect("quic listener bound");
 	// Pin the replacement to the same ports, including a `:0` first bind.
-	config.listen.bind = Some(quic.to_string());
+	config.listen.bind = Some(moq_tokio::listen::Bind::Addr(quic));
 
 	// The application handles: in-process workers publish into the origin the
 	// QUIC sessions see, and the trigger stops the owner from any task. Both
@@ -147,7 +147,7 @@ async fn embed_and_stop(mut config: Config) {
 	group.finish().expect("finish group");
 
 	let url: url::Url = format!("https://{quic}/").parse().expect("parse url");
-	let subscriber_origin = moq_tokio::origin::spawn(Hop::random());
+	let subscriber_origin = moq_tokio::origin::spawn();
 	let consumer = subscriber_origin.consume();
 	let mut announced = consumer.announced();
 	let subscriber = tokio::time::timeout(
@@ -166,7 +166,7 @@ async fn embed_and_stop(mut config: Config) {
 		.await
 		.expect("announcement timeout")
 		.expect("origin closed");
-	assert_eq!(update.path.as_str(), "test");
+	assert_eq!(update.prefix.as_str(), "test");
 	assert!(update.kind.is_active(), "expected announce, got retraction");
 	let announced = tokio::time::timeout(TIMEOUT, consumer.request_broadcast("test"))
 		.await
@@ -216,7 +216,7 @@ async fn embed_and_stop(mut config: Config) {
 
 fn http_and_quic(cert: &std::path::Path, key: &std::path::Path, quic_bind: String) -> Config {
 	let mut config = Config::default();
-	config.listen.bind = Some(quic_bind);
+	config.listen.bind = Some(quic_bind.parse().unwrap());
 	config.listen.tls.cert = vec![cert.to_path_buf()];
 	config.listen.tls.key = vec![key.to_path_buf()];
 	config.web.http.listen = Some(format!("127.0.0.1:{}", free_tcp_port()).parse().expect("parse http"));

@@ -13,7 +13,7 @@
 
 #![cfg(target_os = "linux")]
 
-#[path = "support/quiche.rs"]
+#[path = "support.rs"]
 mod support;
 
 use std::net::UdpSocket;
@@ -60,7 +60,13 @@ fn a_send_staged_on_the_way_out_still_goes() {
 		.block_on(async {
 			let mut tx = sock.acquire().await.expect("acquire");
 			tx[..3].copy_from_slice(b"bye");
-			tx.send(3, peer_addr, 3).expect("send");
+			tx.send(udp::Transmit {
+				to: peer_addr,
+				len: 3,
+				segment: 3,
+				ecn: None,
+			})
+			.expect("send");
 		})
 		.expect("worker");
 	drop(sock);

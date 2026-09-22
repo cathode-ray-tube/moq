@@ -103,7 +103,7 @@ impl Peer {
 	}
 
 	/// What this relay declares in SETUP as its own price toward the peer.
-	/// Defaults to [`Self::cost`]; anything else is rejected until m2.
+	/// Defaults to [`Self::cost`]; anything else is rejected for now.
 	pub fn egress(&self) -> Option<u64> {
 		self.egress
 	}
@@ -777,6 +777,10 @@ pub struct Config {
 	pub tier: Option<String>,
 	/// Released spelling, kept so [`Self::deprecated`] can name that linger is gone.
 	#[doc(hidden)]
+	#[usage(skip)]
+	#[serde(with = "crate::duration::serde_option")]
+	pub linger: Option<std::time::Duration>,
+
 	#[usage(
 		name = "cluster-linger",
 		long = "cluster-linger",
@@ -784,14 +788,15 @@ pub struct Config {
 		setting = "cluster.linger",
 		hide = true
 	)]
-	pub linger: Option<moq_tokio::cli::Duration>,
+	#[serde(default, rename = "__cli_linger", skip_serializing_if = "Option::is_none")]
+	linger_arg: Option<crate::duration::Duration>,
 }
 
 impl Config {
 	/// Released spellings this config was parsed from, each paired with what replaced it.
-	pub fn deprecated(&self) -> moq_tokio::Deprecated {
-		let mut found = moq_tokio::Deprecated::default();
-		if self.linger.is_some() {
+	pub fn deprecated(&self) -> moq_tokio::cli::Deprecated {
+		let mut found = moq_tokio::cli::Deprecated::default();
+		if self.linger.is_some() || self.linger_arg.is_some() {
 			found.changed(
 				"--cluster-linger",
 				Some("MOQ_CLUSTER_LINGER"),
@@ -1101,9 +1106,9 @@ impl Cluster {
 			origin_config.pool = cache.pool;
 			origin_config.cache_duration = cache.duration;
 		}
-		let origin = moq_tokio::origin::spawn(origin_config);
+		let origin = moq_tokio::origin::spawn_config(origin_config);
 		let nodes = crate::nodes::Nodes::new(origin.clone());
-		tracing::info!(hop_id = %origin.id(), configured = config.id.is_some(), "cluster initialized");
+		tracing::info!(hop_id = %origin.hop(), configured = config.id.is_some(), "cluster initialized");
 		Ok(Cluster {
 			config,
 			client: None,
@@ -1194,12 +1199,12 @@ impl Cluster {
 	/// Passed by reference to [`moq_net::Server::with_publisher`] (or the
 	/// equivalent per-request setter), which derives the read handle.
 	pub fn subscriber(&self, token: &auth::Token) -> Option<origin::Producer> {
-		self.origin.with_root(&token.root)?.scope(&token.subscribe)
+		self.origin.scope(&token.root, &token.subscribe).ok()
 	}
 
 	/// Returns an [`origin::Producer`] scoped to this session's publish permissions.
 	pub fn publisher(&self, token: &auth::Token) -> Option<origin::Producer> {
-		self.origin.with_root(&token.root)?.scope(&token.publish)
+		self.origin.scope(&token.root, &token.publish).ok()
 	}
 
 	/// Resolve whether gossip is on and which URL this relay advertises, from
@@ -1556,7 +1561,11 @@ impl Cluster {
 	/// unannounce-then-announce within sub-milliseconds, which clears the
 	/// pending-cleanup timestamp long before the sweep fires.
 	async fn run_discovery(self, self_url: String, token: String, dialed: DialMap) {
-		let Some(consumer) = self.origin.consume().with_root(MESH_PREFIX) else {
+		let Ok(consumer) = self
+			.origin
+			.consume()
+			.scope(MESH_PREFIX, &moq_net::Patterns::from(moq_net::Pattern::all()))
+		else {
 			tracing::warn!("could not scope cluster origin to {MESH_PREFIX}; discovery disabled");
 			return;
 		};
@@ -1572,7 +1581,7 @@ impl Cluster {
 			tokio::select! {
 				ann = announced.next() => {
 					let Some(update) = ann else { return; };
-					let relative = update.path;
+					let relative = update.prefix;
 					// The address to dial, which keeps its query: `run_remote` reads
 					// `?cost=` and `?jwt=` off it. The key is only its identity.
 					let peer = advertised_node_url(relative.as_str());
@@ -1911,8 +1920,7 @@ impl Cluster {
 		// Cluster dials use their configured stats tier. Cluster peers carry no auth
 		// root, so presence is keyed under the empty root within the cluster tier.
 		let mut client = client
-			.with_publisher(&self.origin)
-			.with_subscriber(self.origin.clone())
+			.with_origin(self.origin.clone())
 			.with_stats(self.stats.tier(self.cluster_tier()).session(""));
 		if let Some(cost) = cost {
 			client = client.with_cost(cost);
@@ -1951,7 +1959,7 @@ impl Cluster {
 			.connect
 			.clone()
 			.context("internal: LAN dial without Cluster::with_connect")?;
-		connect.backoff.timeout = std::time::Duration::ZERO.into();
+		connect.backoff.timeout = std::time::Duration::ZERO;
 		connect.once = Some(false);
 		let mut bind = connect.resolve().bind;
 		bind.set_port(0);
@@ -1977,8 +1985,7 @@ impl Cluster {
 		let addrs = moq_tokio::Addrs::collect(target.addrs()).context("peer advertised no reachable address")?;
 		let mut client = self
 			.lan_client(target.fingerprint.as_deref())?
-			.with_publisher(&self.origin)
-			.with_subscriber(self.origin.clone());
+			.with_origin(self.origin.clone());
 		if let Some(cost) = target.cost {
 			client = client.with_cost(cost);
 		}
@@ -2880,7 +2887,7 @@ mod tests {
 			..Default::default()
 		})
 		.expect("valid id");
-		assert_eq!(cluster.origin.id(), 42);
+		assert_eq!(cluster.origin.hop().id(), 42);
 	}
 
 	/// Cache settings land on the one origin serving, node discovery, and stats
@@ -2888,12 +2895,9 @@ mod tests {
 	#[tokio::test]
 	async fn constructed_origin_keeps_cache_and_handles() {
 		let duration = Duration::from_secs(5);
-		let cache = crate::cache::Config {
-			duration: Some(duration.into()),
-			..Default::default()
-		}
-		.init()
-		.expect("cache");
+		let mut cache = crate::cache::Config::default();
+		cache.duration = Some(duration);
+		let cache = cache.init().expect("cache");
 		let pool = cache.pool.clone();
 
 		let cluster = Cluster::new(
@@ -2906,7 +2910,7 @@ mod tests {
 		.expect("cluster");
 
 		let origin = cluster.origin.clone();
-		assert_eq!(origin.id(), 42);
+		assert_eq!(origin.hop().id(), 42);
 		assert_eq!(origin.config().cache_duration, duration);
 		assert_eq!(origin.config().pool.expiry(), Some(duration));
 
@@ -2918,7 +2922,7 @@ mod tests {
 		.build(origin.clone());
 		let cluster = cluster.with_stats(stats);
 
-		assert_eq!(cluster.origin.id(), origin.id());
+		assert_eq!(cluster.origin.hop().id(), origin.hop().id());
 		assert_eq!(cluster.origin.config().cache_duration, duration);
 		assert_eq!(cluster.origin.config().pool.expiry(), Some(duration));
 
@@ -2937,7 +2941,7 @@ mod tests {
 		let path = Path::new(MESH_PREFIX).join("https://peer.example/");
 		let mut announced = consumer
 			.clone()
-			.with_root(MESH_PREFIX)
+			.scope(MESH_PREFIX, &moq_net::Patterns::from(moq_net::Pattern::all()))
 			.expect("mesh prefix")
 			.announced();
 		let registration = origin.create_broadcast(&path).expect("node advertise");
@@ -3000,7 +3004,7 @@ mod tests {
 
 		// The self-registration route must be visible on the origin.
 		let update = watcher.try_next().expect("self-registration must be published");
-		assert_eq!(update.path.as_str(), ".internal/origins/rendezvous.example.com:4443");
+		assert_eq!(update.prefix.as_str(), ".internal/origins/rendezvous.example.com:4443");
 		assert!(update.kind.is_active());
 
 		// run() must NOT have returned: dropping the broadcast (via run returning)
@@ -3112,7 +3116,7 @@ mod tests {
 	#[test]
 	fn released_cluster_spellings_are_reported_not_applied() {
 		let config = Config {
-			linger: Some(std::time::Duration::from_secs(5).into()),
+			linger: Some(std::time::Duration::from_secs(5)),
 			connect: vec![Peer::new("root.example.com:4443")],
 			..Default::default()
 		};
@@ -3528,7 +3532,7 @@ mod tests {
 	#[tokio::test]
 	async fn lan_cluster_path_carries_broadcasts_both_ways() {
 		const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-		let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+		let _ = moq_tokio::crypto::install_default();
 
 		let node = new_cluster(Config::default()).expect("node cluster");
 		let fingerprint = new_cluster(Config::default()).expect("fingerprint cluster");
@@ -3537,7 +3541,7 @@ mod tests {
 		_from_node.announce(Default::default()).expect("announce");
 
 		let mut listen = moq_tokio::listen::Config::default();
-		listen.bind = Some("127.0.0.1:0".to_string());
+		listen.bind = Some("127.0.0.1:0".parse().unwrap());
 		listen.tls.generate = vec!["moq-cluster-lan".to_string()];
 		let server = listen.init(Default::default()).expect("bind");
 		let port = server.local_addr().expect("local addr").port();
@@ -3584,7 +3588,7 @@ mod tests {
 			.await
 			.expect("timed out waiting for from-node")
 			.expect("origin closed");
-		assert_eq!(update.path.as_str(), "from-node");
+		assert_eq!(update.prefix.as_str(), "from-node");
 
 		let _from_fp = fingerprint.origin.create_broadcast("from-fingerprint").expect("create");
 		_from_fp.announce(Default::default()).expect("announce");
@@ -3594,7 +3598,7 @@ mod tests {
 				.await
 				.expect("timed out waiting for from-fingerprint")
 				.expect("origin closed");
-			if update.path.as_str() == "from-fingerprint" {
+			if update.prefix.as_str() == "from-fingerprint" {
 				break;
 			}
 		}

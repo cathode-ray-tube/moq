@@ -31,15 +31,16 @@ pub(crate) struct Vaapi {
 	encoder: Encoder,
 }
 
-// The encoder is `!Send` (libva uses `Rc` internally) but is created, used, and
-// dropped only on the dedicated encode thread (see `encode::sink`); the `Send`
-// impl just lets the boxed trait object satisfy `Backend: Send`.
-unsafe impl Send for Vaapi {}
-
 impl Vaapi {
 	pub(crate) fn open(config: &Config) -> Result<Box<dyn Backend>, Error> {
 		let bitrate = config.resolved_bitrate().as_bps().min(u32::MAX as u64) as u32;
-		let vaapi = VaapiConfig::new(config.width, config.height, config.framerate, bitrate, config.gop);
+		let vaapi = VaapiConfig::new(
+			config.width,
+			config.height,
+			config.framerate.rounded(),
+			bitrate,
+			config.gop,
+		);
 		let encoder = Encoder::new(vaapi).map_err(|e| Error::Codec(anyhow::anyhow!("VAAPI encoder init: {e:?}")))?;
 
 		tracing::info!(

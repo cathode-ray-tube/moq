@@ -10,11 +10,14 @@
 ///
 /// Panics if called outside a tokio runtime.
 ///
-/// Accepts a [`Config`](moq_net::origin::Config) or a bare
-/// [`Hop`](moq_net::Hop) id (which uses the default config).
-pub fn spawn(config: impl Into<moq_net::origin::Config>) -> moq_net::origin::Producer {
-	let (producer, driver) = moq_net::origin::Producer::new(config.into());
-	tokio::spawn(driver.run(crate::runtime::Runtime::<()>::new()));
+pub fn spawn() -> moq_net::origin::Producer {
+	spawn_config(moq_net::origin::Config::default())
+}
+
+/// Build and spawn an origin producer with an explicit configuration.
+pub fn spawn_config(config: moq_net::origin::Config) -> moq_net::origin::Producer {
+	let (producer, driver) = moq_net::origin::Producer::new(config);
+	tokio::spawn(moq_net::time::run(driver));
 	producer
 }
 
@@ -26,14 +29,14 @@ mod tests {
 	/// reaches a consumer, and dropping the announcement retracts it.
 	#[tokio::test]
 	async fn spawn_drives_the_origin() {
-		let origin = spawn(moq_net::origin::Config::new(moq_net::Hop::random()));
+		let origin = spawn();
 		let mut announced = origin.consume().announced();
 
 		let broadcast = origin.create_broadcast("cam").expect("create broadcast");
 		broadcast.announce(Default::default()).expect("create broadcast");
 
 		let update = announced.next().await.expect("announce");
-		assert_eq!(update.path.as_str(), "cam");
+		assert_eq!(update.prefix.as_str(), "cam");
 		assert!(update.kind.is_active());
 
 		broadcast.finish();
@@ -46,6 +49,6 @@ mod tests {
 	#[test]
 	#[should_panic(expected = "no reactor running")]
 	fn spawn_outside_runtime_panics() {
-		let _ = spawn(moq_net::origin::Config::new(moq_net::Hop::random()));
+		let _ = spawn();
 	}
 }

@@ -16,8 +16,8 @@
 //!   1:1, so group N of every rung is the same content as source group N.
 //!
 //! The codec work is `moq-video`: hardware where available (NVDEC + NVENC on
-//! Linux, VideoToolbox on macOS, Media Foundation on Windows) with openh264 as
-//! the H.264 software fallback. On an NVIDIA GPU the whole pipeline is
+//! Linux, VideoToolbox on macOS, Media Foundation on Windows), with the default
+//! `openh264` feature providing H.264 software fallback. On an NVIDIA GPU the whole pipeline is
 //! GPU-resident: NVDEC decodes and scales in hardware and NVENC encodes the
 //! CUDA frame in place, with no CPU copies. Other decoders scale on the CPU.
 
@@ -81,7 +81,7 @@ impl Transcoder {
 	) -> Result<Self, Error> {
 		// The catalog starts empty and fills in during `run`, exactly like a
 		// media importer that hasn't seen parameter sets yet.
-		let derived = moq_mux::catalog::Producer::new(&mut output)?;
+		let derived = moq_mux::catalog::Producer::new(&mut output, moq_mux::catalog::Config::default())?;
 		let dynamic = output.dynamic();
 
 		Ok(Self {
@@ -248,7 +248,7 @@ mod tests {
 	/// resolve a ladder, since no rung encodes until someone asks.
 	fn source_catalog(width: u32, height: u32) -> Source {
 		let mut broadcast = moq_net::broadcast::Info::default().produce();
-		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 		let track = broadcast
 			.create_track("video", hang::container::track_info(hang::catalog::PRIORITY.video))
 			.unwrap();
@@ -309,7 +309,7 @@ mod tests {
 	/// to decode while the group is still open.
 	fn write_keyframe(group: &mut moq_net::group::Producer) {
 		let mut encoder = moq_video::encode::Encoder::new(&{
-			let mut config = moq_video::encode::Config::new(320, 240, 30);
+			let mut config = moq_video::encode::Config::new(320, 240, moq_video::Rate::new(30, 1).unwrap());
 			config.kind = moq_video::encode::Kind::Software;
 			config
 		})
@@ -336,7 +336,7 @@ mod tests {
 	/// `groups` groups of `frames` gray frames each, encoded with openh264.
 	fn source_broadcast(groups: u64, frames: u64) -> Source {
 		let mut broadcast = moq_net::broadcast::Info::default().produce();
-		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 
 		let mut video = hang::catalog::VideoConfig::new(hang::catalog::H264 {
 			inline: true,
@@ -354,7 +354,7 @@ mod tests {
 		let track = broadcast.create_track("video", info).unwrap();
 
 		let mut encoder = moq_video::encode::Encoder::new(&{
-			let mut config = moq_video::encode::Config::new(320, 240, 30);
+			let mut config = moq_video::encode::Config::new(320, 240, moq_video::Rate::new(30, 1).unwrap());
 			config.kind = moq_video::encode::Kind::Software;
 			config
 		})
@@ -393,7 +393,7 @@ mod tests {
 	/// producing task's handle (the track producer lives inside it).
 	fn source_broadcast_live(groups: u64, frames: u64) -> (Source, tokio::task::JoinHandle<()>) {
 		let mut broadcast = moq_net::broadcast::Info::default().produce();
-		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 
 		let mut video = hang::catalog::VideoConfig::new(hang::catalog::H264 {
 			inline: true,
@@ -420,11 +420,12 @@ mod tests {
 		};
 
 		let task = tokio::spawn(async move {
-			let mut encoder = moq_video::encode::Encoder::new(&{
-				let mut config = moq_video::encode::Config::new(320, 240, 30);
+			let mut encoder = moq_video::encode::Sink::open(&{
+				let mut config = moq_video::encode::Config::new(320, 240, moq_video::Rate::new(30, 1).unwrap());
 				config.kind = moq_video::encode::Kind::Software;
 				config
 			})
+			.await
 			.unwrap();
 			let gray = vec![0x80u8; 320 * 240 * 4];
 
@@ -439,7 +440,7 @@ mod tests {
 					if index == 0 {
 						encoder.keyframe();
 					}
-					for encoded in encoder.encode(&gray_frame(&gray, timestamp)).unwrap() {
+					for encoded in encoder.encode(gray_frame(&gray, timestamp)).await.unwrap() {
 						let frame = hang::container::Frame {
 							timestamp: encoded.timestamp,
 							payload: encoded.payload,
@@ -586,7 +587,7 @@ mod tests {
 	/// with the NVIDIA driver). Probed through the public API so the hardware
 	/// test skips cleanly on GPU-less CI.
 	fn hardware_available() -> bool {
-		let mut encode = moq_video::encode::Config::new(160, 120, 30);
+		let mut encode = moq_video::encode::Config::new(160, 120, moq_video::Rate::new(30, 1).unwrap());
 		encode.kind = moq_video::encode::Kind::Hardware;
 		if moq_video::encode::Encoder::new(&encode).is_err() {
 			return false;
@@ -758,14 +759,14 @@ mod tests {
 			ladder: Ladder::new([Rung::new(120, moq_net::bandwidth::Rate::from_bps(100_000))]).unwrap(),
 			encoder: moq_video::encode::Kind::Software,
 			decoder: moq_video::decode::Kind::Software,
-			source: Some(moq_net::PathRelativeOwned::from(".".to_string())),
+			source: Some(moq_net::path::RelativeOwned::from(".".to_string())),
 			..Default::default()
 		};
 
 		// The passthrough reference (`..`) resolves against the output broadcast's path, so
 		// the output must be minted through an origin: a standalone producer has no path, and
 		// `..` from it would escape, failing the catalog read below.
-		let origin = moq_tokio::origin::spawn(moq_net::Hop::random());
+		let origin = moq_tokio::origin::spawn();
 		let output = origin.create_broadcast("room/transcode").unwrap();
 		let consumer = output.consume();
 		let transcoder = tokio::spawn(run(source.broadcast.consume(), output, config));
@@ -1012,7 +1013,7 @@ mod tests {
 			.unwrap(),
 			encoder: moq_video::encode::Kind::Software,
 			decoder: moq_video::decode::Kind::Software,
-			source: Some(moq_net::PathRelativeOwned::from(".".to_string())),
+			source: Some(moq_net::path::RelativeOwned::from(".".to_string())),
 			..Default::default()
 		};
 

@@ -33,14 +33,16 @@ class Moq internal constructor(
     fun createBroadcast(path: String): BroadcastProducer = session.publish().createBroadcast(path)
 
     /**
-     * Discover routes whose prefix starts with [prefix] as a [Flow]. The
-     * subscription is acquired on collection and cancelled when collection
-     * ends. Use [announced] for the raw handle.
+     * Discover routes matching [config] as a [Flow]. Each update stays relative
+     * to the origin. The subscription is acquired on
+     * collection and cancelled when collection ends. Use [announced] for the raw handle.
      */
-    fun announcements(prefix: String = ""): Flow<MoqAnnounceUpdate> = session.consume().announcements(prefix)
+    fun announcements(config: AnnounceConfig = AnnounceConfig()): Flow<MoqAnnounceUpdate> =
+        session.consume().announcements(config)
 
-    /** Raw announcement handle under [prefix]. */
-    fun announced(prefix: String = ""): MoqAnnounceConsumer = session.consume().announced(prefix)
+    /** Raw announcement handle for [config]; update prefixes stay relative to the origin. */
+    fun announced(config: AnnounceConfig = AnnounceConfig()): MoqAnnounceConsumer =
+        session.consume().announced(config)
 
     /**
      * Await a route covering exactly [path], then resolve the broadcast there.
@@ -125,7 +127,7 @@ class Moq internal constructor(
         ): Moq {
             val client = MoqClient()
             try {
-                if (!tlsVerify) client.setTlsDisableVerify(true)
+				if (!tlsVerify) client.setTlsVerify(false)
                 if (tlsRoots != null) client.setTlsRoots(tlsRoots)
                 if (tlsSystemRoots != null) client.setTlsSystemRoots(tlsSystemRoots)
                 if (tlsFingerprints != null) client.setTlsFingerprints(tlsFingerprints)

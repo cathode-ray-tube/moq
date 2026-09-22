@@ -4,26 +4,25 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from typing import Literal
 
-from moq_ffi import MoqRequest, MoqServer
+from moq_ffi import MoqRequest, MoqServer, MoqTransport
 
 from .origin import OriginProducer
 from .publish import BroadcastProducer
 from .session import Session
 
-# The wire transport carrying a session: raw QUIC, iroh's peer-to-peer QUIC, or WebSocket.
-Transport = Literal["quic", "iroh", "websocket"]
+# The network transport carrying an incoming session.
+Transport = MoqTransport
 
 
 class Request:
     """Wraps MoqRequest, an incoming session that can be accepted or rejected.
 
     Use `await request.accept()` to complete the handshake, or
-    `await request.reject(code)` to reject with an HTTP status code.
+    `await request.reject(code)` to reject with an application error code.
 
     Dropping a Request without responding closes the underlying connection
-    silently; call `reject(code)` to send an explicit HTTP status.
+    silently; call `reject(code)` to send an explicit MoQ error.
     """
 
     def __init__(self, inner: MoqRequest) -> None:
@@ -46,8 +45,8 @@ class Request:
 
     @property
     def transport(self) -> Transport:
-        """The wire transport carrying this session (`"quic"`, `"iroh"`, or `"websocket"`)."""
-        return self._inner.transport()  # type: ignore[return-value]
+        """The network transport carrying this session."""
+        return self._inner.transport()
 
     def set_publish(self, origin: OriginProducer | None) -> None:
         """Override the publish origin for this session. Falls back to the
@@ -75,7 +74,9 @@ class Request:
         return Session(await self._inner.accept())
 
     async def reject(self, code: int) -> None:
-        """Reject the session with the given HTTP status code.
+        """Reject the session with the given application error code.
+
+        Codes 401 and 403 map to the protocol's unauthorized error.
 
         Raises `Error.AlreadyResponded` if `accept()` or `reject()` has already
         been called.

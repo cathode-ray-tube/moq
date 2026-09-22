@@ -1,3 +1,4 @@
+use crate::runtime::Timers as _;
 use std::{
 	collections::{HashMap, hash_map::Entry},
 	task::{Poll, ready},
@@ -15,8 +16,7 @@ use crate::{
 
 use super::{Message, Version, cluster, error::request, peer};
 
-use web_async::Lock;
-use web_transport_trait::{MaybeSend, MaybeSync};
+use kio::Lock;
 
 const TRACK_ALIAS_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -382,9 +382,9 @@ struct Advertised {
 }
 
 #[derive(Clone)]
-pub(super) struct Subscriber<S: crate::transport::poll::Session, R: crate::runtime::Runtime> {
+pub(super) struct Subscriber<S: crate::transport::poll::Session> {
 	// Arms the track-alias and request-id timeouts.
-	runtime: R,
+	runtime: crate::time::Clock,
 	session: S,
 	// Traffic stats are attributed through this tagged origin handle.
 	origin: origin::Producer,
@@ -421,8 +421,8 @@ pub(super) struct Subscriber<S: crate::transport::poll::Session, R: crate::runti
 /// seen is worth waiting on briefly (draft-19 section 11.4.2). Three outcomes:
 /// the subscription, [`Error::Cancel`] for an alias we retired, and [`Error::NotFound`]
 /// once the wait expires without any binding at all.
-async fn resolve_track_alias<R: crate::runtime::Runtime>(
-	runtime: &R,
+async fn resolve_track_alias(
+	runtime: &crate::time::Clock,
 	aliases: kio::Consumer<AliasTable>,
 	alias: u64,
 ) -> Result<RequestId, Error> {
@@ -447,15 +447,13 @@ async fn resolve_track_alias<R: crate::runtime::Runtime>(
 	.await
 }
 
-impl<S, R> Subscriber<S, R>
+impl<S> Subscriber<S>
 where
 	S: crate::transport::poll::Boxable,
-	R: crate::runtime::Runtime + MaybeSend + MaybeSync + 'static,
-	R::Timer: MaybeSend,
 {
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
-		runtime: R,
+		runtime: crate::time::Clock,
 		session: S,
 		origin: origin::Producer,
 		control: Control,
@@ -2097,7 +2095,7 @@ where
 		let producer = crate::recv::Group::new(producer);
 
 		let res = {
-			let mut ingest = GroupIngest::new(&group, timescale, self.version, start);
+			let mut ingest = GroupIngest::new(self.runtime.clone(), &group, timescale, self.version, start);
 			let mut writing = producer.clone();
 			kio::wait(|waiter| {
 				if let Poll::Ready(err) = track.poll_closed(waiter) {
@@ -2128,11 +2126,9 @@ where
 	}
 }
 
-impl<S, R> Subscriber<S, R>
+impl<S> Subscriber<S>
 where
 	S: crate::transport::poll::Boxable,
-	R: crate::runtime::Runtime + MaybeSend + MaybeSync + 'static,
-	R::Timer: MaybeSend,
 {
 	/// The group producer this subgroup stream writes into, and the Object ID it starts at.
 	///
@@ -2238,6 +2234,7 @@ where
 /// the id delta, the extension headers (carrying the timestamp), the size, the
 /// status for empty objects, and the streamed payload.
 struct GroupIngest {
+	runtime: crate::time::Clock,
 	has_extensions: bool,
 	has_end: bool,
 	timescale: Option<Timescale>,
@@ -2265,8 +2262,15 @@ enum IngestPhase {
 }
 
 impl GroupIngest {
-	fn new(group: &ietf::GroupHeader, timescale: Option<Timescale>, version: Version, start: u64) -> Self {
+	fn new(
+		runtime: crate::time::Clock,
+		group: &ietf::GroupHeader,
+		timescale: Option<Timescale>,
+		version: Version,
+		start: u64,
+	) -> Self {
 		Self {
+			runtime,
 			has_extensions: group.flags.has_extensions,
 			has_end: group.flags.has_end,
 			timescale,
@@ -2278,11 +2282,9 @@ impl GroupIngest {
 	}
 }
 
-impl<S, R> Subscriber<S, R>
+impl<S> Subscriber<S>
 where
 	S: crate::transport::poll::Boxable,
-	R: crate::runtime::Runtime + MaybeSend + MaybeSync + 'static,
-	R::Timer: MaybeSend,
 {
 	/// Read a fill fetch stream: the head of the group a subscription joins part way through.
 	///
@@ -2516,7 +2518,7 @@ where
 				}
 				_ => None,
 			};
-			let timestamp = timestamp.unwrap_or_else(crate::Timestamp::now);
+			let timestamp = timestamp.unwrap_or_else(|| crate::Timestamp::from(self.runtime.now()));
 
 			// A fetch object has no status field from draft-16 on; a zero length is simply
 			// an empty object. Draft-14 and 15 still encode Normal (0) after a zero length.
@@ -2717,14 +2719,14 @@ impl GroupIngest {
 					}
 					// `create_frame_owned` is the allocation chokepoint and rejects an
 					// oversized `size` before allocating, so no pre-check is needed.
-					let timestamp = timestamp.unwrap_or_else(crate::Timestamp::now);
+					let timestamp = timestamp.unwrap_or_else(|| crate::Timestamp::from(self.runtime.now()));
 					let frame = group.create_frame_owned(frame::Info { size, timestamp })?;
 					self.phase = IngestPhase::Payload { frame };
 				}
 				IngestPhase::Status { timestamp } => {
 					let status: u64 = ready!(reader.poll_decode(&mut cx))?;
 					if status == 0 {
-						let timestamp = timestamp.unwrap_or_else(crate::Timestamp::now);
+						let timestamp = timestamp.unwrap_or_else(|| crate::Timestamp::from(self.runtime.now()));
 						let frame = group.create_frame_owned(frame::Info { size: 0, timestamp })?;
 						frame.finish()?;
 						self.phase = IngestPhase::Delta;
@@ -2765,11 +2767,10 @@ mod tests {
 
 	/// The tokio-backed test runtime. Its transport parameter is phantom, so one
 	/// type serves every fake session in this module.
-	type TestRuntime = crate::runtime::tokio_test::Tokio<crate::lite::test_transport::SinkSession>;
 
 	#[tokio::test(start_paused = true)]
 	async fn track_alias_waits_for_control_message() {
-		let runtime = TestRuntime::new();
+		let runtime = crate::time::Clock::tokio();
 		let aliases = TrackAliases::default();
 		let pending = resolve_track_alias(&runtime, aliases.consume(), 7);
 		tokio::pin!(pending);
@@ -2785,7 +2786,7 @@ mod tests {
 	async fn unknown_track_alias_times_out() {
 		let aliases = TrackAliases::default();
 		assert!(matches!(
-			resolve_track_alias(&TestRuntime::new(), aliases.consume(), 7).await,
+			resolve_track_alias(&crate::time::Clock::tokio(), aliases.consume(), 7).await,
 			Err(Error::NotFound)
 		));
 	}
@@ -2812,7 +2813,7 @@ mod tests {
 		let (tasks, _task_set) = crate::util::TaskSet::new();
 
 		Subscriber::new(
-			TestRuntime::new(),
+			crate::time::Clock::tokio(),
 			session,
 			origin,
 			Control::new(None, false),
@@ -2873,17 +2874,14 @@ mod tests {
 	async fn a_rooted_subscriber_asks_for_its_scope_not_its_root() {
 		let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
 		let scope = crate::Patterns::from(crate::Pattern::subtree("cam").unwrap());
-		let scoped = origin
-			.with_root("rootns")
-			.and_then(|rooted| rooted.scope(&scope))
-			.expect("scope the origin");
+		let scoped = origin.scope("rootns", &scope).expect("scope the origin");
 
 		let gate = kio::Producer::new(true);
 		let session = crate::lite::test_transport::SinkSession::gated_bi(gate.consume());
 		let log = session.log.clone();
 		let (tasks, _task_set) = crate::util::TaskSet::new();
 		let mut subscriber = Subscriber::new(
-			TestRuntime::new(),
+			crate::time::Clock::tokio(),
 			session.clone(),
 			scoped,
 			Control::new(None, false),
@@ -2946,10 +2944,7 @@ mod tests {
 		let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
 		let consumer = origin.consume();
 		let scope = crate::Patterns::from(crate::Pattern::subtree("cam").unwrap());
-		let scoped = origin
-			.with_root("rootns")
-			.and_then(|rooted| rooted.scope(&scope))
-			.expect("scope the origin");
+		let scoped = origin.scope("rootns", &scope).expect("scope the origin");
 
 		let session = crate::lite::test_transport::ScriptedSession::new(namespace_response(VERSION, "x.hang").await);
 		let (tasks, _task_set) = crate::util::TaskSet::new();
@@ -2958,7 +2953,7 @@ mod tests {
 		let peer_setup = peer::PeerSetup::default();
 		peer_setup.set(peer::Peer::default());
 		let mut subscriber = Subscriber::new(
-			TestRuntime::new(),
+			crate::time::Clock::tokio(),
 			session.clone(),
 			scoped,
 			Control::new(None, false),
@@ -3014,7 +3009,7 @@ mod tests {
 		insert_track_alias(&aliases, 7, RequestId(11)).unwrap();
 		retire_track_alias(&aliases, 7, RequestId(11));
 
-		let runtime = TestRuntime::new();
+		let runtime = crate::time::Clock::tokio();
 		let resolve = resolve_track_alias(&runtime, aliases.consume(), 7);
 		tokio::pin!(resolve);
 
@@ -3038,7 +3033,7 @@ mod tests {
 		insert_track_alias(&aliases, 7, RequestId(11)).unwrap();
 		retire_track_alias(&aliases, 7, RequestId(11));
 
-		let err = resolve_track_alias(&TestRuntime::new(), aliases.consume(), 7)
+		let err = resolve_track_alias(&crate::time::Clock::tokio(), aliases.consume(), 7)
 			.await
 			.expect_err("a retired alias resolves to a cancellation");
 
@@ -3083,14 +3078,14 @@ mod tests {
 	/// exercised without driving a whole SUBSCRIBE exchange.
 	fn subscriber_with_tracks(
 		tracks: &[(RequestId, &str, &str)],
-	) -> Subscriber<crate::lite::test_transport::SinkSession, TestRuntime> {
+	) -> Subscriber<crate::lite::test_transport::SinkSession> {
 		let (tasks, task_set) = crate::util::TaskSet::new();
 		// The tests drive binding directly, so nothing spawns; leaking keeps the handle alive
 		// without a spawner.
 		std::mem::forget(task_set);
 
 		let subscriber = Subscriber::new(
-			TestRuntime::new(),
+			crate::time::Clock::tokio(),
 			crate::lite::test_transport::SinkSession::new(Default::default()),
 			crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce(),
 			Control::new(None, false),
@@ -3241,7 +3236,7 @@ mod tests {
 
 		let (tasks, _task_set) = crate::util::TaskSet::new();
 		let mut subscriber = Subscriber::new(
-			TestRuntime::new(),
+			crate::time::Clock::tokio(),
 			session,
 			crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce(),
 			Control::new(None, false),
@@ -3297,7 +3292,7 @@ mod tests {
 
 		let (tasks, _task_set) = crate::util::TaskSet::new();
 		let mut subscriber = Subscriber::new(
-			TestRuntime::new(),
+			crate::time::Clock::tokio(),
 			session,
 			crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce(),
 			Control::new(None, false),
@@ -3402,7 +3397,7 @@ mod tests {
 
 		let (tasks, _task_set) = crate::util::TaskSet::new();
 		let mut subscriber = Subscriber::new(
-			TestRuntime::new(),
+			crate::time::Clock::tokio(),
 			adapter,
 			crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce(),
 			control,
@@ -3518,7 +3513,7 @@ mod tests {
 
 		let (tasks, _task_set) = crate::util::TaskSet::new();
 		let mut subscriber = Subscriber::new(
-			TestRuntime::new(),
+			crate::time::Clock::tokio(),
 			session,
 			crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce(),
 			Control::new(None, false),
@@ -3616,7 +3611,7 @@ mod tests {
 		let session = crate::lite::test_transport::ScriptedSession::new(subscribe_ok);
 		let (tasks, _task_set) = crate::util::TaskSet::new();
 		let mut subscriber = Subscriber::new(
-			TestRuntime::new(),
+			crate::time::Clock::tokio(),
 			session,
 			crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce(),
 			Control::new(None, false),
@@ -3708,7 +3703,7 @@ mod tests {
 		let consumer = origin.consume();
 		let (tasks, _task_set) = crate::util::TaskSet::new();
 		let mut subscriber = Subscriber::new(
-			TestRuntime::new(),
+			crate::time::Clock::tokio(),
 			session,
 			origin,
 			Control::new(None, false),
@@ -3769,7 +3764,7 @@ mod tests {
 		// hop chain of its own.
 		let (tasks, _task_set) = crate::util::TaskSet::new();
 		let mut subscriber = Subscriber::new(
-			TestRuntime::new(),
+			crate::time::Clock::tokio(),
 			session,
 			origin,
 			Control::new(None, false),
@@ -3809,7 +3804,7 @@ mod tests {
 			let (tasks, task_set) = crate::util::TaskSet::new();
 			std::mem::forget(task_set);
 			let mut subscriber = Subscriber::new(
-				TestRuntime::new(),
+				crate::time::Clock::tokio(),
 				crate::lite::test_transport::SinkSession::new(Default::default()),
 				origin.clone(),
 				Control::new(None, false),
@@ -3845,7 +3840,7 @@ mod tests {
 	fn cluster_subscriber(
 		self_origin: crate::Hop,
 	) -> (
-		Subscriber<crate::lite::test_transport::SinkSession, TestRuntime>,
+		Subscriber<crate::lite::test_transport::SinkSession>,
 		crate::origin::Producer,
 	) {
 		let session = crate::lite::test_transport::SinkSession::new(Default::default());
@@ -3856,7 +3851,7 @@ mod tests {
 		std::mem::forget(task_set);
 
 		let subscriber = Subscriber::new(
-			TestRuntime::new(),
+			crate::time::Clock::tokio(),
 			session,
 			origin.clone(),
 			Control::new(None, false),
@@ -3989,7 +3984,7 @@ mod tests {
 		let peer_setup = peer::PeerSetup::default();
 		peer_setup.set(peer::Peer::default());
 		let mut subscriber = Subscriber::new(
-			TestRuntime::new(),
+			crate::time::Clock::tokio(),
 			session.clone(),
 			origin,
 			Control::new(None, false),
@@ -4060,7 +4055,7 @@ mod tests {
 			..Default::default()
 		});
 		let mut subscriber = Subscriber::new(
-			TestRuntime::new(),
+			crate::time::Clock::tokio(),
 			session.clone(),
 			origin,
 			Control::new(None, false),
@@ -4134,7 +4129,7 @@ mod tests {
 		let (tasks, task_set) = crate::util::TaskSet::new();
 		std::mem::forget(task_set);
 		let mut subscriber = Subscriber::new(
-			TestRuntime::new(),
+			crate::time::Clock::tokio(),
 			session.clone(),
 			origin,
 			Control::new(None, false),
@@ -4189,7 +4184,7 @@ mod tests {
 		let (tasks, task_set) = crate::util::TaskSet::new();
 		std::mem::forget(task_set);
 		let mut subscriber = Subscriber::new(
-			TestRuntime::new(),
+			crate::time::Clock::tokio(),
 			session.clone(),
 			origin,
 			Control::new(None, false),
@@ -4506,7 +4501,7 @@ mod tests {
 		attached: &cluster::Advert,
 		script: Vec<u8>,
 	) -> (
-		Subscriber<crate::lite::test_transport::ScriptedSession, TestRuntime>,
+		Subscriber<crate::lite::test_transport::ScriptedSession>,
 		crate::origin::Consumer,
 		Stream<crate::lite::test_transport::ScriptedSession, Version>,
 		crate::origin::Driver,
@@ -4521,7 +4516,7 @@ mod tests {
 		std::mem::forget(task_set);
 
 		let mut subscriber = Subscriber::new(
-			TestRuntime::new(),
+			crate::time::Clock::tokio(),
 			session.clone(),
 			origin,
 			Control::new(None, false),
@@ -4551,7 +4546,7 @@ mod tests {
 		attached: &cluster::Advert,
 		updates: &[cluster::Advert],
 	) -> (
-		Subscriber<crate::lite::test_transport::ScriptedSession, TestRuntime>,
+		Subscriber<crate::lite::test_transport::ScriptedSession>,
 		crate::origin::Consumer,
 		Stream<crate::lite::test_transport::ScriptedSession, Version>,
 	) {
@@ -4953,7 +4948,7 @@ mod tests {
 			std::mem::forget(task_set);
 
 			let mut subscriber = Subscriber::new(
-				TestRuntime::new(),
+				crate::time::Clock::tokio(),
 				session.clone(),
 				origin,
 				Control::new(None, false),
@@ -5354,8 +5349,6 @@ mod stitch_tests {
 		util::{TaskSet, Tasks},
 	};
 
-	type TestRuntime = crate::runtime::tokio_test::Tokio<ScriptedSession>;
-
 	const VERSION: Version = Version::Draft20;
 	const ALIAS: u64 = 7;
 	const REQUEST: RequestId = RequestId(1);
@@ -5458,7 +5451,7 @@ mod stitch_tests {
 	/// A subscriber holding one draft-20 subscription, as its SUBSCRIBE_OK left it: the
 	/// alias bound, the timescale declared, and `fill` waiting on its fetch stream.
 	struct Harness {
-		subscriber: Subscriber<ScriptedSession, TestRuntime>,
+		subscriber: Subscriber<ScriptedSession>,
 		session: ScriptedSession,
 		track: track::Producer,
 		fill: kio::Producer<Fill>,
@@ -5472,7 +5465,7 @@ mod stitch_tests {
 			let tasks = TaskSet::new();
 
 			let subscriber = Subscriber::new(
-				TestRuntime::new(),
+				crate::time::Clock::tokio(),
 				session.clone(),
 				origin,
 				Control::new(None, false),
@@ -5989,8 +5982,6 @@ mod joining_fetch_tests {
 		util::{TaskSet, Tasks},
 	};
 
-	type TestRuntime = crate::runtime::tokio_test::Tokio<ScriptedSession>;
-
 	const JOINING_DRAFTS: [Version; 6] = [
 		Version::Draft14,
 		Version::Draft15,
@@ -6101,7 +6092,7 @@ mod joining_fetch_tests {
 	}
 
 	struct JoinRun {
-		subscriber: Subscriber<ScriptedSession, TestRuntime>,
+		subscriber: Subscriber<ScriptedSession>,
 		session: ScriptedSession,
 		_hold: (
 			crate::broadcast::Producer,
@@ -6117,7 +6108,7 @@ mod joining_fetch_tests {
 			let session = ScriptedSession::per_stream(vec![ok, fetch]);
 			let (tasks, _task_set) = crate::util::TaskSet::new();
 			let subscriber = Subscriber::new(
-				TestRuntime::new(),
+				crate::time::Clock::tokio(),
 				session.clone(),
 				crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce(),
 				Control::new(None, false),
@@ -6262,7 +6253,7 @@ mod joining_fetch_tests {
 		let log = session.log.clone();
 		let (tasks, _task_set) = crate::util::TaskSet::new();
 		let mut subscriber = Subscriber::new(
-			TestRuntime::new(),
+			crate::time::Clock::tokio(),
 			session,
 			crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce(),
 			Control::new(None, false),

@@ -133,7 +133,7 @@ client = moq.Client(
   - `.url`, `.path`, `.query`, `.transport`. The query-free path is uniform across transports; the root or missing path is `""`. The encoded query may contain credentials.
   - `.set_publish(origin)`, `.set_consume(origin)`. Per-request overrides, captured at `accept()`. Raise if the request is already answered, cancelled, or currently accepting.
   - `await .accept() → Session`. Complete the handshake (hold the result to keep the connection alive).
-  - `await .reject(code)`. Reject with an HTTP status code.
+  - `await .reject(code)`. Reject with an application error code; 401 and 403 map to unauthorized.
   - `.cancel()`. Cancel an in-flight `accept()`/`reject()` call.
 - **`Session`**. An established connection. Holding it keeps the connection alive; it is also an `async with` context manager that shuts down on exit.
   - `await .closed()`. Wait until the session closes.
@@ -194,7 +194,7 @@ All consumers (`CatalogConsumer`, `MediaConsumer`, `TrackConsumer`, `AudioConsum
   - `await .requested_broadcast() → BroadcastRequest`. Call `.accept(broadcast)` to serve it, or `.reject(code)` to fail the requester.
   - Async iterator yielding `BroadcastRequest`
 - **`OriginConsumer`**. Discover broadcasts.
-  - `.announced(prefix) → AnnounceConsumer` (async iterator)
+  - `.announced(prefix, filter=None) → AnnounceConsumer` (async iterator); `filter` is a pattern relative to the literal prefix, while each update's `.prefix` stays origin-relative and `.captures` reports wildcard matches
   - `.announced_broadcast(path) → AnnouncedBroadcast` (awaitable, waits for a future announcement)
   - `.request_broadcast(path) → BroadcastConsumer` (awaitable; announced now or a dynamic fallback, else raises)
 

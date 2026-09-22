@@ -3,8 +3,8 @@
 //! [`Addrs`] is the peer's address list, [`Config`] is how to reach it, and the
 //! accept side lives in [`crate::listen`].
 
+use crate::Backoff;
 use crate::connection::Goaway;
-use crate::{Backoff, QuicBackend};
 use std::net;
 use url::Url;
 
@@ -160,14 +160,6 @@ pub(crate) struct Legacy {
 	bind: Option<net::SocketAddr>,
 
 	#[usage(
-		name = "client-backend",
-		long = "client-backend",
-		env = "MOQ_CLIENT_BACKEND",
-		hide = true
-	)]
-	backend: Option<QuicBackend>,
-
-	#[usage(
 		name = "client-connect-timeout",
 		long = "client-connect-timeout",
 		env = "MOQ_CLIENT_CONNECT_TIMEOUT",
@@ -220,7 +212,8 @@ pub(crate) struct Legacy {
 			"moq-transport-18",
 			"moq-transport-19",
 			"moq-transport-20",
-			"moq-transport-21"
+			"moq-transport-21",
+			"moq-transport-22"
 		),
 		hide = true
 	)]
@@ -229,8 +222,8 @@ pub(crate) struct Legacy {
 
 impl Legacy {
 	/// The released spellings in use, each paired with what replaced it.
-	fn deprecated(&self) -> crate::Deprecated {
-		let mut found = crate::Deprecated::default();
+	fn deprecated(&self) -> crate::cli::Deprecated {
+		let mut found = crate::cli::Deprecated::default();
 		if self.url.is_some() {
 			found.flag(
 				"--client-connect",
@@ -243,13 +236,6 @@ impl Legacy {
 				"--client-bind",
 				Some("MOQ_CLIENT_BIND"),
 				"--connect-bind / MOQ_CONNECT_BIND",
-			);
-		}
-		if self.backend.is_some() {
-			found.flag(
-				"--client-backend",
-				Some("MOQ_CLIENT_BACKEND"),
-				"--connect-backend / MOQ_CONNECT_BACKEND",
 			);
 		}
 		if self.timeout.is_some() {
@@ -354,7 +340,7 @@ pub enum ConnectError {
 impl ConnectError {
 	/// Only the transports that carry an HTTP status (WebTransport, WebSocket) can
 	/// classify one; qmux over tcp/unix has no such response.
-	#[cfg(any(feature = "noq", feature = "quinn", feature = "quiche", feature = "websocket"))]
+	#[cfg(any(feature = "noq", feature = "websocket"))]
 	pub(crate) fn from_status_u16(status: u16) -> Option<Self> {
 		match status {
 			401 => Some(Self::Unauthorized),
@@ -370,10 +356,7 @@ impl ConnectError {
 	}
 }
 
-#[cfg(all(
-	test,
-	any(feature = "noq", feature = "quinn", feature = "quiche", feature = "websocket")
-))]
+#[cfg(all(test, any(feature = "noq", feature = "websocket")))]
 mod tests {
 	use super::*;
 
@@ -395,7 +378,7 @@ failover_delay = "1s"
 		)
 		.expect("parse");
 		assert!(config.url.is_none());
-		assert_eq!(config.race, crate::cli::Duration::from(DEFAULT_RACE));
+		assert_eq!(config.race, DEFAULT_RACE);
 		let reported = config.deprecated().to_string();
 		assert!(reported.contains("connect -> url"), "{reported}");
 		assert!(reported.contains("failover_delay -> race"), "{reported}");
@@ -518,16 +501,6 @@ pub struct Config {
 	)]
 	pub bind: Option<net::SocketAddr>,
 
-	/// The QUIC backend to use.
-	/// Auto-detected from compiled features if not specified.
-	#[usage(
-		name = "connect-backend",
-		long = "connect-backend",
-		env = "MOQ_CONNECT_BACKEND",
-		setting = "connect.backend"
-	)]
-	pub backend: Option<QuicBackend>,
-
 	/// Delay before also dialing the next resolved address (Happy Eyeballs).
 	///
 	/// When DNS returns multiple addresses, attempts alternate between IPv6 and
@@ -537,14 +510,20 @@ pub struct Config {
 	///
 	/// This staggers the attempts within one [`crate::Client::connect`]; [`Self::timeout`]
 	/// bounds that call as a whole.
+	#[usage(skip)]
+	#[serde(with = "crate::cli::duration::serde_duration")]
+	pub race: std::time::Duration,
+
 	#[usage(
 		name = "connect-race",
 		long = "connect-race",
 		env = "MOQ_CONNECT_RACE",
+		default_value_t = crate::cli::Duration::fallback(DEFAULT_RACE),
 		default = "250ms",
 		setting = "connect.race"
 	)]
-	pub race: crate::cli::Duration,
+	#[serde(default, rename = "__cli_race", skip_serializing_if = "Option::is_none")]
+	pub(crate) race_arg: Option<crate::cli::Duration>,
 
 	/// The released `failover_delay` key, kept so [`deprecated`](Self::deprecated) can name [`race`](Self::race).
 	#[serde(default, skip_serializing)]
@@ -558,14 +537,20 @@ pub struct Config {
 	/// The full answer is authoritative, including which family to try first, so
 	/// this is how long the IPv4-only one waits for it before going ahead alone.
 	/// Defaults to 50ms; `0s` dials as soon as any address resolves.
+	#[usage(skip)]
+	#[serde(with = "crate::cli::duration::serde_duration")]
+	pub resolution_delay: std::time::Duration,
+
 	#[usage(
 		name = "connect-resolution-delay",
 		long = "connect-resolution-delay",
 		env = "MOQ_CONNECT_RESOLUTION_DELAY",
+		default_value_t = crate::cli::Duration::fallback(DEFAULT_RESOLUTION_DELAY),
 		default = "50ms",
 		setting = "connect.resolution_delay"
 	)]
-	pub resolution_delay: crate::cli::Duration,
+	#[serde(default, rename = "__cli_resolution_delay", skip_serializing_if = "Option::is_none")]
+	pub(crate) resolution_delay_arg: Option<crate::cli::Duration>,
 
 	/// Maximum time for one [`crate::Client::connect`], covering the dial and the MoQ
 	/// handshake. Defaults to 30 seconds; set to 0 to wait forever.
@@ -576,14 +561,20 @@ pub struct Config {
 	/// never speaks would hang the whole connect. [`crate::Connection`] only re-arms
 	/// its backoff between attempts, so an attempt that never returns stalls the
 	/// retry loop indefinitely.
+	#[usage(skip)]
+	#[serde(with = "crate::cli::duration::serde_duration")]
+	pub timeout: std::time::Duration,
+
 	#[usage(
 		name = "connect-timeout",
 		long = "connect-timeout",
 		env = "MOQ_CONNECT_TIMEOUT",
+		default_value_t = crate::cli::Duration::fallback(DEFAULT_TIMEOUT),
 		default = "30s",
 		setting = "connect.timeout"
 	)]
-	pub timeout: crate::cli::Duration,
+	#[serde(default, rename = "__cli_timeout", skip_serializing_if = "Option::is_none")]
+	pub(crate) timeout_arg: Option<crate::cli::Duration>,
 
 	/// Restrict the client to specific MoQ protocol version(s).
 	///
@@ -610,7 +601,8 @@ pub struct Config {
 			"moq-transport-18",
 			"moq-transport-19",
 			"moq-transport-20",
-			"moq-transport-21"
+			"moq-transport-21",
+			"moq-transport-22"
 		)
 	)]
 	pub version: Vec<moq_net::Version>,
@@ -685,11 +677,13 @@ impl Default for Config {
 			url: None,
 			connect: None,
 			bind: None,
-			backend: None,
-			race: DEFAULT_RACE.into(),
+			race: DEFAULT_RACE,
+			race_arg: None,
 			failover_delay: None,
-			resolution_delay: DEFAULT_RESOLUTION_DELAY.into(),
-			timeout: DEFAULT_TIMEOUT.into(),
+			resolution_delay: DEFAULT_RESOLUTION_DELAY,
+			resolution_delay_arg: None,
+			timeout: DEFAULT_TIMEOUT,
+			timeout_arg: None,
 			version: Vec::new(),
 			tls: Default::default(),
 			once: None,
@@ -712,7 +706,7 @@ impl Config {
 	/// old spellings are parsed so the process can name their replacement, not so it
 	/// can honor them: [`crate::Client::new`] rejects them too, so a config that
 	/// skipped the check can't reach a dial that quietly ignored half of it.
-	pub fn deprecated(&self) -> crate::Deprecated {
+	pub fn deprecated(&self) -> crate::cli::Deprecated {
 		let mut found = self.legacy.deprecated();
 		if self.connect.is_some() {
 			found.toml("connect", "url", None);
@@ -734,10 +728,12 @@ impl Config {
 
 	/// Build the [`crate::Client`] this config describes.
 	pub fn init(self, quic: crate::quic::Config) -> crate::Result<crate::Client> {
-		crate::client::Config::default()
-			.with_connect(self)
-			.with_quic(quic)
-			.init()
+		crate::client::Config {
+			connect: self,
+			quic,
+			..Default::default()
+		}
+		.init()
 	}
 
 	/// Returns the configured versions, defaulting to all if none specified.
@@ -757,9 +753,9 @@ impl Config {
 	pub fn resolve(&self) -> Resolved {
 		Resolved {
 			bind: self.bind.unwrap_or_else(default_bind),
-			race: self.race.into_std(),
-			resolution_delay: self.resolution_delay.into_std(),
-			timeout: self.timeout.into_std(),
+			race: crate::cli::Duration::resolve(self.race_arg, self.race),
+			resolution_delay: crate::cli::Duration::resolve(self.resolution_delay_arg, self.resolution_delay),
+			timeout: crate::cli::Duration::resolve(self.timeout_arg, self.timeout),
 		}
 	}
 }

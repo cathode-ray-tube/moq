@@ -23,16 +23,14 @@
 //! counterpart (mirror of `moq-audio`'s consumer) lives in the sibling
 //! [`decode`](crate::decode) module.
 //!
-//! [`rate`] holds the policy mapping a congestion-control bandwidth estimate
-//! onto the encoder's bitrate, which `publish_capture` drives for you.
+//! The shared [`moq_mux::rate`] policy maps a congestion-control bandwidth
+//! estimate onto the encoder's bitrate, which `publish_capture` drives for you.
 
 mod backend;
 mod encoded;
 mod encoder;
 mod producer;
 mod sink;
-
-pub mod rate;
 
 pub use backend::NAMES;
 pub use encoded::Encoded;
@@ -41,3 +39,14 @@ pub use producer::Producer;
 #[cfg(feature = "capture")]
 pub use producer::{Options, publish_capture};
 pub use sink::Sink;
+
+#[cfg(test)]
+mod tests {
+	/// The worker-backed API is the supported way to move an encoder between
+	/// tasks or threads, so keep that contract checked on every platform.
+	#[test]
+	fn sink_is_send() {
+		fn assert_send<T: Send>() {}
+		assert_send::<super::Sink>();
+	}
+}

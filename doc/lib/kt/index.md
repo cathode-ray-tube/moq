@@ -25,9 +25,10 @@ import dev.moq.*
 
 // Subscribe. The Flow is live, so run it in its own coroutine.
 Moq.connect("https://relay.example.com", tlsRoots = listOf("ca.pem")).use { moq ->
-    moq.announcements("live/").collect { announcement ->
-        // An announcement is a route; its path is relative to the prefix.
-        val broadcast = moq.requestBroadcast("live/" + announcement.path())
+    moq.announcements(AnnounceConfig(prefix = "live/", filter = "*/camera")).collect { announcement ->
+        // Updates stay origin-relative; captures reports what each wildcard matched.
+        println(announcement.captures())
+        val broadcast = moq.requestBroadcast(announcement.prefix())
         println(broadcast.catalog())
     }
 }
@@ -56,8 +57,9 @@ The three advertising operations: `moq.createBroadcast(path)` (or
 advertisement; `origin.dynamic(prefix, route)` claims `prefix` and every
 path beneath it (`""` for everything). Hold the returned `OriginDynamic`
 while the claim should stay advertised, and reject the requests you will not
-serve. A route is a capability, not an inventory; `announcement.path()` is
-the covered prefix.
+serve. A route is a capability, not an inventory. `announcements(config)` takes
+a literal prefix plus an optional relative pattern; `announcement.prefix()`
+stays origin-relative and `captures()` reports the wildcard matches.
 
 Sessions reconnect with backoff when the transport drops and re-announce local
 broadcasts. `moq.epoch()` counts the connections, 1 on the first, pairing with
@@ -68,7 +70,8 @@ inbound stream cap.
 `Server.listen(bind, tlsGenerate = ...)` accepts sessions with per-request
 `accept()`/`reject()`. Generated configuration setters, including
 `MoqRequest.setPublish`/`setConsume`, throw if a connect, listen, or accept is
-in flight, or after cancel. JSON tracks take `@Serializable` types
+in flight, or after cancel. `MoqRequest.transport()` returns a `Transport` enum.
+JSON tracks take `@Serializable` types
 (`publishJsonSnapshot`, `publishJsonStream`, `valuesAs<T>()`), and the rest of
 the [shared feature list](/lib/#what-every-binding-can-do) maps one to one:
 `fetchGroup`/`fetchMediaGroup`, `dynamic()` for tracks and `dynamic(prefix)` for broadcasts, `appendDatagram`/`datagrams()`,

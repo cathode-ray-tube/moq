@@ -225,7 +225,7 @@ async fn run(config: &Config) -> Result<()> {
 	let client = config.client.clone().init(config.quic.clone())?;
 
 	// Publish origin: the game session broadcast.
-	let publish_origin = moq_tokio::origin::spawn(moq_net::Hop::random());
+	let publish_origin = moq_tokio::origin::spawn();
 	let default_game_prefix = format!("{}/game", config.prefix);
 	let default_viewer_prefix = format!("{}/viewer", config.prefix);
 	let game_prefix = config.prefix_game.as_deref().unwrap_or(&default_game_prefix);
@@ -243,9 +243,9 @@ async fn run(config: &Config) -> Result<()> {
 	// Consume origin: viewer broadcasts under the viewer prefix.
 	// JS publishes viewer feedback at "{viewer_prefix}/{name}/{viewerId}"
 	let viewer_path = format!("{viewer_prefix}/{name}");
-	let consume_origin = moq_tokio::origin::spawn(moq_net::Hop::random());
+	let consume_origin = moq_tokio::origin::spawn();
 	let viewer_consumer = consume_origin
-		.with_root(&viewer_path)
+		.scope(&viewer_path, &moq_net::Patterns::from(moq_net::Pattern::all()))
 		.expect("viewer prefix should be valid")
 		.consume();
 
@@ -257,13 +257,13 @@ async fn run(config: &Config) -> Result<()> {
 		.connect(url);
 
 	// Set up catalog and encoders.
-	let catalog = moq_mux::catalog::Producer::new(&mut broadcast)?;
+	let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default())?;
 	let video_encoder = video::VideoEncoder::spawn(broadcast.clone(), catalog.clone()).await;
 
 	let audio_encoder = audio::AudioEncoder::new(broadcast.clone(), catalog.clone(), 44100)?;
 
 	let video_track = video_encoder.demand.clone();
-	let audio_track = audio_encoder.track().demand();
+	let audio_track = audio_encoder.demand();
 
 	let status_publisher = status::StatusPublisher::new(&mut broadcast)?;
 

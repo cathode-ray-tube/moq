@@ -39,8 +39,6 @@ pub struct Options {
 	/// Bitrate in bits per second. `None` lets Opus pick. PCM requires `None`
 	/// because its bitrate is fixed by the sample rate and channel count.
 	pub bitrate: Option<moq_net::bandwidth::Rate>,
-	/// Enable Opus in-band forward error correction.
-	pub fec: bool,
 	/// Enable Opus discontinuous transmission during silence.
 	pub dtx: bool,
 	/// Encoded frame duration. Opus accepts 2.5 / 5 / 10 / 20 / 40 / 60 ms.
@@ -70,7 +68,6 @@ impl Default for Options {
 			sample_rate: None,
 			channels: None,
 			bitrate: None,
-			fec: false,
 			dtx: false,
 			frame_duration: Duration::from_millis(20),
 			bandwidth: moq_net::bandwidth::Allocator::unlimited(),
@@ -87,7 +84,6 @@ impl Options {
 			sample_rate: self.sample_rate,
 			channels: self.channels,
 			bitrate: self.bitrate,
-			fec: self.fec,
 			dtx: self.dtx,
 			frame_duration: self.frame_duration,
 		}
@@ -106,9 +102,8 @@ impl Options {
 pub struct Producer<E: CatalogExt = ()> {
 	encoder: Encoder,
 	resampler: Option<Resampler>,
-	track: moq_mux::container::Producer<moq_mux::container::legacy::Wire>,
-	/// Owns the catalog rendition, retiring it when this producer goes away.
-	rendition: moq_mux::catalog::AudioTrack<E>,
+	track: moq_mux::container::Producer<moq_mux::container::legacy::Wire, hang::catalog::AudioConfig>,
+	_ext: std::marker::PhantomData<fn() -> E>,
 	pending: Vec<f32>,
 	/// Samples emitted since the current epoch (reset by [`reset_epoch`](Self::reset_epoch)).
 	frames_produced: u64,
@@ -143,14 +138,14 @@ struct Terminal {
 /// [`Reserved`](moq_mux::catalog::Reserved) this does not withhold the catalog:
 /// subscribers see the broadcast without this rendition until it resolves.
 pub(crate) struct Reserved<E: CatalogExt = ()> {
-	track: moq_mux::container::Producer<moq_mux::container::legacy::Wire>,
-	rendition: moq_mux::catalog::AudioTrack<E>,
+	track: moq_mux::container::Producer<moq_mux::container::legacy::Wire, hang::catalog::AudioConfig>,
+	_ext: std::marker::PhantomData<fn() -> E>,
 }
 
 impl<E: CatalogExt> Reserved<E> {
 	pub(crate) fn new(
 		broadcast: &mut moq_net::broadcast::Producer,
-		mut catalog: moq_mux::catalog::Producer<E>,
+		catalog: moq_mux::catalog::Producer<E>,
 		options: &Options,
 	) -> Result<Self, Error> {
 		let track = match &options.track {
@@ -165,11 +160,16 @@ impl<E: CatalogExt> Reserved<E> {
 				catalog.track_info(hang::catalog::PRIORITY.audio),
 			)?,
 		};
-		let name = track.name().to_string();
-		let track = catalog.media_producer(track, moq_mux::container::legacy::Wire(moq_mux::container::Kind::Audio))?;
-		let rendition = catalog.rendition(&name)?;
+		let track = catalog.audio(
+			track,
+			moq_mux::container::legacy::Wire(moq_mux::container::Kind::Audio),
+			None,
+		)?;
 
-		Ok(Self { track, rendition })
+		Ok(Self {
+			track,
+			_ext: std::marker::PhantomData,
+		})
 	}
 
 	/// Build the encoder for `input` and register the rendition describing it.
@@ -196,7 +196,7 @@ impl<E: CatalogExt> Reserved<E> {
 			)?)
 		};
 
-		self.rendition.set(encoder.catalog())?;
+		self.track.set(encoder.catalog())?;
 
 		Ok(Registered { encoder, resampler })
 	}
@@ -207,7 +207,7 @@ impl<E: CatalogExt> Reserved<E> {
 			encoder: registered.encoder,
 			resampler: registered.resampler,
 			track: self.track,
-			rendition: self.rendition,
+			_ext: self._ext,
 			pending: Vec::new(),
 			frames_produced: 0,
 			epoch_us: None,
@@ -233,7 +233,7 @@ pub(crate) struct Registered {
 impl<E: CatalogExt> Reserved<E> {
 	/// The resolved track name, available before the layout is.
 	pub(crate) fn name(&self) -> &str {
-		self.rendition.name()
+		self.track.name()
 	}
 
 	/// The underlying track producer, e.g. to watch subscriber state.
@@ -269,12 +269,18 @@ impl<E: CatalogExt> Producer<E> {
 
 	/// The name of the published track, which is [`Options::track`] resolved.
 	pub fn track_name(&self) -> &str {
-		self.rendition.name()
+		self.track.name()
 	}
 
-	/// The underlying track producer, e.g. to watch subscriber state via
-	/// [`used`](moq_net::track::Producer::used) / [`unused`](moq_net::track::Producer::unused).
-	pub fn track(&self) -> &moq_net::track::Producer {
+	/// A watch-only handle to the track's subscriber demand, created eagerly so
+	/// subscription state is observable before any frames arrive. Watch it via
+	/// [`used`](moq_net::track::Demand::used) / [`unused`](moq_net::track::Demand::unused).
+	pub fn demand(&self) -> moq_net::track::Demand {
+		self.track.track().demand()
+	}
+
+	#[cfg(feature = "capture")]
+	pub(crate) fn track(&self) -> &moq_net::track::Producer {
 		self.track.track()
 	}
 
@@ -398,7 +404,7 @@ impl<E: CatalogExt> Producer<E> {
 	}
 
 	fn publish(
-		track: &mut moq_mux::container::Producer<moq_mux::container::legacy::Wire>,
+		track: &mut moq_mux::container::Producer<moq_mux::container::legacy::Wire, hang::catalog::AudioConfig>,
 		encoded: Encoded,
 		timestamp: Timestamp,
 	) -> Result<(), Error> {
@@ -420,7 +426,7 @@ impl<E: CatalogExt> Producer<E> {
 
 	/// Publish terminal packets after an empty frame that carries their logical endpoint.
 	fn publish_terminal(
-		track: &mut moq_mux::container::Producer<moq_mux::container::legacy::Wire>,
+		track: &mut moq_mux::container::Producer<moq_mux::container::legacy::Wire, hang::catalog::AudioConfig>,
 		terminal: Terminal,
 	) -> Result<(), Error> {
 		track.write(MuxFrame {
@@ -531,6 +537,73 @@ mod tests {
 	use crate::decode::{Config as DecodeConfig, Consumer as AudioConsumer};
 	use crate::{Activity, Format};
 
+	#[test]
+	fn options_preserve_encoder_configuration() {
+		let input = Input {
+			format: Format::S16,
+			sample_rate: 44_100,
+			channels: 1,
+		};
+		let bitrate = moq_net::bandwidth::Rate::from_bps(96_000);
+		let options = Options {
+			codec: Codec::Opus,
+			sample_rate: Some(24_000),
+			channels: Some(1),
+			bitrate: Some(bitrate),
+			dtx: true,
+			frame_duration: Duration::from_millis(10),
+			..Options::default()
+		};
+
+		let config = options.config(input);
+		assert_eq!(config.input.format, Format::S16);
+		assert_eq!(config.input.sample_rate, 44_100);
+		assert_eq!(config.input.channels, 1);
+		assert_eq!(config.codec, Codec::Opus);
+		assert_eq!(config.sample_rate, Some(24_000));
+		assert_eq!(config.channels, Some(1));
+		assert_eq!(config.bitrate, Some(bitrate));
+		assert!(config.dtx);
+		assert_eq!(config.frame_duration, Duration::from_millis(10));
+	}
+
+	#[tokio::test]
+	async fn demand_follows_subscribers_and_closes_with_the_producer() {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let consumer = broadcast.consume();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
+		let options = Options {
+			track: Some("audio".into()),
+			..Options::default()
+		};
+		let mut producer = Producer::new(&mut broadcast, catalog, Input::default(), &options).unwrap();
+		let demand = producer.demand();
+
+		assert_eq!(demand.name(), "audio");
+		assert!(!demand.is_used());
+		let subscriber = consumer.track("audio").unwrap().subscribe(None).await.unwrap();
+		tokio::time::timeout(Duration::from_secs(1), demand.used())
+			.await
+			.expect("subscription demand")
+			.unwrap();
+		assert!(demand.is_used());
+
+		drop(subscriber);
+		drop(consumer);
+		tokio::time::timeout(Duration::from_secs(1), demand.unused())
+			.await
+			.expect("subscription released")
+			.unwrap();
+		assert!(!demand.is_used());
+
+		producer.finish().unwrap();
+		drop(producer);
+		let closed = tokio::time::timeout(Duration::from_secs(1), demand.closed())
+			.await
+			.expect("producer closed");
+		assert!(matches!(closed, moq_net::Error::Dropped));
+	}
+
 	/// Terminal Opus lookahead samples survive both exact-frame and partial-frame input.
 	#[tokio::test]
 	async fn finish_publishes_the_opus_lookahead_tail() {
@@ -548,7 +621,7 @@ mod tests {
 			let decoder_config = Encoder::new(&options.config(input.clone())).unwrap().catalog();
 
 			let mut broadcast = moq_net::broadcast::Info::new().produce();
-			let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+			let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 			let consumer = broadcast.consume();
 			let mut producer = Producer::new(&mut broadcast, catalog, input, &options).unwrap();
 			let mut audio = AudioConsumer::new(
@@ -593,7 +666,7 @@ mod tests {
 		};
 
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 		let consumer = broadcast.consume();
 		let options = Options {
 			track: Some("audio".to_string()),
@@ -640,7 +713,7 @@ mod tests {
 		};
 
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 		let consumer = broadcast.consume();
 		let options = Options {
 			track: Some("audio".to_string()),
@@ -675,7 +748,7 @@ mod tests {
 	#[tokio::test]
 	async fn reset_epoch_drops_the_encoder_lookahead() {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 		let consumer = broadcast.consume();
 		let options = Options {
 			track: Some("audio".to_string()),
@@ -724,7 +797,7 @@ mod tests {
 		let decoder_config = Encoder::new(&options.config(input.clone())).unwrap().catalog();
 
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 		let subscriber = broadcast.consume();
 		let mut producer = Producer::new(&mut broadcast, catalog, input, &options).unwrap();
 		let mut audio = AudioConsumer::new(
@@ -772,7 +845,7 @@ mod tests {
 		let decoder_config = Encoder::new(&options.config(input.clone())).unwrap().catalog();
 
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 		let subscriber = broadcast.consume();
 		let mut producer = Producer::new(&mut broadcast, catalog, input, &options).unwrap();
 		let mut consumer = AudioConsumer::new(&subscriber, &decoder_config, "audio", DecodeConfig::new())
@@ -820,7 +893,7 @@ mod tests {
 	/// frame's `write`.
 	async fn published_pts(frames: &[Frame], reset_before: Option<usize>) -> Vec<u128> {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 		let consumer = broadcast.consume();
 
 		// Input rate == Opus codec rate, so there's no resampler and sample
@@ -869,7 +942,7 @@ mod tests {
 	#[tokio::test]
 	async fn resampling_does_not_shift_the_first_pts() {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 		let consumer = broadcast.consume();
 
 		// 44.1 kHz in, and Opus only runs at 48 kHz, so this one resamples.
@@ -922,7 +995,7 @@ mod tests {
 	#[tokio::test]
 	async fn abort_after_finish() {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 		let consumer = broadcast.consume();
 		let options = Options {
 			track: Some("audio".to_string()),
@@ -959,7 +1032,7 @@ mod tests {
 	#[tokio::test]
 	async fn write_after_finish_is_closed() {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 		let options = Options {
 			track: Some("audio".to_string()),
 			..Options::default()
@@ -987,7 +1060,7 @@ mod tests {
 	#[tokio::test]
 	async fn default_options_derive_the_track_name() {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 
 		let first = Producer::new(&mut broadcast, catalog.clone(), Input::default(), &Options::default()).unwrap();
 		assert_eq!(first.track_name(), "0.opus");

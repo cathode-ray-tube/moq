@@ -10,7 +10,7 @@ async fn main() -> anyhow::Result<()> {
 	moq_tokio::Log::new(tracing::Level::DEBUG).init()?;
 
 	// Create an origin that the session can publish incoming broadcasts to.
-	let origin = moq_tokio::origin::spawn(moq_net::Hop::random());
+	let origin = moq_tokio::origin::spawn();
 	let consumer = origin.consume();
 
 	// Run the subscription and the session in parallel.
@@ -44,8 +44,8 @@ async fn run_subscribe(consumer: moq_net::origin::Consumer) -> anyhow::Result<()
 	// Wait for a route to be announced, then resolve the broadcast at its path.
 	// The convention is that a publisher announces each broadcast's exact path.
 	let update = consumer.announced().next().await.context("origin closed")?;
-	anyhow::ensure!(update.kind.is_active(), "route retracted: {}", update.path);
-	let path = update.path;
+	anyhow::ensure!(update.kind.is_active(), "route retracted: {}", update.prefix);
+	let path = update.prefix;
 
 	tracing::info!(%path, "broadcast announced");
 	let broadcast = consumer.request_broadcast(&path).await?;

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use futures::FutureExt as _;
 use moq_net::{Hop, Timestamp, Version};
-use support::harness::{MockConnectOptions, MockPair, TokioRuntime, connect_mock};
+use support::harness::{MockConnectOptions, MockPair, connect_mock};
 
 /// Maximum time any single test may run before being treated as a deadlock.
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -21,7 +21,7 @@ const PAYLOAD: &[u8] = b"datagram payload";
 /// Build an origin producer, spawning its driver on the ambient runtime.
 fn produce_origin(hop: u64) -> moq_net::origin::Producer {
 	let (producer, driver) = moq_net::origin::Producer::new(moq_net::origin::Config::new(Hop::new(hop).unwrap()));
-	tokio::spawn(driver.run(TokioRuntime::<()>::new()));
+	tokio::spawn(support::harness::run(driver));
 	producer
 }
 

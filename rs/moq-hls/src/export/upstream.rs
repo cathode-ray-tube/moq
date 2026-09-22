@@ -24,7 +24,7 @@ impl Upstream {
 	/// and subsequent media fetches reuse that request's result.
 	///
 	/// Fails when the reference escapes above the origin root and so names no broadcast at all.
-	pub fn bind(&self, rel: Option<&moq_net::PathRelativeOwned>) -> moq_mux::Result<moq_mux::Binding> {
+	pub fn bind(&self, rel: Option<&moq_net::path::RelativeOwned>) -> moq_mux::Result<moq_mux::Binding> {
 		if self.source.resolve_reference(rel) == self.source.resolve_reference(None) {
 			Ok(moq_mux::Binding::new(self.broadcast.clone()))
 		} else {
@@ -39,8 +39,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn self_references_keep_the_catalog_broadcast_after_replacement() {
-		let (origin, driver) = moq_net::origin::Producer::new(moq_net::Hop::random().into());
-		let driver = tokio::spawn(driver.run(moq_tokio::runtime::Runtime::<()>::new()));
+		let (origin, driver) = moq_net::origin::Producer::new(moq_net::origin::Config::default());
+		let driver = tokio::spawn(moq_net::time::run(driver));
 		let old = origin.create_broadcast("a/live").unwrap();
 		let source = moq_mux::Source::new(origin.consume(), "a/live");
 		let upstream = Upstream {
@@ -55,7 +55,7 @@ mod tests {
 		assert!(!upstream.source.broadcast().await.unwrap().is_closed());
 
 		for reference in [None, Some(""), Some("live"), Some("./live"), Some("../a/live")] {
-			let rel = reference.map(|value| moq_net::PathRelative::new(value).to_owned());
+			let rel = reference.map(|value| moq_net::path::Relative::new(value).to_owned());
 			let bound = upstream.bind(rel.as_ref()).unwrap().broadcast().await.unwrap();
 			assert!(
 				bound.is_closed(),

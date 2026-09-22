@@ -20,7 +20,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use moq_auth::{Event, Grant, Pattern, Patterns, Request};
 use moq_relay::{Config, Connection, Relay, auth, cluster, web};
-use moq_tokio::moq_net::{self, Hop};
+use moq_tokio::moq_net;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -178,7 +178,7 @@ async fn spawn_ws_relay(auth: moq_relay::auth::Auth) -> (u16, tokio::task::JoinH
 	// Stream listeners bind lazily, so this server never opens a socket; only
 	// its certificate handle is used.
 	let mut server_config = moq_tokio::listen::Config::default();
-	server_config.bind = Some("[::]:0".to_string());
+	server_config.bind = Some("[::]:0".parse().unwrap());
 	server_config.tls.generate = vec!["localhost".into()];
 	let certificates = server_config
 		.init(Default::default())
@@ -202,7 +202,7 @@ fn client() -> moq_tokio::Client {
 	let mut config = moq_tokio::connect::Config::default();
 	config.tls.insecure = Some(true);
 	config.once = Some(true);
-	config.websocket.delay = Duration::ZERO.into();
+	config.websocket.delay = Duration::ZERO;
 	config.bind = Some("127.0.0.1:0".parse().expect("parse bind"));
 	config.init(Default::default()).expect("client init")
 }
@@ -216,7 +216,7 @@ fn room_url(scheme: &str, port: u16) -> url::Url {
 /// Connect a publisher and a subscriber to `url` and prove one frame
 /// round-trips. Returns both sessions so the caller can watch them close.
 async fn connect_and_round_trip(url: &url::Url) -> (moq_tokio::Connection, moq_tokio::Connection) {
-	let pub_origin = moq_tokio::origin::spawn(Hop::random());
+	let pub_origin = moq_tokio::origin::spawn();
 	let broadcast = pub_origin.create_broadcast("test").expect("create broadcast");
 	broadcast.announce(Default::default()).expect("create broadcast");
 	let track = broadcast.create_track("video", None).expect("create track");
@@ -238,7 +238,7 @@ async fn connect_and_round_trip(url: &url::Url) -> (moq_tokio::Connection, moq_t
 	.expect("publisher connect timeout")
 	.expect("publisher connect failed");
 
-	let sub_origin = moq_tokio::origin::spawn(Hop::random());
+	let sub_origin = moq_tokio::origin::spawn();
 	let sub_consumer = sub_origin.consume();
 	let mut announcements = sub_consumer.announced();
 	let sub_session = tokio::time::timeout(
@@ -257,7 +257,7 @@ async fn connect_and_round_trip(url: &url::Url) -> (moq_tokio::Connection, moq_t
 		.await
 		.expect("announcement timeout")
 		.expect("origin closed");
-	assert_eq!(update.path.as_str(), "test");
+	assert_eq!(update.prefix.as_str(), "test");
 	assert!(update.kind.is_active(), "expected announce, got retraction");
 	let bc = sub_consumer
 		.request_broadcast("test")
@@ -291,7 +291,7 @@ async fn assert_refused(url: &url::Url) {
 }
 
 async fn assert_refused_with(client: moq_tokio::Client, url: &url::Url) {
-	let origin = moq_tokio::origin::spawn(Hop::random());
+	let origin = moq_tokio::origin::spawn();
 	let result = tokio::time::timeout(
 		TIMEOUT,
 		client
@@ -317,7 +317,7 @@ async fn spawn_quic_relay(
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
 	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 	let mut config = moq_tokio::listen::Config::default();
-	config.bind = Some("127.0.0.1:0".to_string());
+	config.bind = Some("127.0.0.1:0".parse().unwrap());
 	config.tls.generate = vec!["localhost".into()];
 	config.tls.root = root.into_iter().collect();
 	let server = config.init(Default::default()).expect("server init");
@@ -476,7 +476,7 @@ async fn http_routes_hold_a_lease() {
 	let (port, relay) = spawn_ws_relay(build_auth(script.spawn().await)).await;
 
 	// A publisher whose group stays open, so a fetch of it keeps streaming.
-	let pub_origin = moq_tokio::origin::spawn(Hop::random());
+	let pub_origin = moq_tokio::origin::spawn();
 	let broadcast = pub_origin.create_broadcast("test").expect("create broadcast");
 	broadcast.announce(Default::default()).expect("announce");
 	let track = broadcast.create_track("video", None).expect("create track");
@@ -498,7 +498,7 @@ async fn http_routes_hold_a_lease() {
 
 	// Wait until the announcement reaches the relay before asking over HTTP:
 	// the /announced handler only reports what has arrived so far.
-	let sub_origin = moq_tokio::origin::spawn(Hop::random());
+	let sub_origin = moq_tokio::origin::spawn();
 	let mut announcements = sub_origin.consume().announced();
 	let _sub_session = tokio::time::timeout(
 		TIMEOUT,
@@ -515,7 +515,7 @@ async fn http_routes_hold_a_lease() {
 		.await
 		.expect("announcement timeout")
 		.expect("origin closed");
-	assert_eq!(update.path.as_str(), "test");
+	assert_eq!(update.prefix.as_str(), "test");
 	assert!(update.kind.is_active(), "expected announce, got retraction");
 
 	let http = reqwest::Client::new();
@@ -727,7 +727,7 @@ async fn a_certificate_admits_only_what_the_server_grants() {
 	.await;
 	let (addr, relay) = spawn_quic_relay(build_auth(narrow), Some(root.clone())).await;
 	let url: url::Url = format!("moql://127.0.0.1:{}/room", addr.port()).parse().unwrap();
-	let origin = moq_tokio::origin::spawn(Hop::random());
+	let origin = moq_tokio::origin::spawn();
 	let session = tokio::time::timeout(
 		TIMEOUT,
 		mtls_client()
@@ -886,7 +886,7 @@ async fn a_relay_without_an_auth_source_is_decided_by_the_embedder() {
 		let mut config = Config::default();
 		config.listen.tcp.bind = Some(format!("127.0.0.1:{port}").parse().expect("parse addr"));
 		// The sessions are gone by the time the trigger fires; no need to wait out the default window.
-		config.drain_timeout = Duration::from_millis(100).into();
+		config.drain_timeout = Duration::from_millis(100);
 		config
 	};
 

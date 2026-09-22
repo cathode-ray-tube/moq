@@ -13,17 +13,17 @@ use web_async::spawn;
 
 use crate::{COMPRESSED_SUFFIX, SessionsFrame, TrafficFrame, sessions_track, traffic_track};
 
-/// Settings for a [`Producer`]. Construct with [`ProducerConfig::new`] and chain
+/// Settings for a [`Producer`]. Construct with [`Config::new`] and chain
 /// the `with_*` setters (e.g.
-/// `ProducerConfig::new().with_origin(origin).with_prefix(".foo")`), then hand it
+/// `Config::new().with_origin(origin).with_prefix(".foo")`), then hand it
 /// to [`Producer::new`].
 ///
 /// With no origin set the resulting producer is a no-op: its registry is
 /// disabled (bumps are dropped) and no task spawns. Call
-/// [`ProducerConfig::with_origin`] to publish.
+/// [`Config::with_origin`] to publish.
 #[derive(Clone)]
 #[non_exhaustive]
-pub struct ProducerConfig {
+pub struct Config {
 	/// Origin the stats broadcasts are created on.
 	/// When `None`, [`Producer::new`] spawns no task and publishes nothing.
 	pub origin: Option<origin::Producer>,
@@ -50,7 +50,7 @@ pub struct ProducerConfig {
 	pub depth: usize,
 }
 
-impl ProducerConfig {
+impl Config {
 	/// A config with default settings: no origin (no-op), `.stats` prefix, 1s
 	/// interval, and no node suffix. Call [`Self::with_origin`] to actually
 	/// publish.
@@ -96,7 +96,7 @@ impl ProducerConfig {
 	}
 }
 
-impl Default for ProducerConfig {
+impl Default for Config {
 	fn default() -> Self {
 		Self::new()
 	}
@@ -148,8 +148,8 @@ impl Producer {
 	/// [`Producer`] clone is dropped. With no origin the producer is a no-op
 	/// (its registry is disabled, nothing is published) and no task spawns, so
 	/// it's safe to build outside an async runtime.
-	pub fn new(config: ProducerConfig) -> Self {
-		let ProducerConfig {
+	pub fn new(config: Config) -> Self {
+		let Config {
 			origin,
 			prefix,
 			node,
@@ -636,17 +636,13 @@ struct GroupPublisher {
 impl GroupPublisher {
 	fn create(origin: &origin::Producer, prefix: &Path, group: &Path, node: Option<&str>) -> Option<Self> {
 		let advertised = advertised_path(prefix, group, node);
-		let broadcast = match origin.create_broadcast(&advertised) {
+		let broadcast = match origin.publish(&advertised, origin::Route::default()) {
 			Ok(broadcast) => broadcast,
 			Err(err) => {
 				tracing::warn!(advertised = %advertised, ?err, "stats: origin rejected stats broadcast");
 				return None;
 			}
 		};
-		if let Err(err) = broadcast.announce(origin::Route::default()) {
-			tracing::warn!(advertised = %advertised, ?err, "stats: origin rejected stats announce");
-			return None;
-		}
 		tracing::debug!(advertised = %advertised, "stats: publishing broadcast");
 
 		let mut traffic = TrackFamily::new();
@@ -885,9 +881,9 @@ fn advertised_path(prefix: &Path, group: &Path, node: Option<&str>) -> PathOwned
 mod tests {
 	/// Build an origin producer, spawning its driver on the ambient runtime.
 	fn produce_origin() -> moq_net::origin::Producer {
-		let (producer, driver) = moq_net::origin::Producer::new(moq_net::Hop::random().into());
+		let (producer, driver) = moq_net::origin::Producer::new(moq_net::origin::Config::default());
 		if tokio::runtime::Handle::try_current().is_ok() {
-			tokio::spawn(driver.run(moq_tokio::runtime::Runtime::<()>::new()));
+			tokio::spawn(moq_net::time::run(driver));
 		} else {
 			// A sync test: nothing polls the driver, and dropping it would tear
 			// the origin down, so leak it and rely on the synchronous half.
@@ -906,7 +902,7 @@ mod tests {
 	fn test_producer(node: Option<&str>) -> (Producer, origin::Producer) {
 		let origin = produce_origin();
 		let producer = Producer::new(
-			ProducerConfig::new()
+			Config::new()
 				.with_origin(origin.clone())
 				.with_node(node.map(|s| PathOwned::from(s.to_string()))),
 		);
@@ -992,10 +988,10 @@ mod tests {
 		assert!(update.kind.is_active());
 		let broadcast = origin
 			.consume()
-			.request_broadcast(moq_net::Path::new(update.path.as_str()))
+			.request_broadcast(moq_net::Path::new(update.prefix.as_str()))
 			.await
 			.expect("resolve");
-		(update.path.as_str().to_string(), broadcast)
+		(update.prefix.as_str().to_string(), broadcast)
 	}
 
 	/// Advance past one publish interval so the task drains and writes frames.

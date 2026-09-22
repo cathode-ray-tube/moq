@@ -32,8 +32,6 @@ iroh = ["moq-tokio/iroh"]
 cluster-lan = ["moq-relay/cluster-lan"]
 jemalloc = ["moq-tokio/jemalloc"]
 noq = ["moq-tokio/noq"]
-quinn = ["moq-tokio/quinn"]
-quiche = ["moq-tokio/quiche"]
 # qlog trace capture (`--client-quic-qlog <DIR>`). Off by default: it compiles the
 # qlog machinery into the enabled backends and is only wanted for debugging or
 # congestion-control testing.
@@ -59,7 +57,7 @@ play = ["dep:moq-video", "moq-video/render", "dep:moq-audio", "moq-audio/playbac
 # the matching moq-video feature, so it only bites when something else pulls in
 # moq-video: `capture`, `transcode`, or `play`. For a build with no CUDA
 # dependencies, drop it:
-#   cargo build -p moq-cli --no-default-features --features "iroh noq websocket capture"
+#   cargo build -p moq-cli --no-default-features --features "iroh,noq,websocket,capture"
 nvidia = ["moq-video?/nvidia", "moq-transcode?/nvidia"]
 # Compatibility aliases for the pre-consolidation names, kept so a manifest that
 # already asks for the old split still resolves. Undocumented on purpose: the
@@ -94,24 +92,26 @@ axum = { workspace = true }
 axum-server = { workspace = true }
 bytes = { workspace = true }
 hang = { workspace = true }
+humantime = { workspace = true }
 moq-audio = { workspace = true, optional = true, features = ["aac"] }
 moq-auth = { workspace = true, features = ["serve"] }
 # `server` enables the HTTP egress server for `moq export hls`; the importer is always available.
 moq-hls = { workspace = true, features = ["server"] }
 moq-mux = { workspace = true }
 # Cluster, LAN mesh, and inbound `/.cluster` auth. default-features off so the
-# CLI's own feature set (iroh, backends, cluster-lan) is what selects them.
+# CLI's own feature set (iroh, noq, cluster-lan) is what selects them.
 moq-relay = { workspace = true }
 moq-rtc = { workspace = true }
 moq-rtmp = { workspace = true }
 moq-srt = { workspace = true }
 # Raw qmux listeners are part of the CLI surface. `uds` compiles only on Unix.
 moq-tokio = { workspace = true, default-features = false, features = ["aws-lc-rs", "tcp", "uds"] }
-moq-transcode = { workspace = true, optional = true }
-moq-video = { workspace = true, optional = true }
+moq-transcode = { workspace = true, optional = true, features = ["openh264"] }
+moq-video = { workspace = true, optional = true, features = ["openh264"] }
 pollster = { workspace = true, optional = true }
 reqwest = { workspace = true, features = ["rustls", "json"] }
 rustls = { version = "0.23", features = ["aws-lc-rs"], default-features = false }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tower-http = { workspace = true }

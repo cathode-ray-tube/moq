@@ -125,7 +125,7 @@ func awaitAnnouncement(t *testing.T, ctx context.Context, announced *moq.Announc
 		if ann == nil {
 			t.Fatalf("announcement stream ended before %q", path)
 		}
-		if ann.Active() && ann.Path() == path {
+		if ann.Active() && ann.Prefix() == path {
 			return
 		}
 	}
@@ -181,7 +181,7 @@ func TestReconnectAcrossRelayRestart(t *testing.T) {
 	subscriber := dialWorker(t, ctx, url)
 	defer subscriber.Close()
 
-	announced, err := subscriber.Announced("")
+	announced, err := subscriber.Announced(moq.AnnounceOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

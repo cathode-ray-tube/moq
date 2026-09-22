@@ -10,7 +10,6 @@ use std::collections::BTreeSet;
 use std::net::TcpListener;
 use std::time::Duration;
 
-use moq_net::Hop;
 use moq_relay::{
 	Connection, auth,
 	cluster::{self, Peer},
@@ -29,8 +28,8 @@ async fn within<T>(step: &str, fut: impl std::future::Future<Output = T>) -> T {
 
 /// Run an integration-test future on a dedicated thread with a large stack.
 ///
-/// Under `--all-features`, `moq-tokio` compiles every transport backend
-/// (quinn, quiche, noq, iroh, websocket) into its `Session`/`Client` types.
+/// Under `--all-features`, `moq-tokio` compiles every transport
+/// (noq, iroh, websocket, and qmux) into its `Session`/`Client` types.
 /// These multi-relay tests hold several such values live across await points,
 /// so the single test future's state machine is large, and in an unoptimized
 /// build it overflows libtest's default 2 MiB per-test thread stack (a SIGABRT
@@ -98,7 +97,7 @@ fn drain_session_with_zero_timeout_closes_at_once() {
 async fn drain_session_with_zero_timeout_closes_at_once_inner() {
 	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-	let origin = moq_tokio::origin::spawn(Hop::random());
+	let origin = moq_tokio::origin::spawn();
 	let (port, mut accepted, _handle) = spawn_upstream(origin);
 	wait_listening(port).await;
 
@@ -148,7 +147,7 @@ fn spawn_upstream(
 		let mut server = server.listen().await.expect("listen");
 		while let Some(request) = server.accept().await {
 			// Serve the shared origin bidirectionally, like a relay peer would.
-			let scratch = moq_tokio::origin::spawn(Hop::random());
+			let scratch = moq_tokio::origin::spawn();
 			let session = match request.with_publisher(&origin).with_subscriber(scratch).ok().await {
 				Ok(session) => session,
 				Err(err) => {
@@ -187,7 +186,7 @@ async fn cluster_migrates_on_upstream_goaway_inner() {
 
 	tokio::time::timeout(TEST_TIMEOUT, async {
 		// ── the shared "live" broadcast both siblings can serve ─────────
-		let upstream_origin = moq_tokio::origin::spawn(Hop::random());
+		let upstream_origin = moq_tokio::origin::spawn();
 		let broadcast = upstream_origin.create_broadcast("cam").expect("create broadcast");
 		broadcast.announce(Default::default()).expect("create broadcast");
 		let track = broadcast.create_track("video", None).expect("create track");
@@ -201,7 +200,7 @@ async fn cluster_migrates_on_upstream_goaway_inner() {
 		let mut client_config = moq_tokio::connect::Config::default();
 		client_config.tls.insecure = Some(true);
 		// Short handover so the test observes the old session close quickly.
-		client_config.goaway.handover = Duration::from_secs(2).into();
+		client_config.goaway.handover = Duration::from_secs(2);
 		let client = client_config.init(Default::default()).expect("client init");
 
 		let mut cluster_config = cluster::Config::default();
@@ -247,7 +246,7 @@ async fn cluster_migrates_on_upstream_goaway_inner() {
 		// re-prices the old route and the sibling announces its own).
 		let mut announcements = cluster.origin.consume().announced();
 		let first = announcements.next().await.expect("initial announce");
-		assert_eq!(first.path.as_str(), "cam");
+		assert_eq!(first.prefix.as_str(), "cam");
 
 		// ── sibling A drains with a redirect to sibling B ────────────────
 		session_a
@@ -324,7 +323,7 @@ async fn spawn_relay_with_upstream(
 	let mut client_config = moq_tokio::connect::Config::default();
 	client_config.tls.insecure = Some(true);
 	// Short handover so the test observes the old session close quickly.
-	client_config.goaway.handover = Duration::from_secs(2).into();
+	client_config.goaway.handover = Duration::from_secs(2);
 	let client = client_config.init(Default::default()).expect("client init");
 
 	let cluster = cluster::Cluster::new(cluster::Options::new(cluster_config))
@@ -384,7 +383,7 @@ async fn cluster_diamond_goaway_seamless_failover_inner() {
 	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
 	// ── TOP: origin server serving the same broadcast to both mids ──────
-	let top_origin = moq_tokio::origin::spawn(Hop::random());
+	let top_origin = moq_tokio::origin::spawn();
 	let broadcast = top_origin.create_broadcast("diamond").expect("create broadcast");
 	broadcast.announce(Default::default()).expect("create broadcast");
 	let track = broadcast.create_track("video", None).expect("create track");
@@ -402,11 +401,11 @@ async fn cluster_diamond_goaway_seamless_failover_inner() {
 		.expect("TOP accept channel closed");
 
 	// ── MID-A: mini-relay consuming TOP, serving BOTTOM, drains later ───
-	let mid_a_origin = moq_tokio::origin::spawn(Hop::random());
+	let mid_a_origin = moq_tokio::origin::spawn();
 	let mut client_config = moq_tokio::connect::Config::default();
 	client_config.tls.insecure = Some(true);
 	// Short handover so the test observes the old session close quickly.
-	client_config.goaway.handover = Duration::from_secs(2).into();
+	client_config.goaway.handover = Duration::from_secs(2);
 	let mid_a_client = client_config.init(Default::default()).expect("mid-a client init");
 	let (_mid_a_upstream_client, mid_a_upstream) = within(
 		"MID-A connects to TOP",
@@ -434,7 +433,7 @@ async fn cluster_diamond_goaway_seamless_failover_inner() {
 		.expect("MID-A accept channel closed");
 
 	// ── SUBSCRIBER: connects to BOTTOM ───────────────────────────────────
-	let sub_origin = moq_tokio::origin::spawn(Hop::random());
+	let sub_origin = moq_tokio::origin::spawn();
 	let mut sub_client_config = moq_tokio::connect::Config::default();
 	sub_client_config.tls.insecure = Some(true);
 	let sub_client = sub_client_config
@@ -456,7 +455,7 @@ async fn cluster_diamond_goaway_seamless_failover_inner() {
 	let first = within("broadcast announced through the MID-A leg", announcements.next())
 		.await
 		.expect("origin closed before the announce");
-	assert_eq!(first.path.as_str(), "diamond");
+	assert_eq!(first.prefix.as_str(), "diamond");
 
 	let bc = within("broadcast resolves on the subscriber origin", async {
 		let consumer = sub_origin.consume();
@@ -656,7 +655,7 @@ async fn collect_group(sub: &mut moq_net::track::Subscriber, seen: &mut BTreeSet
 async fn cluster_reconnects_on_empty_uri_goaway_inner() {
 	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-	let upstream_origin = moq_tokio::origin::spawn(Hop::random());
+	let upstream_origin = moq_tokio::origin::spawn();
 	let broadcast = upstream_origin.create_broadcast("cam").expect("create broadcast");
 	broadcast.announce(Default::default()).expect("create broadcast");
 	let track = broadcast.create_track("video", None).expect("create track");
@@ -667,7 +666,7 @@ async fn cluster_reconnects_on_empty_uri_goaway_inner() {
 	let mut client_config = moq_tokio::connect::Config::default();
 	client_config.tls.insecure = Some(true);
 	// Short handover so the test observes the old session close quickly.
-	client_config.goaway.handover = Duration::from_secs(2).into();
+	client_config.goaway.handover = Duration::from_secs(2);
 	let client = client_config.init(Default::default()).expect("client init");
 
 	let mut cluster_config = cluster::Config::default();
@@ -775,7 +774,7 @@ fn goaway_handover_is_enforced_while_the_replacement_dial_hangs() {
 async fn goaway_handover_is_enforced_while_the_replacement_dial_hangs_inner() {
 	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-	let upstream_origin = moq_tokio::origin::spawn(Hop::random());
+	let upstream_origin = moq_tokio::origin::spawn();
 	let (port, mut accepted, _handle) = spawn_upstream(upstream_origin);
 	wait_listening(port).await;
 
@@ -793,11 +792,11 @@ async fn goaway_handover_is_enforced_while_the_replacement_dial_hangs_inner() {
 	let handover = Duration::from_millis(200);
 	let mut client_config = moq_tokio::connect::Config::default();
 	client_config.tls.insecure = Some(true);
-	client_config.goaway.handover = handover.into();
+	client_config.goaway.handover = handover;
 	// The GOAWAY has to land on a *healthy* session, which is the path that goes
 	// straight into the replacement dial. Below this bar it takes the immediate
 	// redirect path instead, whose sleep polls the drain either way.
-	client_config.backoff.initial = Duration::from_millis(50).into();
+	client_config.backoff.initial = Duration::from_millis(50);
 	let client = client_config.init(Default::default()).expect("client init");
 
 	let url: Url = format!("tcp://127.0.0.1:{port}/").parse().expect("parse url");

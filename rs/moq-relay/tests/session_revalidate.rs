@@ -17,7 +17,7 @@ use axum::{Json, Router};
 use moq_auth::{Event, Grant, Pattern, Patterns, Request};
 use moq_relay::session::{Filter, List, Nudged};
 use moq_relay::{Connection, auth, cluster, internal, web};
-use moq_tokio::moq_net::{self, Hop};
+use moq_tokio::moq_net;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -163,7 +163,7 @@ impl Fixture {
 			let port = free_port();
 			let cluster = cluster::Cluster::new(cluster::Options::default()).expect("cluster init");
 			let mut server_config = moq_tokio::listen::Config::default();
-			server_config.bind = Some("[::]:0".to_string());
+			server_config.bind = Some("[::]:0".parse().unwrap());
 			server_config.tls.generate = vec!["localhost".into()];
 			let certificates = server_config
 				.init(Default::default())
@@ -256,7 +256,7 @@ fn client_at(bind: &str) -> moq_tokio::Client {
 	let mut config = moq_tokio::connect::Config::default();
 	config.tls.insecure = Some(true);
 	config.once = Some(true);
-	config.websocket.delay = Duration::ZERO.into();
+	config.websocket.delay = Duration::ZERO;
 	config.bind = Some(bind.parse().expect("parse bind"));
 	config.init(Default::default()).expect("client init")
 }
@@ -265,7 +265,7 @@ async fn connect(url: url::Url, bind: &str) -> moq_tokio::Connection {
 	tokio::time::timeout(
 		TIMEOUT,
 		client_at(bind)
-			.with_subscriber(moq_tokio::origin::spawn(Hop::random()))
+			.with_subscriber(moq_tokio::origin::spawn())
 			.with_reconnect(false)
 			.connect(url)
 			.established(),

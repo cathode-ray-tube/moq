@@ -9,9 +9,9 @@
 //! Kernel-gated: skips loudly below the Linux 6.12 floor (GitHub-hosted CI),
 //! and runs everywhere else.
 
-#![cfg(all(target_os = "linux", any(feature = "noq", feature = "quiche", feature = "quinn")))]
+#![cfg(all(target_os = "linux", feature = "noq"))]
 
-#[path = "support/quiche.rs"]
+#[path = "support.rs"]
 mod support;
 
 use std::net::UdpSocket;
@@ -80,10 +80,14 @@ fn a_steered_group_serves_a_shared_port() {
 	// guarantees it. The group is held for as long as the sockets are served,
 	// since it is what holds the port.
 	let mut group = Group::acquire("127.0.0.1:0".parse().expect("addr"), WORKERS).expect("group");
-	let mut members = Vec::new();
+	let mut claims = Vec::new();
 	while let Some(member) = group.member() {
-		let shard = member.shard();
-		members.push((shard, member.bind().expect("bind group member")));
+		claims.push(member.bind().expect("bind group member"));
+	}
+	let mut group = group.complete(claims).expect("complete group");
+	let mut members = Vec::new();
+	while let Some(member) = group.member().expect("clone retained socket") {
+		members.push((member.shard(), member.into_inner()));
 	}
 	let addr = group.addr();
 
@@ -161,7 +165,7 @@ fn a_steered_group_serves_a_shared_port() {
 					std::time::Instant::now() < deadline,
 					"only {total} of {DIALS} dials were accepted"
 				);
-				moq_net::runtime::Deadline::after(&handle, std::time::Duration::from_millis(10))
+				moq_uring::Timer::after(&handle, std::time::Duration::from_millis(10))
 					.wait()
 					.await;
 			}

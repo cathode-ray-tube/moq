@@ -81,7 +81,7 @@ pub(crate) struct BroadcastProducer {
 /// arm silently dropped.
 struct MediaProducer {
 	// Boxed because the codec splitters/imports make this much larger than the container one.
-	import: Box<moq_mux::import::Track<Extra>>,
+	import: Box<moq_mux::import::Track>,
 	/// Subscriber demand (name/used/unused) for the one track this publishes.
 	demand: moq_net::track::Demand,
 }
@@ -93,7 +93,7 @@ struct ContainerProducer {
 
 /// A byte-stream importer for one codec track, where frame boundaries are inferred.
 struct MediaStreamProducer {
-	import: Box<moq_mux::import::TrackStream<Extra>>,
+	import: Box<moq_mux::import::TrackStream>,
 }
 
 /// A byte-stream importer for a container, which recovers its own framing.
@@ -154,8 +154,9 @@ impl MoqBroadcastProducer {
 	/// Wrap a `moq_net::broadcast::Producer` (standalone or origin-created), attaching
 	/// the catalog track every FFI broadcast carries.
 	pub(crate) fn from_inner(mut broadcast: moq_net::broadcast::Producer) -> Result<Self, MoqError> {
-		let catalog =
-			moq_mux::catalog::Producer::with_catalog(&mut broadcast, moq_mux::catalog::hang::Catalog::default())?;
+		let config =
+			moq_mux::catalog::Config::default().with_catalog(moq_mux::catalog::hang::Catalog::<Extra>::default());
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, config)?;
 		Ok(Self {
 			state: std::sync::Mutex::new(Some(BroadcastProducer { broadcast, catalog })),
 		})
@@ -286,8 +287,9 @@ impl MoqBroadcastProducer {
 	///
 	/// `json` is any JSON document (object, array, string, ...) serialized as a UTF-8 string.
 	/// Errors with [`MoqError::Json`] if `json` doesn't parse, or with the reserved-section
-	/// error if `name` is `video`/`audio` (owned by the media pipeline). The section is
-	/// republished on the catalog track immediately.
+	/// error if `name` is a HANG root (`video`, `audio`, `text`, `archive`, `clock`, `json`,
+	/// `binary`, or retired `timeline`) or an MSF root (`version`, `generatedAt`, `isComplete`,
+	/// `tracks`, or `initDataList`). The section is republished on the catalog track immediately.
 	pub fn set_catalog_section(&self, name: String, json: String) -> Result<(), MoqError> {
 		let _guard = crate::ffi::enter();
 		let value: serde_json::Value = serde_json::from_str(&json)?;
@@ -871,7 +873,7 @@ impl MoqGroupProducer {
 
 impl MoqMediaProducer {
 	/// Wrap a single-codec importer, capturing the demand handle its track exposes.
-	fn new(import: moq_mux::import::Track<Extra>) -> Arc<Self> {
+	fn new(import: moq_mux::import::Track) -> Arc<Self> {
 		let demand = import.demand();
 		Arc::new(Self {
 			inner: std::sync::Mutex::new(Some(MediaProducer {

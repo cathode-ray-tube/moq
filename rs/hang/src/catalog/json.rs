@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, btree_map};
 
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::{Compression, Mode, Timeline};
+use crate::catalog::{Compression, Mode};
 
 /// The JSON tracks a broadcast publishes, keyed by track name.
 ///
@@ -68,7 +68,7 @@ pub struct JsonConfig {
 	/// broadcast that served this catalog (e.g. `./source`). If unset, the track lives in the same
 	/// broadcast as the catalog.
 	#[serde(default)]
-	pub broadcast: Option<moq_net::PathRelativeOwned>,
+	pub broadcast: Option<moq_net::path::RelativeOwned>,
 
 	/// Whether the track is a latest-value document or an append log. Always stated: see [`Mode`].
 	#[serde_as(as = "serde_with::DisplayFromStr")]
@@ -83,10 +83,6 @@ pub struct JsonConfig {
 	/// descriptive: a consumer that doesn't recognize it can still read the track.
 	#[serde(default)]
 	pub schema: Option<String>,
-
-	/// The companion timeline track indexing this track's groups, if the publisher offers one.
-	#[serde(default)]
-	pub timeline: Option<Timeline>,
 
 	/// Fields this build doesn't recognize, kept so the entry round-trips.
 	///
@@ -106,7 +102,6 @@ impl JsonConfig {
 			mode,
 			compression: None,
 			schema: None,
-			timeline: None,
 			extra: Default::default(),
 		}
 	}

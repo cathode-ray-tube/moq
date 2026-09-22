@@ -17,14 +17,14 @@ import { Time } from "@moq/net";
 import * as Publish from "@moq/publish";
 import { Effect, Signal } from "@moq/signals";
 import type { Fault, FixtureState } from "./contract";
-import { OFFSET_STEPS, SAMPLE_RATE } from "./contract";
+import { KEYFRAME_INTERVAL_MS, OFFSET_STEPS, SAMPLE_RATE } from "./contract";
 import * as Pattern from "./pattern";
 
 /** Cap the encoder rather than letting it track a bandwidth estimate, so runs are comparable. */
 const MAX_BITRATE = 1_000_000;
 
 /** Short GOP so a late subscriber tunes in quickly and a rejoin is not dominated by keyframe wait. */
-const KEYFRAME_INTERVAL = Time.Milli.fromSecond(0.5 as Time.Second);
+const KEYFRAME_INTERVAL = Time.Milli(KEYFRAME_INTERVAL_MS);
 
 /** How far ahead the tone table is scheduled on the audio clock. */
 const SCHEDULE_AHEAD = 2; // seconds
@@ -106,7 +106,7 @@ export class Fixture {
 		// Handed to the capture only once this page has user activation. The capture builds its own
 		// AudioContext the moment a source appears and never resumes it, so one built before the
 		// first gesture stays suspended and no audio is ever captured. See
-		// /quest/m2/publish-audio-unlock.md; until that lands, giving it the source late is what keeps
+		// /quest/next/publish-audio-unlock.md; until that lands, giving it the source late is what keeps
 		// this fixture measuring the player rather than that gap.
 		const audioSource = new Signal<Publish.Audio.Source | undefined>(undefined);
 

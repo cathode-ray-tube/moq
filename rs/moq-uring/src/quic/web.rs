@@ -7,7 +7,7 @@
 //! selection) using [`web_transport_proto`]'s state machines, and
 //! [`Request::respond`] yields a [`Session`].
 //!
-//! [`Session`] is the one transport type the worker's runtime drives:
+//! [`Session`] supports both raw QUIC and WebTransport on the worker:
 //! [`Session::raw`] wraps a raw-QUIC connection in the same type with the
 //! WebTransport layering disabled, so native peers and browsers run the same
 //! machinery. Stream and session error codes map through the HTTP/3 error
@@ -311,7 +311,7 @@ impl Request {
 		// The guard stays armed across the wait below. Cancelling this future
 		// mid-grace would otherwise skip the deliberate close and leak the
 		// connection, which is the very thing the guard is here to prevent.
-		let mut deadline = moq_net::runtime::Deadline::after(&self.handle, CLOSE_GRACE);
+		let mut deadline = crate::Timer::after(&self.handle, CLOSE_GRACE);
 		let send = &mut self.send;
 		kio::wait(|waiter| {
 			let mut cx = Context::from_waker(waiter.waker());
@@ -419,7 +419,7 @@ struct State {
 
 /// A MoQ transport over the worker: raw QUIC, or a WebTransport session.
 ///
-/// The runtime's one transport type. [`Request::respond`] builds the web
+/// [`Request::respond`] builds the web
 /// flavor; [`Session::raw`] wraps a raw-QUIC [`Connection`] with the layering
 /// disabled. Clones share the session.
 pub struct Session {
@@ -431,7 +431,7 @@ pub struct Session {
 }
 
 impl Session {
-	/// Wrap a raw-QUIC connection in the runtime's transport type, with no
+	/// Wrap a raw-QUIC connection in a session, with no
 	/// WebTransport layering: streams and datagrams pass through untouched.
 	pub fn raw(conn: Connection) -> Self {
 		let protocol = web_transport_trait::poll::Session::protocol(&conn).map(str::to_owned);
@@ -735,7 +735,7 @@ impl web_transport_trait::poll::Session for Session {
 		// the task rather than here because flow control can take it in
 		// pieces, and abandoning a partial frame would leave the browser with
 		// neither the code nor the reason.
-		let mut deadline = moq_net::runtime::Deadline::after(&web.handle, CLOSE_GRACE);
+		let mut deadline = crate::Timer::after(&web.handle, CLOSE_GRACE);
 		let reason = reason.to_string();
 		let mut conn = self.conn.clone();
 		web.handle.spawn(async move {

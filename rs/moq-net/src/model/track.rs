@@ -34,12 +34,12 @@ use std::{
 /// Default [`Info::max_age`] when the publisher doesn't set one.
 pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(5);
 
-/// How long a datagram stays in the per-track buffer before it is dropped.
+/// Maximum number of datagrams retained in the per-track send buffer.
 ///
 /// Datagrams are a best-effort send buffer, not a replay cache (unlike groups): only the last
-/// few tens of milliseconds are kept, so a consumer that stalls loses stale datagrams instead of
-/// replaying them. Sized like a typical send buffer for real-time audio/video.
-const MAX_DATAGRAM_AGE: Duration = Duration::from_millis(50);
+/// 64 datagrams are kept, so a stalled consumer cannot retain an unbounded backlog.
+/// The payload size limit also bounds the buffer's memory use.
+const MAX_DATAGRAMS: usize = 64;
 
 /// Slack before the eviction order is rebuilt, so a track holding just a few groups
 /// doesn't rebuild on every write.
@@ -55,12 +55,12 @@ const EVICT_SCAN: usize = 4;
 pub(super) struct ExpiryScan {
 	start: usize,
 	// Ceiling on how many entries this pass examines. `EVICT_SCAN` from the write
-	// path, the whole queue from the pool's sweep. Either way the pass stops once it
-	// has retained `EVICT_SCAN` entries, so its cost tracks what it reclaims rather
-	// than how much the track has cached.
+	// path, the whole queue from the pool's cleanup pass.
 	width: usize,
 	now: u64,
 	max_ticks: u64,
+	// Cleanup dates pending activity; write-driven scans only check dated entries.
+	gc: bool,
 }
 
 /// Publisher-side properties of a track.
@@ -187,12 +187,11 @@ pub(crate) struct TrackState {
 	// what each track writes and never touches another track's cache.
 	debt: u64,
 
-	// Datagrams in arrival order paired with their arrival time, a best-effort send buffer
-	// evicted by age (see `MAX_DATAGRAM_AGE`). Shares the group `max_sequence` namespace but
-	// is otherwise independent.
-	datagrams: VecDeque<(Datagram, crate::runtime::Instant)>,
+	// Datagrams in arrival order, bounded by `MAX_DATAGRAMS`. Shares the group
+	// sequence namespace but is otherwise independent.
+	datagrams: VecDeque<Datagram>,
 
-	// Number of datagrams dropped off the front (aged out), mapping a subscriber's absolute
+	// Number of datagrams dropped off the front (over capacity), mapping a subscriber's absolute
 	// cursor to an index into `datagrams` (mirrors `offset` for groups).
 	datagram_offset: usize,
 
@@ -303,7 +302,7 @@ pub(crate) struct FetchOutcome {
 
 impl TrackState {
 	fn normalize_info(broadcast: &broadcast::Info, mut info: Info) -> Info {
-		info.max_age = info.max_age.min(broadcast.origin.cache_duration);
+		info.max_age = info.max_age.min(broadcast.cache_duration);
 		info
 	}
 
@@ -358,7 +357,7 @@ impl TrackState {
 	/// resumes at the oldest still-buffered datagram, skipping the lost ones.
 	fn poll_recv_datagram(&self, index: usize) -> Poll<Result<Option<(Datagram, usize)>>> {
 		let start = index.saturating_sub(self.datagram_offset);
-		if let Some((datagram, _)) = self.datagrams.get(start) {
+		if let Some(datagram) = self.datagrams.get(start) {
 			return Poll::Ready(Ok(Some((datagram.clone(), self.datagram_offset + start))));
 		}
 
@@ -372,17 +371,13 @@ impl TrackState {
 		}
 	}
 
-	/// Push a datagram onto the buffer, dropping any that have aged past [`MAX_DATAGRAM_AGE`].
+	/// Push a datagram, dropping the oldest when the send buffer is full.
 	fn push_datagram(&mut self, datagram: Datagram) {
-		let now = crate::model::clock::now();
-		self.datagrams.push_back((datagram, now));
-		while let Some((_, at)) = self.datagrams.front() {
-			if now.duration_since(*at) <= MAX_DATAGRAM_AGE {
-				break;
-			}
+		if self.datagrams.len() == MAX_DATAGRAMS {
 			self.datagrams.pop_front();
 			self.datagram_offset += 1;
 		}
+		self.datagrams.push_back(datagram);
 	}
 
 	/// Find the smallest-sequence cached group satisfying
@@ -601,7 +596,7 @@ impl TrackState {
 	/// fetched, or written) entries in front of them: every position is revisited
 	/// within a few writes. Expiry throughput is therefore EVICT_SCAN groups per write; the
 	/// byte budget reclaims the remainder under memory pressure, and the pool's sweep
-	/// ([`Self::expiry_scan_full`]) covers a track that stopped writing entirely.
+	/// ([`Self::expiry_scan_drain`]) covers a track that stopped writing entirely.
 	pub(super) fn evict_expired(&mut self) {
 		let scan = self.expiry_scan();
 		self.evict_expired_scan(scan);
@@ -614,25 +609,26 @@ impl TrackState {
 			width: EVICT_SCAN,
 			now: self.cache.pool().now(),
 			max_ticks: self.cache.pool().expiry_ticks(),
+			gc: false,
 		}
 	}
 
-	/// Describe a scan that drains the stale front of the eviction order, for the
-	/// pool's sweep.
-	///
-	/// A write's rotating window is fine while writes keep coming, because the next
-	/// one revisits the rest. The sweep is the only thing running on a track nobody
-	/// writes, so that window would take a backlog's length in sweeps to reach the
-	/// oldest entry. This starts at the front, where the oldest entries are, and the
-	/// shared stop rule ends it once the front stops yielding victims. A track that
-	/// went quiet has its whole backlog stale and contiguous there, so one sweep takes
-	/// all of it; a track with nothing due costs `EVICT_SCAN` entries, not its depth.
+	/// Scan every cached candidate so undated accesses and old entries cannot hide
+	/// behind fresh entries at the front of the eviction order.
 	pub(super) fn expiry_scan_drain(&self) -> ExpiryScan {
 		ExpiryScan {
 			start: 0,
 			width: self.evict.len(),
 			now: self.cache.pool().now(),
 			max_ticks: self.cache.pool().expiry_ticks(),
+			gc: true,
+		}
+	}
+
+	#[cfg(test)]
+	pub(super) fn date_cache_accesses(&self, now: u64) {
+		for slot in self.lookup.values() {
+			slot.group.cache_accessed_tick(Some(now));
 		}
 	}
 
@@ -655,12 +651,15 @@ impl TrackState {
 				}
 				if slot.group.is_aborted()
 					|| (Some(sequence) != self.latest_group
-						&& scan.now.saturating_sub(slot.group.cache_accessed_tick()) > scan.max_ticks)
+						&& slot
+							.group
+							.cache_accessed_tick(scan.gc.then_some(scan.now))
+							.is_some_and(|tick| scan.now.saturating_sub(tick) > scan.max_ticks))
 				{
 					return true;
 				}
 				retained += 1;
-				if retained >= EVICT_SCAN {
+				if !scan.gc && retained >= EVICT_SCAN {
 					break;
 				}
 			}
@@ -699,13 +698,15 @@ impl TrackState {
 					continue;
 				}
 				if Some(sequence) == self.latest_group
-					|| scan.now.saturating_sub(slot.group.cache_accessed_tick()) <= scan.max_ticks
+					|| slot
+						.group
+						.cache_accessed_tick(scan.gc.then_some(scan.now))
+						.is_none_or(|tick| scan.now.saturating_sub(tick) <= scan.max_ticks)
 				{
-					// Nothing to reclaim here. The front of the queue is the oldest
-					// content, so a run of these means the rest is fresher still: stop
-					// rather than walk a whole cache to find nothing.
+					// Writes keep their scan bounded. Cleanup visits the entire
+					// queue to date pending accesses and find idle entries behind them.
 					retained += 1;
-					if retained >= EVICT_SCAN {
+					if !scan.gc && retained >= EVICT_SCAN {
 						break;
 					}
 					continue;
@@ -781,7 +782,7 @@ impl TrackState {
 			broadcast: broadcast.clone(),
 			..Default::default()
 		});
-		let cache = cache::Track::new(broadcast.origin.pool.clone(), state.downgrade());
+		let cache = cache::Track::new(broadcast.pool.clone(), state.downgrade());
 		state.write().ok().expect("a new track is open").cache = cache;
 		state
 	}
@@ -4425,22 +4426,21 @@ mod test {
 		assert_eq!(&recv_datagram(&mut b).payload[..], b"second");
 	}
 
-	#[tokio::test]
-	async fn datagram_evicts_stale() {
+	#[test]
+	fn datagram_buffer_drops_oldest_at_capacity() {
 		let mut producer = track_producer("test", None);
-		let mut dg = producer.subscribe(None);
-		let ts = Timestamp::from_millis(0).unwrap();
-
-		producer.append_datagram(ts, &b"old"[..]).unwrap(); // sequence 0
-
-		// Age past the send-buffer window, then push a fresh datagram: the stale one is evicted.
-		crate::model::clock::advance(MAX_DATAGRAM_AGE + Duration::from_millis(10));
-		producer.append_datagram(ts, &b"new"[..]).unwrap(); // sequence 1
-
-		// A lagging consumer resumes at the oldest still-buffered datagram (the fresh one).
-		let got = recv_datagram(&mut dg);
-		assert_eq!(got.sequence, 1);
-		assert_eq!(&got.payload[..], b"new");
+		let mut slow = producer.subscribe(None);
+		let mut fast = producer.subscribe(None);
+		let count = MAX_DATAGRAMS * 3;
+		for sequence in 0..count {
+			producer.append_datagram(Timestamp::ZERO, b"x".as_slice()).unwrap();
+			assert_eq!(recv_datagram(&mut fast).sequence, sequence as u64);
+		}
+		assert_eq!(producer.state.read().datagrams.len(), MAX_DATAGRAMS);
+		for sequence in count - MAX_DATAGRAMS..count {
+			assert_eq!(recv_datagram(&mut slow).sequence, sequence as u64);
+		}
+		assert!(slow.poll_recv_datagram(&kio::Waiter::noop()).is_pending());
 	}
 
 	#[tokio::test]
@@ -4811,13 +4811,9 @@ mod test {
 
 	/// Mint a track under an origin caching into `pool`.
 	fn track_producer_pooled(name: impl Into<Arc<str>>, pool: cache::Pool) -> Producer {
-		let origin = crate::origin::Config {
-			pool,
-			..crate::origin::Config::default()
-		};
 		Producer::new(
 			Arc::new(broadcast::Info {
-				origin,
+				pool,
 				..Default::default()
 			}),
 			name,
@@ -4843,6 +4839,46 @@ mod test {
 			!producer.state.read().lookup.contains_key(&0),
 			"the sweep reclaimed an idle open group with no write behind it"
 		);
+	}
+
+	#[test]
+	fn cache_gc_dates_activity_before_expiring_it() {
+		let pool = cache::Pool::new(cache::Config::default().with_expiry(Duration::from_secs(1)));
+		let now = crate::model::clock::now();
+		assert_eq!(pool.gc(now), Some(now + Duration::from_millis(500)));
+		let producer = track_producer_pooled("test", pool.clone());
+		let mut group = producer.append_group().unwrap();
+		group.write_frame(Timestamp::ZERO, b"first".as_slice()).unwrap();
+		producer.append_group().unwrap();
+		// Activity written while cleanup was idle gets the new supplied time.
+		let later = now + Duration::from_secs(60);
+		pool.gc(later);
+		assert!(producer.state.read().lookup.contains_key(&0));
+		pool.gc(later + Duration::from_secs(2));
+		assert!(!producer.state.read().lookup.contains_key(&0));
+	}
+
+	#[test]
+	fn cache_gc_reaches_old_entries_behind_a_fresh_front() {
+		let expiry = Duration::from_secs(1);
+		let pool = cache::Pool::new(cache::Config::default().with_expiry(expiry));
+		let producer = track_producer_pooled("test", pool.clone());
+		let now = crate::model::clock::now();
+		let groups: Vec<_> = (0..EVICT_SCAN * 3).map(|_| producer.append_group().unwrap()).collect();
+		producer.append_group().unwrap();
+		pool.gc(now);
+		// Keep more than a write scan's worth of leading entries fresh.
+		for group in &groups[..EVICT_SCAN * 2] {
+			group.cache_refresh();
+		}
+		pool.gc(now + expiry * 2);
+		let state = producer.state.read();
+		for sequence in 0..EVICT_SCAN * 2 {
+			assert!(state.lookup.contains_key(&(sequence as u64)), "fresh front survives");
+		}
+		for sequence in EVICT_SCAN * 2..EVICT_SCAN * 3 {
+			assert!(!state.lookup.contains_key(&(sequence as u64)), "old tail is reclaimed");
+		}
 	}
 
 	/// One sweep drains a whole idle backlog, not a rotating window of it: a quiet
@@ -5022,13 +5058,9 @@ mod test {
 	/// Mint a track under an origin whose retention ceiling is `cap`, so the
 	/// track's own window is clamped down to it on bind.
 	fn track_producer_capped(name: impl Into<Arc<str>>, info: Info, cap: Duration) -> Producer {
-		let origin = crate::origin::Config {
-			cache_duration: cap,
-			..crate::origin::Config::default()
-		};
 		Producer::new(
 			Arc::new(broadcast::Info {
-				origin,
+				cache_duration: cap,
 				..Default::default()
 			}),
 			name,
@@ -7321,10 +7353,7 @@ mod test {
 			.with_expiry(cache::DEFAULT_EXPIRY);
 		let pool = cache::Pool::new(config);
 		let broadcast = broadcast::Info {
-			origin: crate::origin::Config {
-				pool: pool.clone(),
-				..crate::origin::Config::default()
-			},
+			pool: pool.clone(),
 			..Default::default()
 		};
 		let producer = Producer::new(Arc::new(broadcast), "test", None);
@@ -7499,10 +7528,7 @@ mod test {
 			.with_expiry(cache::DEFAULT_EXPIRY);
 		let pool = cache::Pool::new(config);
 		let broadcast = broadcast::Info {
-			origin: crate::origin::Config {
-				pool: pool.clone(),
-				..crate::origin::Config::default()
-			},
+			pool: pool.clone(),
 			..Default::default()
 		};
 		let request = Request::new(Arc::new(broadcast), "test");
@@ -7690,10 +7716,7 @@ mod test {
 			.with_expiry(cache::DEFAULT_EXPIRY);
 		let pool = cache::Pool::new(config);
 		let broadcast = broadcast::Info {
-			origin: crate::origin::Config {
-				pool: pool.clone(),
-				..crate::origin::Config::default()
-			},
+			pool: pool.clone(),
 			..Default::default()
 		};
 		let request = Request::new(Arc::new(broadcast), "test");

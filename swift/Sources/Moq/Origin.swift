@@ -112,9 +112,9 @@ public final class OriginConsumer: Sendable {
         self.ffi = ffi
     }
 
-    /// Stream every route announced under a prefix.
-    public func announced(prefix: String) throws -> AnnounceConsumer {
-        AnnounceConsumer(try ffi.announced(prefix: prefix))
+    /// Stream routes under a literal prefix matching an optional pattern filter.
+    public func announced(prefix: String = "", filter: String? = nil) throws -> AnnounceConsumer {
+        AnnounceConsumer(try ffi.announced(config: MoqAnnounceConfig(prefix: prefix, filter: filter)))
     }
 
     /// Wait for a route covering an exact path, then resolve the broadcast there.
@@ -165,7 +165,7 @@ public final class AnnounceConsumer: AsyncSequence, Sendable {
 
 /// A single route announcement or retraction.
 ///
-/// A route claims that `path` and every path beneath it can be served; it
+/// A route claims that `prefix` and every path beneath it can be served; it
 /// carries no broadcast. Resolve a specific path with `OriginConsumer.requestBroadcast`.
 /// By convention a publisher announces each broadcast's exact path.
 public final class AnnounceUpdate: Sendable {
@@ -175,13 +175,18 @@ public final class AnnounceUpdate: Sendable {
         self.ffi = ffi
     }
 
-    /// The prefix the route covers, relative to the `announced` prefix.
-    public var path: String {
-        ffi.path()
+    /// The covered prefix, relative to the origin.
+    public var prefix: String {
+        ffi.prefix()
+    }
+
+    /// What each filter wildcard matched, or `nil` for a partial overlap.
+    public var captures: [String]? {
+        ffi.captures()
     }
 
     /// Whether the route is active (`true`) or was retracted (`false`). A
-    /// repeated active announcement for the same path is a metadata update.
+    /// repeated active announcement for the same prefix is a metadata update.
     public var active: Bool {
         ffi.active()
     }

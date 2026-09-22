@@ -6,16 +6,16 @@ use web_transport_trait::Stats as _;
 
 use crate::{Error, SessionError, Version, bandwidth, goaway};
 
-/// A close requested by a session handle, executed by the machine.
+/// A close requested by a session handle, executed by the driver.
 #[derive(Clone)]
 struct Close {
 	code: u32,
 	reason: String,
 }
 
-/// The stats cell shared between the machine's sampler and the handles.
+/// The stats cell shared between the driver's sampler and the handles.
 struct StatsState {
-	/// The latest sample the machine took (or the construction-time snapshot).
+	/// The latest sample the driver took (or the construction-time snapshot).
 	sample: Stats,
 	/// A handle read the stats since the last sample: keep sampling.
 	demanded: bool,
@@ -62,25 +62,24 @@ pub struct Stats {
 
 /// A MoQ transport session, wrapping a WebTransport connection.
 ///
-/// Returned by [`crate::Client::connect`] and [`crate::Server::accept`], which hand
-/// the session's protocol [`runtime::Machine`](crate::runtime::Machine) to the
-/// [`Runtime`](crate::runtime::Runtime) they were given: that runtime is the only
-/// thing driving the session.
+/// Returned with a [`Driver`](crate::Driver) by [`crate::Client::connect`] and
+/// [`crate::Server::accept`]. The caller must poll or spawn that driver to run
+/// the session.
 ///
 /// Like every handle in this library, the lifecycle is reference counted: clones
 /// share the connection, the transport closes when the last clone drops, and
 /// [`abort`](Self::abort) closes it explicitly with an error. The handle and the
-/// machine are severed in both directions: the machine holds no `Session` clone,
-/// so the runtime running it never keeps the session alive, and the `Session`
+/// driver are severed in both directions: the driver holds no `Session` clone,
+/// so running it never keeps the session alive, and the `Session`
 /// holds no transport, so the handle is `Send + Sync` whatever transport the
-/// runtime drives. Everything transport-shaped (the close, the close reason,
-/// the stats sample) is relayed through the machine.
+/// driver uses. Everything transport-shaped (the close, the close reason,
+/// the stats sample) is relayed through the driver.
 #[derive(Clone)]
 pub struct Session {
-	/// Handle side to machine: `Some` once [`abort`](Self::abort) ran; the
+	/// Handle side to driver: `Some` once [`abort`](Self::abort) ran; the
 	/// channel closing (the last handle dropping) is the implicit Cancel.
 	close: kio::Producer<Option<Close>>,
-	/// Machine to handle side: the transport's terminal error.
+	/// Driver to handle side: the transport's terminal error.
 	closed: kio::Consumer<Option<Error>>,
 	stats: kio::Shared<StatsState>,
 	version: Version,
@@ -112,7 +111,7 @@ impl Session {
 	/// Returns a snapshot of the current connection statistics.
 	///
 	/// Cheap and non-blocking: this reads the latest sample the session's
-	/// machine took, and schedules a refresh, so periodic polling observes
+	/// driver took, and schedules a refresh, so periodic polling observes
 	/// fresh counters (100ms cadence). See [`Stats`] for which
 	/// metrics each backend reports.
 	pub fn stats(&self) -> Stats {
@@ -132,7 +131,7 @@ impl Session {
 	/// Close the transport with an explicit error, instead of waiting for the last
 	/// clone to drop. Idempotent: the first close wins.
 	///
-	/// The close is executed by the session's machine, so it reaches the wire
+	/// The close is executed by the session's driver, so it reaches the wire
 	/// once the runtime polls it (immediately on a live runtime).
 	pub fn abort(&self, err: Error) {
 		if let Ok(mut close) = self.close.write()
@@ -151,7 +150,7 @@ impl Session {
 	/// rejection arrives as `Error::Session(SessionError::Unauthorized)`); every peer code is
 	/// preserved as [`Error::Session`], and a close carrying no application code surfaces as
 	/// [`Error::Transport`]. See [`Error::from_transport`]. If the runtime drops
-	/// the machine instead of running it to completion, this resolves with
+	/// the driver instead of running it to completion, this resolves with
 	/// [`Error::Cancel`].
 	pub async fn closed(&self) -> Error {
 		match self
@@ -163,7 +162,7 @@ impl Session {
 			.await
 		{
 			Ok(err) => err,
-			// The machine was dropped before it could observe the close.
+			// The driver was dropped before it could observe the close.
 			Err(kio::Closed) => Error::Cancel,
 		}
 	}
@@ -200,16 +199,16 @@ impl Session {
 }
 
 impl Session {
-	pub(super) fn new<R>(
-		runtime: R,
-		session: R::Transport,
+	pub(super) fn new<S>(
+		runtime: crate::time::Clock,
+		session: S,
 		version: Version,
 		recv_bandwidth: Option<bandwidth::Consumer>,
-		protocol: crate::runtime::Protocol<R>,
+		protocol: crate::driver::Protocol<S>,
 		goaway: goaway::Handle,
-	) -> (Self, crate::runtime::Machine<R>)
+	) -> (Self, crate::Driver<S>)
 	where
-		R: crate::runtime::Runtime + 'static,
+		S: crate::transport::poll::Session,
 	{
 		let sample = snapshot(&session);
 
@@ -230,7 +229,7 @@ impl Session {
 		});
 
 		let supervisor = Supervisor {
-			runtime,
+			runtime: runtime.clone(),
 			closed_watch: session.clone(),
 			session,
 			close: Some(close.consume()),
@@ -249,41 +248,27 @@ impl Session {
 			recv_bandwidth,
 			goaway: Arc::new(goaway),
 		};
-		let machine = crate::runtime::Machine::new(crate::runtime::MachineState {
-			protocol,
-			supervisor: Some(supervisor),
-			result: None,
-		});
+		let driver = crate::Driver::new(
+			runtime.clone(),
+			crate::driver::State {
+				protocol,
+				supervisor: Some(supervisor),
+				result: None,
+			},
+		);
 
-		(session, machine)
-	}
-
-	/// Build the session, hand its machine to the runtime, and return the handle.
-	pub(super) fn spawn<R>(
-		runtime: R,
-		session: R::Transport,
-		version: Version,
-		recv_bandwidth: Option<bandwidth::Consumer>,
-		protocol: crate::runtime::Protocol<R>,
-		goaway: goaway::Handle,
-	) -> Self
-	where
-		R: crate::runtime::Runtime + 'static,
-	{
-		let (session, machine) = Self::new(runtime.clone(), session, version, recv_bandwidth, protocol, goaway);
-		runtime.spawn(machine);
-		session
+		(session, driver)
 	}
 }
 
-/// The machine's transport-facing half of a [`Session`]: it executes the
+/// The driver's transport-facing half of a [`Session`]: it executes the
 /// handles' close requests, publishes the transport's terminal error, and
 /// samples the connection stats (including the send-bandwidth estimate) while
 /// anyone is consuming them.
 ///
 /// Finishes once the transport reports closed; everything else is moot then.
-pub(crate) struct Supervisor<S, R: crate::runtime::Timers> {
-	runtime: R,
+pub(crate) struct Supervisor<S> {
+	runtime: crate::time::Clock,
 	session: S,
 	// A dedicated clone for the close watch, since each pending poll operation
 	// needs its own handle.
@@ -298,17 +283,19 @@ pub(crate) struct Supervisor<S, R: crate::runtime::Timers> {
 	/// The send-rate estimate channel, when the backend reports one. `None`
 	/// also once every consumer is gone for good.
 	send_bandwidth: Option<bandwidth::Producer>,
-	mode: SamplerMode<R>,
+	mode: SamplerMode,
 }
 
-enum SamplerMode<R: crate::runtime::Timers> {
+enum SamplerMode {
 	/// Nobody wants stats; sampling is paused.
 	Idle,
 	/// Someone does; sample when the deadline elapses.
-	Polling { deadline: crate::runtime::Deadline<R> },
+	Polling {
+		deadline: crate::runtime::Deadline<crate::time::Clock>,
+	},
 }
 
-impl<S: crate::transport::poll::Session, R: crate::runtime::Timers> Supervisor<S, R> {
+impl<S: crate::transport::poll::Session> Supervisor<S> {
 	const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 	pub(crate) fn poll(&mut self, waiter: &kio::Waiter) -> Poll<()> {

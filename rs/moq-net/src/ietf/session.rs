@@ -7,17 +7,15 @@ use crate::{
 	util::{MaybeBoxedExt, MaybeSendBox, TaskSet, err_only},
 };
 
-use web_transport_trait::{MaybeSend, MaybeSync};
-
 use super::{
 	Control, Message, Publisher, Subscriber, Version, adapter::ControlStreamAdapter, cluster, peer, solicit,
 	subscriber::is_protocol_violation,
 };
 
 /// Everything one moq-transport session needs to start.
-pub struct Config<S: crate::transport::poll::Session, R: crate::runtime::Runtime> {
+pub struct Config<S: crate::transport::poll::Session> {
 	/// The runtime that arms the session's timers.
-	pub runtime: R,
+	pub runtime: crate::time::Clock,
 
 	pub session: S,
 
@@ -66,13 +64,9 @@ pub struct Config<S: crate::transport::poll::Session, R: crate::runtime::Runtime
 	pub peer_declared: Option<peer::Peer>,
 }
 
-pub fn start<S, R>(
-	config: Config<S, R>,
-) -> Result<(MaybeSendBox<'static, Result<(), Error>>, crate::goaway::Handle), Error>
+pub fn start<S>(config: Config<S>) -> Result<(MaybeSendBox<'static, Result<(), Error>>, crate::goaway::Handle), Error>
 where
 	S: crate::transport::poll::Boxable,
-	R: crate::runtime::Runtime + MaybeSend + MaybeSync + 'static,
-	R::Timer: MaybeSend,
 {
 	let Config {
 		runtime,
@@ -442,8 +436,8 @@ pub struct PeerSetup<S: crate::transport::poll::Session> {
 /// has no content to route, so a throwaway id is all it can offer.
 fn self_origin(publish: Option<&origin::Consumer>, subscribe: Option<&origin::Producer>) -> Hop {
 	publish
-		.map(|origin| **origin)
-		.or_else(|| subscribe.map(|origin| **origin))
+		.map(|origin| origin.hop())
+		.or_else(|| subscribe.map(|origin| origin.hop()))
 		.unwrap_or_else(Hop::random)
 }
 
@@ -514,8 +508,8 @@ fn peer_from_params(params: &ietf::Parameters, version: Version) -> Result<peer:
 /// server passes `None`. `self_origin` and `cost` are the MoQ Cluster options, which
 /// declare our identity and (client-only) what this link costs to cross. The MoQ Solicit
 /// declaration is unconditional, so it takes no argument.
-async fn run_setup<S: crate::transport::poll::Session, R: crate::runtime::Runtime>(
-	runtime: R,
+async fn run_setup<S: crate::transport::poll::Session>(
+	runtime: crate::time::Clock,
 	mut session: S,
 	version: Version,
 	path: Option<String>,
@@ -587,9 +581,9 @@ async fn run_setup<S: crate::transport::poll::Session, R: crate::runtime::Runtim
 ///
 /// For v17, this also handles the SETUP stream (0x2F00) and GOAWAY.
 /// For v14-16, all uni streams are group data.
-async fn run_unis<S, R>(
+async fn run_unis<S>(
 	mut session: S,
-	subscriber: Subscriber<S, R>,
+	subscriber: Subscriber<S>,
 	// Where to record the peer's MoQ Cluster options once its SETUP arrives. `None`
 	// for draft-14..16, whose SETUP rides the control stream instead.
 	peer_setup: Option<peer::PeerSetup>,
@@ -600,8 +594,6 @@ async fn run_unis<S, R>(
 ) -> Result<(), Error>
 where
 	S: crate::transport::poll::Boxable,
-	R: crate::runtime::Runtime + MaybeSend + MaybeSync + 'static,
-	R::Timer: MaybeSend,
 {
 	let outer_version = crate::Version::Ietf(version);
 	let mut tasks = TaskSet::owned();
@@ -705,14 +697,12 @@ where
 	}
 }
 
-async fn run_uni_group<S, R>(
-	subscriber: &mut Subscriber<S, R>,
+async fn run_uni_group<S>(
+	subscriber: &mut Subscriber<S>,
 	stream: &mut Reader<S::RecvStream, Version>,
 ) -> Result<(), Error>
 where
 	S: crate::transport::poll::Boxable,
-	R: crate::runtime::Runtime + MaybeSend + MaybeSync + 'static,
-	R::Timer: MaybeSend,
 {
 	let kind: u64 = stream.decode_peek().await?;
 
@@ -734,16 +724,14 @@ where
 }
 
 /// Accept incoming bidi streams and dispatch to the correct handler based on message type.
-async fn run_dispatch<S, R>(
+async fn run_dispatch<S>(
 	session: S,
-	publisher: Publisher<S, R>,
-	mut subscriber: Subscriber<S, R>,
+	publisher: Publisher<S>,
+	mut subscriber: Subscriber<S>,
 	version: Version,
 ) -> Result<(), Error>
 where
 	S: crate::transport::poll::Boxable,
-	R: crate::runtime::Runtime + MaybeSend + MaybeSync + 'static,
-	R::Timer: MaybeSend,
 {
 	// PUBLISH_NAMESPACE decodes differently once the MoQ Cluster extension is
 	// negotiated, so the whole dispatch loop waits for the peer's SETUP first. The peer
@@ -884,10 +872,6 @@ mod tests {
 	use super::*;
 	use crate::model::ProduceTest;
 
-	/// The tokio-backed test runtime. Its transport parameter is phantom, so one
-	/// type serves every fake session in this module.
-	type TestRuntime = crate::runtime::tokio_test::Tokio<crate::lite::test_transport::SinkSession>;
-
 	fn occurrences(log: &crate::lite::test_transport::Log, needle: &[u8]) -> usize {
 		let writes = log.writes.lock().unwrap();
 		writes.windows(needle.len()).filter(|window| *window == needle).count()
@@ -934,7 +918,7 @@ mod tests {
 		let log = session.log.clone();
 
 		let (driver, _goaway) = start(Config {
-			runtime: TestRuntime::new(),
+			runtime: crate::time::Clock::tokio(),
 			session,
 			setup: None,
 			request_id_max: None,
@@ -984,8 +968,7 @@ mod tests {
 			.map(|prefix| crate::Pattern::subtree(prefix).unwrap())
 			.collect();
 		let scoped = origin
-			.with_root("rootns")
-			.and_then(|rooted| rooted.scope(&scope))
+			.scope("rootns", &scope)
 			.expect("scope the origin to two prefixes");
 
 		let gate = kio::Producer::new(true);
@@ -993,7 +976,7 @@ mod tests {
 		let log = session.log.clone();
 
 		let (driver, _goaway) = start(Config {
-			runtime: TestRuntime::new(),
+			runtime: crate::time::Clock::tokio(),
 			session,
 			setup: None,
 			request_id_max: None,
@@ -1043,7 +1026,7 @@ mod tests {
 		let log = session.log.clone();
 
 		let (driver, _goaway) = start(Config {
-			runtime: TestRuntime::new(),
+			runtime: crate::time::Clock::tokio(),
 			session,
 			setup: None,
 			request_id_max: None,
@@ -1150,7 +1133,7 @@ mod tests {
 		let log = session.log.clone();
 
 		let (driver, _goaway) = start(Config {
-			runtime: TestRuntime::new(),
+			runtime: crate::time::Clock::tokio(),
 			session,
 			setup: None,
 			request_id_max: None,
@@ -1219,7 +1202,7 @@ mod tests {
 		let (tasks, _task_set) = TaskSet::new();
 		let peer_setup = peer::PeerSetup::default();
 		let subscriber = Subscriber::new(
-			TestRuntime::new(),
+			crate::time::Clock::tokio(),
 			session.clone(),
 			origin,
 			Control::new(None, true),
@@ -1342,7 +1325,7 @@ mod tests {
 			.expect("open the control stream");
 
 		let (driver, _goaway) = start(Config {
-			runtime: TestRuntime::new(),
+			runtime: crate::time::Clock::tokio(),
 			session,
 			setup: Some(setup),
 			request_id_max: None,

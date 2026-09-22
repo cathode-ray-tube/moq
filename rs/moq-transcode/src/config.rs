@@ -1,6 +1,6 @@
 //! Transcoder configuration: the rung ladder and catalog wiring.
 
-use moq_net::PathRelativeOwned;
+use moq_net::path::RelativeOwned;
 
 use crate::Ladder;
 
@@ -28,16 +28,16 @@ pub struct Config {
 	/// and audio) through this path so players fetch them from the source
 	/// directly; the transcoder never proxies or subscribes them. `None` omits
 	/// them from the derivative catalog.
-	pub source: Option<PathRelativeOwned>,
+	pub source: Option<RelativeOwned>,
 
 	/// Which video encoder implementation encodes the rungs. The default
 	/// prefers hardware (NVENC on Linux, VideoToolbox on macOS, Media
-	/// Foundation on Windows) and falls back to openh264.
+	/// Foundation on Windows) and falls back to OpenH264 when enabled.
 	pub encoder: moq_video::encode::Kind,
 
 	/// Which video decoder implementation decodes the source. The default
-	/// prefers hardware and falls back to openh264 (H.264 only; H.265 sources
-	/// need a hardware decoder).
+	/// prefers hardware and falls back to OpenH264 when enabled (H.264 only;
+	/// H.265 sources need a hardware decoder).
 	pub decoder: moq_video::decode::Kind,
 
 	/// Frame resize behavior. Automatic mode keeps GPU-backed frames on the GPU.

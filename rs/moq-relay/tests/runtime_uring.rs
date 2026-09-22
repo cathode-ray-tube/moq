@@ -11,7 +11,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
 use moq_relay::{Config, Relay};
-use moq_tokio::moq_net::{self, Hop};
+use moq_tokio::moq_net;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 const WORKERS: u16 = 2;
@@ -80,7 +80,7 @@ fn certificate(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf
 /// CI container may restrict which cores it may run on.
 fn uring_config(cert: &std::path::Path, key: &std::path::Path, port: u16) -> Config {
 	let mut config = Config::default();
-	config.listen.bind = Some(format!("127.0.0.1:{port}"));
+	config.listen.bind = Some(format!("127.0.0.1:{port}").parse().unwrap());
 	config.listen.tls.cert = vec![cert.to_path_buf()];
 	config.listen.tls.key = vec![key.to_path_buf()];
 	config.runtime.workers = Some(WORKERS);
@@ -133,7 +133,7 @@ async fn uring_workers_serve_webtransport_and_raw_quic() {
 	// ...and a raw-QUIC subscriber (moql, the native path).
 	let raw_url: url::Url = format!("moql://127.0.0.1:{port}/uring").parse().expect("parse url");
 
-	let origin = moq_tokio::origin::spawn(Hop::random());
+	let origin = moq_tokio::origin::spawn();
 	let broadcast = origin.create_broadcast("test").expect("create broadcast");
 	broadcast.announce(Default::default()).expect("create broadcast");
 	let track = broadcast.create_track("video", None).expect("create track");
@@ -148,7 +148,7 @@ async fn uring_workers_serve_webtransport_and_raw_quic() {
 	// Several subscribers of each flavor, spread over the steered workers.
 	let mut subscribers = Vec::new();
 	for url in [&wt_url, &raw_url, &wt_url, &raw_url] {
-		let origin = moq_tokio::origin::spawn(Hop::random());
+		let origin = moq_tokio::origin::spawn();
 		let consumer = origin.consume();
 		let announced = consumer.announced();
 		let connection = connect(client().with_subscriber(origin), url.clone()).await;
@@ -160,7 +160,7 @@ async fn uring_workers_serve_webtransport_and_raw_quic() {
 			.await
 			.unwrap_or_else(|_| panic!("subscriber {index} announcement timeout"))
 			.expect("origin closed");
-		assert_eq!(update.path.as_str(), "test");
+		assert_eq!(update.prefix.as_str(), "test");
 		assert!(update.kind.is_active(), "expected announce, got retraction");
 		let broadcast = tokio::time::timeout(TIMEOUT, consumer.request_broadcast("test"))
 			.await
@@ -296,7 +296,7 @@ async fn an_mtls_client_authenticates_without_a_token() {
 	// unauthorized session establishes and is then closed, so merely
 	// connecting proves nothing.
 	let url: url::Url = format!("moql://127.0.0.1:{port}/mtls").parse().expect("parse url");
-	let origin = moq_tokio::origin::spawn(Hop::random());
+	let origin = moq_tokio::origin::spawn();
 	let broadcast = origin.create_broadcast("test").expect("create broadcast");
 	broadcast.announce(Default::default()).expect("create broadcast");
 	let track = broadcast.create_track("video", None).expect("create track");
@@ -307,7 +307,7 @@ async fn an_mtls_client_authenticates_without_a_token() {
 	group.finish().expect("finish group");
 	let publisher = connect(client().with_publisher(&origin), url.clone()).await;
 
-	let subscriber_origin = moq_tokio::origin::spawn(Hop::random());
+	let subscriber_origin = moq_tokio::origin::spawn();
 	let consumer = subscriber_origin.consume();
 	let mut announced = consumer.announced();
 	let subscriber = connect(client().with_subscriber(subscriber_origin), url).await;
@@ -316,7 +316,7 @@ async fn an_mtls_client_authenticates_without_a_token() {
 		.await
 		.expect("announcement timeout")
 		.expect("origin closed");
-	assert_eq!(update.path.as_str(), "test");
+	assert_eq!(update.prefix.as_str(), "test");
 	assert!(update.kind.is_active(), "expected announce, got retraction");
 	let announced = tokio::time::timeout(TIMEOUT, consumer.request_broadcast("test"))
 		.await
@@ -376,8 +376,8 @@ async fn uring_workers_write_qlog_traces() {
 	// A real session, so a trace covers a handshake and application data
 	// rather than a connection that only ever exchanged Initials.
 	let url: url::Url = format!("moql://127.0.0.1:{port}/qlog").parse().expect("parse url");
-	let origin = moq_tokio::origin::spawn(Hop::random());
-	let broadcast = origin.create_broadcast("test").expect("create broadcast");
+	let origin = moq_tokio::origin::spawn();
+	let mut broadcast = origin.create_broadcast("test").expect("create broadcast");
 	broadcast.announce(Default::default()).expect("create broadcast");
 	let track = broadcast.create_track("video", None).expect("create track");
 	let mut group = track.append_group().expect("append group");
@@ -387,7 +387,7 @@ async fn uring_workers_write_qlog_traces() {
 	group.finish().expect("finish group");
 	let publisher = connect(client().with_publisher(&origin), url.clone()).await;
 
-	let subscriber_origin = moq_tokio::origin::spawn(Hop::random());
+	let subscriber_origin = moq_tokio::origin::spawn();
 	let consumer = subscriber_origin.consume();
 	let mut announced = consumer.announced();
 	let subscriber = connect(client().with_subscriber(subscriber_origin), url).await;

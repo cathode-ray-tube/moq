@@ -63,7 +63,7 @@ pub(crate) struct MediaFoundation {
 	codec: Codec,
 	width: u32,
 	height: u32,
-	framerate: u32,
+	framerate: crate::Rate,
 	bitrate: u32,
 	gop: u32,
 	/// The color space of the input frames, stamped onto both media types so the
@@ -100,12 +100,6 @@ pub(crate) struct MediaFoundation {
 	_manager: Option<IMFDXGIDeviceManager>,
 	_com: ComGuard,
 }
-
-// The MFT and its COM handles are created, driven, and dropped only on the
-// dedicated encode thread (see `encode::sink`), so the per-thread COM apartment
-// this opens in `ComGuard::new` stays balanced. `Send` lets the boxed trait
-// object satisfy `Backend: Send`.
-unsafe impl Send for MediaFoundation {}
 
 impl MediaFoundation {
 	pub(crate) fn open(config: &Config) -> Result<Box<dyn Backend>, Error> {
@@ -283,7 +277,10 @@ impl MediaFoundation {
 				.SetUINT64(&MF_MT_FRAME_SIZE, pack_2x32(self.width, self.height))
 				.map_err(|e| mf_err("output frame size", e))?;
 			media
-				.SetUINT64(&MF_MT_FRAME_RATE, pack_2x32(self.framerate, 1))
+				.SetUINT64(
+					&MF_MT_FRAME_RATE,
+					pack_2x32(self.framerate.numerator(), self.framerate.denominator()),
+				)
 				.map_err(|e| mf_err("output frame rate", e))?;
 			self.set_color(&media)?;
 			self.transform
@@ -309,7 +306,10 @@ impl MediaFoundation {
 				.SetUINT64(&MF_MT_FRAME_SIZE, pack_2x32(self.width, self.height))
 				.map_err(|e| mf_err("input frame size", e))?;
 			media
-				.SetUINT64(&MF_MT_FRAME_RATE, pack_2x32(self.framerate, 1))
+				.SetUINT64(
+					&MF_MT_FRAME_RATE,
+					pack_2x32(self.framerate.numerator(), self.framerate.denominator()),
+				)
 				.map_err(|e| mf_err("input frame rate", e))?;
 			self.set_color(&media)?;
 			self.transform
@@ -360,7 +360,7 @@ impl MediaFoundation {
 
 	/// One frame's worth of the Media Foundation sample clock, in 100ns units.
 	fn tick(&self) -> i64 {
-		HNS_PER_SEC / self.framerate.max(1) as i64
+		HNS_PER_SEC * i64::from(self.framerate.denominator()) / i64::from(self.framerate.numerator())
 	}
 
 	/// The sample time for the frame currently going in.

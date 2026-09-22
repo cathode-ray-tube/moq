@@ -207,7 +207,7 @@ fn video_ceiling(
 		.or_else(|| rendition.bitrate.map(moq_net::bandwidth::Rate::from_bps))
 		.unwrap_or_else(|| {
 			moq_net::bandwidth::Rate::from_bps(
-				((config.size().pixels() * config.framerate as u64) as f64 * 0.07) as u64,
+				(config.size().pixels() as f64 * config.framerate.as_f64() * 0.07) as u64,
 			)
 		})
 }
@@ -217,7 +217,7 @@ async fn follow_reservation(
 	mut consumer: moq_net::bandwidth::Consumer,
 	ceiling: Arc<AtomicU64>,
 ) {
-	use moq_video::encode::rate::{Control, Policy};
+	use moq_mux::rate::{Control, Policy};
 
 	let mut max = moq_net::bandwidth::Rate::from_bps(ceiling.load(Ordering::SeqCst));
 	let mut control = Control::new(Policy::new(max));
@@ -328,7 +328,7 @@ impl VideoEncoder {
 		let size = self.size;
 		let surface = match self.format {
 			moq_video_pixel_format::MOQ_VIDEO_PIXEL_FORMAT_I420 => {
-				moq_video::Surface::I420(moq_video::I420::new(size.width, size.height, data.to_vec())?)
+				moq_video::Surface::I420(moq_video::I420::new(size, data.to_vec())?)
 			}
 			moq_video_pixel_format::MOQ_VIDEO_PIXEL_FORMAT_RGBA => moq_video::Surface::rgba(data, size)?,
 		};
@@ -530,14 +530,19 @@ impl Video {
 			if let Some(size) = output.size
 				&& frame.size() != size
 			{
-				frame = frame.resize(size)?;
+				frame = frame.resize(size, &moq_video::resize::Config::default())?;
 			}
 			let size = frame.size();
 			let data = match output.format {
-				moq_video_pixel_format::MOQ_VIDEO_PIXEL_FORMAT_I420 => frame.surface.into_i420()?,
-				moq_video_pixel_format::MOQ_VIDEO_PIXEL_FORMAT_RGBA => {
-					bytes::Bytes::from(frame.surface.to_rgba()?.into_data())
+				moq_video_pixel_format::MOQ_VIDEO_PIXEL_FORMAT_I420 => {
+					bytes::Bytes::from(frame.surface.into_i420()?.into_data())
 				}
+				moq_video_pixel_format::MOQ_VIDEO_PIXEL_FORMAT_RGBA => bytes::Bytes::from(
+					frame
+						.surface
+						.to_rgba(&moq_video::convert::Config::default())?
+						.into_data(),
+				),
 			};
 			let frame = VideoFrame {
 				// The C ABI carries microseconds; the decoded frame's Timestamp is
@@ -676,7 +681,9 @@ pub unsafe extern "C" fn moq_encode_video(
 
 		let format = pixel_format_from_u32(raw_input.format)?;
 
-		let mut config = moq_video::encode::Config::new(raw_input.width, raw_input.height, raw_input.framerate);
+		let framerate = moq_video::Rate::new(raw_input.framerate, 1)
+			.map_err(|_| Error::Video(moq_video::Error::InvalidFramerate(raw_input.framerate).into()))?;
+		let mut config = moq_video::encode::Config::new(raw_input.width, raw_input.height, framerate);
 		config.codec = codec_from_u32(raw_output.codec)?;
 		config.kind = unsafe { encoder_kind(raw_output)? };
 		// The C ABI spells an unset knob as 0, which neither field accepts as a real
@@ -741,13 +748,12 @@ pub extern "C" fn moq_encode_video_reservation(producer: u32) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moq_encode_video_demand(
 	producer: u32,
-	on_demand: Option<extern "C" fn(user_data: *mut c_void, status: i32)>,
+	on_demand: crate::moq_status_callback,
 	user_data: *mut c_void,
 ) -> i32 {
 	ffi::enter(move || {
 		let producer = ffi::parse_id(producer)?;
-		let on_demand = on_demand.ok_or(Error::InvalidPointer)?;
-		let on_demand = unsafe { OnStatus::new(user_data, Some(on_demand)) };
+		let on_demand = unsafe { OnStatus::new(user_data, on_demand)? };
 		let mut state = State::lock();
 		let demand = state.video.demand(producer)?;
 		state.publish.demand(demand, on_demand)
@@ -861,7 +867,7 @@ pub extern "C" fn moq_encode_video_finish(producer: u32) -> i32 {
 /// once more with a terminal code: `0` (closed cleanly) or a negative error.
 /// After the terminal (`<= 0`) callback, `on_frame` is never called again and
 /// `user_data` is never touched again, so release `user_data` there. The terminal
-/// callback fires even after [`moq_decode_video_close`].
+/// callback fires even after [`moq_decode_video_cancel`].
 ///
 /// Starts at the newest cached group so reopening live playback skips the backlog.
 ///
@@ -873,7 +879,7 @@ pub unsafe extern "C" fn moq_decode_video(
 	catalog: u32,
 	index: u32,
 	output: *const moq_video_decoder_output,
-	on_frame: Option<extern "C" fn(user_data: *mut c_void, frame: i32)>,
+	on_frame: crate::moq_status_callback,
 	user_data: *mut c_void,
 ) -> i32 {
 	ffi::enter(move || {
@@ -893,7 +899,7 @@ pub unsafe extern "C" fn moq_decode_video(
 		// delivery loop still enforces it, since other backends ignore it.
 		config.resize = size;
 		let output = DecoderOutput { format, size };
-		let on_frame = unsafe { OnStatus::new(user_data, on_frame) };
+		let on_frame = unsafe { OnStatus::new(user_data, on_frame)? };
 
 		let mut state = State::lock();
 		let (broadcast, video_cfg, name) = state.consume.video_rendition(catalog, index as usize)?;
@@ -911,7 +917,7 @@ pub unsafe extern "C" fn moq_decode_video(
 /// released. Frame ids already delivered are likewise not freed; release each
 /// with [`moq_decode_video_frame_free`].
 #[unsafe(no_mangle)]
-pub extern "C" fn moq_decode_video_close(consumer: u32) -> i32 {
+pub extern "C" fn moq_decode_video_cancel(consumer: u32) -> i32 {
 	ffi::enter(move || {
 		let consumer = ffi::parse_id(consumer)?;
 		State::lock().video.consume_close(consumer)
@@ -954,12 +960,15 @@ mod tests {
 		moq_net::track::Subscriber,
 	) {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let catalog =
-			moq_mux::catalog::Producer::with_catalog(&mut broadcast, moq_mux::catalog::hang::Catalog::default())
-				.unwrap();
+		let config = moq_mux::catalog::Config::default()
+			.with_catalog(moq_mux::catalog::hang::Catalog::<moq_mux::catalog::hang::Extra>::default());
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, config).unwrap();
 		let consumer = broadcast.consume();
 		// Probed rather than hand-built, so the test track carries what a real one would.
-		let rendition = moq_video::encode::Config::new(320, 240, 30).probe().await.unwrap();
+		let rendition = moq_video::encode::Config::new(320, 240, moq_video::Rate::new(30, 1).unwrap())
+			.probe()
+			.await
+			.unwrap();
 		let producer = moq_video::encode::Producer::new(broadcast, catalog, rendition).unwrap();
 
 		let name = producer.demand().name().to_string();

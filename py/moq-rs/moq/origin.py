@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from moq_ffi import (
+    MoqAnnounceConfig,
     MoqAnnounceConsumer,
     MoqAnnouncedBroadcast,
     MoqAnnounceUpdate,
@@ -23,7 +24,7 @@ from .subscribe import BroadcastConsumer
 class AnnounceUpdate:
     """A route announcement (or retraction) from :meth:`OriginConsumer.announced`.
 
-    A route claims that :attr:`path` and every path beneath it can be served; it
+    A route claims that :attr:`prefix` and every path beneath it can be served; it
     carries no broadcast. Resolve a specific path with :meth:`OriginConsumer.request_broadcast`.
     By convention a publisher announces each broadcast's exact path, so
     subscribers can enumerate broadcasts from routes.
@@ -33,15 +34,20 @@ class AnnounceUpdate:
         self._inner = inner
 
     @property
-    def path(self) -> str:
-        """The prefix the route covers, relative to the ``announced`` prefix."""
-        return self._inner.path()
+    def prefix(self) -> str:
+        """The covered prefix, relative to the origin."""
+        return self._inner.prefix()
+
+    @property
+    def captures(self) -> list[str] | None:
+        """What each filter wildcard matched, or ``None`` for a partial overlap."""
+        return self._inner.captures()
 
     @property
     def active(self) -> bool:
         """Whether the route is active (``True``) or was retracted (``False``).
 
-        A repeated active announcement for the same pattern is a metadata update.
+        A repeated active announcement for the same prefix is a metadata update.
         """
         return self._inner.active()
 
@@ -165,9 +171,9 @@ class OriginConsumer:
     def __init__(self, inner: MoqOriginConsumer) -> None:
         self._inner = inner
 
-    def announced(self, prefix: str = "") -> AnnounceConsumer:
-        """Async-iterate route announcements under ``prefix`` (empty matches all)."""
-        return AnnounceConsumer(self._inner.announced(prefix))
+    def announced(self, prefix: str = "", *, filter: str | None = None) -> AnnounceConsumer:
+        """Iterate routes in the literal ``prefix`` matching the optional pattern ``filter``."""
+        return AnnounceConsumer(self._inner.announced(MoqAnnounceConfig(prefix=prefix, filter=filter)))
 
     def announced_broadcast(self, path: str) -> AnnouncedBroadcast:
         """Await a route covering ``path``, then resolve the broadcast there."""

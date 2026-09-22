@@ -234,11 +234,11 @@ pub enum Error {
 	/// whichever address happened to be unroutable or to blackhole until its
 	/// timeout. A host with a single address reports that error directly instead.
 	#[error("all {} connection attempts failed: {}", .0.len(), crate::failover::describe(.0))]
-	Failover(Vec<crate::failover::Failure<Error>>),
+	Failover(Vec<crate::failover::Attempt<Error>>),
 }
 
 impl crate::failover::Aggregate for Error {
-	fn aggregate(failures: Vec<crate::failover::Failure<Self>>) -> Self {
+	fn aggregate(failures: Vec<crate::failover::Attempt<Self>>) -> Self {
 		Self::Failover(failures)
 	}
 
@@ -516,7 +516,7 @@ pub(crate) struct NoqServer {
 }
 
 impl NoqServer {
-	pub fn new(config: listen::Config, quic: &crate::quic::Config, member: Option<listen::Member>) -> Result<Self> {
+	pub fn new(config: listen::Config, quic: &crate::quic::Config, member: Option<listen::Socket>) -> Result<Self> {
 		let mut transport = noq::TransportConfig::default();
 		let quic = quic.resolve();
 		apply_transport(&mut transport, &quic);
@@ -569,13 +569,19 @@ impl NoqServer {
 		// There's a bit more boilerplate to make a generic endpoint.
 		let runtime = noq::default_runtime().ok_or(Error::NoRuntime)?;
 
-		let listen =
-			crate::util::resolve(config.bind.as_deref(), crate::server::DEFAULT_BIND).map_err(Error::ResolveBind)?;
+		let listen = config
+			.bind
+			.as_ref()
+			.map(crate::listen::Bind::resolve)
+			.transpose()
+			.map_err(Error::ResolveBind)?
+			.unwrap_or(crate::server::DEFAULT_BIND);
+		let load_balancer = config.load_balancer();
 
 		// Configure connection ID generator with server ID if provided
 		let mut endpoint_config = noq::EndpointConfig::default();
-		if let Some(shard) = member.as_ref().map(listen::Member::shard) {
-			if config.lb_id.is_some() {
+		if let Some(shard) = member.as_ref().map(listen::Socket::shard) {
+			if load_balancer.is_some() {
 				return Err(Error::ShardWithQuicLb);
 			}
 			tracing::debug!(
@@ -584,8 +590,9 @@ impl NoqServer {
 				"encoding the shard in connection IDs"
 			);
 			endpoint_config.cid_generator(Arc::new(move || Box::new(ShardIdGenerator::new(shard))));
-		} else if let Some(server_id) = config.lb_id {
-			let nonce_len = config.lb_nonce.unwrap_or(8);
+		} else if let Some(load_balancer) = load_balancer {
+			let server_id = load_balancer.id;
+			let nonce_len = load_balancer.nonce;
 			if nonce_len < 4 {
 				return Err(Error::QuicLbNonceTooSmall);
 			}
@@ -605,14 +612,12 @@ impl NoqServer {
 			}));
 		}
 
-		// A group member binds the address its group holds, not the one this
-		// config resolved: the group is what guarantees every member shares one
-		// port, in the order the kernel steers by.
+		// A group socket was released only after every member bound and the
+		// steering filter covered the final array.
 		let socket = match member {
-			Some(member) => member.bind(),
-			None => crate::bind::udp(crate::bind::Udp::new(listen)),
-		}
-		.map_err(Error::BindSocket)?;
+			Some(member) => member.into_inner(),
+			None => crate::bind::udp(crate::bind::Udp::new(listen)).map_err(Error::BindSocket)?,
+		};
 
 		// Create the generic QUIC endpoint.
 		let quic = noq::Endpoint::new(endpoint_config, Some(tls), socket, runtime).map_err(Error::CreateEndpoint)?;
@@ -820,12 +825,10 @@ mod tests {
 	fn apply_windows_writes_each_field() {
 		let defaults = format!("{:?}", noq::TransportConfig::default());
 
-		let quic = crate::quic::Config {
-			receive_window: Some(64 << 20),
-			stream_receive_window: Some(8 << 20),
-			send_window: Some(32 << 20),
-			..Default::default()
-		};
+		let mut quic = crate::quic::Config::default();
+		quic.receive_window = Some(64 << 20);
+		quic.stream_receive_window = Some(8 << 20);
+		quic.send_window = Some(32 << 20);
 
 		let mut transport = noq::TransportConfig::default();
 		apply_windows(&mut transport, &quic.resolve());
@@ -863,7 +866,7 @@ mod tests {
 	#[tokio::test]
 	async fn default_reaches_the_live_connection() {
 		let server_config = listen::Config {
-			bind: Some("127.0.0.1:0".to_string()),
+			bind: Some("127.0.0.1:0".parse().unwrap()),
 			tls: crate::tls::Listen {
 				generate: vec!["localhost".into()],
 				..Default::default()

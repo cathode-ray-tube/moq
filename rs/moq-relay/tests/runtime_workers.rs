@@ -10,7 +10,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
 use moq_relay::{Config, Relay};
-use moq_tokio::moq_net::{self, Hop};
+use moq_tokio::moq_net;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 const WORKERS: u16 = 4;
@@ -45,7 +45,7 @@ fn certificate(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf
 /// and none of these tests are about placement.
 fn worker_config(cert: &std::path::Path, key: &std::path::Path, port: u16, workers: u16) -> Config {
 	let mut config = Config::default();
-	config.listen.bind = Some(format!("127.0.0.1:{port}"));
+	config.listen.bind = Some(format!("127.0.0.1:{port}").parse().unwrap());
 	config.listen.tls.cert = vec![cert.to_path_buf()];
 	config.listen.tls.key = vec![key.to_path_buf()];
 	config.runtime.workers = Some(workers);
@@ -96,7 +96,7 @@ async fn workers_serve_quic_and_share_one_origin() {
 	let url: url::Url = format!("https://127.0.0.1:{port}/workers").parse().expect("parse url");
 
 	// ── publisher ───────────────────────────────────────────────────
-	let origin = moq_tokio::origin::spawn(Hop::random());
+	let origin = moq_tokio::origin::spawn();
 	let broadcast = origin.create_broadcast("test").expect("create broadcast");
 	broadcast.announce(Default::default()).expect("create broadcast");
 	let track = broadcast.create_track("video", None).expect("create track");
@@ -111,7 +111,7 @@ async fn workers_serve_quic_and_share_one_origin() {
 	// ── subscribers ─────────────────────────────────────────────────
 	let mut subscribers = Vec::new();
 	for _ in 0..WORKERS {
-		let origin = moq_tokio::origin::spawn(Hop::random());
+		let origin = moq_tokio::origin::spawn();
 		let consumer = origin.consume();
 		let announced = consumer.announced();
 		let connection = connect(client().with_subscriber(origin), url.clone()).await;
@@ -123,7 +123,7 @@ async fn workers_serve_quic_and_share_one_origin() {
 			.await
 			.unwrap_or_else(|_| panic!("subscriber {index} announcement timeout"))
 			.expect("origin closed");
-		assert_eq!(update.path.as_str(), "test");
+		assert_eq!(update.prefix.as_str(), "test");
 		assert!(update.kind.is_active(), "expected announce, got retraction");
 		let broadcast = tokio::time::timeout(TIMEOUT, consumer.request_broadcast("test"))
 			.await

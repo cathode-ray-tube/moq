@@ -4,6 +4,7 @@ import { type Consumer as BroadcastConsumer, Producer as BroadcastProducer } fro
 import { Route } from "../hop.ts";
 import { Producer as OriginProducer } from "../origin.ts";
 import * as Path from "../path.ts";
+import { registerWire, wireOf } from "../wire.ts";
 import type { Established } from "./established.ts";
 import { forwardAnnounced } from "./forward.ts";
 
@@ -32,6 +33,7 @@ class FakeSession {
 
 	constructor(discovery = true) {
 		this.discovery = discovery;
+		registerWire(this, { consume: (path) => this.consume(path) });
 		this.closed = new Promise((resolve) => {
 			this.#die = resolve;
 		});
@@ -73,13 +75,13 @@ test("a discovery failure under a live session downgrades the origin", async () 
 	forwardAnnounced(session.session, origin);
 
 	// The relay announces a broadcast, which lands in the table.
-	session.announces.append({ path, captures: undefined, kind: "announced", route: Route.default });
+	session.announces.append({ prefix: path, captures: undefined, kind: "announced", route: Route.default });
 	await settle();
 	expect(origin.discovery.peek()).toBe(true);
-	expect(origin.routes(path)).toBe(true);
+	expect(wireOf(origin).routes(path)).toBe(true);
 
 	// A watcher gated on the announcement is live on that route.
-	const watched = new Announce.Broadcast({ origin, path });
+	const watched = origin.request(path, { announced: true });
 	await settle();
 	await settle();
 	expect(watched.active.peek()).toBeDefined();
@@ -92,7 +94,7 @@ test("a discovery failure under a live session downgrades the origin", async () 
 
 	// Everything the stream fed is retracted, and the origin stops claiming a discovery that
 	// no longer works. Leaving it true is what used to strand every gated watcher offline.
-	expect(origin.routes(path)).toBe(false);
+	expect(wireOf(origin).routes(path)).toBe(false);
 	expect(origin.discovery.peek()).toBe(false);
 
 	// So the watcher falls back to a standing request, which this same session answers.
@@ -114,7 +116,7 @@ test("a request outlives the discovery failure that fed it", async () => {
 	forwardAnnounced(session.session, origin);
 
 	// Announced, so the table routes it and no blind answer is needed.
-	session.announces.append({ path, captures: undefined, kind: "announced", route: Route.default });
+	session.announces.append({ prefix: path, captures: undefined, kind: "announced", route: Route.default });
 	await settle();
 
 	const request = origin.request(path);

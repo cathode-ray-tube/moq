@@ -8,7 +8,7 @@ async fn main() -> anyhow::Result<()> {
 	moq_tokio::Log::new(tracing::Level::DEBUG).init()?;
 
 	// Create an origin that we can publish to and the session can consume from.
-	let origin = moq_tokio::origin::spawn(moq_net::Hop::random());
+	let origin = moq_tokio::origin::spawn();
 
 	// Run the broadcast production and the session in parallel.
 	// This is a simple example of how you can concurrently run multiple tasks.
@@ -61,7 +61,7 @@ fn create_track(broadcast: &mut moq_net::broadcast::Producer) -> anyhow::Result<
 
 	// Create the catalog describing our video track.
 	// Multiple renditions allow the viewer to choose based on their capabilities.
-	let mut catalog = hang::catalog::Catalog::default();
+	let mut catalog = hang::catalog::Catalog::<()>::default();
 	catalog.video.insert(video_track, video_config)?;
 
 	// Publish the catalog as a "catalog.json" track in the broadcast.

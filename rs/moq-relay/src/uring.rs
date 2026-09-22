@@ -108,7 +108,7 @@ pub struct Workers {
 	/// The reuseport group the workers bound into. Held for the group's
 	/// lifetime, because it is what holds the listen port against a second
 	/// group.
-	_group: moq_sock::shard::Group,
+	_group: moq_sock::shard::Bound,
 }
 
 impl Workers {
@@ -132,14 +132,11 @@ impl Workers {
 		// beats starting and quietly behaving differently from what the
 		// operator configured, which is the whole failure mode this mode is
 		// most likely to produce.
-		if listen.lb_id.is_some() {
+		if listen.load_balancer().is_some() {
 			anyhow::bail!(
 				"io_uring workers issue shard-steered connection ids and cannot also carry a \
 				 QUIC-LB server id (listen.lb_id)"
 			);
-		}
-		if let Some(backend) = listen.backend.as_ref() {
-			anyhow::bail!("io_uring workers serve their own QUIC stack; listen.backend={backend:?} cannot apply");
 		}
 		let (cert, key) = match (listen.tls.cert.as_slice(), listen.tls.key.as_slice()) {
 			([cert], [key]) => (cert.clone(), key.clone()),
@@ -171,8 +168,9 @@ impl Workers {
 			use std::net::ToSocketAddrs;
 			let bind = listen
 				.bind
-				.as_deref()
+				.as_ref()
 				.context("io_uring workers need an explicit listen.bind")?;
+			let bind = bind.to_string();
 			bind.to_socket_addrs()
 				.with_context(|| format!("failed to resolve {bind}"))?
 				.next()
@@ -184,17 +182,27 @@ impl Workers {
 		// that already holds it), refuses a size the steering filter could not
 		// address, and hands out members in the order the kernel numbers them
 		// by.
-		let mut group = moq_sock::shard::Group::acquire(requested, config.count)
+		let mut forming = moq_sock::shard::Group::acquire(requested, config.count)
 			.with_context(|| format!("failed to take the reuseport group on {requested}"))?;
-		let count = group.count();
+		let count = forming.count();
 
-		let mut members = Vec::with_capacity(count as usize);
-		while let Some(member) = group.member() {
+		let mut claims = Vec::with_capacity(count as usize);
+		while let Some(member) = forming.member() {
 			let shard = member.shard();
-			let socket = member
+			let claim = member
 				.bind()
-				.with_context(|| format!("failed to bind worker {} on {}", shard.index(), group.addr()))?;
-			members.push(Member { shard, socket });
+				.with_context(|| format!("failed to bind worker {} on {}", shard.index(), forming.addr()))?;
+			claims.push(claim);
+		}
+		let mut group = forming
+			.complete(claims)
+			.context("failed to complete the reuseport group")?;
+		let mut members = Vec::with_capacity(count as usize);
+		while let Some(member) = group.member().context("failed to clone a reuseport member")? {
+			members.push(Member {
+				shard: member.shard(),
+				socket: member.into_inner(),
+			});
 		}
 		// Whatever the first member bound, which is the requested address unless
 		// it asked for an ephemeral port.
@@ -241,7 +249,7 @@ impl Workers {
 		server.transport = transport(&quic)?;
 
 		// GSO is a property of the socket, not the connection, so it rides the
-		// worker's UDP config rather than quiche's.
+		// worker's UDP config rather than the connection's.
 		let mut udp = moq_uring::udp::Config::default();
 		udp.gso = quic.gso.unwrap_or(true);
 
@@ -655,7 +663,7 @@ async fn serve_connection(
 
 	let request = moq_net::Server::new()
 		.with_versions(serve.versions.clone())
-		.accept_request_lite(handle.clone(), transport)
+		.accept_request_lite(std::time::Instant::now(), transport)
 		.await
 		.context("moq handshake failed")?;
 
@@ -696,7 +704,7 @@ async fn serve_connection(
 		let mut auth_request = serve.auth.request(moq_auth::Transport::Quic, path);
 		auth_request.query = query;
 		// moq-uring's connection does not expose the peer address or SNI yet, so
-		// the request carries the protocol alone; see quest/m2/uring-link-facts.md.
+		// the request carries the protocol alone; see quest/next/uring-link-facts.md.
 		auth_request.alpn = alpn.clone();
 		auth_request.role = request.role().map(|role| match role {
 			moq_net::Role::Publisher => moq_auth::Role::Publisher,
@@ -740,13 +748,14 @@ async fn serve_connection(
 	};
 
 	let role = request.role();
-	let grants = match crate::connection::authorize(&serve.cluster, lease.token(), role, &moq_tokio::Transport::Quic) {
-		Ok(grants) => grants,
-		Err(err) => {
-			request.close(moq_net::Error::Unauthorized);
-			return Err(err);
-		}
-	};
+	let grants =
+		match crate::connection::authorize(&serve.cluster, lease.token(), role, &moq_tokio::server::Transport::Quic) {
+			Ok(grants) => grants,
+			Err(err) => {
+				request.close(moq_net::Error::Unauthorized);
+				return Err(err);
+			}
+		};
 
 	let peer_hop = request.peer_hop();
 	let mut request = request.with_stats(grants.stats);
@@ -756,10 +765,17 @@ async fn serve_connection(
 	if let Some(publish) = grants.publish {
 		request = request.with_subscriber(publish);
 	}
-	let session = request.ok().await?;
+	let (session, driver) = request.ok().await?;
+	let driver_handle = handle.clone();
+	handle.spawn(async move {
+		match driver_handle.run(driver).await {
+			moq_net::Error::Closed => {}
+			err => tracing::debug!(%err, "session driver ended"),
+		}
+	});
 	let node_connection = peer_hop.map(|origin| serve.cluster.nodes.connect_inbound(id, origin));
 
-	tracing::info!(id, version = %session.version(), transport = %moq_tokio::Transport::Quic, "negotiated");
+	tracing::info!(id, version = %session.version(), transport = %moq_tokio::server::Transport::Quic, "negotiated");
 
 	// The session handle is Send + Sync however its transport is driven, so
 	// its lifecycle (credential expiry, GOAWAY drain) lives with the timers

@@ -50,7 +50,7 @@ impl VideoTransform {
 enum SourceState {
 	/// Waiting for the target broadcast (the catalog broadcast, or a cross-broadcast
 	/// reference) to resolve; the track (by name) is subscribed once it does.
-	Requesting(kio::Pending<moq_net::origin::Pending>, String),
+	Requesting(kio::Pending<moq_net::origin::Requesting>, String),
 	/// Waiting for the subscription to resolve (blocks on the publisher's SUBSCRIBE_OK).
 
 	Subscribing(kio::Pending<moq_net::track::Subscribing>),
@@ -491,7 +491,7 @@ pub(crate) fn build_video_transform(
 #[cfg(test)]
 mod tests {
 	use hang::catalog::{AudioCodec, Container, H264};
-	use moq_net::PathRelative;
+	use moq_net::path::Relative;
 
 	use super::*;
 	use crate::container::test_util::Live;
@@ -504,14 +504,14 @@ mod tests {
 			inline: true,
 		});
 		config.container = Container::Legacy;
-		config.broadcast = broadcast.map(|b| PathRelative::new(b).into_owned());
+		config.broadcast = broadcast.map(|b| Relative::new(b).into_owned());
 		config
 	}
 
 	fn audio(broadcast: Option<&str>) -> AudioConfig {
 		let mut config = AudioConfig::new(AudioCodec::Opus, 48_000, 2);
 		config.container = Container::Legacy;
-		config.broadcast = broadcast.map(|b| PathRelative::new(b).into_owned());
+		config.broadcast = broadcast.map(|b| Relative::new(b).into_owned());
 		config
 	}
 

@@ -21,7 +21,7 @@ use crate::{Result, SessionsFrame, TrafficFrame, parse_node_path, sessions_track
 /// the `with_*` setters.
 ///
 /// The `prefix` and `depth` must match the producing side's
-/// [`ProducerConfig`](crate::ProducerConfig): they are how announced paths are
+/// [`produce::Config`](crate::produce::Config): they are how announced paths are
 /// recognized as node broadcasts and filtered from sibling categories under the
 /// same prefix.
 #[derive(Debug, Clone)]
@@ -206,7 +206,7 @@ enum Reader<V: Mergeable> {
 	/// retracting (the table has already changed), while an unqueued
 	/// `Unroutable` means nothing serves the path at all.
 	Resolving {
-		pending: Pending<origin::Pending>,
+		pending: Pending<origin::Requesting>,
 		queued: bool,
 	},
 	/// Awaiting the subscription handshake.
@@ -320,7 +320,7 @@ impl<V: Mergeable> Merged<V> {
 	/// changed (only a non-sticky contribution leaving does; a sticky one is
 	/// kept).
 	fn apply_announce(&mut self, update: moq_net::announce::Update) -> bool {
-		let path = update.path;
+		let path = update.prefix;
 		let absolute = self.announce.absolute(&path).to_owned();
 
 		// Only fold node-category routes; skip sibling categories a producer
@@ -478,9 +478,9 @@ fn resolve<V: Mergeable>(origin: &origin::Consumer, path: &PathOwned) -> Reader<
 mod tests {
 	/// Build an origin producer, spawning its driver on the ambient runtime.
 	fn produce_origin() -> moq_net::origin::Producer {
-		let (producer, driver) = moq_net::origin::Producer::new(moq_net::Hop::random().into());
+		let (producer, driver) = moq_net::origin::Producer::new(moq_net::origin::Config::default());
 		if tokio::runtime::Handle::try_current().is_ok() {
-			tokio::spawn(driver.run(moq_tokio::runtime::Runtime::<()>::new()));
+			tokio::spawn(moq_net::time::run(driver));
 		} else {
 			// A sync test: nothing polls the driver, and dropping it would tear
 			// the origin down, so leak it and rely on the synchronous half.
@@ -493,7 +493,7 @@ mod tests {
 
 	use moq_net::{PathOwned, Timestamp, announce, broadcast, origin, track};
 
-	use crate::{Producer, ProducerConfig};
+	use crate::{Producer, produce};
 
 	use super::*;
 
@@ -502,7 +502,7 @@ mod tests {
 	/// `.stats/<group>/node/<node>`).
 	fn node_producer(origin: &origin::Producer, node: &str) -> Producer {
 		Producer::new(
-			ProducerConfig::new()
+			produce::Config::new()
 				.with_origin(origin.clone())
 				.with_node(PathOwned::from(node.to_string()))
 				.with_depth(1),

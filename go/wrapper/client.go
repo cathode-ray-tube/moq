@@ -202,7 +202,7 @@ func Dial(ctx context.Context, url string, opts ...ClientOption) (*Client, error
 	inner := ffi.NewMoqClient()
 	var err error
 	if !cfg.tlsVerify {
-		err = inner.SetTlsDisableVerify(true)
+		err = inner.SetTlsVerify(false)
 	}
 	if err == nil && cfg.tlsRootsSet {
 		err = inner.SetTlsRoots(cfg.tlsRoots)
@@ -267,9 +267,9 @@ func (c *Client) CreateBroadcast(path string) (*BroadcastProducer, error) {
 	return c.publisher.CreateBroadcast(path)
 }
 
-// Announced streams routes announced by the remote under prefix.
-func (c *Client) Announced(prefix string) (*AnnounceConsumer, error) {
-	return c.consumer.Announced(prefix)
+// Announced streams routes announced by the remote under a pattern scope.
+func (c *Client) Announced(options AnnounceOptions) (*AnnounceConsumer, error) {
+	return c.consumer.Announced(options)
 }
 
 // AnnouncedBroadcast waits for a route covering path, then resolves the
