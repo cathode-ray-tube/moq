@@ -87,7 +87,6 @@ Public API: none beyond the required quests. Wire: none.
 
 ## Required
 
-- [uring identity](/quest/main/uring-identity.md) - bind sockets, connections, workers, and steering identity together
 - [Binding audio tests](/quest/next/binding-audio-tests.md) - every binding proves the audio config it exposes
 - [Decode format](/quest/next/ffi-decode-format.md) - the C-only decode knob reaches every uniffi binding
 - [JSON mutate](/quest/next/json-mutate.md) - Rust and JS share the closure edit
