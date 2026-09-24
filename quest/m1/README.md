@@ -34,7 +34,7 @@ transport, benchmark tooling); worktrees isolate commits, not semantics.
 - [Data sections](/quest/m1/data-sections.md) - an application lists JSON and binary tracks in its own catalog section with its own per-track fields, published in one moq-mux call; data entries gain `bitrate` and `jitter`
 - [Broadcast close](/quest/m1/broadcast-close/README.md) - `close()` is the one way to end a broadcast in every language, a permanent retraction that leaves in-flight tracks alone
 - [Gateway embedding](/quest/m1/gateway-embed.md) - moq-hls, moq-rtmp, and moq-rtc expose the loop their binaries run to an in-process embedder
-- [Ingest source](/quest/m1/net-ingest-source.md) - an announce says whether the broadcast entered on this relay or a peer
+- [Relay peer set](/quest/m1/relay-peer-set.md) - a wire consumer tells a client hop from a peer hop, and every mesh credential can mark a peer
 - [Publisher clocks](/quest/m1/publisher-clock.md) - wire the shared clock through native and browser publisher restarts
 - [CLI inspection](/quest/m1/cli-inspect/README.md) - `moq ls` lists what is live and `moq fetch` reads a group over MoQ, and a guide shows how to inspect a relay
 - [JS caught up](/quest/m1/js-announce-caught-up.md) - @moq/net's announce consumer says when the initial set has landed, like Rust
