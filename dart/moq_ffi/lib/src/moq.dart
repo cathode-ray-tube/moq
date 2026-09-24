@@ -8116,14 +8116,9 @@ class FfiConverterOptionalBool {
     if (value == null) {
       return toRustBuffer(Uint8List.fromList([0]));
     }
-    final length = FfiConverterOptionalBool.allocationSize(value);
-    final Pointer<Uint8> frameData = calloc<Uint8>(length);
-    final buf = frameData.asTypedList(length);
+    final buf = Uint8List(FfiConverterOptionalBool.allocationSize(value));
     FfiConverterOptionalBool.write(value, buf);
-    final bytes = calloc<ForeignBytes>();
-    bytes.ref.len = length;
-    bytes.ref.data = frameData;
-    return RustBuffer.fromBytes(bytes.ref);
+    return toRustBuffer(buf);
   }
 
   static int write(bool? value, Uint8List buf) {
@@ -8166,14 +8161,9 @@ class FfiConverterOptionalDouble64 {
     if (value == null) {
       return toRustBuffer(Uint8List.fromList([0]));
     }
-    final length = FfiConverterOptionalDouble64.allocationSize(value);
-    final Pointer<Uint8> frameData = calloc<Uint8>(length);
-    final buf = frameData.asTypedList(length);
+    final buf = Uint8List(FfiConverterOptionalDouble64.allocationSize(value));
     FfiConverterOptionalDouble64.write(value, buf);
-    final bytes = calloc<ForeignBytes>();
-    bytes.ref.len = length;
-    bytes.ref.data = frameData;
-    return RustBuffer.fromBytes(bytes.ref);
+    return toRustBuffer(buf);
   }
 
   static int write(double? value, Uint8List buf) {
@@ -8216,14 +8206,11 @@ class FfiConverterOptionalMoqAnnounceUpdate {
     if (value == null) {
       return toRustBuffer(Uint8List.fromList([0]));
     }
-    final length = FfiConverterOptionalMoqAnnounceUpdate.allocationSize(value);
-    final Pointer<Uint8> frameData = calloc<Uint8>(length);
-    final buf = frameData.asTypedList(length);
+    final buf = Uint8List(
+      FfiConverterOptionalMoqAnnounceUpdate.allocationSize(value),
+    );
     FfiConverterOptionalMoqAnnounceUpdate.write(value, buf);
-    final bytes = calloc<ForeignBytes>();
-    bytes.ref.len = length;
-    bytes.ref.data = frameData;
-    return RustBuffer.fromBytes(bytes.ref);
+    return toRustBuffer(buf);
   }
 
   static int write(MoqAnnounceUpdate? value, Uint8List buf) {
@@ -8266,14 +8253,9 @@ class FfiConverterOptionalMoqCatalog {
     if (value == null) {
       return toRustBuffer(Uint8List.fromList([0]));
     }
-    final length = FfiConverterOptionalMoqCatalog.allocationSize(value);
-    final Pointer<Uint8> frameData = calloc<Uint8>(length);
-    final buf = frameData.asTypedList(length);
+    final buf = Uint8List(FfiConverterOptionalMoqCatalog.allocationSize(value));
     FfiConverterOptionalMoqCatalog.write(value, buf);
-    final bytes = calloc<ForeignBytes>();
-    bytes.ref.len = length;
-    bytes.ref.data = frameData;
-    return RustBuffer.fromBytes(bytes.ref);
+    return toRustBuffer(buf);
   }
 
   static int write(MoqCatalog? value, Uint8List buf) {
@@ -8316,14 +8298,11 @@ class FfiConverterOptionalMoqDatagram {
     if (value == null) {
       return toRustBuffer(Uint8List.fromList([0]));
     }
-    final length = FfiConverterOptionalMoqDatagram.allocationSize(value);
-    final Pointer<Uint8> frameData = calloc<Uint8>(length);
-    final buf = frameData.asTypedList(length);
+    final buf = Uint8List(
+      FfiConverterOptionalMoqDatagram.allocationSize(value),
+    );
     FfiConverterOptionalMoqDatagram.write(value, buf);
-    final bytes = calloc<ForeignBytes>();
-    bytes.ref.len = length;
-    bytes.ref.data = frameData;
-    return RustBuffer.fromBytes(bytes.ref);
+    return toRustBuffer(buf);
   }
 
   static int write(MoqDatagram? value, Uint8List buf) {
@@ -8366,14 +8345,11 @@ class FfiConverterOptionalMoqDimensions {
     if (value == null) {
       return toRustBuffer(Uint8List.fromList([0]));
     }
-    final length = FfiConverterOptionalMoqDimensions.allocationSize(value);
-    final Pointer<Uint8> frameData = calloc<Uint8>(length);
-    final buf = frameData.asTypedList(length);
+    final buf = Uint8List(
+      FfiConverterOptionalMoqDimensions.allocationSize(value),
+    );
     FfiConverterOptionalMoqDimensions.write(value, buf);
-    final bytes = calloc<ForeignBytes>();
-    bytes.ref.len = length;
-    bytes.ref.data = frameData;
-    return RustBuffer.fromBytes(bytes.ref);
+    return toRustBuffer(buf);
   }
 
   static int write(MoqDimensions? value, Uint8List buf) {
@@ -8421,16 +8397,11 @@ class FfiConverterOptionalMoqFetchGroupOptions {
     if (value == null) {
       return toRustBuffer(Uint8List.fromList([0]));
     }
-    final length = FfiConverterOptionalMoqFetchGroupOptions.allocationSize(
-      value,
+    final buf = Uint8List(
+      FfiConverterOptionalMoqFetchGroupOptions.allocationSize(value),
     );
-    final Pointer<Uint8> frameData = calloc<Uint8>(length);
-    final buf = frameData.asTypedList(length);
     FfiConverterOptionalMoqFetchGroupOptions.write(value, buf);
-    final bytes = calloc<ForeignBytes>();
-    bytes.ref.len = length;
-    bytes.ref.data = frameData;
-    return RustBuffer.fromBytes(bytes.ref);
+    return toRustBuffer(buf);
   }
 
   static int write(MoqFetchGroupOptions? value, Uint8List buf) {
@@ -8473,14 +8444,9 @@ class FfiConverterOptionalMoqFrame {
     if (value == null) {
       return toRustBuffer(Uint8List.fromList([0]));
     }
-    final length = FfiConverterOptionalMoqFrame.allocationSize(value);
-    final Pointer<Uint8> frameData = calloc<Uint8>(length);
-    final buf = frameData.asTypedList(length);
+    final buf = Uint8List(FfiConverterOptionalMoqFrame.allocationSize(value));
     FfiConverterOptionalMoqFrame.write(value, buf);
-    final bytes = calloc<ForeignBytes>();
-    bytes.ref.len = length;
-    bytes.ref.data = frameData;
-    return RustBuffer.fromBytes(bytes.ref);
+    return toRustBuffer(buf);
   }
 
   static int write(MoqFrame? value, Uint8List buf) {
@@ -8523,14 +8489,11 @@ class FfiConverterOptionalMoqGroupConsumer {
     if (value == null) {
       return toRustBuffer(Uint8List.fromList([0]));
     }
-    final length = FfiConverterOptionalMoqGroupConsumer.allocationSize(value);
-    final Pointer<Uint8> frameData = calloc<Uint8>(length);
-    final buf = frameData.asTypedList(length);
+    final buf = Uint8List(
+      FfiConverterOptionalMoqGroupConsumer.allocationSize(value),
+    );
     FfiConverterOptionalMoqGroupConsumer.write(value, buf);
-    final bytes = calloc<ForeignBytes>();
-    bytes.ref.len = length;
-    bytes.ref.data = frameData;
-    return RustBuffer.fromBytes(bytes.ref);
+    return toRustBuffer(buf);
   }
 
   static int write(MoqGroupConsumer? value, Uint8List buf) {
@@ -8573,14 +8536,11 @@ class FfiConverterOptionalMoqMediaFrame {
     if (value == null) {
       return toRustBuffer(Uint8List.fromList([0]));
     }
-    final length = FfiConverterOptionalMoqMediaFrame.allocationSize(value);
-    final Pointer<Uint8> frameData = calloc<Uint8>(length);
-    final buf = frameData.asTypedList(length);
+    final buf = Uint8List(
+      FfiConverterOptionalMoqMediaFrame.allocationSize(value),
+    );
     FfiConverterOptionalMoqMediaFrame.write(value, buf);
-    final bytes = calloc<ForeignBytes>();
-    bytes.ref.len = length;
-    bytes.ref.data = frameData;
-    return RustBuffer.fromBytes(bytes.ref);
+    return toRustBuffer(buf);
   }
 
   static int write(MoqMediaFrame? value, Uint8List buf) {
@@ -8623,14 +8583,11 @@ class FfiConverterOptionalMoqOriginProducer {
     if (value == null) {
       return toRustBuffer(Uint8List.fromList([0]));
     }
-    final length = FfiConverterOptionalMoqOriginProducer.allocationSize(value);
-    final Pointer<Uint8> frameData = calloc<Uint8>(length);
-    final buf = frameData.asTypedList(length);
+    final buf = Uint8List(
+      FfiConverterOptionalMoqOriginProducer.allocationSize(value),
+    );
     FfiConverterOptionalMoqOriginProducer.write(value, buf);
-    final bytes = calloc<ForeignBytes>();
-    bytes.ref.len = length;
-    bytes.ref.data = frameData;
-    return RustBuffer.fromBytes(bytes.ref);
+    return toRustBuffer(buf);
   }
 
   static int write(MoqOriginProducer? value, Uint8List buf) {
@@ -8673,14 +8630,9 @@ class FfiConverterOptionalMoqRequest {
     if (value == null) {
       return toRustBuffer(Uint8List.fromList([0]));
     }
-    final length = FfiConverterOptionalMoqRequest.allocationSize(value);
-    final Pointer<Uint8> frameData = calloc<Uint8>(length);
-    final buf = frameData.asTypedList(length);
+    final buf = Uint8List(FfiConverterOptionalMoqRequest.allocationSize(value));
     FfiConverterOptionalMoqRequest.write(value, buf);
-    final bytes = calloc<ForeignBytes>();
-    bytes.ref.len = length;
-    bytes.ref.data = frameData;
-    return RustBuffer.fromBytes(bytes.ref);
+    return toRustBuffer(buf);
   }
 
   static int write(MoqRequest? value, Uint8List buf) {
@@ -8723,14 +8675,11 @@ class FfiConverterOptionalMoqSubscription {
     if (value == null) {
       return toRustBuffer(Uint8List.fromList([0]));
     }
-    final length = FfiConverterOptionalMoqSubscription.allocationSize(value);
-    final Pointer<Uint8> frameData = calloc<Uint8>(length);
-    final buf = frameData.asTypedList(length);
+    final buf = Uint8List(
+      FfiConverterOptionalMoqSubscription.allocationSize(value),
+    );
     FfiConverterOptionalMoqSubscription.write(value, buf);
-    final bytes = calloc<ForeignBytes>();
-    bytes.ref.len = length;
-    bytes.ref.data = frameData;
-    return RustBuffer.fromBytes(bytes.ref);
+    return toRustBuffer(buf);
   }
 
   static int write(MoqSubscription? value, Uint8List buf) {
@@ -8773,14 +8722,11 @@ class FfiConverterOptionalMoqTrackInfo {
     if (value == null) {
       return toRustBuffer(Uint8List.fromList([0]));
     }
-    final length = FfiConverterOptionalMoqTrackInfo.allocationSize(value);
-    final Pointer<Uint8> frameData = calloc<Uint8>(length);
-    final buf = frameData.asTypedList(length);
+    final buf = Uint8List(
+      FfiConverterOptionalMoqTrackInfo.allocationSize(value),
+    );
     FfiConverterOptionalMoqTrackInfo.write(value, buf);
-    final bytes = calloc<ForeignBytes>();
-    bytes.ref.len = length;
-    bytes.ref.data = frameData;
-    return RustBuffer.fromBytes(bytes.ref);
+    return toRustBuffer(buf);
   }
 
   static int write(MoqTrackInfo? value, Uint8List buf) {
@@ -8823,14 +8769,11 @@ class FfiConverterOptionalMoqVideoHint {
     if (value == null) {
       return toRustBuffer(Uint8List.fromList([0]));
     }
-    final length = FfiConverterOptionalMoqVideoHint.allocationSize(value);
-    final Pointer<Uint8> frameData = calloc<Uint8>(length);
-    final buf = frameData.asTypedList(length);
+    final buf = Uint8List(
+      FfiConverterOptionalMoqVideoHint.allocationSize(value),
+    );
     FfiConverterOptionalMoqVideoHint.write(value, buf);
-    final bytes = calloc<ForeignBytes>();
-    bytes.ref.len = length;
-    bytes.ref.data = frameData;
-    return RustBuffer.fromBytes(bytes.ref);
+    return toRustBuffer(buf);
   }
 
   static int write(MoqVideoHint? value, Uint8List buf) {
@@ -8873,14 +8816,11 @@ class FfiConverterOptionalSequenceString {
     if (value == null) {
       return toRustBuffer(Uint8List.fromList([0]));
     }
-    final length = FfiConverterOptionalSequenceString.allocationSize(value);
-    final Pointer<Uint8> frameData = calloc<Uint8>(length);
-    final buf = frameData.asTypedList(length);
+    final buf = Uint8List(
+      FfiConverterOptionalSequenceString.allocationSize(value),
+    );
     FfiConverterOptionalSequenceString.write(value, buf);
-    final bytes = calloc<ForeignBytes>();
-    bytes.ref.len = length;
-    bytes.ref.data = frameData;
-    return RustBuffer.fromBytes(bytes.ref);
+    return toRustBuffer(buf);
   }
 
   static int write(List<String>? value, Uint8List buf) {
@@ -8923,14 +8863,9 @@ class FfiConverterOptionalString {
     if (value == null) {
       return toRustBuffer(Uint8List.fromList([0]));
     }
-    final length = FfiConverterOptionalString.allocationSize(value);
-    final Pointer<Uint8> frameData = calloc<Uint8>(length);
-    final buf = frameData.asTypedList(length);
+    final buf = Uint8List(FfiConverterOptionalString.allocationSize(value));
     FfiConverterOptionalString.write(value, buf);
-    final bytes = calloc<ForeignBytes>();
-    bytes.ref.len = length;
-    bytes.ref.data = frameData;
-    return RustBuffer.fromBytes(bytes.ref);
+    return toRustBuffer(buf);
   }
 
   static int write(String? value, Uint8List buf) {
@@ -8973,14 +8908,9 @@ class FfiConverterOptionalUInt64 {
     if (value == null) {
       return toRustBuffer(Uint8List.fromList([0]));
     }
-    final length = FfiConverterOptionalUInt64.allocationSize(value);
-    final Pointer<Uint8> frameData = calloc<Uint8>(length);
-    final buf = frameData.asTypedList(length);
+    final buf = Uint8List(FfiConverterOptionalUInt64.allocationSize(value));
     FfiConverterOptionalUInt64.write(value, buf);
-    final bytes = calloc<ForeignBytes>();
-    bytes.ref.len = length;
-    bytes.ref.data = frameData;
-    return RustBuffer.fromBytes(bytes.ref);
+    return toRustBuffer(buf);
   }
 
   static int write(int? value, Uint8List buf) {
@@ -9023,14 +8953,9 @@ class FfiConverterOptionalUint8List {
     if (value == null) {
       return toRustBuffer(Uint8List.fromList([0]));
     }
-    final length = FfiConverterOptionalUint8List.allocationSize(value);
-    final Pointer<Uint8> frameData = calloc<Uint8>(length);
-    final buf = frameData.asTypedList(length);
+    final buf = Uint8List(FfiConverterOptionalUint8List.allocationSize(value));
     FfiConverterOptionalUint8List.write(value, buf);
-    final bytes = calloc<ForeignBytes>();
-    bytes.ref.len = length;
-    bytes.ref.data = frameData;
-    return RustBuffer.fromBytes(bytes.ref);
+    return toRustBuffer(buf);
   }
 
   static int write(Uint8List? value, Uint8List buf) {
@@ -9232,7 +9157,7 @@ class FfiConverterUint8List {
 
   static LiftRetVal<Uint8List> read(Uint8List buf) {
     final length = buf.buffer.asByteData(buf.offsetInBytes).getInt32(0);
-    final bytes = Uint8List.view(buf.buffer, buf.offsetInBytes + 4, length);
+    final bytes = buf.sublist(4, 4 + length);
     return LiftRetVal(bytes, length + 4);
   }
 
