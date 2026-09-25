@@ -68,4 +68,4 @@ source changed rather than scanning every mount or session.
 ## Related
 
 - [Origin narrowing](/quest/m1/origin-narrowing.md) - the same origin/auth area; land them in sequence
-- [Auth embedder](/quest/m1/auth-embedder.md) - `Cluster::admit` should carry mounts too
+- `Cluster::admit` (#3943) - should carry mounts too
