@@ -1469,7 +1469,12 @@ class FfiConverterMoqVideoProperties {
 class MoqAnnounceConfig {
   final String prefix;
   final String? filter;
-  MoqAnnounceConfig({this.prefix = '', this.filter = null});
+  final bool hidden;
+  MoqAnnounceConfig({
+    this.prefix = '',
+    this.filter = null,
+    this.hidden = false,
+  });
 }
 
 class FfiConverterMoqAnnounceConfig {
@@ -1489,8 +1494,13 @@ class FfiConverterMoqAnnounceConfig {
     );
     final filter = filter_lifted.value;
     new_offset += filter_lifted.bytesRead;
+    final hidden_lifted = FfiConverterBool.read(
+      Uint8List.view(buf.buffer, new_offset),
+    );
+    final hidden = hidden_lifted.value;
+    new_offset += hidden_lifted.bytesRead;
     return LiftRetVal(
-      MoqAnnounceConfig(prefix: prefix, filter: filter),
+      MoqAnnounceConfig(prefix: prefix, filter: filter, hidden: hidden),
       new_offset - buf.offsetInBytes,
     );
   }
@@ -1499,6 +1509,7 @@ class FfiConverterMoqAnnounceConfig {
     final total_length =
         FfiConverterString.allocationSize(value.prefix) +
         FfiConverterOptionalString.allocationSize(value.filter) +
+        FfiConverterBool.allocationSize(value.hidden) +
         0;
     final buf = Uint8List(total_length);
     write(value, buf);
@@ -1515,12 +1526,17 @@ class FfiConverterMoqAnnounceConfig {
       value.filter,
       Uint8List.view(buf.buffer, new_offset),
     );
+    new_offset += FfiConverterBool.write(
+      value.hidden,
+      Uint8List.view(buf.buffer, new_offset),
+    );
     return new_offset - buf.offsetInBytes;
   }
 
   static int allocationSize(MoqAnnounceConfig value) {
     return FfiConverterString.allocationSize(value.prefix) +
         FfiConverterOptionalString.allocationSize(value.filter) +
+        FfiConverterBool.allocationSize(value.hidden) +
         0;
   }
 }
