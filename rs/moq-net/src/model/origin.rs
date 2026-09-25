@@ -6291,6 +6291,77 @@ mod tests {
 		assert_eq!(&group.read_frame().await.unwrap().unwrap().payload[..], b"live");
 	}
 
+	/// A returning reader judges the warm cache against the logical track's live
+	/// edge, not the parked segment's own frozen one: groups the fresh source
+	/// has left behind by more than the budget are skipped, exactly as they would
+	/// be on one unspliced track.
+	///
+	/// A local source is released rather than parked (it keeps its own cache), so
+	/// this goes through a served front, which is what actually holds the warm copy.
+	/// The copy resolves at the cached edge, not past it: resolving past it drops
+	/// the cache outright, which is a different case.
+	#[tokio::test]
+	async fn resumed_reader_skips_warm_groups_behind_the_new_edge() {
+		let ms = |v: u64| crate::Timestamp::from_millis(v).unwrap();
+		let (_server, _upstream, mut dynamic, resolved) = served_front().await;
+		let budget = track::Subscription::default().with_max_age(Duration::from_millis(100));
+		let write = |source: &track::Producer, sequence: u64, millis: u64| {
+			let mut group = source.create_group(sequence.into()).unwrap();
+			group.write_frame(ms(millis), b"x".as_ref()).unwrap();
+			group.finish().unwrap();
+		};
+		let drain = |subscription: &mut track::Subscriber| {
+			let mut sequences = Vec::new();
+			while let Poll::Ready(group) = subscription.poll_recv_group(&kio::Waiter::noop()) {
+				sequences.push(group.unwrap().expect("track ended").sequence);
+			}
+			sequences
+		};
+
+		let track = resolved.track("video").unwrap();
+		let first = budget.clone();
+		let subscribing = tokio::spawn(async move { track.subscribe(first).await });
+		let request = tokio::time::timeout(Duration::from_secs(1), dynamic.requested_track())
+			.await
+			.expect("the front asked the source")
+			.expect("request");
+		let source = request.resolving_start().accept(None);
+		for (sequence, millis) in [(0, 0), (1, 20), (2, 40), (3, 60)] {
+			write(&source, sequence, millis);
+		}
+		let mut subscription = subscribing.await.unwrap().expect("subscribe");
+		next_group(&mut subscription).await.unwrap().expect("a cached group");
+		drain(&mut subscription);
+		drop(subscription);
+
+		tokio::time::timeout(Duration::from_secs(1), source.unused())
+			.await
+			.expect("parked")
+			.expect("source open");
+		drop(source);
+
+		let track = resolved.track("video").unwrap();
+		let second = budget.clone();
+		let subscribing = tokio::spawn(async move { track.subscribe(second).await });
+		let request = tokio::time::timeout(Duration::from_secs(1), dynamic.requested_track())
+			.await
+			.expect("the front asked the source again")
+			.expect("request");
+		let mut source = request.resolving_start().accept(None);
+		for (sequence, millis) in [(20, 400), (21, 420), (22, 440)] {
+			write(&source, sequence, millis);
+		}
+		// At the cached edge, not past it, so the warm copy stays and the budget
+		// decides. Past it, the copy has already judged the cache stale.
+		source.start_at(3).unwrap();
+		let mut subscription = subscribing.await.unwrap().expect("resubscribe");
+		settle(|| subscription.latest() == Some(22)).await;
+
+		// Groups 0..=2 reach at most 60ms against an edge at 440ms. Group 3 reaches
+		// where group 20 starts, 40ms behind that edge, inside the 100ms budget.
+		assert_eq!(drain(&mut subscription), [3, 20, 21, 22]);
+	}
+
 	/// A front serving from another front's spliced copy has no snapshot to keep:
 	/// it still drops upstream on the unused edge, so the publisher's `unused()`
 	/// resolves far below `TRACK_IDLE_LINGER` through the whole chain. The next
@@ -6345,10 +6416,11 @@ mod tests {
 			"every front keeps the delivered groups after releasing its source"
 		);
 
+		// A budget spanning the cache, so the returning reader replays it.
 		let mut subscription = edge_resolved
 			.track("video")
 			.unwrap()
-			.subscribe(None)
+			.subscribe(track::Subscription::default().with_max_age(Duration::from_secs(3600)))
 			.await
 			.expect("resubscribe");
 		tokio::time::timeout(Duration::from_secs(5), track.used())
