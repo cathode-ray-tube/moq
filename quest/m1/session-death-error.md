@@ -53,8 +53,3 @@ controls: a finished track still ends clean while its session lives.
 ## Closes
 
 - [#4061](https://github.com/moq-dev/moq/issues/4061) - close this issue when the quest finishes
-
-## Related
-
-- [JS track tail](/quest/m1/js-track-tail.md) - the clean-end half: a track that did end is delivered whole
-- [Rust track tail](/quest/m1/rust-track-tail.md) - the same in moq-net
