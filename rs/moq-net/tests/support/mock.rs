@@ -11,7 +11,7 @@
 //! plagues real-transport tests.
 
 use std::{
-	sync::Arc,
+	sync::{Arc, Mutex},
 	task::{Context, Poll},
 };
 
