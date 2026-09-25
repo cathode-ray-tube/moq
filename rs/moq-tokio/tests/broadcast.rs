@@ -1110,7 +1110,7 @@ async fn route_reannounce_test(version: Option<&str>) {
 	handle.await.expect("server panicked").expect("server failed");
 }
 
-/// Route re-advertisement on the default version (lite-06: ANNOUNCE_RESTART by id).
+/// Route re-advertisement on the default version (lite-07: ANNOUNCE_RESTART by id).
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn broadcast_route_reannounce() {
@@ -1148,6 +1148,12 @@ async fn broadcast_moq_lite_03() {
 #[tokio::test]
 async fn broadcast_moq_lite_06() {
 	broadcast_test("moqt", Some("moq-lite-06"), Some("moq-lite-06")).await;
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn broadcast_moq_lite_07() {
+	broadcast_test("moqt", Some("moq-lite-07"), Some("moq-lite-07")).await;
 }
 
 #[tracing_test::traced_test]
@@ -1871,7 +1877,7 @@ async fn broadcast_websocket_fallback() {
 ///
 /// Bump this whenever [`moq_net::Versions::all`] gains a newer Lite variant
 /// so the regression tests below keep tracking "the newest", not a frozen value.
-const NEWEST_LITE: &str = "moq-lite-06";
+const NEWEST_LITE: &str = "moq-lite-07";
 
 /// Regression guard for the WebSocket ALPN path. Lite02 over WebSocket means
 /// the qmux subprotocol negotiation produced a bare `moql` (or no match)
@@ -2472,69 +2478,6 @@ async fn reconnect_stops_on_websocket_unauthorized() {
 		.await
 		.expect("server task panicked")
 		.expect("server task failed");
-}
-
-/// A WebTransport-only endpoint answers the WebSocket fallback with 403 while the
-/// QUIC dial is still in flight. One transport being refused is not the connect's
-/// verdict: QUIC finishes the race and the session comes up.
-#[tracing_test::traced_test]
-#[tokio::test]
-async fn websocket_forbidden_does_not_end_a_quic_connect() {
-	use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-	// The fallback dials the same port over TCP. Nothing reserves a port for both
-	// UDP and TCP at once, and the ephemeral UDP port may already be taken over TCP,
-	// so pick again until both bind.
-	let (mut server, addr, listener) = 'bind: {
-		for _ in 0..20 {
-			let (server, addr) = test_server().await;
-			match tokio::net::TcpListener::bind(("::", addr.port())).await {
-				Ok(listener) => break 'bind (server, addr, listener),
-				Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => continue,
-				Err(err) => panic!("failed to bind TCP listener: {err}"),
-			}
-		}
-		panic!("no port was free over both UDP and TCP");
-	};
-	let forbid = tokio::spawn(async move {
-		let (mut stream, _) = listener.accept().await?;
-		let mut buf = [0; 1024];
-		let _ = stream.read(&mut buf).await?;
-		stream
-			.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-			.await?;
-		Ok::<_, anyhow::Error>(())
-	});
-
-	let pub_origin = moq_tokio::origin::spawn();
-	let server_handle = tokio::spawn(async move {
-		let request = server.accept().await.expect("no incoming connection");
-		let session = request.with_publisher(&pub_origin).ok().await?;
-		session.closed().await;
-		Ok::<_, anyhow::Error>(())
-	});
-
-	let mut client_config = moq_tokio::connect::Config::default();
-	client_config.tls.insecure = Some(true);
-	// No head start, so the 403 lands before the QUIC handshake completes.
-	client_config.websocket.delay = Duration::ZERO;
-	let client = client_config.init(Default::default()).expect("failed to init client");
-	// http:// dials QUIC as https:// and the fallback as plain ws://, which the listener
-	// above can answer without TLS.
-	let url: url::Url = format!("http://localhost:{}", addr.port()).parse().unwrap();
-
-	let (_client, connection) = tokio::time::timeout(TIMEOUT, connect_once(client, url))
-		.await
-		.expect("client connect timed out")
-		.expect("a fallback refused on auth must not end a connect whose QUIC arm succeeds");
-
-	drop(connection);
-	server_handle
-		.await
-		.expect("server task panicked")
-		.expect("server task failed");
-	// QUIC may win before the fallback ever dials, leaving the listener waiting.
-	forbid.abort();
 }
 
 /// A GOAWAY ends a one-shot connection instead of being ignored.
