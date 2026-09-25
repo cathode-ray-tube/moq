@@ -137,16 +137,18 @@ export class Producer {
 	#timeline?: TimelineRecorder;
 	#encrypter?: FrameEncrypter;
 
-	// The newest timestamp written, reported to the timeline when the track closes.
+	/** The newest timestamp written. */
 	#end?: Time.Micro;
 
-	// Exclusive presentation end of finished groups.
+	/** Exclusive presentation end of finished groups. */
 	#liveEdge?: Time.Micro;
 
-	// Gap between consecutive timestamps, used to close the last group.
+	/** Gap between consecutive timestamps. */
 	#interval?: Time.Micro;
 
-	/** Wrap a track to publish legacy-container frames into it. */
+	/** Whether a marker has already been written for the latest cut. */
+	#marked = false;
+
 	constructor(
 		track: Moq.Track.Producer,
 		format: Format,
@@ -177,6 +179,8 @@ export class Producer {
 		timestamp: Time.Micro,
 		keyframe: boolean,
 	): void | Promise<void> {
+		this.#marked = false;
+
 		if (!this.#encrypter) {
 			return this.#encodePlaintext(data, timestamp, keyframe);
 		}
@@ -194,7 +198,7 @@ export class Producer {
 				this.#previous !== undefined &&
 				timestamp < this.#previous;
 
-			this.cut(rewound ? undefined : timestamp);
+			this.#close(rewound ? undefined : timestamp);
 
 			if (rewound) {
 				this.#interval = undefined;
@@ -252,7 +256,10 @@ export class Producer {
 			this.#refuse(timestamp);
 		}
 
-		const payload = await this.#encodeEncryptedFrame(data, timestamp);
+		const payload = await this.#encodeEncryptedFrame(
+			data,
+			timestamp,
+		);
 
 		this.#group.writeFrame({
 			payload,
@@ -286,8 +293,9 @@ export class Producer {
 			this.#previous !== undefined &&
 			timestamp > this.#previous
 		) {
-			const delta = (timestamp - this.#previous) as Time.Micro;
-			this.#interval = delta;
+			this.#interval = (
+				timestamp - this.#previous
+			) as Time.Micro;
 		}
 
 		this.#previous = timestamp;
@@ -297,23 +305,122 @@ export class Producer {
 		}
 	}
 
-	/** Flush and close the current group at the supplied or estimated end timestamp. */
+	/**
+	 * Flush and close the current group at the supplied or estimated end
+	 * timestamp, then mark a break in the timeline.
+	 */
 	cut(end?: Time.Micro): void | Promise<void> {
 		if (!this.#encrypter) {
 			return this.#cutPlaintext(end);
 		}
 
-		return this.#cutEncrypted(end);
+		return this.#cutEncryptedWithMarker(end);
 	}
 
 	#cutPlaintext(end?: Time.Micro): void {
-		if (!this.#group) return;
+		this.#close(end);
+
+		// Nothing is measured across the break.
+		this.#interval = undefined;
+
+		const timestamp = end ?? this.#liveEdge;
+
+		if (
+			this.#format.kind === "data" ||
+			this.#marked ||
+			timestamp === undefined
+		) {
+			return;
+		}
+
+		const group = this.#track.appendGroup();
+
+		this.#timeline?.record(
+			group.sequence,
+			timestamp,
+			false,
+		);
+		this.#timeline?.end(timestamp);
+
+		group.writeFrame({
+			payload: encodeFrame(new Uint8Array(), timestamp),
+			timestamp: Time.Timestamp.fromMicros(timestamp),
+		});
+
+		group.close();
+
+		this.#liveEdge =
+			this.#liveEdge === undefined
+				? timestamp
+				: (Math.max(
+					this.#liveEdge,
+					timestamp,
+				) as Time.Micro);
+
+		this.#marked = true;
+	}
+
+	async #cutEncryptedWithMarker(
+		end?: Time.Micro,
+	): Promise<void> {
+		await this.#cutEncrypted(end);
+
+		this.#interval = undefined;
+
+		const timestamp = end ?? this.#liveEdge;
+
+		if (
+			this.#format.kind === "data" ||
+			this.#marked ||
+			timestamp === undefined
+		) {
+			return;
+		}
+
+		const group = this.#track.appendGroup();
+
+		this.#timeline?.record(
+			group.sequence,
+			timestamp,
+			false,
+		);
+		this.#timeline?.end(timestamp);
+
+		const payload = await this.#encrypter!.encrypt(
+			group.sequence,
+			encodeFrame(new Uint8Array(), timestamp),
+		);
+
+		group.writeFrame({
+			payload,
+			timestamp: Time.Timestamp.fromMicros(timestamp),
+		});
+
+		group.close();
+
+		this.#liveEdge =
+			this.#liveEdge === undefined
+				? timestamp
+				: (Math.max(
+					this.#liveEdge,
+					timestamp,
+				) as Time.Micro);
+
+		this.#marked = true;
+	}
+
+	/**
+	 * Close the current group without writing a marker group.
+	 */
+	#close(end?: Time.Micro): void {
+		if (!this.#group) {
+			return;
+		}
 
 		this.#validateEnd(end);
 
 		end ??= this.#estimatedEnd();
 
-		// Preserve the original Format API and synchronous behavior.
 		this.#format.finishGroup(
 			this.#group,
 			this.#reordered ? undefined : end,
@@ -323,7 +430,9 @@ export class Producer {
 	}
 
 	async #cutEncrypted(end?: Time.Micro): Promise<void> {
-		if (!this.#group) return;
+		if (!this.#group) {
+			return;
+		}
 
 		this.#validateEnd(end);
 
@@ -341,7 +450,10 @@ export class Producer {
 	}
 
 	async #finishEncryptedGroup(end: Time.Micro): Promise<void> {
-		const plaintext = encodeFrame(new Uint8Array(), end);
+		const plaintext = encodeFrame(
+			new Uint8Array(),
+			end,
+		);
 
 		const payload = await this.#encrypter!.encrypt(
 			this.#group!.sequence,
@@ -369,9 +481,16 @@ export class Producer {
 	}
 
 	#estimatedEnd(): Time.Micro | undefined {
-		return this.#end !== undefined && this.#interval !== undefined
-			? ((this.#end + this.#interval) as Time.Micro)
-			: undefined;
+		if (
+			this.#end === undefined ||
+			this.#interval === undefined
+		) {
+			return undefined;
+		}
+
+		return (
+			this.#end + this.#interval
+		) as Time.Micro;
 	}
 
 	#closeGroup(end?: Time.Micro): void {
@@ -404,31 +523,40 @@ export class Producer {
 			this.#liveEdge !== undefined &&
 			timestamp < this.#liveEdge
 		) {
-			throw new Error("frame timestamp is below the live edge");
+			throw new Error(
+				"frame timestamp is below the live edge",
+			);
 		}
 	}
 
 	/** Close the track and current group, optionally with an error. */
 	close(err?: Error): void | Promise<void> {
-		if (!this.#encrypter) {
-			if (!err) {
-				this.cut();
-			}
-
+		if (err) {
 			this.#group?.close(err);
 			this.#track.close(err);
 			return;
 		}
 
-		return this.#closeEncrypted(err);
+		if (!this.#encrypter) {
+			this.#cutPlaintext();
+			this.#group?.close();
+			this.#track.close();
+			return;
+		}
+
+		return this.#closeEncrypted();
 	}
 
 	async #closeEncrypted(err?: Error): Promise<void> {
-		if (!err) {
-			await this.#cutEncrypted();
+		if (err) {
+			this.#group?.close(err);
+			this.#track.close(err);
+			return;
 		}
 
-		this.#group?.close(err);
-		this.#track.close(err);
+		await this.#cutEncrypted();
+
+		this.#group?.close();
+		this.#track.close();
 	}
 }
