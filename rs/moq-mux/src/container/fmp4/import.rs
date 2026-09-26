@@ -198,7 +198,7 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	{
 		self.encrypter = Some(Box::new(encrypter));
 
-		}
+		self
 	}
 
 	/// Publish on the broadcast clock rather than the source's own decode times.

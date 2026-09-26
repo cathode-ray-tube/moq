@@ -450,67 +450,58 @@ impl<E: CatalogExt> Producer<E> {
 	) -> crate::Result<super::Rendition<E, C>> {
 		super::Rendition::live(self.clone(), name.into())
 	}
-
+	
 	/// Publish a video track and own its catalog rendition.
-	pub fn video<C: crate::container::Container>(
-		&self,
-		track: moq_net::track::Producer,
-		container: C,
-		config: impl Into<Option<hang::catalog::VideoConfig>>,
-	) -> crate::Result<crate::container::Producer<C, hang::catalog::VideoConfig>>
-	where
-		crate::Error: From<C::Error>,
-	{
-		self.track(track, container, config)
-	}
+pub fn video<C: crate::container::Container<Error = crate::error::Error>>(
+    &self,
+    track: moq_net::track::Producer,
+    container: C,
+    config: impl Into<Option<hang::catalog::VideoConfig>>,
+) -> crate::Result<crate::container::Producer<C, hang::catalog::VideoConfig>> {
+    self.track(track, container, config)
+}
 
-	/// Publish an audio track and own its catalog rendition.
-	pub fn audio<C: crate::container::Container>(
-		&self,
-		track: moq_net::track::Producer,
-		container: C,
-		config: impl Into<Option<hang::catalog::AudioConfig>>,
-	) -> crate::Result<crate::container::Producer<C, hang::catalog::AudioConfig>>
-	where
-		crate::Error: From<C::Error>,
-	{
-		self.track(track, container, config)
-	}
+/// Publish an audio track and own its catalog rendition.
+pub fn audio<C: crate::container::Container<Error = crate::error::Error>>(
+    &self,
+    track: moq_net::track::Producer,
+    container: C,
+    config: impl Into<Option<hang::catalog::AudioConfig>>,
+) -> crate::Result<crate::container::Producer<C, hang::catalog::AudioConfig>> {
+    self.track(track, container, config)
+}
 
-	/// Publish a text track and own its catalog rendition.
-	pub fn text<C: crate::container::Container>(
-		&self,
-		track: moq_net::track::Producer,
-		container: C,
-		config: impl Into<Option<hang::catalog::TextConfig>>,
-	) -> crate::Result<crate::container::Producer<C, hang::catalog::TextConfig>>
-	where
-		crate::Error: From<C::Error>,
-	{
-		self.track(track, container, config)
-	}
+/// Publish a text track and own its catalog rendition.
+pub fn text<C: crate::container::Container<Error = crate::error::Error>>(
+    &self,
+    track: moq_net::track::Producer,
+    container: C,
+    config: impl Into<Option<hang::catalog::TextConfig>>,
+) -> crate::Result<crate::container::Producer<C, hang::catalog::TextConfig>> {
+    self.track(track, container, config)
+}
 
-	/// Publish a track using a custom catalog config.
-	pub fn track<C, R>(
-		&self,
-		track: moq_net::track::Producer,
-		container: C,
-		config: impl Into<Option<R>>,
-	) -> crate::Result<crate::container::Producer<C, R>>
-	where
-		C: crate::container::Container,
-		R: super::RenditionConfig<E>,
-		crate::Error: From<C::Error>,
-	{
-		let rendition = self.rendition(track.name())?;
-		self.media(track, container, rendition, config.into())
-	}
+/// Publish a track using a custom catalog config.
+pub fn track<C, R>(
+    &self,
+    track: moq_net::track::Producer,
+    container: C,
+    config: impl Into<Option<R>>,
+) -> crate::Result<crate::container::Producer<C, R>>
+where
+    C: crate::container::Container<Error = crate::error::Error>,
+    R: super::RenditionConfig<E>,
+{
+    let rendition = self.rendition(track.name())?;
+    self.media(track, container, rendition, config.into())
+}
 
-	/// Whether a live producer or published config already claims `name` in `R`'s section.
-	pub fn is_claimed<R: super::RenditionConfig<E>>(&self, name: &str) -> bool {
-		let mut state = take(&self.current);
-		R::get_mut(&mut state.catalog, name).is_some() || state.owned.contains(&owner_key::<R>(name))
-	}
+/// Whether a live producer or published config already claims `name` in `R`'s section.
+pub fn is_claimed<R: super::RenditionConfig<E>>(&self, name: &str) -> bool {
+    let mut state = take(&self.current);
+    R::get_mut(&mut state.catalog, name).is_some()
+        || state.owned.contains(&owner_key::<R>(name))
+}
 
 	/// Take `name` in `C`'s section for a new [`Rendition`](super::Rendition), which owns it until
 	/// the handle drops.
@@ -584,7 +575,7 @@ pub(super) fn media<C, R>(
     config: Option<R>,
 ) -> crate::Result<crate::container::Producer<C, R>>
 where
-    C: crate::container::Container,
+    C: crate::container::Container<Error = crate::error::Error>,
     R: super::RenditionConfig<E>,
     crate::Error: From<C::Error>,
 {
@@ -610,8 +601,8 @@ pub(crate) fn media_raw<C>(
     container: C,
 ) -> crate::Result<crate::container::Producer<C>>
 where
-    C: crate::container::Container,
-    crate::Error: From<C::Error>,
+    C: crate::container::Container<Error = crate::error::Error>,
+
 {
     let mut catalog = self.clone();
     let recorder = catalog.enroll(track.name())?;

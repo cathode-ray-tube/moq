@@ -173,7 +173,8 @@ impl<C: Container<Error = crate::error::Error>> Producer<C> {
 	}
 }
 
-impl<C: Container, R: Clone + Send + 'static> Producer<C, R>
+impl<C: Container<Error = crate::error::Error>, R: Clone + Send + 'static>
+    Producer<C, R>
 where
 	crate::Error: From<C::Error>,
 {
@@ -203,6 +204,7 @@ where
 			estimator: crate::catalog::Estimator::new(),
 			bandwidth: None,
 			rendition: Some(Box::new(rendition)),
+			encrypter: None,
 		}
 	}
 
@@ -231,7 +233,7 @@ fn write_container(&mut self, frames: &[Frame]) -> crate::Result<()> {
     match self.encrypter.as_mut() {
         Some(encrypter) => {
             let mut protected =
-                crate::container::ProtectedFrame::new(output, encrypter.as_mut());
+                crate::container::ProtectedWriteFrame::new(output, encrypter.as_mut());
 
             self.container.write(&mut protected, frames)?;
         }
@@ -291,23 +293,6 @@ pub fn name(&self) -> &str {
             .set(config)
     }
 
-    /// Modify the published catalog config.
-    ///
-    /// Estimate fields the config left to detection at [`set`](Self::set)
-    /// stay owned by detection. Call `set` with the field filled in to pin it.
-    pub fn modify(&mut self) -> crate::Result<Guard<'_, R>> {
-        let rendition = self
-            .rendition
-            .as_mut()
-            .ok_or(crate::Error::NotPublished)?;
-
-        let config = rendition.config()?;
-
-        Ok(Guard {
-            rendition: rendition.as_mut(),
-            config: Some(config),
-        })
-    }
 
     /// Resolve a timestamp on the broadcast's shared clock.
     pub fn timestamp(
@@ -328,12 +313,7 @@ pub fn name(&self) -> &str {
         Ok(())
     }
 
-    /// The catalog key owned by this producer.
-    pub fn name(&self) -> &str {
-        self.rendition
-            .as_ref()
-            .map_or(self.inner.name(), |rendition| rendition.name())
-    }
+ 
 
     /// A watch-only handle to this track's subscriber demand.
     pub fn demand(&self) -> moq_net::track::Demand {
@@ -389,9 +369,11 @@ impl<R> Drop for Guard<'_, R> {
     }
 }
 
-impl<C: Container, R: Clone + Send + 'static> Producer<C, R>
+impl<C: Container<Error = crate::error::Error>, R: Clone + Send + 'static>
+    Producer<C, R>
 where
     crate::Error: From<C::Error>,
+     R: Clone + Send + 'static,
 {
 	#[cfg(test)]
 	fn bandwidth_ceiling(&self) -> Option<moq_net::bandwidth::Rate> {

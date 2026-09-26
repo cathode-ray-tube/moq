@@ -364,64 +364,67 @@ impl<E: CatalogExt> Reserved<E> {
 	}
 
 	/// Publish a reserved video track and own its catalog rendition.
-	pub fn video<C: crate::container::Container>(
-		&self,
-		track: moq_net::track::Producer,
-		container: C,
-		config: impl Into<Option<hang::catalog::VideoConfig>>,
-	) -> crate::Result<crate::container::Producer<C, hang::catalog::VideoConfig>>
-	where
-		crate::Error: From<C::Error>,
-	{
-		self.track(track, container, config)
-	}
+pub fn video<C>(
+    &self,
+    track: moq_net::track::Producer,
+    container: C,
+    config: impl Into<Option<hang::catalog::VideoConfig>>,
+) -> crate::Result<crate::container::Producer<C, hang::catalog::VideoConfig>>
+where
+    C: crate::container::Container<Error = crate::error::Error>,
+{
+    self.catalog.track(track, container, config)
+}
 
-	/// Publish a reserved audio track and own its catalog rendition.
-	pub fn audio<C: crate::container::Container>(
-		&self,
-		track: moq_net::track::Producer,
-		container: C,
-		config: impl Into<Option<hang::catalog::AudioConfig>>,
-	) -> crate::Result<crate::container::Producer<C, hang::catalog::AudioConfig>>
-	where
-		crate::Error: From<C::Error>,
-	{
-		self.track(track, container, config)
-	}
+/// Publish a reserved audio track and own its catalog rendition.
+pub fn audio<C>(
+    &self,
+    track: moq_net::track::Producer,
+    container: C,
+    config: impl Into<Option<hang::catalog::AudioConfig>>,
+) -> crate::Result<crate::container::Producer<C, hang::catalog::AudioConfig>>
+where
+    C: crate::container::Container<Error = crate::error::Error>,
+{
+    self.catalog.track(track, container, config)
+}
 
-	/// Publish a reserved text track and own its catalog rendition.
-	pub fn text<C: crate::container::Container>(
-		&self,
-		track: moq_net::track::Producer,
-		container: C,
-		config: impl Into<Option<hang::catalog::TextConfig>>,
-	) -> crate::Result<crate::container::Producer<C, hang::catalog::TextConfig>>
-	where
-		crate::Error: From<C::Error>,
-	{
-		self.track(track, container, config)
-	}
+/// Publish a reserved text track and own its catalog rendition.
+pub fn text<C>(
+    &self,
+    track: moq_net::track::Producer,
+    container: C,
+    config: impl Into<Option<hang::catalog::TextConfig>>,
+) -> crate::Result<crate::container::Producer<C, hang::catalog::TextConfig>>
+where
+    C: crate::container::Container<Error = crate::error::Error>,
+{
+    self.catalog.track(track, container, config)
+}
 
-	/// Publish a reserved track using a custom catalog config.
-	pub fn track<C, R>(
-		&self,
-		track: moq_net::track::Producer,
-		container: C,
-		config: impl Into<Option<R>>,
-	) -> crate::Result<crate::container::Producer<C, R>>
-	where
-		C: crate::container::Container,
-		R: RenditionConfig<E>,
-		crate::Error: From<C::Error>,
-	{
-		let rendition = self.init(track.name())?;
-		self.catalog.media(track, container, rendition, config.into())
-	}
+/// Publish a reserved track using a custom catalog config.
+pub fn track<C, R>(
+    &self,
+    track: moq_net::track::Producer,
+    container: C,
+    config: impl Into<Option<R>>,
+) -> crate::Result<crate::container::Producer<C, R>>
+where
+    C: crate::container::Container<Error = crate::error::Error>,
+    R: RenditionConfig<E>,
+{
+    let rendition = self.init(track.name())?;
+    self.catalog.media(track, container, rendition, config.into())
+}
 
-	/// Resolve a timestamp on the broadcast's shared clock (see [`Producer::timestamp`]).
-	pub fn timestamp(&self, hint: Option<moq_net::Timestamp>) -> crate::Result<moq_net::Timestamp> {
-		self.catalog.timestamp(hint)
-	}
+/// Resolve a timestamp on the broadcast's shared clock (see [`Producer::timestamp`]).
+pub fn timestamp(
+    &self,
+    hint: Option<moq_net::Timestamp>,
+) -> crate::Result<moq_net::Timestamp> {
+    self.catalog.timestamp(hint)
+}
+
 
 	/// The underlying catalog [`Producer`], for edits that outlive this reservation.
 	///
