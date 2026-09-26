@@ -15,15 +15,29 @@ pub enum Version {
 	/// implicitly assigns the next ordinal, and `ended`/`restart` reference that id
 	/// instead of repeating the path. Also adds the route cost carried alongside the
 	/// hop chain, ranking above hop count in route selection. Advertised over ALPN
-	/// as `moq-lite-06`.
+	/// as `moq-lite-06` and preferred by the default version sets.
 	Lite06,
 	/// Lite-07. Adds the hidden opt-in to ANNOUNCE_REQUEST: without it, a route with
-	/// a `.`-prefixed segment below the requested prefix is left out. Advertised over
-	/// ALPN as `moq-lite-07` and preferred by the default version sets.
+	/// a `.`-prefixed segment below the requested prefix is left out. SUBSCRIBE_END
+	/// carries the number of group streams opened, replacing SUBSCRIBE_DROP.
+	/// The wire format is still work-in-progress, so it is advertised over ALPN as
+	/// `moq-lite-07-wip` and only when explicitly requested; the default version sets
+	/// leave it out.
 	Lite07,
 }
 
 impl Version {
+	/// Whether SUBSCRIBE_END carries the subscription's group stream count, sent once
+	/// every counted stream is open, in place of SUBSCRIBE_DROP. Added in lite-07.
+	#[allow(clippy::match_like_matches_macro)]
+	pub fn has_stream_count(self) -> bool {
+		// Match form so future versions default forward (CLAUDE.md convention).
+		match self {
+			Self::Lite01 | Self::Lite02 | Self::Lite03 | Self::Lite04 | Self::Lite05 | Self::Lite06 => false,
+			_ => true,
+		}
+	}
+
 	/// Whether the version has lite-05's dedicated TRACK stream and related stream
 	/// layout changes.
 	///
@@ -203,7 +217,7 @@ impl fmt::Display for Version {
 			Self::Lite04 => write!(f, "moq-lite-04"),
 			Self::Lite05 => write!(f, "moq-lite-05"),
 			Self::Lite06 => write!(f, "moq-lite-06"),
-			Self::Lite07 => write!(f, "moq-lite-07"),
+			Self::Lite07 => write!(f, "moq-lite-07-wip"),
 		}
 	}
 }

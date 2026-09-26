@@ -11,7 +11,7 @@
 //! plagues real-transport tests.
 
 use std::{
-	sync::Arc,
+	sync::{Arc, Mutex},
 	task::{Context, Poll},
 };
 
@@ -103,6 +103,9 @@ pub struct MockSendStream {
 	tx: Option<kio::Queue<StreamChunk>>,
 	closed: Arc<ClosedSignal>,
 	park: kio::Park,
+	/// Acknowledge the FIN as soon as it is sent, for a stream the peer's transport holds
+	/// back from its application (see [`MockSession::hold_unis`]).
+	ack_fin: bool,
 }
 
 impl poll::SendStream for MockSendStream {
@@ -123,6 +126,9 @@ impl poll::SendStream for MockSendStream {
 	fn finish(&mut self) -> Result<(), Self::Error> {
 		if let Some(tx) = self.tx.take() {
 			let _ = tx.try_push(StreamChunk::Fin);
+			if self.ack_fin {
+				self.closed.set(Ok(()));
+			}
 		}
 		Ok(())
 	}
@@ -257,6 +263,7 @@ fn new_stream_pair() -> (MockSendStream, MockRecvStream) {
 		tx: Some(queue.clone()),
 		closed: closed.clone(),
 		park: kio::Park::default(),
+		ack_fin: false,
 	};
 	let recv = MockRecvStream {
 		rx: queue,
@@ -299,6 +306,8 @@ struct SessionSide {
 	protocol: Option<&'static str>,
 	/// Connection-level close state shared with the peer.
 	conn: Arc<ConnectionState>,
+	/// Uni streams this side opened that the peer has not accepted yet, while held.
+	held: Mutex<Option<Vec<MockRecvStream>>>,
 }
 
 /// An in-memory mock WebTransport session.
@@ -363,7 +372,13 @@ impl poll::Session for MockSession {
 	}
 
 	fn poll_open_uni(&mut self, _cx: &mut Context<'_>) -> Poll<Result<Self::SendStream, Self::Error>> {
-		let (our_send, peer_recv) = new_stream_pair();
+		let (mut our_send, peer_recv) = new_stream_pair();
+
+		if let Some(held) = self.side.held.lock().unwrap().as_mut() {
+			our_send.ack_fin = true;
+			held.push(peer_recv);
+			return Poll::Ready(Ok(our_send));
+		}
 
 		// Deliver peer_recv to the peer's accept_uni.
 		match self.side.peer_uni.try_push(peer_recv) {
@@ -420,6 +435,34 @@ impl poll::Session for MockSession {
 	}
 }
 
+// Only some test binaries steer delivery.
+#[allow(dead_code)]
+impl MockSession {
+	/// Hold back the uni streams this side opens from now on.
+	///
+	/// The peer's transport has them, so a FIN is acknowledged at once, but its application
+	/// does not see them until [`Self::release_unis`]. That is QUIC delivering streams out of
+	/// order: a publisher can see a group stream acknowledged and end the subscription
+	/// before the subscriber has read the group's header.
+	pub fn hold_unis(&self) {
+		self.side.held.lock().unwrap().get_or_insert_default();
+	}
+
+	/// Deliver the held uni streams to the peer in the order they were opened, and stop
+	/// holding.
+	pub fn release_unis(&self) {
+		for stream in self.side.held.lock().unwrap().take().unwrap_or_default() {
+			let _ = self.side.peer_uni.try_push(stream);
+		}
+	}
+
+	/// Lose the held uni streams, as if each were reset before its header arrived, and
+	/// stop holding.
+	pub fn drop_unis(&self) {
+		self.side.held.lock().unwrap().take();
+	}
+}
+
 impl MockSession {
 	fn close_error(&self) -> MockError {
 		self.side
@@ -463,6 +506,7 @@ pub fn create_mock_session_pair(protocol: Option<&'static str>) -> (MockSession,
 		peer_datagrams: c2s_datagrams.clone(),
 		protocol,
 		conn: conn.clone(),
+		held: Mutex::default(),
 	});
 
 	let server_side = Arc::new(SessionSide {
@@ -474,6 +518,7 @@ pub fn create_mock_session_pair(protocol: Option<&'static str>) -> (MockSession,
 		peer_datagrams: s2c_datagrams,
 		protocol,
 		conn,
+		held: Mutex::default(),
 	});
 
 	let new = |side| MockSession {
