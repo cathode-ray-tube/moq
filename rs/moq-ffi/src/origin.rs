@@ -147,14 +147,25 @@ impl OriginDynamic {
 
 impl Announced {
 	async fn next(&mut self) -> Result<Option<Arc<MoqAnnounceUpdate>>, MoqError> {
-		match self.inner.next().await {
-			Some(update) => Ok(Some(Arc::new(MoqAnnounceUpdate {
+		// The bindings have no caught-up marker yet.
+		let update = loop {
+			match self.inner.next().await {
+				Some(moq_net::announce::Event::Announced(update) | moq_net::announce::Event::Updated(update)) => {
+					break Some((update, true));
+				}
+				Some(moq_net::announce::Event::Retracted(update)) => break Some((update, false)),
+				Some(moq_net::announce::Event::Live) => continue,
+				None => break None,
+			}
+		};
+		match update {
+			Some((update, active)) => Ok(Some(Arc::new(MoqAnnounceUpdate {
 				prefix: update.prefix.to_string(),
 				captures: update
 					.captures
 					.map(|captures| captures.into_iter().map(|capture| capture.to_string()).collect()),
 				route: update.route.into(),
-				active: update.kind.is_active(),
+				active,
 			}))),
 			None => Ok(None),
 		}
@@ -303,9 +314,8 @@ impl MoqOriginProducer {
 	/// tracks; an on-demand handler is [`Self::dynamic`]. Create, `dynamic()` if
 	/// tracks are served on demand, populate, then announce.
 	///
-	/// [`MoqBroadcastProducer::finish`] unpublishes immediately. Dropping the producer
-	/// without finishing also unpublishes, but subscribers observe the end as a
-	/// failure rather than a deliberate one.
+	/// [`MoqBroadcastProducer::close`] ends it for good; dropping its last handle,
+	/// `dynamic()` included, does the same.
 	pub fn create_broadcast(&self, path: String) -> Result<Arc<MoqBroadcastProducer>, MoqError> {
 		let _guard = crate::ffi::enter();
 		// Surfaces Error::Unauthorized (out of scope) via the MoqError::Protocol conversion.
@@ -504,7 +514,7 @@ impl MoqAnnounceUpdate {
 impl MoqAnnouncedBroadcast {
 	/// Wait until the broadcast is announced. Returns `Closed` if cancelled or the origin is closed.
 	///
-	/// Use `broadcast.closed()` to learn when the broadcast ends.
+	/// Its end arrives as an inactive [`MoqAnnounceUpdate`] on the origin's announcements.
 	pub async fn available(&self) -> Result<Arc<MoqBroadcastConsumer>, MoqError> {
 		self.task.run(|mut state| async move { state.available().await }).await
 	}

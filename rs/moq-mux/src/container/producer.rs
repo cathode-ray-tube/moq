@@ -201,7 +201,7 @@ where
 			previous_timestamp: None,
 			cadence: None,
 			reordered: false,
-			estimator: crate::catalog::Estimator::new(),
+			estimator: rendition.estimator(),
 			bandwidth: None,
 			rendition: Some(Box::new(rendition)),
 			encrypter: None,
@@ -251,7 +251,7 @@ fn write_container(&mut self, frames: &[Frame]) -> crate::Result<()> {
 ///
 /// Estimate fields the config left to detection at [`set`](Self::set) stay owned by detection:
 /// an edit to them here is published but replaced by the next measurement, except that jitter
-/// never drops below the published value. Call `set` with the field filled in to pin it.
+/// and delay never drop below the published value. Call `set` with the field filled in to pin it.
 pub fn modify(&mut self) -> crate::Result<Guard<'_, R>> {
     let rendition = self
         .rendition
@@ -265,6 +265,7 @@ pub fn modify(&mut self) -> crate::Result<Guard<'_, R>> {
         config: Some(config),
     })
 }
+
 
 /// Record when a locally encoded frame reached the transport. Imported media must leave
 /// this clock observation out and rely on its container batch and reorder measurements.
@@ -894,7 +895,7 @@ mod tests {
 	}
 
 	#[test]
-	fn catalog_flush_measures_each_rendition_against_its_own_minimum() {
+	fn catalog_flush_measures_delay_across_renditions_and_jitter_within_each() {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 		let mut tracks = Vec::new();
@@ -914,9 +915,11 @@ mod tests {
 		let ms = std::time::Duration::from_millis;
 		let pts = |millis: u64| Timestamp::from_micros(millis * 1_000).unwrap();
 		tracks[0].flush(pts(0), anchor).unwrap();
-		// A constant 200ms offset behind the other rendition is not jitter.
+		// A constant 200ms offset behind the other rendition is delay, not jitter.
 		tracks[1].flush(pts(0), anchor + ms(200)).unwrap();
 		assert_eq!(catalog.snapshot().video.renditions["slow"].jitter, None);
+		assert_eq!(catalog.snapshot().video.renditions["slow"].delay, Some(ms(200)));
+		assert_eq!(catalog.snapshot().video.renditions["fast"].delay, None);
 
 		// A frame flushed 60ms later than the slow rendition's own minimum is.
 		tracks[1].flush(pts(40), anchor + ms(300)).unwrap();

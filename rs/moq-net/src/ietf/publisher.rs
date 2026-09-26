@@ -218,8 +218,9 @@ impl<S: crate::transport::poll::Session> Namespaces<S> {
 enum NamespaceEvent {
 	/// The session or stream ended, with the result to surface.
 	Closed(Result<(), Error>),
-	/// An origin-level route (un)announce, `None` once the announce stream ends.
-	Update(Option<crate::announce::Update>),
+	/// An origin-level route (un)announce and whether it is active, `None` once
+	/// the announce stream ends.
+	Update(Option<(crate::announce::Announce, bool)>),
 	/// The retry sleep fired: re-offer whatever the peer should be holding and isn't.
 	Retry,
 }
@@ -577,6 +578,7 @@ where
 						// object Timestamp below is in these units.
 						// We serve the newest group first, matching moq-lite.
 						true => ietf::Properties {
+							max_cache_duration: track.info().max_age,
 							timescale: Some(track.info().timescale),
 							priority: Some(super::priority::to_wire(track.info().priority)),
 							group_order: Some(GroupOrder::Descending),
@@ -1866,8 +1868,20 @@ where
 					if let Poll::Ready(res) = target.poll_closed(&mut cx) {
 						return Poll::Ready(NamespaceEvent::Closed(res));
 					}
-					if let Poll::Ready(update) = announced.poll_next(waiter) {
-						return Poll::Ready(NamespaceEvent::Update(update));
+					// The origin's live marker means nothing to the peer here.
+					while let Poll::Ready(next) = announced.poll_next(waiter) {
+						match next {
+							Some(crate::announce::Event::Live) => continue,
+							Some(
+								crate::announce::Event::Announced(update) | crate::announce::Event::Updated(update),
+							) => {
+								return Poll::Ready(NamespaceEvent::Update(Some((update, true))));
+							}
+							Some(crate::announce::Event::Retracted(update)) => {
+								return Poll::Ready(NamespaceEvent::Update(Some((update, false))));
+							}
+							None => return Poll::Ready(NamespaceEvent::Update(None)),
+						}
 					}
 					if retry.poll(waiter).is_ready() {
 						return Poll::Ready(NamespaceEvent::Retry);
@@ -1908,14 +1922,14 @@ where
 					stream.writer.finish()?;
 					return stream.writer.closed().await;
 				}
-				NamespaceEvent::Update(Some(update)) => {
+				NamespaceEvent::Update(Some((update, active))) => {
 					let path = update.prefix;
 					let suffix = path
 						.strip_prefix(&prefix)
 						.expect("origin returned invalid prefix")
 						.to_owned();
 
-					if update.kind.is_active() {
+					if active {
 						// A repeat for a live suffix is a metadata update: keep the
 						// peer's refusal state and re-run the selection.
 						match ns.watched.get_mut(&suffix) {

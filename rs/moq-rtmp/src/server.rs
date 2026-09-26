@@ -1301,11 +1301,11 @@ async fn run_handshake<S: Stream>(stream: &mut S, peer: SocketAddr) -> anyhow::R
 /// An active publish: the moq-mux FLV importer, which owns the origin-created
 /// [`BroadcastProducer`](moq_net::broadcast::Producer) it publishes into.
 /// Either [`Self::finish`] or dropping it closes the broadcast and unannounces
-/// the path, the former without the dropped-without-finish warning.
+/// the path.
 struct Publisher {
 	importer: FlvImport,
-	// A clone of the importer's producer, so a deliberate end can finish() the
-	// broadcast (prompt unannounce) even though the importer owns it.
+	// A clone of the importer's producer, so an end can close the broadcast
+	// (prompt unannounce) even though the importer owns it.
 	broadcast: moq_net::broadcast::Producer,
 }
 
@@ -1343,7 +1343,7 @@ impl Publisher {
 	/// the broadcast so the origin unannounces it immediately.
 	fn finish(&mut self) -> anyhow::Result<()> {
 		self.importer.finish()?;
-		self.broadcast.finish();
+		self.broadcast.close();
 		Ok(())
 	}
 
@@ -1351,9 +1351,10 @@ impl Publisher {
 	/// (the client disconnected, a protocol error) rather than a generic
 	/// `Error::Dropped` from the importer being dropped.
 	///
-	/// Consumes the publisher: the broadcast is done.
+	/// Consumes the publisher and closes the broadcast.
 	fn abort(self, err: moq_net::Error) {
 		self.importer.abort(err);
+		self.broadcast.close();
 	}
 }
 
@@ -1661,7 +1662,7 @@ mod tests {
 		consumer.routed("live/cam0").await.unwrap();
 		let broadcast = consumer.request_broadcast("live/cam0").await.unwrap();
 		let info = broadcast.track("0.flv-v").unwrap().query().await.unwrap();
-		assert_eq!(info.max_age, Duration::from_secs(3));
+		assert_eq!(info.max_age, Some(Duration::from_secs(3)));
 	}
 
 	/// End-to-end play: publish a real broadcast into an origin (via the FLV importer, so it

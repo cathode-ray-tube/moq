@@ -335,10 +335,11 @@ async fn subscribe(
 			biased;
 			_ = &mut deadline => break,
 			update = announced.next() => {
-				let Some(update) = update else { break };
-				if !update.kind.is_active() {
-					continue;
-				}
+				let update = match update {
+					Some(moq_net::announce::Event::Announced(update) | moq_net::announce::Event::Updated(update)) => update,
+					Some(moq_net::announce::Event::Retracted(_) | moq_net::announce::Event::Live) => continue,
+					None => break,
+				};
 				let path = update.prefix.to_string();
 				if own.contains(&path) || !seen.insert(path.clone()) {
 					continue;
@@ -360,12 +361,11 @@ async fn subscribe(
 	// Top up from late announcements, first-come: the pool was too small, so
 	// there is nothing to spread over.
 	while selected < want {
-		let Some(update) = announced.next().await else {
-			break;
+		let update = match announced.next().await {
+			Some(moq_net::announce::Event::Announced(update) | moq_net::announce::Event::Updated(update)) => update,
+			Some(moq_net::announce::Event::Retracted(_) | moq_net::announce::Event::Live) => continue,
+			None => break,
 		};
-		if !update.kind.is_active() {
-			continue;
-		}
 		let path = update.prefix.to_string();
 		if own.contains(&path) || !seen.insert(path.clone()) {
 			continue;
@@ -799,7 +799,7 @@ mod tests {
 
 		task.await.unwrap().unwrap();
 		assert_eq!(stats.groups_recv.load(Ordering::Relaxed), 1);
-		broadcast.finish();
+		broadcast.close();
 	}
 
 	/// The relay fails a group it gave up on (`Error::Lagged` once a subscriber
@@ -850,7 +850,7 @@ mod tests {
 		write_group(&mut track);
 		wait_for(&stats.groups_recv, 3).await;
 		track.finish().unwrap();
-		broadcast.finish();
+		broadcast.close();
 
 		task.await
 			.unwrap()

@@ -182,6 +182,9 @@ pub struct Producer<E: CatalogExt = ()> {
 	/// Connection allocator passthrough tracks claim their peak-hold bitrate on.
 	/// See [`Config::with_bandwidth`].
 	bandwidth: moq_net::bandwidth::Allocator,
+	/// The minimum flush lateness across this catalog's renditions, which each rendition's
+	/// advertised `delay` is measured against.
+	baseline: super::estimate::Baseline,
 }
 
 // Manual Clone so a producer is cheaply clonable regardless of whether `E` is.
@@ -194,6 +197,7 @@ impl<E: CatalogExt> Clone for Producer<E> {
 			timeline: self.timeline.clone(),
 			max_age: self.max_age,
 			bandwidth: self.bandwidth.clone(),
+			baseline: self.baseline.clone(),
 		}
 	}
 }
@@ -342,6 +346,7 @@ impl<E: CatalogExt> Producer<E> {
 			timeline,
 			max_age: config.max_age,
 			bandwidth: config.bandwidth,
+			baseline: Default::default(),
 		})
 	}
 
@@ -612,11 +617,17 @@ where
         .with_bandwidth(self.bandwidth.clone()))
 }
 
-/// The allocator passthrough tracks claim on. fMP4 writes groups by hand,
-/// so it reads this itself.
-pub(crate) fn bandwidth(&self) -> moq_net::bandwidth::Allocator {
-    self.bandwidth.clone()
-}
+
+
+	/// A fresh estimator whose `delay` is measured against this catalog's other renditions.
+	pub(crate) fn estimator(&self) -> super::Estimator {
+		super::Estimator::with_broadcast(self.baseline.clone())
+	}
+
+	/// The allocator passthrough tracks claim on. fMP4 writes groups by hand, so it reads this itself.
+	pub(crate) fn bandwidth(&self) -> moq_net::bandwidth::Allocator {
+		self.bandwidth.clone()
+	}
 
 
 	/// Enroll `track` in the broadcast's timeline, advertising the timeline in the catalog's
@@ -940,6 +951,7 @@ fn to_msf_media<E: CatalogExt>(catalog: &hang::Catalog) -> moq_msf::Catalog<E> {
 		track.max_grp_sap_starting_type = sap_type;
 		track.max_obj_sap_starting_type = sap_type;
 		track.jitter = config.jitter;
+		track.delay = config.delay;
 		tracks.push(track);
 	}
 
@@ -970,6 +982,7 @@ fn to_msf_media<E: CatalogExt>(catalog: &hang::Catalog) -> moq_msf::Catalog<E> {
 		track.max_grp_sap_starting_type = Some(1);
 		track.max_obj_sap_starting_type = Some(1);
 		track.jitter = config.jitter;
+		track.delay = config.delay;
 		tracks.push(track);
 	}
 
@@ -1019,13 +1032,12 @@ mod test {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 
 		// Unset, a catalog mints hang's media defaults, sized so a segmented egress can serve a
-		// full playlist window rather than moq-net's live-edge default.
+		// full playlist window. Raw tracks impose no publisher age limit.
 		let catalog = Producer::new(&mut broadcast, Config::default()).unwrap();
 		assert_eq!(
 			catalog.track_info(hang::catalog::PRIORITY.video).max_age,
 			hang::container::track_info(hang::catalog::PRIORITY.video).max_age
 		);
-		assert!(catalog.track_info(hang::catalog::PRIORITY.video).max_age > moq_net::track::DEFAULT_MAX_AGE);
 
 		// An override reaches every media track this catalog mints, and does NOT disturb the
 		// timescale hang pins (or survive a retimescale for a source-scale container).
@@ -1034,22 +1046,22 @@ mod test {
 		let catalog = Producer::new(&mut broadcast, config).unwrap();
 
 		let info = catalog.track_info(hang::catalog::PRIORITY.video);
-		assert_eq!(info.max_age, std::time::Duration::from_secs(3));
+		assert_eq!(info.max_age, Some(std::time::Duration::from_secs(3)));
 		assert_eq!(info.timescale, hang::container::TIMESCALE);
 
 		let at = info.with_timescale(moq_net::Timescale::MILLI);
-		assert_eq!(at.max_age, std::time::Duration::from_secs(3));
+		assert_eq!(at.max_age, Some(std::time::Duration::from_secs(3)));
 		assert_eq!(at.timescale, moq_net::Timescale::MILLI);
 
 		// Every handle mints under the same policy, whatever order it was taken in: the codec
 		// paths hold a reservation and the container paths hold a clone.
 		assert_eq!(
 			catalog.reserve().track_info(hang::catalog::PRIORITY.video).max_age,
-			std::time::Duration::from_secs(3)
+			Some(std::time::Duration::from_secs(3))
 		);
 		assert_eq!(
 			catalog.clone().track_info(hang::catalog::PRIORITY.video).max_age,
-			std::time::Duration::from_secs(3)
+			Some(std::time::Duration::from_secs(3))
 		);
 	}
 
@@ -1607,6 +1619,7 @@ mod test {
 		video_config.framerate = Some(30.0);
 		video_config.container = Container::Legacy;
 		video_config.jitter = Some(std::time::Duration::from_millis(100));
+		video_config.delay = Some(std::time::Duration::from_millis(200));
 
 		let mut video_renditions = BTreeMap::new();
 		video_renditions.insert("video0".to_string(), video_config);
@@ -1614,6 +1627,7 @@ mod test {
 		let mut audio_config = AudioConfig::new(AudioCodec::Opus, 48_000, 2);
 		audio_config.container = Container::Legacy;
 		audio_config.jitter = Some(std::time::Duration::from_millis(40));
+		audio_config.delay = Some(std::time::Duration::from_millis(80));
 
 		let mut audio_renditions = BTreeMap::new();
 		audio_renditions.insert("audio0".to_string(), audio_config);
@@ -1630,12 +1644,14 @@ mod test {
 		assert_eq!(video.max_grp_sap_starting_type, Some(2));
 		assert_eq!(video.max_obj_sap_starting_type, Some(2));
 		assert_eq!(video.jitter, Some(std::time::Duration::from_millis(100)));
+		assert_eq!(video.delay, Some(std::time::Duration::from_millis(200)));
 
 		let audio = &msf.tracks[1];
 		assert_eq!(audio.role, Some(moq_msf::Role::Audio));
 		assert_eq!(audio.max_grp_sap_starting_type, Some(1));
 		assert_eq!(audio.max_obj_sap_starting_type, Some(1));
 		assert_eq!(audio.jitter, Some(std::time::Duration::from_millis(40)));
+		assert_eq!(audio.delay, Some(std::time::Duration::from_millis(80)));
 	}
 
 	#[test]

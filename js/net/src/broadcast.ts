@@ -4,6 +4,7 @@
  * @module
  */
 import { type GetPromise, Once, Signal } from "@moq/signals";
+import { NotFound } from "./error.ts";
 import type { Consumer as GroupConsumer } from "./group.ts";
 import { Route } from "./hop.ts";
 import { hooks, type TrackSequence } from "./internal.ts";
@@ -24,7 +25,7 @@ let attachAnnouncer: (producer: Producer, announcer: Announcer) => void;
 class BroadcastState {
 	requested = new Signal<track.Request[]>([]);
 	pending = new Set<track.Request>();
-	closed = new Once<Error | null>();
+	closed = new Once<null>();
 	tracks = new Map<string, track.Producer>();
 	sequences = new Map<string, TrackSequence>();
 	// Live consumer handles sharing this state (see {@link Consumer.clone}). The broadcast
@@ -44,10 +45,10 @@ function dequeueRequest(state: BroadcastState): track.Request | undefined {
 //
 // Once.set throws on a second settle, and the producer and each consumer handle close
 // independently, so this has to be idempotent.
-function closeState(state: BroadcastState, abort?: Error) {
+function closeState(state: BroadcastState) {
 	if (state.closed.peek() !== undefined) return;
-	state.closed.set(abort ?? null);
-	for (const request of state.pending) request.reject(abort);
+	state.closed.set(null);
+	for (const request of state.pending) request.reject();
 	state.requested.mutate((requests) => {
 		requests.length = 0;
 	});
@@ -67,7 +68,7 @@ function subscribe(
 	register = false,
 ): track.Subscriber {
 	if (state.closed.peek() !== undefined) {
-		throw new Error(`broadcast is closed: ${state.closed.peek()}`);
+		throw new Error("broadcast is closed");
 	}
 
 	const existing = state.tracks.get(name);
@@ -102,7 +103,7 @@ async function resolveTrackInfo(state: BroadcastState, name: string): Promise<tr
 	}
 
 	if (state.closed.peek() !== undefined) {
-		return Promise.reject(new Error(`broadcast is closed: ${state.closed.peek()}`));
+		return Promise.reject(new Error("broadcast is closed"));
 	}
 
 	const producer = new track.Producer(name);
@@ -131,7 +132,7 @@ async function fetchGroup(
 	try {
 		for (;;) {
 			const group = await subscriber.recvGroup();
-			if (!group) throw new Error(`group not found: ${sequence}`);
+			if (!group) throw new NotFound(`group ${sequence}`);
 			if (group.sequence === sequence) {
 				// Close the subscription when the returned group finishes, not now: an
 				// in-progress group must keep receiving frames for its lifetime (mirrors
@@ -141,7 +142,7 @@ async function fetchGroup(
 			}
 
 			group.close();
-			if (group.sequence > sequence) throw new Error(`group not found: ${sequence}`);
+			if (group.sequence > sequence) throw new NotFound(`group ${sequence}`);
 		}
 	} catch (err) {
 		subscriber.close();
@@ -170,10 +171,10 @@ export class Producer {
 	}
 
 	/**
-	 * Settles once the broadcast closes: `null` on a clean close, or the abort {@link Error}.
+	 * Settles with `null` once the broadcast closes; a broadcast end carries no cause.
 	 * Peek it synchronously (`undefined` while open), observe it reactively, or `await` it.
 	 */
-	get closed(): GetPromise<Error | null> {
+	get closed(): GetPromise<null> {
 		return this.#state.closed;
 	}
 
@@ -187,9 +188,7 @@ export class Producer {
 			const request = dequeueRequest(this.#state);
 			if (request) return request;
 
-			const closed = this.#state.closed.peek();
-			if (closed instanceof Error) throw closed;
-			if (closed !== undefined) return undefined;
+			if (this.#state.closed.peek() !== undefined) return undefined;
 
 			await Signal.race(this.#state.requested, this.#state.closed);
 		}
@@ -198,7 +197,7 @@ export class Producer {
 	/** Insert a track that is served directly, without an on-demand request round-trip. */
 	insertTrack(track: track.Producer): void {
 		if (this.#state.closed.peek() !== undefined) {
-			throw new Error(`broadcast is closed: ${this.#state.closed.peek()}`);
+			throw new Error("broadcast is closed");
 		}
 
 		const existing = this.#state.tracks.get(track.name);
@@ -251,7 +250,7 @@ export class Producer {
 	 */
 	announce(route: Route | { hops?: Route["hops"]; cost?: Route["cost"] | bigint } = Route.default): void {
 		if (this.#state.closed.peek() !== undefined) {
-			throw new Error(`broadcast is closed: ${this.#state.closed.peek()}`);
+			throw new Error("broadcast is closed");
 		}
 		if (!this.#announcer) throw new Error("broadcast is not attached to an origin");
 		this.#announcer.announce(Route.normalize(route));
@@ -265,11 +264,11 @@ export class Producer {
 		this.#announcer?.unannounce();
 	}
 
-	/** Close the broadcast, optionally with an error to abort waiters. Idempotent. */
-	close(abort?: Error) {
+	/** End the broadcast for good: retract it, serve no new tracks, and refuse a later {@link announce}. Idempotent. */
+	close(): void {
 		this.#announcer?.unannounce();
 		this.#announcer = undefined;
-		closeState(this.#state, abort);
+		closeState(this.#state);
 	}
 }
 
@@ -308,13 +307,13 @@ export class Consumer {
 	}
 
 	/**
-	 * Settles once the broadcast closes: `null` on a clean close, or the abort {@link Error}.
+	 * Settles with `null` once the broadcast closes; a broadcast end carries no cause.
 	 * Peek it synchronously (`undefined` while open), observe it reactively, or `await` it.
 	 *
 	 * Shared by every {@link clone}: it settles once the last handle closes. The subscribing
 	 * wire layer peeks it to evict a closed entry from its per-path consume cache.
 	 */
-	get closed(): GetPromise<Error | null> {
+	get closed(): GetPromise<null> {
 		return this.#state.closed;
 	}
 
@@ -346,22 +345,20 @@ export class Consumer {
 			const request = dequeueRequest(this.#state);
 			if (request) return request;
 
-			const closed = this.#state.closed.peek();
-			if (closed instanceof Error) throw closed;
-			if (closed !== undefined) return undefined;
+			if (this.#state.closed.peek() !== undefined) return undefined;
 
 			await Signal.race(this.#state.requested, this.#state.closed);
 		}
 	}
 
 	/**
-	 * Release this handle. The broadcast is closed (optionally with an error to abort waiters)
-	 * once this was the last live handle; while other {@link clone}s remain open it stays live.
+	 * Release this handle. The broadcast is closed once this was the last live handle;
+	 * while other {@link clone}s remain open it stays live.
 	 */
-	close(abort?: Error) {
+	close(): void {
 		if (this.#closed) return;
 		this.#closed = true;
 		if (--this.#state.consumers > 0) return;
-		closeState(this.#state, abort);
+		closeState(this.#state);
 	}
 }

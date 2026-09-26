@@ -8,7 +8,7 @@ import { createMockTransportPair } from "../mock.ts";
 import { Producer as OriginProducer } from "../origin.ts";
 import * as Path from "../path.ts";
 import { Reader, Stream } from "../stream.ts";
-import { Timestamp } from "../time.ts";
+import { Milli, Timestamp } from "../time.ts";
 import type { Producer as TrackProducer } from "../track.ts";
 import { wireOf } from "../wire.ts";
 import { NativeSession, type Session } from "./adapter.ts";
@@ -210,7 +210,7 @@ test("a blocked group header is reset when the group expires", async () => {
 
 	const { pub, origin } = publisher(pair.server);
 	const broadcast = publish(origin, Path.from("test"));
-	const track = broadcast.createTrack("video");
+	const track = broadcast.createTrack("video", { maxAge: Milli(5000) });
 	const client = await Stream.open(pair.client, { version: VERSION });
 	const server = await Stream.accept(pair.server, VERSION);
 	if (!server) throw new Error("publisher never accepted the subscribe stream");
@@ -639,8 +639,9 @@ test("closing the session ends the unsolicited announce loop", async () => {
 	// The session ends. The origin is untouched: it is shared, and other sessions keep using it.
 	pair.server.close();
 
+	// Ending with the session's error is ending too: the close fails its open streams.
 	await Promise.race([
-		loop,
+		loop.catch(() => undefined),
 		new Promise((_resolve, reject) =>
 			setTimeout(() => reject(new Error("the announce loop outlived its session")), STREAM_WAIT),
 		),
