@@ -4796,7 +4796,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "moq-sock"
 name = "moq-shaper"
 version = "0.0.1"
 dependencies = [
