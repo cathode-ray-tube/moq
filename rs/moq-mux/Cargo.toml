@@ -32,7 +32,7 @@ moq-net = { workspace = true }
 moq-tokio = {
     workspace = true,
     default-features = false,
-    features = ["quinn", "aws-lc-rs"],
+    features = ["noq", "aws-lc-rs"],
 }
 mp4-atom = { version = "0.15", features = ["tokio", "bytes", "serde"] }
 mpeg2ts = "0.6.0"
