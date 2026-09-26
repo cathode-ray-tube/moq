@@ -94,7 +94,7 @@ A Session consists of a connection between a client and a server.
 There is currently no P2P support within QUIC so it's out of scope for moq-lite.
 
 The moq-lite version identifier is `moq-lite-xx` where `xx` is the two-digit draft version.
-The identifier for this draft is `moq-lite-06`.
+The identifier for this draft is `moq-lite-07-wip` while it is a work in progress, and becomes `moq-lite-07` once finalized.
 For bare QUIC, this is negotiated as an ALPN token during the QUIC handshake.
 For WebTransport over HTTP/3, the QUIC ALPN remains `h3` and the moq-lite version is advertised via the `WT-Available-Protocols` and `WT-Protocol` CONNECT headers.
 
@@ -383,6 +383,15 @@ A route covers a path when its prefix is a leading run of the path's segments; m
 A publisher answering a request stream presents each of its routes clamped to the intersection with the requested prefix: a route above the request's prefix appears as the request prefix itself (an empty suffix), which is exactly the covered set the subscriber may see.
 There MAY be multiple Announce Streams, potentially containing overlapping prefixes, that get their own ANNOUNCE_OK + announcements.
 
+#### Hidden Paths {#hidden}
+A route is hidden from a request when a segment of its path below the requested prefix starts with `.` (0x2E).
+A segment inside the prefix never hides anything, so a request that names the hidden segment itself (`.stats`) lists what is under it, and a route at or above the prefix has no segment below it.
+Only the first byte counts: `catalog.v2` is not hidden.
+
+A publisher SHOULD NOT announce a hidden route unless the ANNOUNCE_REQUEST set `Hidden`.
+Hiding is a convenience for discovery, not access control: a publisher MAY treat a subscriber it trusts, such as another relay in its own cluster, as opted in, and MUST authorize hidden paths like any other.
+SUBSCRIBE, FETCH, and TRACK resolve a hidden path exactly as any other.
+
 #### Routing {#routing}
 Each advertisement carries the path of Hop IDs it traversed and an accumulated Warm and Cold Route Cost (see [ANNOUNCE_START](#announce-start)), which relays use to build a loop-free mesh.
 
@@ -438,7 +447,7 @@ A receiver SHOULD NOT cache refusals; rate limiting is the advertiser's concern.
 A subscriber opens Subscribe Streams to request a Track.
 
 The subscriber MUST start a Subscribe Stream with a SUBSCRIBE message followed by any number of SUBSCRIBE_UPDATE messages.
-The publisher replies with a SUBSCRIBE_OK message once the start group is resolved, followed by any number of SUBSCRIBE_END and SUBSCRIBE_DROP messages.
+The publisher replies with a SUBSCRIBE_OK message once the start group is resolved, followed by a SUBSCRIBE_END message once the subscription ends.
 For a live track the publisher MAY withhold SUBSCRIBE_OK until the first matching group resolves the start; if the track has already ended with no matching groups, it sends SUBSCRIBE_END with no preceding SUBSCRIBE_OK.
 A rejection is a stream reset: a publisher that cannot serve the subscription (no such track, an ended broadcast, or any other refusal) MUST promptly reset the stream rather than leave it pending, so a subscriber distinguishes "pending" from "refused" by the reset, not by a timeout.
 A route claims capability rather than inventory, so a subscription for a covered path that names nothing is refused this way too.
@@ -446,9 +455,8 @@ A route claims capability rather than inventory, so a subscription for a covered
 The track's immutable publisher properties are not carried here; they are fetched once via a [Track Stream](#track-stream).
 The subscriber needs the track's TRACK_INFO (notably its timescale) to interpret FRAME messages, and MAY open the Track and Subscribe streams concurrently, buffering frames until it arrives.
 
-The publisher sends SUBSCRIBE_OK once the absolute start position is resolved, and SUBSCRIBE_END once no further groups will be produced (see [SUBSCRIBE_OK](#subscribe-ok) and [SUBSCRIBE_END](#subscribe-end)).
-The publisher closes the stream (FIN) only once every group from start to end has been accounted for, either via a Group Stream (completed or reset) or a SUBSCRIBE_DROP message.
-This MAY occur after SUBSCRIBE_END, since stragglers within the range can still be dropped.
+The publisher sends SUBSCRIBE_OK once the absolute start position is resolved, and SUBSCRIBE_END once no further groups will be produced and every Group Stream it opens for the subscription has been opened (see [SUBSCRIBE_OK](#subscribe-ok) and [SUBSCRIBE_END](#subscribe-end)).
+The publisher closes the stream (FIN) after SUBSCRIBE_END, once every counted Group Stream has finished or been reset.
 Unbounded subscriptions stay open until SUBSCRIBE_END, and either endpoint MAY reset the stream at any time.
 
 ### Fetch
@@ -801,11 +809,16 @@ A subscriber sends an ANNOUNCE_REQUEST message to indicate it wants to receive a
 ANNOUNCE_REQUEST Message {
   Message Length (i)
   Broadcast Path Prefix (s),
+  Hidden (8),
 }
 ~~~
 
 **Broadcast Path Prefix**:
 Indicate interest for any broadcasts with a path that starts with this prefix.
+
+**Hidden**:
+1 to also receive hidden routes (see [Hidden Paths](#hidden)), 0 otherwise.
+Any other value is a PROTOCOL_VIOLATION.
 
 The publisher MUST respond with an ANNOUNCE_OK message followed by ANNOUNCE_START messages for any matching routes, followed by ANNOUNCE_START, ANNOUNCE_END, and ANNOUNCE_UPDATE messages for any future updates, subject to [Routing](#routing).
 Implementations SHOULD consider reasonable limits on the number of matching broadcasts to prevent resource exhaustion.
@@ -1102,7 +1115,7 @@ Set to 0x0 to indicate a SUBSCRIBE_OK message.
 
 **Group**:
 The absolute sequence number of the first group that will be delivered.
-It MUST be greater than or equal to the requested start group; any groups in between are unavailable and implicitly dropped, with no separate SUBSCRIBE_DROP required.
+It MUST be greater than or equal to the requested start group; any groups in between are unavailable.
 A subscriber that requested the latest group learns the resolved sequence here.
 
 There is no matching frame field, because the start frame is never in doubt: a partial group is only delivered when it was asked for, so the subscription starts either exactly where it asked or at the beginning of a later group (see [Positions](#positions)).
@@ -1122,6 +1135,7 @@ SUBSCRIBE_END Message {
   Type (i) = 0x1
   Message Length (i)
   Group (i)
+  Stream Count (i)
 }
 ~~~
 
@@ -1133,34 +1147,14 @@ The exclusive end of the range: the absolute sequence number of the first group 
 A value of 0 means the track ended before producing any groups.
 The subscriber MUST NOT wait for any group at or after this sequence.
 
-SUBSCRIBE_END bounds the range but does not by itself end the stream: the publisher MAY still send SUBSCRIBE_DROP for groups below this sequence that it cannot deliver, and FINs the stream only once every group below this sequence has been accounted for.
+**Stream Count**:
+The number of Group Streams the publisher opened for this subscription, whether they finished or were reset.
+A group that was skipped, never produced, delivered only as a datagram, or given up before its stream opened is not counted.
+A relay counts the Group Streams it opened itself, never the count it received upstream.
 
-## SUBSCRIBE_DROP
-A SUBSCRIBE_DROP message is sent by the publisher on the Subscribe Stream when groups cannot be served.
-It MAY arrive at any point after the subscription is opened, including after SUBSCRIBE_END for stragglers within the resolved range (a leading range is instead dropped implicitly by SUBSCRIBE_OK).
-
-~~~
-SUBSCRIBE_DROP Message {
-  Type (i) = 0x2
-  Message Length (i)
-  Group Start (i)
-  Group End (i)
-  Error Code (i)
-}
-~~~
-
-**Type**:
-Set to 0x2 to indicate a SUBSCRIBE_DROP message.
-
-**Group Start**:
-The first absolute group sequence in the dropped range.
-
-**Group End**:
-The last absolute group sequence in the dropped range (inclusive).
-
-**Error Code**:
-An application-specific error code.
-A value of 0 indicates no error; the groups are simply unavailable.
+The publisher MUST NOT send SUBSCRIBE_END until every Group Stream it will open for the subscription has been opened, so the count is final; it does not wait for them to finish.
+The subscriber has received every Group Stream once it has read the header of `Stream Count` of them, which MAY happen after SUBSCRIBE_END or the FIN since streams are not ordered.
+A Group Stream reset before its header arrived is never seen, so a subscriber SHOULD bound how long it waits for the rest, for example by `Subscriber Max Age`.
 
 ## FETCH
 FETCH is sent by a subscriber to request a single group from a track.
@@ -1313,6 +1307,14 @@ The `Message Length` describes the payload size on the wire.
 
 
 # Appendix A: Changelog
+
+## moq-lite-07
+
+- Assigned `moq-lite-07-wip` as this draft's protocol identifier until it is finalized as `moq-lite-07`.
+- Hid routes with a `.`-prefixed segment below the requested prefix from announce discovery, and added the ANNOUNCE_REQUEST `Hidden` field to opt in.
+- Added `Stream Count` to SUBSCRIBE_END: the number of Group Streams opened for the subscription. SUBSCRIBE_END is now sent once every counted Group Stream has opened, rather than as soon as the final group is known.
+- Removed SUBSCRIBE_DROP and its type 0x2; a group without a Group Stream is not counted.
+- The Subscribe Stream FIN now follows once every counted Group Stream has finished or been reset.
 
 ## moq-lite-06
 

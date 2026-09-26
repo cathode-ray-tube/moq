@@ -1184,9 +1184,16 @@ impl Cluster {
 			Some(moq_auth::Role::Subscriber) => None,
 			_ => publisher.map(|origin| origin.with_stats(stats.clone())),
 		};
+		// An authenticated cluster peer (a verified client certificate or the LAN
+		// credential) discovers hidden routes whether or not it asks. A peer that
+		// predates the hidden opt-in (below moq-lite-07-wip, or moq-transport without
+		// MoQ Hidden) would otherwise lose `.internal/origins` and every other dot
+		// path during a rolling upgrade.
+		// TODO: drop the exemption once deployed peers all opt in.
+		let cluster_peer = request.tls.is_some() || Self::is_lan_path(&request.path);
 		let subscriber = match request.role {
 			Some(moq_auth::Role::Publisher) => None,
-			_ => subscriber.map(|origin| origin.consume().with_stats(stats.clone())),
+			_ => subscriber.map(|origin| origin.consume().with_hidden(cluster_peer).with_stats(stats.clone())),
 		};
 		Ok(Admitted {
 			lease: lease.with_stats(stats.clone()),
@@ -1995,9 +2002,12 @@ impl Cluster {
 
 		// Cluster dials use their configured stats tier. Cluster peers carry no auth
 		// root, so presence is keyed under the empty root within the cluster tier.
-		// The peer's routes entered the cluster elsewhere.
+		// The peer's routes entered the cluster elsewhere. A peer that predates the
+		// hidden opt-in still discovers our hidden routes; see `Cluster::scope`.
+		let origin = self.origin.clone().peer();
 		let mut client = client
-			.with_origin(self.origin.clone().peer())
+			.with_publisher(origin.consume().with_hidden(true))
+			.with_subscriber(origin)
 			.with_stats(self.stats.tier(self.cluster_tier()).session(""));
 		if let Some(cost) = cost {
 			client = client.with_cost(cost);
@@ -3071,7 +3081,7 @@ mod tests {
 
 		// Snapshot a consumer on the cluster origin before run() takes ownership of
 		// `cluster` so we can later check that the registration was published.
-		let mut watcher = cluster.origin.consume().announced();
+		let mut watcher = cluster.origin.consume().with_hidden(true).announced();
 
 		let started = cluster.clone().start().await.expect("cluster start");
 		let mut handle = tokio::spawn(async move { started.run().await });

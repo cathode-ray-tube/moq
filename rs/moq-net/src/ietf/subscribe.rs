@@ -269,10 +269,9 @@ impl Message for SubscribeOk {
 
 		match version {
 			Version::Draft14 => {
-				let expires = u64::decode(r, version)?;
-				if expires != 0 {
-					return Err(DecodeError::Unsupported);
-				}
+				// EXPIRES is when the publisher expects to end the subscription. That end
+				// arrives as PUBLISH_DONE regardless, so there is nothing to act on.
+				let _expires = u64::decode(r, version)?;
 
 				properties.group_order = Some(GroupOrder::decode(r, version)?.any_to_descending());
 
@@ -287,8 +286,9 @@ impl Message for SubscribeOk {
 				// peer that still sends it doesn't have its session torn down over a hint.
 				// LARGEST_OBJECT is required on every draft once the track has content, so
 				// rejecting it would tear down a session over a parameter compliant
-				// publishers must send.
+				// publishers must send. EXPIRES is ignored, as on draft-14.
 				decode_params!(r, version,
+					0x08 => _expires: Option<u64>,
 					0x09 => largest: Option<Location>,
 					0x22 => group_order: Option<GroupOrder>,
 				);
@@ -924,18 +924,45 @@ mod tests {
 	}
 
 	#[test]
-	fn test_subscribe_ok_rejects_non_zero_expires() {
+	fn test_subscribe_ok_ignores_expires_v14() {
 		#[rustfmt::skip]
-		let invalid_bytes = vec![
-			0x01, // subscribe_id
-			0x05, // INVALID: expires = 5
+		let bytes = [
+			0x01, // request_id
+			0x00, // track_alias
+			0x05, // expires = 5
 			0x02, // group_order
 			0x00, // content_exists
 			0x00, // num_params
 		];
 
-		let result: Result<SubscribeOk, _> = decode_message(&invalid_bytes, Version::Draft14);
-		assert!(result.is_err());
+		let decoded: SubscribeOk = decode_message(&bytes, Version::Draft14).unwrap();
+		assert_eq!(decoded.request_id, Some(RequestId(1)));
+	}
+
+	/// The SUBSCRIBE_OK aiomoqt 0.11.0 sends: EXPIRES = 0 and nothing else (#4172).
+	#[test]
+	fn test_subscribe_ok_ignores_expires_aiomoqt() {
+		let bytes = [0x03, 0x00, 0x01, 0x08, 0x00];
+
+		let decoded: SubscribeOk = decode_message(&bytes, Version::Draft16).unwrap();
+		assert_eq!(decoded.request_id, Some(RequestId(3)));
+		assert_eq!(decoded.track_alias, 0);
+		assert!(decoded.largest.is_none());
+	}
+
+	/// The SUBSCRIBE_OK a libquicr relay sends: EXPIRES = 0 followed by five track
+	/// properties (#4172).
+	#[test]
+	fn test_subscribe_ok_ignores_expires_libquicr() {
+		let bytes = [
+			0x02, 0xde, 0x53, 0x15, 0xbf, 0xd6, 0x39, 0x31, 0x88, 0x01, 0x08, 0x00, 0x02, 0x00, 0x02, 0x00, 0x0a, 0x01,
+			0x14, 0x01, 0x0e, 0x01,
+		];
+
+		let decoded: SubscribeOk = decode_message(&bytes, Version::Draft16).unwrap();
+		assert_eq!(decoded.request_id, Some(RequestId(2)));
+		assert_eq!(decoded.properties.priority, Some(1));
+		assert_eq!(decoded.properties.group_order, Some(GroupOrder::Ascending));
 	}
 
 	#[test]
@@ -1034,6 +1061,46 @@ mod tests {
 		assert_eq!(decoded.track_alias, 42);
 	}
 
+	/// The registered priority property is two literal bytes after the message body on
+	/// draft-17+, and absent on older drafts. The decoder returns the same wire value.
+	#[test]
+	fn subscribe_ok_priority_property_bytes_on_every_draft() {
+		for version in [
+			Version::Draft14,
+			Version::Draft15,
+			Version::Draft16,
+			Version::Draft17,
+			Version::Draft18,
+			Version::Draft19,
+			Version::Draft20,
+			Version::Draft21,
+			Version::Draft22,
+		] {
+			let mut msg = SubscribeOk {
+				request_id: matches!(version, Version::Draft14 | Version::Draft15 | Version::Draft16)
+					.then_some(RequestId(7)),
+				track_alias: 42,
+				largest: None,
+				properties: Properties::default(),
+			};
+			let baseline = encode_message(&msg, version);
+			msg.properties.priority = Some(37);
+			let encoded = encode_message(&msg, version);
+			if matches!(version, Version::Draft14 | Version::Draft15 | Version::Draft16) {
+				assert_eq!(encoded, baseline, "{version}");
+			} else {
+				assert_eq!(encoded, [baseline, vec![0x0e, 37]].concat(), "{version}");
+				assert_eq!(
+					decode_message::<SubscribeOk>(&encoded, version)
+						.unwrap()
+						.properties
+						.priority,
+					Some(37)
+				);
+			}
+		}
+	}
+
 	/// GROUP_ORDER (0x22) is only a legal SUBSCRIBE_OK *message parameter* through draft-15;
 	/// a draft-16+ peer closes the session with PROTOCOL_VIOLATION when it sees one. The
 	/// publisher's preference belongs in the DEFAULT_PUBLISHER_GROUP_ORDER track property,
@@ -1046,6 +1113,7 @@ mod tests {
 			largest: None,
 			properties: Properties {
 				timescale: None,
+				priority: None,
 				group_order: Some(GroupOrder::Descending),
 			},
 		};
@@ -1073,6 +1141,7 @@ mod tests {
 			largest: None,
 			properties: Properties {
 				timescale: None,
+				priority: None,
 				group_order: Some(GroupOrder::Descending),
 			},
 		};

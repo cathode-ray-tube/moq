@@ -31,7 +31,7 @@ typealias OriginDynamic = uniffi.moq.MoqOriginDynamic
 typealias BroadcastRequest = uniffi.moq.MoqBroadcastRequest
 /** A stream of route announcements and retractions under a prefix. */
 typealias AnnounceConsumer = uniffi.moq.MoqAnnounceConsumer
-/** A literal prefix plus an optional relative pattern for announcement discovery. */
+/** A literal prefix, an optional relative pattern, and the hidden-path opt-in for announcement discovery. */
 typealias AnnounceConfig = uniffi.moq.MoqAnnounceConfig
 /** A pending wait for a route to cover a specific path. */
 typealias AnnouncedBroadcast = uniffi.moq.MoqAnnouncedBroadcast
@@ -140,9 +140,9 @@ typealias AudioCodec = uniffi.moq.MoqAudioCodec
 typealias AudioSampleFormat = uniffi.moq.MoqAudioSampleFormat
 /** The PCM layout an [AudioConsumer] should decode to. */
 typealias AudioDecoderOutput = uniffi.moq.MoqAudioDecoderOutput
-/** What a [VideoConsumer] decodes to: an optional pixel format and resize, plus a latency budget. */
+/** What a [VideoConsumer] decodes to: an optional resize, a latency budget, and whether frames keep the decoder's native surface. */
 typealias VideoDecoderOutput = uniffi.moq.MoqVideoDecoderOutput
-/** One decoded video frame: packed pixels, the layout they are in, its dimensions, and a timestamp. */
+/** One decoded video frame, owning the decoder's surface until closed; `pixels(format)` converts it to packed CPU pixels. */
 typealias VideoDecodedFrame = uniffi.moq.MoqVideoDecodedFrame
 /** The PCM layout the caller feeds an [AudioProducer]. */
 typealias AudioEncoderInput = uniffi.moq.MoqAudioEncoderInput
@@ -152,7 +152,7 @@ typealias AudioEncoderOutput = uniffi.moq.MoqAudioEncoderOutput
 typealias VideoFrame = uniffi.moq.MoqVideoFrame
 /** A video codec identifier (H.264 or H.265). */
 typealias VideoCodec = uniffi.moq.MoqVideoCodec
-/** A CPU pixel layout (I420 or RGBA): fed to a [VideoProducer], or delivered by `decodeVideo`. */
+/** A CPU pixel layout (I420 or RGBA): fed to a [VideoProducer], or read from a [VideoDecodedFrame]. */
 typealias VideoPixelFormat = uniffi.moq.MoqVideoPixelFormat
 /** The pixel layout, resolution, and framerate the caller feeds a [VideoProducer]. */
 typealias VideoEncoderInput = uniffi.moq.MoqVideoEncoderInput

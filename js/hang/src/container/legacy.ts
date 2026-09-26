@@ -146,7 +146,10 @@ export class Producer {
 	/** Gap between consecutive timestamps. */
 	#interval?: Time.Micro;
 
-	/** Whether a marker has already been written for the latest cut. */
+	/**
+	 * A discontinuity's marker is the newest group, so another one would say
+	 * nothing new.
+	 */
 	#marked = false;
 
 	constructor(
@@ -317,6 +320,18 @@ export class Producer {
 		return this.#cutEncryptedWithMarker(end);
 	}
 
+	/**
+	 * Flush and close the current group, then mark a break in the timeline.
+	 *
+	 * @deprecated Use cut() instead.
+	 */
+	discontinuity(end?: Time.Micro): void | Promise<void> {
+		return this.cut(end);
+	}
+
+	/**
+	 * Flush and close the current plaintext group, then write a marker group.
+	 */
 	#cutPlaintext(end?: Time.Micro): void {
 		this.#close(end);
 

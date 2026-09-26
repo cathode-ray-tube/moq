@@ -51,6 +51,8 @@ Moq.connect("https://relay.example.com").use { moq ->
 }
 ```
 
+`MediaProducer.flush(timestampUs)` records a locally encoded frame's transport handoff on the broadcast media clock. Call it after `writeFrame` for live encoder output; omit it for file, pipe, and network imports. `MediaProducer` is a typealias, so the generated method is available directly.
+
 The three advertising operations: `moq.createBroadcast(path)` (or
 `origin.createBroadcast`) returns an unannounced producer, invisible to everyone;
 `broadcast.announce(route)` / `broadcast.unannounce()` own that exact-path
@@ -59,7 +61,8 @@ path beneath it (`""` for everything). Hold the returned `OriginDynamic`
 while the claim should stay advertised, and reject the requests you will not
 serve. A route is a capability, not an inventory. `announcements(config)` takes
 a literal prefix plus an optional relative pattern; `announcement.prefix()`
-stays origin-relative and `captures()` reports the wildcard matches.
+stays origin-relative and `captures()` reports the wildcard matches. Paths with
+a `.`-prefixed segment below the prefix are [hidden](/concept/moq-lite#hidden-broadcasts) unless `hidden = true`.
 
 Sessions reconnect with backoff when the transport drops and re-announce local
 broadcasts. `moq.epoch()` counts the connections, 1 on the first, pairing with
@@ -91,11 +94,13 @@ native side.
 `AudioCodec.opus()`, and `AudioEncoderOutput.frameDurationUs` sets the Opus
 frame length: 2500, 5000, 10000, 20000 (the default), 40000, or 60000.
 
-`decodeVideo` picks the decoded CPU pixel layout: `VideoDecoderOutput.format`
-is `VideoPixelFormat.I420` when null, or `VideoPixelFormat.RGBA` for four bytes
-a pixel, and every frame repeats the layout it was decoded to. `resize` is best
-effort: only NVDEC has a built-in scaler, and MediaCodec is not it, so read each
-frame's own `width` and `height` rather than assuming it took.
+Each frame from `decodeVideo` owns its decoded picture until `close()` (or
+`use {}`), including after the consumer is cancelled. `frame.pixels(format)`
+converts it on demand: `VideoPixelFormat.I420`, or `VideoPixelFormat.RGBA` for
+four bytes a pixel. Close frames promptly, since held frames hold decoder
+buffers. `resize` is best effort: only NVDEC has a built-in scaler, and
+MediaCodec is not it, so read each frame's own `width()` and `height()` rather
+than assuming it took.
 
 ## Connection stats
 

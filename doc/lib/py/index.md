@@ -69,6 +69,8 @@ async def main():
 asyncio.run(main())
 ```
 
+For already-encoded live output, call `audio.flush(timestamp_us)` after each `audio.write_frame` with the same broadcast-clock PTS. It samples the transport handoff for catalog jitter. File, pipe, and network imports should omit `flush`; raw-pixel and PCM encoders inside the binding measure their own output.
+
 The three advertising operations, as the other bindings spell them:
 `client.create_broadcast(path)` (or `OriginProducer.create_broadcast`) returns
 an unannounced producer, invisible to everyone; `broadcast.announce(route)` /
@@ -79,6 +81,8 @@ advertised, and reject the requests you will not serve. A route is a
 capability, not an inventory. `announced(prefix, filter=...)` combines a literal
 root with an optional relative pattern; each announcement `.prefix` stays
 relative to the origin and `.captures` reports what the pattern wildcards matched.
+Paths with a `.`-prefixed segment below the prefix are [hidden](/concept/moq-lite#hidden-broadcasts) unless
+`hidden=True`.
 
 Sessions reconnect with backoff when the transport drops and re-announce local
 broadcasts. `session.epoch()` counts the connections, 1 on the first, pairing
@@ -106,11 +110,12 @@ WebSocket, TCP, and Unix sockets.
 `moq.AudioCodec.opus()`, and `AudioEncoderOutput.frame_duration_us` sets the
 Opus frame length: 2500, 5000, 10000, 20000 (the default), 40000, or 60000.
 
-`decode_video` picks the decoded CPU pixel layout: `VideoDecoderOutput.format`
-is `VideoPixelFormat.I420` when unset, or `VideoPixelFormat.RGBA` for four
-bytes a pixel, and every frame repeats the layout it was decoded to. `resize`
+Each frame from `decode_video` owns its decoded picture until it is released,
+including after the consumer is cancelled. `frame.pixels(format)` converts it on
+demand: `VideoPixelFormat.I420`, or `VideoPixelFormat.RGBA` for four bytes a
+pixel. Drop frames promptly, since held frames hold decoder buffers. `resize`
 is best effort: only NVDEC has a built-in scaler, so read each frame's own
-`width` and `height` rather than assuming it took.
+`width()` and `height()` rather than assuming it took.
 
 ## Connection stats
 

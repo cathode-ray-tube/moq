@@ -53,6 +53,13 @@ moq --connect https://relay.example.com/anon --broadcast my-stream.hang export t
 moq --connect "https://relay.example.com/rooms/1?jwt=$TOKEN" --broadcast alice.hang import ts
 ```
 
+The `ts`, `fmp4`, and `flv` imports publish on the broadcast clock the catalog
+advertises, not the input's own timestamps. The first frame is stamped when it
+arrives, every track keeps its offset from the others, and an input that
+restarts its timestamps, such as a restarted encoder, continues forward
+after the real gap rather than rewinding. So a feed whose PTS starts hours in,
+or whose first frame arrives late, still names the right wall time.
+
 MPEG-TS import carries H.264/H.265 and AAC/MP2/AC-3/E-AC-3, passes SCTE-35 and
 subtitle PIDs through as tracks, and round-trips the service tables. A
 `discontinuity_indicator` on the program's PCR PID is a system time-base reset,
@@ -271,6 +278,12 @@ See [Authentication](/bin/relay/auth).
 `import --max-age` (default 30 s) tells relays how long to keep old
 groups fetchable, which the [HLS gateway](/bin/hls) depends on. `export --max-age` (default 500 ms) is how long *this* consumer waits for a
 stalled group before skipping. Raising the first never delays playback.
+
+For `export ts`, `--max-age` also bounds how long the muxer holds a leading
+track for a lagging one. Frames go out in media-time order across all tracks,
+not arrival order, so two exporters of one broadcast emit them in one order. A
+track quiet for longer is muxed around until it catches up; a sparse track
+(SCTE-35) costs that wait once per cue. `--max-age 0` keeps arrival order.
 
 ## Debugging
 

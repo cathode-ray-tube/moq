@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
 	Error, Path, PathOwned, SessionError, Timescale, broadcast,
-	coding::{Reader, Stream},
+	coding::{Decode, DecodeError, Reader, Stream},
 	frame, group,
 	ietf::{self, Control, FetchType, Filter, GroupOrder, RequestId},
 	origin, track,
@@ -15,6 +15,7 @@ use crate::{
 };
 
 use super::{Message, Version, cluster, error::request, peer};
+use crate::tail::{self, Settle, Tail};
 
 use kio::Lock;
 
@@ -160,7 +161,9 @@ impl Drop for State {
 			if let Fill::Ready { producer, .. } = &*track.fill.read() {
 				let _ = producer.clone().abort(Error::Cancel);
 			}
-			let _ = track.producer.abort(Error::Cancel);
+			if let Some(producer) = track.producer {
+				let _ = producer.abort(Error::Cancel);
+			}
 		}
 	}
 }
@@ -285,6 +288,8 @@ struct Accepted {
 
 	/// The units its object timestamps are in, when it declared any.
 	timescale: Option<Timescale>,
+	/// The publisher's track default in wire order, if declared.
+	priority: Option<u8>,
 
 	/// The largest Location in the track, absent when it has no content yet. That absence
 	/// is what says a fill we asked for is owed nothing.
@@ -292,7 +297,8 @@ struct Accepted {
 }
 
 struct TrackState {
-	producer: track::Producer,
+	producer: Option<track::Producer>,
+	name: String,
 	alias: Option<u64>,
 
 	// The backfill this subscription asked for, and the rendezvous between its fetch
@@ -317,17 +323,28 @@ struct TrackState {
 
 	// A pre-draft-20 joining FETCH, which reuses the fill rendezvous.
 	joining: Option<JoiningFetch>,
+
+	// The data streams read so far, which PUBLISH_DONE's Stream Count is checked against.
+	tail: kio::Producer<Tail>,
 }
 
 impl TrackState {
+	#[cfg(test)]
 	fn new(
 		producer: track::Producer,
 		broadcast: PathOwned,
 		fill: kio::Producer<Fill>,
 		joining: Option<JoiningFetch>,
 	) -> Self {
+		let mut state = Self::pending(producer.name().to_owned(), broadcast, fill, joining);
+		state.producer = Some(producer);
+		state
+	}
+
+	fn pending(name: String, broadcast: PathOwned, fill: kio::Producer<Fill>, joining: Option<JoiningFetch>) -> Self {
 		Self {
-			producer,
+			producer: None,
+			name,
 			alias: None,
 			broadcast,
 			timescale: None,
@@ -335,6 +352,21 @@ impl TrackState {
 			largest: None,
 			fetch_id: None,
 			joining,
+			tail: Default::default(),
+		}
+	}
+}
+
+/// Counts a data stream toward its subscription's [`Tail`] once its handler is done with it.
+///
+/// Counting at the end rather than at the header means a Stream Count that is reached never
+/// races the stream's own work, such as the END_OF_TRACK that declares where the track ends.
+struct Counted(kio::Producer<Tail>);
+
+impl Drop for Counted {
+	fn drop(&mut self) {
+		if let Ok(mut tail) = self.0.write() {
+			tail.stream();
 		}
 	}
 }
@@ -606,7 +638,7 @@ where
 			return false;
 		};
 
-		held.broadcast == new.broadcast && held.producer.name() == new.producer.name()
+		held.broadcast == new.broadcast && held.name == new.name
 	}
 
 	fn remove_subscribe(&self, request_id: RequestId) -> Option<TrackState> {
@@ -634,9 +666,8 @@ where
 	/// our namespace -- a peer outside it has never heard of our root, so a rooted
 	/// subscriber asks for its scope and mounts the replies under the root.
 	///
-	/// Asked unconditionally, without waiting on the peer's SETUP: a peer with nothing to
-	/// advertise answers with an empty set, which costs one stream, while waiting to find
-	/// out costs a round trip on every session.
+	/// Asked unconditionally: a peer with nothing to advertise answers with an empty set,
+	/// which costs one stream.
 	pub fn subscribe_prefixes(&self) -> Vec<PathOwned> {
 		crate::model::interest_prefixes(&self.origin.allowed())
 	}
@@ -659,6 +690,12 @@ where
 			return Err(Error::GoingAway);
 		}
 
+		// Hidden namespaces are requested too, as on moq-lite: the session mirrors the
+		// peer into the origin and each local reader opts in on its own. The parameter
+		// fails decoding at a peer that doesn't know it, so it waits on the peer's SETUP
+		// to say whether it does (MoQ Hidden).
+		let hidden = self.peer_setup.get().await.hidden;
+
 		let request_id = self.control.next_request_id(&self.runtime).await?;
 
 		// Draft-18+ uses SUBSCRIBE_NAMESPACE (0x50); earlier drafts use the legacy
@@ -669,6 +706,7 @@ where
 					request_id,
 					namespace: prefix.clone(),
 					subscribe_options: 0x01, // NAMESPACE only
+					hidden,
 				};
 				stream.writer.encode(&ietf::SubscribeNamespaceLegacy::ID).await?;
 				stream.writer.encode(&msg).await?;
@@ -677,6 +715,7 @@ where
 				let msg = ietf::SubscribeNamespace {
 					request_id,
 					namespace: prefix.clone(),
+					hidden,
 				};
 				stream.writer.encode(&ietf::SubscribeNamespace::ID).await?;
 				stream.writer.encode(&msg).await?;
@@ -1388,7 +1427,7 @@ where
 	async fn drain(&self, tasks: &mut TaskSet) {
 		let mut session = self.session.clone();
 		kio::wait(|waiter| {
-			let mut cx = std::task::Context::from_waker(waiter.waker());
+			let mut cx = waiter.context();
 			if session.poll_closed(&mut cx).is_ready() {
 				return Poll::Ready(());
 			}
@@ -1407,7 +1446,7 @@ where
 		loop {
 			let next = broadcasts
 				.drive(|waiter| {
-					let mut cx = std::task::Context::from_waker(waiter.waker());
+					let mut cx = waiter.context();
 					if closed_session.poll_closed(&mut cx).is_ready() {
 						return Poll::Ready(None);
 					}
@@ -1496,7 +1535,7 @@ where
 		loop {
 			let next = subscribes
 				.drive(|waiter| {
-					let mut cx = std::task::Context::from_waker(waiter.waker());
+					let mut cx = waiter.context();
 					if closed_session.poll_closed(&mut cx).is_ready() {
 						return Poll::Ready(None);
 					}
@@ -1536,29 +1575,16 @@ where
 		_broadcast: broadcast::Dynamic,
 		request: track::Request,
 	) {
-		// Accept right away: IETF group data can arrive before SubscribeOk, so we
-		// need the producer in place to route it. This also unblocks the
-		// downstream subscriber's `consume_track`.
-		//
-		// Set the track timescale to microseconds: IETF object timestamps default to
-		// microseconds, and `create_frame` normalizes each frame into the track scale.
-		// Accepting at milliseconds (the default) would truncate microsecond precision.
-		//
-		// moq-transport carries no publisher retention property, so the window comes
-		// from the accepting side (see `origin::Config::default_max_age`) rather than
-		// from the peer.
-		let info = track::Info::default()
-			.with_timescale(crate::Timescale::MICRO)
-			.with_max_age(self.origin.default_max_age());
-		let mut track = request.accept(info);
-
-		// A peer that sent GOAWAY told us to stop opening streams on this session.
+		// Data streams wait on the alias bound by SUBSCRIBE_OK, so leave the model request
+		// pending until its immutable track metadata is known.
 		if self.going_away.is_set() {
-			let _ = track.abort(Error::GoingAway);
+			request.reject(Error::GoingAway);
 			return;
 		}
 
-		let subscription = track.subscription();
+		let subscription = request.subscription();
+		// A live join delivers nothing below the group SUBSCRIBE_OK names as Largest.
+		let live = subscription.as_ref().and_then(|s| s.start).is_none();
 		let join = match subscribe_join(
 			subscription.as_ref().and_then(|s| s.start),
 			subscription.as_ref().and_then(|s| s.end),
@@ -1566,7 +1592,7 @@ where
 		) {
 			Ok(join) => join,
 			Err(err) => {
-				let _ = track.abort(err);
+				request.reject(err);
 				return;
 			}
 		};
@@ -1574,7 +1600,7 @@ where
 		let request_id = match self.control.next_request_id(&self.runtime).await {
 			Ok(id) => id,
 			Err(err) => {
-				let _ = track.abort(err);
+				request.reject(err);
 				return;
 			}
 		};
@@ -1583,7 +1609,7 @@ where
 			Ok(s) => s,
 			Err(err) => {
 				tracing::debug!(%err, "failed to open subscribe stream");
-				let _ = track.abort(err);
+				request.reject(err);
 				return;
 			}
 		};
@@ -1599,22 +1625,22 @@ where
 			let mut state = self.state.lock();
 			state.subscribes.insert(
 				request_id,
-				TrackState::new(track.clone(), broadcast_path.to_owned(), fill, joining),
+				TrackState::pending(request.name().to_owned(), broadcast_path.to_owned(), fill, joining),
 			);
 		}
 
 		// Write Subscribe message
 		if let Err(err) = self
-			.write_subscribe(&mut stream, request_id, &broadcast_path, &track, join)
+			.write_subscribe(&mut stream, request_id, &broadcast_path, &request, join)
 			.await
 		{
 			tracing::debug!(%err, "failed to write subscribe");
 			self.remove_subscribe(request_id);
-			let _ = track.abort(err);
+			request.reject(err);
 			return;
 		}
 
-		tracing::info!(broadcast = %self.origin.absolute(&broadcast_path), track = %track.name(), "subscribe started");
+		tracing::info!(broadcast = %self.origin.absolute(&broadcast_path), track = %request.name(), "subscribe started");
 
 		// A publisher can be serving before its SUBSCRIBE_OK reaches us, since the data
 		// streams are independent of the request stream. Waiting for the response alone would
@@ -1627,7 +1653,7 @@ where
 			Unused,
 		}
 
-		let track_name = track.name().to_owned();
+		let track_name = request.name().to_owned();
 		let setup = {
 			let mut response = std::pin::pin!(self.read_subscribe_response(&mut stream));
 			loop {
@@ -1639,7 +1665,7 @@ where
 					if let Poll::Ready(res) = waiter.poll_future(response.as_mut()) {
 						return Poll::Ready(Setup::Response(res));
 					}
-					if track.poll_unused(waiter).is_ready() {
+					if request.poll_unused(waiter).is_ready() {
 						return Poll::Ready(Setup::Unused);
 					}
 					Poll::Pending
@@ -1647,16 +1673,17 @@ where
 				.await;
 
 				match setup {
-					Setup::Response(res) => break Some((res, track)),
-					Setup::Unused => match track.abort_unused(Error::Cancel) {
-						Ok(()) => break None,
-						Err(used) => track = used,
-					},
+					Setup::Response(res) => break Some((res, request)),
+					Setup::Unused => {
+						if request.reject_unused(Error::Cancel) {
+							break None;
+						}
+					}
 				}
 			}
 		};
 
-		let Some((response, mut track)) = setup else {
+		let Some((response, request)) = setup else {
 			tracing::info!(
 				broadcast = %self.origin.absolute(&broadcast_path),
 				track = %track_name,
@@ -1668,118 +1695,152 @@ where
 			return;
 		};
 
-		// Read the response and register the alias mapping
-		let mut fetching: Option<MaybeSendBox<'static, ()>> = None;
-		match response {
-			Ok(Some(Accepted {
-				alias,
-				timescale,
-				largest,
-			})) => {
-				{
-					let mut state = self.state.lock();
-					if let Some(track) = state.subscribes.get_mut(&request_id) {
-						if let Some(timescale) = timescale {
-							track.timescale = Some(timescale);
-						}
-						track.largest = largest;
-						// The fill fetch stream can be waiting on this: the timescale is
-						// what its object timestamps are in.
-						if let Ok(mut fill) = track.fill.write()
-							&& matches!(*fill, Fill::Requested)
-						{
-							// An empty track owes no fill: the publisher opens no fetch
-							// stream for an empty range, so nothing would settle this and
-							// every group would wait on a head that is never coming.
-							*fill = match largest {
-								Some(_) => Fill::Serving(timescale),
-								None => Fill::Done,
-							};
-						}
-					}
-				}
-
-				if let Err(err) = self.register_alias(request_id, alias) {
-					// Only one alias naming two different tracks is the session's problem. A
-					// shared alias we cannot demux, or a request that went away underneath us,
-					// costs this subscription and nothing else.
-					if matches!(err, Error::Duplicate) {
-						tracing::warn!(track_alias = %alias, "publisher reused a live track alias for another track");
-						self.session
-							.close(SessionError::from(&err).to_code(), err.to_string().as_ref());
-					} else {
-						tracing::warn!(track_alias = %alias, %err, "could not bind track alias");
-						// SUBSCRIBE_OK arrived, so the publisher considers this Established and
-						// will keep serving it. Dropping the stream says nothing on the versions
-						// that need UNSUBSCRIBE, so cancel it properly.
-						self.cancel_subscribe(stream, request_id).await;
-					}
-					self.remove_subscribe(request_id);
-					let _ = track.abort(err);
-					return;
-				}
-
-				if let Some(joining) = joining
-					&& largest.is_some()
-				{
-					fetching = self.start_joining_fetch(request_id, &track, joining).await;
-				}
+		// SUBSCRIBE_OK commits the model's immutable metadata before the alias releases
+		// any data stream that arrived ahead of this control response.
+		let accepted = match response {
+			Ok(Some(accepted)) => accepted,
+			Ok(None) => {
+				self.remove_subscribe(request_id);
+				request.reject(Error::UnexpectedMessage);
+				return;
 			}
-			Ok(None) => {}
 			Err(err) => {
 				tracing::debug!(%err, "subscribe response error");
 				self.remove_subscribe(request_id);
-				let _ = track.abort(err);
+				request.reject(err);
 				return;
 			}
 		};
+		let Accepted {
+			alias,
+			timescale,
+			priority,
+			largest,
+		} = accepted;
+		let info = track::Info::default()
+			.with_timescale(Timescale::MICRO)
+			.with_max_age(self.origin.default_max_age())
+			.with_priority(super::priority::from_wire(priority.unwrap_or(128)));
+		// Declared before the track is released to readers, so a warm cache waiting on
+		// this copy judges itself against where the live feed actually starts.
+		let request = match live {
+			true => request.resolving_start(),
+			false => request,
+		};
+		let mut track = request.accept(info);
+		if live {
+			let _ = track.start_at(largest.map(|largest| largest.group));
+		}
+		let mut fetching: Option<MaybeSendBox<'static, ()>> = None;
+		{
+			let mut state = self.state.lock();
+			if let Some(held) = state.subscribes.get_mut(&request_id) {
+				held.producer = Some(track.clone());
+				held.timescale = timescale;
+				held.largest = largest;
+				if let Ok(mut fill) = held.fill.write()
+					&& matches!(*fill, Fill::Requested)
+				{
+					*fill = match largest {
+						Some(_) => Fill::Serving(timescale),
+						None => Fill::Done,
+					};
+				}
+			}
+		}
+		if let Err(err) = self.register_alias(request_id, alias) {
+			if matches!(err, Error::Duplicate) {
+				tracing::warn!(track_alias = %alias, "publisher reused a live track alias for another track");
+				self.session
+					.close(SessionError::from(&err).to_code(), err.to_string().as_ref());
+			} else {
+				tracing::warn!(track_alias = %alias, %err, "could not bind track alias");
+				self.cancel_subscribe(stream, request_id).await;
+			}
+			self.remove_subscribe(request_id);
+			let _ = track.abort(err);
+			return;
+		}
+		if let Some(joining) = joining
+			&& largest.is_some()
+		{
+			fetching = self.start_joining_fetch(request_id, &track, joining).await;
+		}
 
 		// One event ends the subscription: the last consumer leaving, or the
-		// subscribe stream closing. The broadcast ending does not: a retraction
+		// publisher's PUBLISH_DONE. The broadcast ending does not: a retraction
 		// does not disturb subscriptions already in flight.
 		enum End {
 			Unused,
-			StreamClosed(Result<(), Error>),
+			Done(Result<u64, Error>),
 		}
 
 		let mut fetch_done = fetching.is_none();
-		let cancelled = loop {
-			let end = kio::wait(|waiter| {
-				if !fetch_done
-					&& let Some(fut) = fetching.as_mut()
-					&& waiter.poll_future(fut.as_mut()).is_ready()
-				{
-					fetch_done = true;
-				}
-				if track.poll_unused(waiter).is_ready() {
-					return Poll::Ready(End::Unused);
-				}
-				let mut cx = std::task::Context::from_waker(waiter.waker());
-				stream.reader.poll_closed(&mut cx).map(End::StreamClosed)
-			})
-			.await;
+		let cancelled = {
+			let mut done = std::pin::pin!(Self::read_publish_done(&mut stream.reader, self.version));
+			loop {
+				let end = kio::wait(|waiter| {
+					if !fetch_done
+						&& let Some(fut) = fetching.as_mut()
+						&& waiter.poll_future(fut.as_mut()).is_ready()
+					{
+						fetch_done = true;
+					}
+					if track.poll_unused(waiter).is_ready() {
+						return Poll::Ready(End::Unused);
+					}
+					waiter.poll_future(done.as_mut()).map(End::Done)
+				})
+				.await;
 
-			match end {
-				End::Unused => match track.abort_unused(Error::Cancel) {
-					Ok(()) => {
-						tracing::info!(broadcast = %self.origin.absolute(&broadcast_path), track = %track_name, "subscribe cancelled");
-						break true;
-					}
-					Err(used) => track = used,
-				},
-				End::StreamClosed(res) => {
-					match res {
+				match end {
+					End::Unused => match track.abort_unused(Error::Cancel) {
 						Ok(()) => {
-							tracing::info!(broadcast = %self.origin.absolute(&broadcast_path), track = %track_name, "subscribe complete");
-							let _ = track.finish();
+							tracing::info!(broadcast = %self.origin.absolute(&broadcast_path), track = %track_name, "subscribe cancelled");
+							break true;
 						}
-						Err(err) => {
-							tracing::debug!(%err, "subscribe stream closed with error");
-							let _ = track.abort(err);
+						Err(used) => track = used,
+					},
+					End::Done(res) => {
+						match res {
+							Ok(count) => {
+								tracing::info!(broadcast = %self.origin.absolute(&broadcast_path), track = %track_name, "subscribe complete");
+								// The publisher sends PUBLISH_DONE once every data stream it opened
+								// is closed, but QUIC does not order them, so some can still be on
+								// their way. Wait until Stream Count of them are read, or a bounded
+								// grace for any reset before its header (the draft says to use a
+								// timeout). The count is a hint: a published peer sends 0, which
+								// waits out the grace.
+								let tail = self
+									.state
+									.lock()
+									.subscribes
+									.get(&request_id)
+									.map(|held| held.tail.consume());
+								if let Some(tail) = tail {
+									let mut settle = Settle::new(&self.runtime, tail, tail::GRACE);
+									kio::wait(|waiter| {
+										if !fetch_done
+											&& let Some(fut) = fetching.as_mut()
+											&& waiter.poll_future(fut.as_mut()).is_ready()
+										{
+											fetch_done = true;
+										}
+										settle.poll(waiter, |tail| count > 0 && tail.streams() >= count)
+									})
+									.await;
+								}
+								// A no-op once an END_OF_TRACK declared the end.
+								let _ = track.finish();
+							}
+							Err(err) => {
+								tracing::debug!(%err, "subscribe ended with error");
+								let _ = track.abort(err);
+							}
 						}
+						// The publisher already ended the request, so there is nothing to cancel.
+						break false;
 					}
-					// The publisher already ended the request, so there is nothing to cancel.
-					break false;
 				}
 			}
 		};
@@ -1794,6 +1855,23 @@ where
 				stream.writer.finish().ok();
 			}
 		}
+	}
+
+	/// Read the PUBLISH_DONE that ends an Established subscription, as the end it reports
+	/// and, for a clean end, its Stream Count.
+	///
+	/// The publisher must send it before its FIN (draft-19 section 3.3.2), so a FIN
+	/// without one is a failed request, not a clean end.
+	async fn read_publish_done(reader: &mut Reader<S::RecvStream, Version>, version: Version) -> Result<u64, Error> {
+		match reader.decode_maybe::<u64>().await? {
+			Some(ietf::PublishDone::ID) => {}
+			Some(_) => return Err(Error::UnexpectedMessage),
+			None => return Err(Error::ProtocolViolation),
+		}
+		let msg: ietf::PublishDone = reader.decode().await?;
+		tracing::debug!(message = ?msg, "received publish done");
+		msg.end(version)?;
+		Ok(msg.stream_count)
 	}
 
 	/// Tell the publisher to stop serving a subscription we are walking away from.
@@ -1854,17 +1932,20 @@ where
 		stream: &mut Stream<S, Version>,
 		request_id: RequestId,
 		broadcast: &Path<'_>,
-		track: &track::Producer,
+		request: &track::Request,
 		join: Join,
 	) -> Result<(), Error> {
+		// Read the aggregate now: a subscriber can join while the request ID and stream
+		// were awaited, and nothing updates the priority after SUBSCRIBE.
+		let priority = request.subscription().map(|s| s.priority).unwrap_or(0);
 		stream.writer.encode(&ietf::Subscribe::ID).await?;
 		stream
 			.writer
 			.encode(&ietf::Subscribe {
 				request_id,
 				track_namespace: broadcast.to_owned(),
-				track_name: track.name().into(),
-				subscriber_priority: super::priority::to_wire(track.subscription().map(|s| s.priority).unwrap_or(0)),
+				track_name: request.name().into(),
+				subscriber_priority: super::priority::to_wire(priority),
 				group_order: GroupOrder::Descending,
 				filter: join.filter,
 				fill: join.fill,
@@ -2007,6 +2088,7 @@ where
 				Ok(Some(Accepted {
 					alias: msg.track_alias,
 					timescale: msg.properties.timescale,
+					priority: msg.properties.priority,
 					largest: msg.largest,
 				}))
 			}
@@ -2035,7 +2117,7 @@ where
 	}
 
 	pub async fn recv_group(&mut self, stream: &mut Reader<S::RecvStream, Version>) -> Result<(), Error> {
-		let group: ietf::GroupHeader = stream.decode().await?;
+		let mut group: ietf::GroupHeader = stream.decode().await?;
 
 		if group.sub_group_id != 0 {
 			tracing::warn!(sub_group_id = %group.sub_group_id, "subgroup ID is not supported, dropping stream");
@@ -2064,11 +2146,24 @@ where
 			}
 		};
 
-		let (track, timescale, fill) = {
+		let (mut track, timescale, fill, _counted) = {
 			let state = self.state.lock();
 			let track = state.subscribes.get(&request_id).ok_or(Error::NotFound)?;
-			(track.producer.clone(), track.timescale, track.fill.clone())
+			(
+				track.producer.clone().ok_or(Error::NotFound)?,
+				track.timescale,
+				track.fill.clone(),
+				// Every data stream counts toward PUBLISH_DONE's Stream Count, even one
+				// dropped below.
+				Counted(track.tail.clone()),
+			)
 		};
+
+		// An omitted header priority inherits the track property, then wire 128.
+		// The track info carries that fallback after SUBSCRIBE_OK (draft-21 section 10.4).
+		if !group.flags.has_priority {
+			group.publisher_priority = super::priority::to_wire(track.publisher_priority());
+		}
 
 		// FIRST_OBJECT clear says this stream starts partway through the group, which the
 		// draft lets a publisher do to answer a filter. Without a head it is unusable: the
@@ -2095,9 +2190,9 @@ where
 		// The peek inside blocks until the publisher produces the group's first object, so
 		// race it against the subscription going away the same way the group read below is.
 		// Otherwise dropping the local subscriber cannot end this handler.
-		let (producer, start) = {
+		let opened = {
 			let mut opening = track.clone();
-			let mut open = std::pin::pin!(self.open_group(stream, &mut opening, &fill, group.group_id));
+			let mut open = std::pin::pin!(self.open_group(stream, &mut opening, &fill, &group));
 			kio::wait(|waiter| {
 				if let Poll::Ready(err) = track.poll_closed(waiter) {
 					return Poll::Ready(Err(err));
@@ -2105,6 +2200,11 @@ where
 				waiter.poll_future(open.as_mut())
 			})
 			.await?
+		};
+		let (producer, start) = match opened {
+			Opened::Group(producer, start) => (producer, start),
+			// No object at or past object 0 of this group exists, so neither does the group.
+			Opened::EndOfTrack => return end_track(&mut track, group.group_id),
 		};
 
 		// Guarded: this handler can be dropped at any await below, and a group producer
@@ -2134,12 +2234,84 @@ where
 				tracing::debug!(%err, group = %producer.sequence, "group error");
 				let _ = producer.abort(err);
 			}
-			_ => {
+			Ok(Ended::Group) => {
 				let _ = producer.finish();
+			}
+			// No object past this group's last one exists, so the track ends after it.
+			Ok(Ended::Track) => {
+				let _ = producer.finish();
+				return end_track(&mut track, group.group_id.saturating_add(1));
 			}
 		}
 
 		Ok(())
+	}
+}
+
+/// Mark where the track ends, as an END_OF_TRACK object said.
+///
+/// Draft-14 on carries no end location in PUBLISH_DONE, so this is what lets a subscriber
+/// learn the end before the live edge reaches it. A boundary at or below a group already
+/// received is the publisher breaking its own end, which no later group can repair. A
+/// marker that lands after the subscription already ended (its grace expired) changes
+/// nothing.
+fn end_track(track: &mut track::Producer, end: u64) -> Result<(), Error> {
+	if track.final_sequence().is_some() {
+		return Ok(());
+	}
+	if let Err(err) = track.finish_at(end) {
+		tracing::warn!(%err, end, "invalid END_OF_TRACK");
+		let _ = track.clone().abort(Error::ProtocolViolation);
+		return Err(Error::ProtocolViolation);
+	}
+	Ok(())
+}
+
+/// How [`Subscriber::open_group`] resolved a subgroup stream.
+enum Opened {
+	/// The group producer the stream writes into, and the Object ID it starts at.
+	Group(group::Producer, u64),
+	/// The stream's first object is an END_OF_TRACK at object 0: the group does not exist.
+	EndOfTrack,
+}
+
+/// How a subgroup stream ended cleanly.
+#[derive(Debug, PartialEq, Eq)]
+enum Ended {
+	/// The stream finished, or carried an explicit end of group.
+	Group,
+	/// It carried an END_OF_TRACK after the group's last object.
+	Track,
+}
+
+/// Object status: no object at or past this location exists (every implemented draft).
+const END_OF_TRACK: u64 = 0x4;
+
+/// The start of a subgroup stream's first object, peeked before its group is created.
+#[derive(Debug, Clone, Copy)]
+struct FirstObject {
+	/// The Object ID, which the first object's delta is.
+	id: u64,
+	end_of_track: bool,
+}
+
+/// [`FirstObject`] for a stream whose objects carry extensions, or don't.
+#[derive(Debug)]
+struct PeekFirst<const EXTENSIONS: bool>(FirstObject);
+
+impl<const EXTENSIONS: bool> Decode<Version> for PeekFirst<EXTENSIONS> {
+	fn decode<B: bytes::Buf>(buf: &mut B, version: Version) -> Result<Self, DecodeError> {
+		let id = u64::decode(buf, version)?;
+		if EXTENSIONS {
+			let size = usize::decode(buf, version)?;
+			if buf.remaining() < size {
+				return Err(DecodeError::Short);
+			}
+			buf.advance(size);
+		}
+		let size = u64::decode(buf, version)?;
+		let end_of_track = size == 0 && u64::decode(buf, version)? == END_OF_TRACK;
+		Ok(Self(FirstObject { id, end_of_track }))
 	}
 }
 
@@ -2149,29 +2321,36 @@ where
 {
 	/// The group producer this subgroup stream writes into, and the Object ID it starts at.
 	///
-	/// Normally the stream starts the group. While a fill is outstanding it may instead be
-	/// the tail of the group the fill fetch stream began, which the first Object ID decides,
-	/// so the stream is peeked before any producer exists. A subscription with no fill skips
-	/// the peek: creating the group up front is what it has always done, and waiting for the
-	/// first object would hold the group back for as long as the publisher takes to produce
-	/// it.
+	/// The first object is peeked before any producer exists, since an END_OF_TRACK at
+	/// object 0 means the group does not exist at all. Normally the stream then starts the
+	/// group. While a fill is outstanding it may instead be the tail of the group the fill
+	/// fetch stream began, which the first Object ID decides.
 	async fn open_group(
 		&self,
 		stream: &mut Reader<S::RecvStream, Version>,
 		track: &mut track::Producer,
 		fill: &kio::Producer<Fill>,
-		sequence: u64,
-	) -> Result<(group::Producer, u64), Error> {
+		header: &ietf::GroupHeader,
+	) -> Result<Opened, Error> {
+		let sequence = header.group_id;
 		// Stats (groups/frames/bytes) are counted in the model as the group is written,
 		// through the tagged `track::Producer`.
 		let create = |track: &mut track::Producer| track.create_group(group::Info { sequence });
 
+		let first = match header.flags.has_extensions {
+			true => stream.decode_peek_maybe::<PeekFirst<true>>().await?.map(|peek| peek.0),
+			false => stream.decode_peek_maybe::<PeekFirst<false>>().await?.map(|peek| peek.0),
+		};
+		if first.is_some_and(|first| first.id == 0 && first.end_of_track) {
+			return Ok(Opened::EndOfTrack);
+		}
+
 		if !fill.read().outstanding() {
-			return Ok((create(track)?, 0));
+			return Ok(Opened::Group(create(track)?, 0));
 		}
 
 		// The first object's ID delta is its absolute Object ID (see `next_object_id`).
-		match stream.decode_peek_maybe::<u64>().await? {
+		match first.map(|first| first.id) {
 			// A group delivered from its start stands alone, unless the fill already
 			// headed this very sequence: the publisher then served those objects twice,
 			// and the model has one producer per group. Publish the head as the prefix it
@@ -2186,13 +2365,13 @@ where
 					return Err(Error::Unsupported);
 				}
 
-				Ok((create(track)?, 0))
+				Ok(Opened::Group(create(track)?, 0))
 			}
 
 			// A group starting partway through is the tail of one the fill began, and
 			// without that head it has a hole at the front.
 			Some(start) => match self.claim_fill(fill, track, sequence, Some(start)).await? {
-				Some(producer) => Ok((producer, start)),
+				Some(producer) => Ok(Opened::Group(producer, start)),
 				None => {
 					tracing::warn!(sequence, start, "no fill to stitch a mid-group stream onto");
 					Err(Error::Unsupported)
@@ -2202,8 +2381,8 @@ where
 			// A stream that ends without an object: the group is over and had nothing
 			// outside the fill's range, so the head it delivered is the whole group.
 			None => match self.claim_fill(fill, track, sequence, None).await? {
-				Some(producer) => Ok((producer, 0)),
-				None => Ok((create(track)?, 0)),
+				Some(producer) => Ok(Opened::Group(producer, 0)),
+				None => Ok(Opened::Group(create(track)?, 0)),
 			},
 		}
 	}
@@ -2274,8 +2453,8 @@ enum IngestPhase {
 	Status { timestamp: Option<crate::Timestamp> },
 	/// Streaming the object payload.
 	Payload { frame: frame::ProducerOwned },
-	/// An explicit end-of-group status arrived.
-	Finished,
+	/// An explicit end-of-group or end-of-track status arrived.
+	Finished(Ended),
 }
 
 impl GroupIngest {
@@ -2316,27 +2495,23 @@ where
 		let _: u64 = stream.decode().await?;
 		let header: ietf::FetchHeader = stream.decode().await?;
 
-		let (track, fill, joining, largest) = {
+		let (subscribe_id, fill, joining, largest, _counted) = {
 			let state = self.state.lock();
 			// A draft-20 fill is named by the SUBSCRIBE's request id. A pre-draft-20 joining
 			// FETCH has its own id, which `fetches` maps back to that subscription.
-			let subscribe_id = state
-				.fetches
-				.get(&header.request_id)
-				.copied()
-				.unwrap_or(header.request_id);
+			let joined = state.fetches.get(&header.request_id).copied();
+			let subscribe_id = joined.unwrap_or(header.request_id);
 			let track = state.subscribes.get(&subscribe_id).ok_or(Error::NotFound)?;
-			(track.producer.clone(), track.fill.clone(), track.joining, track.largest)
+			// A fill is one of the subscription's own data streams, so PUBLISH_DONE counts
+			// it. A joining FETCH is a request of its own.
+			let counted = joined.is_none().then(|| Counted(track.tail.clone()));
+			(subscribe_id, track.fill.clone(), track.joining, track.largest, counted)
 		};
 
 		// SUBSCRIBE_OK declares the units these object timestamps are in, and this stream can
 		// be reordered ahead of it. Taking the fill in the same step is what refuses a second
 		// stream for a request that asked for one fill.
 		let timescale = kio::wait(|waiter| {
-			if let Poll::Ready(err) = track.poll_closed(waiter) {
-				return Poll::Ready(Err(err));
-			}
-
 			let accepted = fill.poll(waiter, |fill| match **fill {
 				Fill::Requested => Poll::Pending,
 				_ => Poll::Ready(()),
@@ -2358,6 +2533,16 @@ where
 			}
 		})
 		.await?;
+		// A fill stream can overtake SUBSCRIBE_OK. The fill gate above is released only
+		// after that response commits track Info and installs the producer.
+		let track = {
+			let state = self.state.lock();
+			state
+				.subscribes
+				.get(&subscribe_id)
+				.and_then(|track| track.producer.clone())
+				.ok_or(Error::NotFound)?
+		};
 
 		// Race the peer's stream against the subscription going away, the same way a
 		// subgroup stream is served. Otherwise a peer that stalls partway through a payload
@@ -2689,21 +2874,21 @@ fn settle_join_live(fill: &kio::Producer<Fill>) {
 }
 
 impl GroupIngest {
-	/// `Ready(Ok(()))` once the stream FINs on an object boundary (or an explicit
-	/// end-of-group status arrives). The caller finishes or aborts the group; an
-	/// object cut short mid-payload was already aborted here with the reason.
+	/// `Ready(Ok(_))` once the stream FINs on an object boundary, or an explicit
+	/// end-of-group or end-of-track status arrives. The caller finishes or aborts the
+	/// group; an object cut short mid-payload was already aborted here with the reason.
 	fn poll<R: crate::transport::poll::RecvStream>(
 		&mut self,
 		reader: &mut Reader<R, Version>,
 		group: &mut group::Producer,
 		waiter: &kio::Waiter,
-	) -> Poll<Result<(), Error>> {
-		let mut cx = std::task::Context::from_waker(waiter.waker());
+	) -> Poll<Result<Ended, Error>> {
+		let mut cx = waiter.context();
 		loop {
 			match &mut self.phase {
 				IngestPhase::Delta => {
 					let Some(id_delta) = ready!(reader.poll_decode_maybe::<u64>(&mut cx))? else {
-						return Poll::Ready(Ok(()));
+						return Poll::Ready(Ok(Ended::Group));
 					};
 					self.prior_object = Some(next_object_id(self.prior_object, id_delta, self.start)?);
 					self.phase = match self.has_extensions {
@@ -2748,7 +2933,11 @@ impl GroupIngest {
 						frame.finish()?;
 						self.phase = IngestPhase::Delta;
 					} else if status == 3 && !self.has_end {
-						self.phase = IngestPhase::Finished;
+						self.phase = IngestPhase::Finished(Ended::Group);
+					} else if status == END_OF_TRACK {
+						// Defined on every implemented draft, whether or not the header marks
+						// the group's end.
+						self.phase = IngestPhase::Finished(Ended::Track);
 					} else {
 						return Poll::Ready(Err(Error::Unsupported));
 					}
@@ -2769,7 +2958,10 @@ impl GroupIngest {
 						}
 					}
 				}
-				IngestPhase::Finished => return Poll::Ready(Ok(())),
+				IngestPhase::Finished(ended) => {
+					let ended = std::mem::replace(ended, Ended::Group);
+					return Poll::Ready(Ok(ended));
+				}
 			}
 		}
 	}
@@ -2897,13 +3089,17 @@ mod tests {
 		let session = crate::lite::test_transport::SinkSession::gated_bi(gate.consume());
 		let log = session.log.clone();
 		let (tasks, _task_set) = crate::util::TaskSet::new();
+		// The request waits on the peer's SETUP to learn whether it may opt in to
+		// hidden namespaces.
+		let peer_setup = peer::PeerSetup::default();
+		peer_setup.set(peer::Peer::default());
 		let mut subscriber = Subscriber::new(
 			crate::time::Clock::tokio(),
 			session.clone(),
 			scoped,
 			Control::new(None, false),
 			None,
-			peer::PeerSetup::default(),
+			peer_setup,
 			crate::Hop::new(1).unwrap(),
 			None,
 			Version::Draft16,
@@ -3668,7 +3864,7 @@ mod tests {
 
 	/// Establish a draft-20 subscription against a SUBSCRIBE_OK carrying `largest`, and
 	/// report whether a fill is still outstanding once it is accepted.
-	async fn fill_after_subscribe_ok(largest: Option<ietf::Location>) -> bool {
+	async fn fill_after_subscribe_ok(largest: Option<ietf::Location>, priority: Option<u8>) -> bool {
 		let version = Version::Draft20;
 
 		let subscribe_ok = {
@@ -3681,7 +3877,10 @@ mod tests {
 					request_id: None,
 					track_alias: 7,
 					largest,
-					properties: Default::default(),
+					properties: ietf::Properties {
+						priority,
+						..Default::default()
+					},
 				})
 				.await
 				.unwrap();
@@ -3726,6 +3925,11 @@ mod tests {
 				.values()
 				.next()
 				.expect("the subscription is registered");
+			assert_eq!(
+				track.producer.as_ref().unwrap().publisher_priority(),
+				255 - priority.unwrap_or(128),
+				"SUBSCRIBE_OK priority must be committed before alias registration"
+			);
 			let fill = track.fill.read();
 			fill.outstanding()
 		};
@@ -3740,7 +3944,7 @@ mod tests {
 	#[tokio::test(start_paused = true)]
 	async fn an_empty_track_settles_the_fill() {
 		assert!(
-			!fill_after_subscribe_ok(None).await,
+			!fill_after_subscribe_ok(None, Some(37)).await,
 			"no LARGEST_OBJECT means no content, so no fill is owed"
 		);
 	}
@@ -3750,9 +3954,14 @@ mod tests {
 	#[tokio::test(start_paused = true)]
 	async fn a_track_with_content_still_awaits_its_fill() {
 		assert!(
-			fill_after_subscribe_ok(Some(ietf::Location { group: 3, object: 4 })).await,
+			fill_after_subscribe_ok(Some(ietf::Location { group: 3, object: 4 }), Some(37)).await,
 			"a fetch stream is still owed"
 		);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn an_older_peer_without_priority_property_uses_wire_default() {
+		assert!(!fill_after_subscribe_ok(None, None).await);
 	}
 
 	/// Tombstones are bounded: a session churning through subscriptions must not
@@ -5670,6 +5879,42 @@ mod stitch_tests {
 		assert!(matches!(*h.fill.read(), Fill::Done), "the head was claimed");
 	}
 
+	/// Append an END_OF_TRACK object: delta 0, an empty payload, then its status.
+	fn end_of_track(mut stream: Vec<u8>) -> Vec<u8> {
+		for value in [0u64, 0, END_OF_TRACK] {
+			value.encode(&mut stream, VERSION).unwrap();
+		}
+		stream
+	}
+
+	/// END_OF_TRACK after a group's last object ends the track right after that group.
+	#[tokio::test]
+	async fn an_end_of_track_after_a_group_ends_the_track_after_it() {
+		let h = Harness::new(Fill::Done, vec![end_of_track(tail_stream(SEQUENCE, 0, &[b"last"]))]);
+		let mut consumer = h.track.subscribe(None);
+		let mut stream = h.stream().await;
+
+		h.subscriber.clone().recv_group(&mut stream).await.unwrap();
+		assert_eq!(h.track.final_sequence(), Some(SEQUENCE + 1));
+
+		let mut group = consumer.recv_group().await.unwrap().expect("the group arrives");
+		assert_eq!(group.read_frame().await.unwrap().unwrap().payload.as_ref(), b"last");
+		assert!(group.read_frame().await.unwrap().is_none(), "the group is finished");
+		assert!(consumer.recv_group().await.unwrap().is_none(), "then the track ends");
+	}
+
+	/// END_OF_TRACK at object 0 says the group does not exist, so the track ends before it
+	/// and no group is created for it.
+	#[tokio::test]
+	async fn an_end_of_track_at_object_zero_creates_no_group() {
+		let h = Harness::new(Fill::Done, vec![end_of_track(tail_stream(SEQUENCE, 0, &[]))]);
+		let mut stream = h.stream().await;
+
+		h.subscriber.clone().recv_group(&mut stream).await.unwrap();
+		assert_eq!(h.track.final_sequence(), Some(SEQUENCE));
+		assert_eq!(h.track.latest(), None, "no group was created");
+	}
+
 	/// The group ended exactly where we joined it, so the subscription's stream carries no
 	/// objects at all. That still ends the group, which is what publishes the head.
 	#[tokio::test]
@@ -5862,6 +6107,28 @@ mod stitch_tests {
 
 		let (_, frames) = read_group(&mut consumer).await;
 		assert_eq!(frames.len(), 2, "the head is published as the prefix it is");
+	}
+
+	/// A fetch stream can arrive before SUBSCRIBE_OK commits the pending track. It waits
+	/// for that response instead of looking up a producer that does not exist yet.
+	#[tokio::test]
+	async fn an_early_fill_waits_for_subscribe_ok() {
+		let h = Harness::new(Fill::Requested, vec![fill_stream(SEQUENCE, &[b"head-0"])]);
+		{
+			let mut state = h.subscriber.state.lock();
+			state.subscribes.get_mut(&REQUEST).unwrap().producer = None;
+		}
+		let mut fill = h.stream().await;
+		let mut subscriber = h.subscriber.clone();
+		let mut receiving = Box::pin(subscriber.recv_fill(&mut fill));
+		assert!(futures::poll!(receiving.as_mut()).is_pending());
+		{
+			let mut state = h.subscriber.state.lock();
+			state.subscribes.get_mut(&REQUEST).unwrap().producer = Some(h.track.clone());
+		}
+		*h.fill.write().ok().unwrap() = Fill::Serving(Some(Timescale::MICRO));
+		receiving.await.expect("early fill");
+		assert!(matches!(*h.fill.read(), Fill::Ready { .. }));
 	}
 
 	/// A fetch stream answering a subscription that asked for no fill duplicates a group the

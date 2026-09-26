@@ -8,7 +8,7 @@ use crate::{
 };
 
 use super::{
-	Control, Message, Publisher, Subscriber, Version, adapter::ControlStreamAdapter, cluster, peer, solicit,
+	Control, Message, Publisher, Subscriber, Version, adapter::ControlStreamAdapter, cluster, hidden, peer, solicit,
 	subscriber::is_protocol_violation,
 };
 
@@ -162,7 +162,7 @@ where
 					let runtime = runtime.clone();
 					tasks.push(async move {
 						let payload = kio::wait(|waiter| {
-							let mut cx = std::task::Context::from_waker(waiter.waker());
+							let mut cx = waiter.context();
 							if session.poll_closed(&mut cx).is_ready() {
 								return std::task::Poll::Ready(None);
 							}
@@ -498,6 +498,7 @@ fn peer_from_params(params: &ietf::Parameters, version: Version) -> Result<peer:
 	Ok(peer::Peer {
 		cluster: cluster::peer_from_setup(params, version)?,
 		solicit: solicit::from_setup(params, version)?,
+		hidden: hidden::from_setup(params, version),
 	})
 }
 
@@ -529,6 +530,7 @@ async fn run_setup<S: crate::transport::poll::Session>(
 	}
 	cluster::peer_into_setup(&mut parameters, self_origin, cost, version);
 	solicit::into_setup(&mut parameters, version);
+	hidden::into_setup(&mut parameters, version);
 	let parameters = parameters.encode_bytes(version)?;
 
 	writer.encode(&setup::Setup { parameters }).await?;
@@ -538,7 +540,7 @@ async fn run_setup<S: crate::transport::poll::Session>(
 	// drops without draining; keep holding either way (closing this stream
 	// mid-session is a protocol violation on strict peers).
 	let payload = kio::wait(|waiter| {
-		let mut cx = std::task::Context::from_waker(waiter.waker());
+		let mut cx = waiter.context();
 		if session.poll_closed(&mut cx).is_ready() {
 			return std::task::Poll::Ready(None);
 		}
@@ -604,7 +606,7 @@ where
 	loop {
 		let recv = tasks
 			.drive(|waiter| {
-				let mut cx = std::task::Context::from_waker(waiter.waker());
+				let mut cx = waiter.context();
 				session.poll_accept_uni(&mut cx)
 			})
 			.await
@@ -618,7 +620,7 @@ where
 		// tolerated: bytes that arrive and do not parse stay session-fatal.
 		let kind: u64 = match tasks
 			.drive(|waiter| {
-				let mut cx = std::task::Context::from_waker(waiter.waker());
+				let mut cx = waiter.context();
 				reader.poll_decode_peek(&mut cx)
 			})
 			.await
@@ -748,7 +750,7 @@ where
 	loop {
 		let mut stream = tasks
 			.drive(|waiter| {
-				let mut cx = std::task::Context::from_waker(waiter.waker());
+				let mut cx = waiter.context();
 				Stream::poll_accept(&mut accept, version, &mut cx)
 			})
 			.await?;
@@ -759,7 +761,7 @@ where
 		let mut hdr_size: Option<u16> = None;
 		let header = tasks
 			.drive(|waiter| {
-				let mut cx = std::task::Context::from_waker(waiter.waker());
+				let mut cx = waiter.context();
 				let id = match hdr_id {
 					Some(id) => id,
 					None => *hdr_id.insert(std::task::ready!(stream.reader.poll_decode(&mut cx))?),
@@ -988,7 +990,8 @@ mod tests {
 			version: Version::Draft18,
 			path: None,
 			peer_setup_stream: None,
-			peer_declared: None,
+			// The requests wait on the peer's SETUP (MoQ Hidden).
+			peer_declared: Some(peer::Peer::default()),
 		})
 		.expect("start the session");
 		let _driver = tokio::spawn(driver);

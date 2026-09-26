@@ -53,6 +53,10 @@ pub enum Error {
 	#[error("unsupported track compression: {0}")]
 	UnsupportedCompression(String),
 
+	/// A locally published track's catalog entry points at another broadcast.
+	#[error("a locally published track can't reference another broadcast")]
+	ForeignBroadcast,
+
 	/// Error parsing or building CMAF moof+mdat fragments.
 	#[error("cmaf: {0}")]
 	Cmaf(#[from] crate::container::fmp4::Error),
@@ -225,6 +229,10 @@ pub enum Error {
 	/// A broadcast reference escapes the consumer's authorized root.
 	#[error("broadcast reference escapes the root: {0}")]
 	EscapingBroadcast(String),
+
+	/// A rendition tried to lower jitter already advertised to subscribers.
+	#[error("catalog jitter cannot decrease for a published rendition")]
+	JitterDecreased,
 }
 
 impl Error {

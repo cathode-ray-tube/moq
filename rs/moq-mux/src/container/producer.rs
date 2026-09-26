@@ -89,8 +89,8 @@ pub struct Producer<C: Container, R = ()> {
 	/// A presentation endpoint cannot bound the decode-order tail after reordering.
 	reordered: bool,
 
-	/// Measures the jitter and bitrate of what gets written, for the catalog. Always on: it costs
-	/// two counters, and a caller who doesn't publish a rendition simply never reads it.
+	/// Measures bitrate, reorder, batch, and explicit encoder flush observations for the catalog.
+	/// A caller without a published rendition simply never reads the estimate.
 	estimator: crate::catalog::Estimator,
 
     	/// Optional encrypter.
@@ -219,31 +219,69 @@ where
         self
     }
 
-    /// Writes encoded container payloads through the configured writer chain.
-    fn write_container(&mut self, frames: &[Frame]) -> crate::Result<()> {
-        let group = match self.group.as_mut() {
-            Some(group) => group,
-            None => return Ok(()),
-        };
+/// Writes encoded container payloads through the configured writer chain.
+fn write_container(&mut self, frames: &[Frame]) -> crate::Result<()> {
+    let group = match self.group.as_mut() {
+        Some(group) => group,
+        None => return Ok(()),
+    };
 
-        let output = crate::container::MoqFrameWriter { group };
+    let output = crate::container::MoqFrameWriter { group };
 
-        match self.encrypter.as_mut() {
-            Some(encrypter) => {
-                let mut protected =
-                    crate::container::ProtectedFrame::new(output, encrypter.as_mut());
+    match self.encrypter.as_mut() {
+        Some(encrypter) => {
+            let mut protected =
+                crate::container::ProtectedFrame::new(output, encrypter.as_mut());
 
-                self.container.write(&mut protected, frames)?;
-            }
-            None => {
-                let mut plain = output;
-
-                self.container.write(&mut plain, frames)?;
-            }
+            self.container.write(&mut protected, frames)?;
         }
+        None => {
+            let mut plain = output;
 
-        Ok(())
+            self.container.write(&mut plain, frames)?;
+        }
     }
+
+    Ok(())
+}
+
+/// Modify the published catalog config.
+///
+/// Estimate fields the config left to detection at [`set`](Self::set) stay owned by detection:
+/// an edit to them here is published but replaced by the next measurement, except that jitter
+/// never drops below the published value. Call `set` with the field filled in to pin it.
+pub fn modify(&mut self) -> crate::Result<Guard<'_, R>> {
+    let rendition = self
+        .rendition
+        .as_mut()
+        .ok_or(crate::Error::NotPublished)?;
+
+    let config = rendition.config()?;
+
+    Ok(Guard {
+        rendition: rendition.as_mut(),
+        config: Some(config),
+    })
+}
+
+/// Record when a locally encoded frame reached the transport. Imported media must leave
+/// this clock observation out and rely on its container batch and reorder measurements.
+pub fn flush(
+    &mut self,
+    timestamp: moq_net::Timestamp,
+    now: std::time::Instant,
+) -> crate::Result<()> {
+    self.estimator.flush(timestamp, now);
+    self.publish_estimate()
+}
+
+/// The catalog key owned by this producer.
+pub fn name(&self) -> &str {
+    self.rendition
+        .as_ref()
+        .map_or(self.inner.name(), |rendition| rendition.name())
+}
+
 
     /// Publish or replace this track's catalog config.
     pub fn set(&mut self, config: R) -> crate::Result<()> {
@@ -449,6 +487,15 @@ where
 		self.live_edge
 	}
 
+	/// The lowest timestamp the next [`write`](Self::write) accepts: the live edge, or for a
+	/// keyframe, the edge once the group it closes is counted too.
+	pub(crate) fn floor(&self, keyframe: bool) -> Option<moq_net::Timestamp> {
+		match (self.live_edge, self.end.filter(|_| keyframe)) {
+			(Some(edge), Some(end)) if timestamp_lt(edge, end) => Some(end),
+			(edge, end) => edge.or(end),
+		}
+	}
+
 	/// Write a frame to the track.
 	///
 	/// A keyframe closes any open group and starts a new one. A non-keyframe extends the current
@@ -528,7 +575,7 @@ where
 				let first = iter.next().unwrap();
 				let (min, max) = iter.fold((first, first), |(min, max), d| (min.min(d), max.max(d)));
 				if max.saturating_sub(min) >= self.buffer_duration {
-					self.flush(None)?;
+					self.flush_buffer(None)?;
 				}
 			}
 		}
@@ -546,6 +593,12 @@ where
 	/// must be a keyframe. An explicit bound before the last ordered video frame
 	/// returns [`InvalidEnd`](super::InvalidEnd) without flushing or closing the group.
 	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> crate::Result<()> {
+		let marker_at = end.or_else(|| self.estimated_end());
+		self.close(end, marker_at)
+	}
+
+	/// Close the current group, ending a video track's group with a duration marker at `marker_at`.
+	fn close(&mut self, end: Option<moq_net::Timestamp>, marker_at: Option<moq_net::Timestamp>) -> crate::Result<()> {
 		if self.container.kind() == Kind::Video
 			&& !self.reordered
 			&& let Some((end, previous)) = end.zip(self.previous_timestamp)
@@ -559,8 +612,6 @@ where
 		self.estimator.cut(end);
 		self.claim();
 
-		let marker_at = end.or_else(|| self.estimated_end());
-
 		// Tell the timeline where this group's content stops: the duration marker when we
 		// write one, else the caller's bound, else the furthest point we wrote.
 		if let Some(recorder) = self.recorder.as_mut()
@@ -570,7 +621,7 @@ where
 		}
 
 		let tail_end = marker_at.filter(|_| !self.reordered);
-		self.flush(tail_end)?;
+		self.flush_buffer(tail_end)?;
 		if let Some(group) = self.group.as_mut() {
 		    let writer = MoqFrameWriter { group };
 		
@@ -669,11 +720,12 @@ where
 	/// an empty payload is data. The next [`write`](Self::write) opens the group after the
 	/// marker and must continue forward from the live edge; it cannot rewind.
 	///
-	/// To bound the closing group's final frame, [`cut(end)`](Self::cut) before calling this;
-	/// the open group is closed either way (an unbounded [`cut`](Self::cut) here is a no-op
-	/// after yours).
+	/// To bound the closing group's final frame, [`cut(end)`](Self::cut) before calling this.
+	/// Otherwise the open group closes without a duration marker: what resumes may land sooner
+	/// than one estimated frame later (a capture that reopens at once), and a guessed end past
+	/// it would read as a rewind to every consumer.
 	pub fn discontinuity(&mut self) -> crate::Result<()> {
-		self.cut(None)?;
+		self.close(None, None)?;
 		// Nothing is measured across the break: the frames still open on this side have no end, and
 		// the gap to the far side is not a frame duration.
 		self.estimator.discontinuity();
@@ -727,7 +779,7 @@ where
 	/// stays exact in native ticks; a micros round-trip would quantize scales like
 	/// 90 kHz (3003 ticks is not a whole number of micros) and fMP4 would refuse
 	/// the inexact `trun` conversion.
-	fn flush(&mut self, next: Option<moq_net::Timestamp>) -> crate::Result<()> {
+	fn flush_buffer(&mut self, next: Option<moq_net::Timestamp>) -> crate::Result<()> {
 		if self.buffer.is_empty() {
 			return Ok(());
 		}
@@ -844,7 +896,7 @@ mod tests {
 	/// The catalog estimate falls out of the writes themselves: a publisher never records anything
 	/// by hand, it just hands `estimate()` to its rendition.
 	#[tokio::test]
-	async fn writes_measure_the_catalog_estimate() {
+	async fn writes_measure_bitrate_without_inventing_jitter() {
 		let track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
 		let mut producer = Producer::new(track, Container::Legacy(crate::container::Kind::Data));
 
@@ -855,8 +907,39 @@ mod tests {
 		producer.finish().unwrap();
 
 		let estimate = producer.estimate();
-		assert_eq!(estimate.jitter, Some(std::time::Duration::from_millis(25)));
+		assert_eq!(estimate.jitter, None, "PTS spacing alone is not flush delay");
 		assert_eq!(estimate.bitrate, Some(1_600_000));
+	}
+
+	#[test]
+	fn catalog_flush_measures_each_rendition_against_its_own_minimum() {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+		let mut tracks = Vec::new();
+		for name in ["fast", "slow"] {
+			let net = broadcast
+				.create_track(name, catalog.track_info(hang::catalog::PRIORITY.video))
+				.unwrap();
+			let config = hang::catalog::VideoConfig::new(hang::catalog::VideoCodec::VP8);
+			let mut track = catalog
+				.video(net, Container::Legacy(crate::container::Kind::Video), config)
+				.unwrap();
+			track.write(frame(0, true)).unwrap();
+			tracks.push(track);
+		}
+
+		let anchor = std::time::Instant::now();
+		let ms = std::time::Duration::from_millis;
+		let pts = |millis: u64| Timestamp::from_micros(millis * 1_000).unwrap();
+		tracks[0].flush(pts(0), anchor).unwrap();
+		// A constant 200ms offset behind the other rendition is not jitter.
+		tracks[1].flush(pts(0), anchor + ms(200)).unwrap();
+		assert_eq!(catalog.snapshot().video.renditions["slow"].jitter, None);
+
+		// A frame flushed 60ms later than the slow rendition's own minimum is.
+		tracks[1].flush(pts(40), anchor + ms(300)).unwrap();
+		assert_eq!(catalog.snapshot().video.renditions["fast"].jitter, None);
+		assert_eq!(catalog.snapshot().video.renditions["slow"].jitter, Some(ms(60)));
 	}
 
 	/// A passthrough producer claims nothing until the first window closes, then
@@ -1028,7 +1111,7 @@ mod tests {
 
 		producer.write(frame(0, true)).unwrap();
 		producer.write(frame(16_000, false)).unwrap();
-		assert_eq!(producer.estimate().jitter, Some(std::time::Duration::from_millis(16)));
+		assert_eq!(producer.estimate().jitter, None, "PTS spacing alone is not flush delay");
 
 		producer.reorder(Timestamp::from_micros(48_000).unwrap());
 		assert_eq!(
@@ -1527,5 +1610,29 @@ mod tests {
 		producer.finish().unwrap();
 		let groups = collect_payloads(consumer).await;
 		assert_eq!(groups.last().unwrap().last(), Some(&(1_060_000, 0)));
+	}
+
+	/// A capture that reopens at once resumes sooner than one frame after the break. Guessing
+	/// the closing group's end from its cadence would put a duration marker past the resumed
+	/// keyframe, which a consumer reads as a rewind and refuses.
+	#[tokio::test]
+	async fn a_prompt_resume_after_a_discontinuity_is_not_a_rewind() {
+		let track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let subscriber = track.subscribe(replay());
+		let mut producer = Producer::new(track, Container::Legacy(crate::container::Kind::Video));
+		producer.write(frame(1_000_000, true)).unwrap();
+		producer.write(frame(1_040_000, false)).unwrap();
+		producer.discontinuity().unwrap();
+		// Resumed 10ms later, inside the 40ms cadence measured before the break.
+		producer.write(frame(1_050_000, true)).unwrap();
+		producer.finish().unwrap();
+
+		let mut consumer =
+			crate::container::Consumer::new(subscriber, Container::Legacy(crate::container::Kind::Video));
+		let mut timestamps = Vec::new();
+		while let Some(frame) = consumer.read().await.unwrap() {
+			timestamps.push(frame.timestamp.as_micros());
+		}
+		assert_eq!(timestamps, [1_000_000, 1_040_000, 1_050_000]);
 	}
 }

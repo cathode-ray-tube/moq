@@ -55,6 +55,8 @@ try broadcast.announce()
 session.shutdown()
 ```
 
+For already-encoded live output, call `audio.flush(timestampUs:)` after `writeFrame` with the same broadcast-clock PTS. It measures catalog jitter at the transport handoff. File, pipe, and network imports should omit `flush`; built-in encoders observe their own output.
+
 The three advertising operations: `session.publish.createBroadcast(path:)`
 returns an unannounced producer, invisible to everyone; `broadcast.announce(route:)` /
 `broadcast.unannounce()` own that exact-path advertisement;
@@ -64,6 +66,8 @@ claim should stay advertised, and reject the requests you will not serve. A
 route is a capability, not an inventory. `announced(prefix:filter:)` combines a
 literal root with an optional relative pattern; `announcement.prefix` stays
 relative to the origin and `captures` reports what the wildcards matched.
+Paths with a `.`-prefixed segment below the prefix are [hidden](/concept/moq-lite#hidden-broadcasts) unless
+`hidden: true`.
 
 For a self-signed relay on your own test network, `try client.setTlsVerify(false)`
 accepts any certificate; prefer `setTlsRoots` or a fingerprint anywhere else.
@@ -94,11 +98,12 @@ divides the connection's send estimate; pass it to `encodeVideo` /
 `AudioCodec.opus()`, and `AudioEncoderOutput.frameDurationUs` sets the Opus
 frame length: 2500, 5000, 10000, 20000 (the default), 40000, or 60000.
 
-`decodeVideo` picks the decoded CPU pixel layout: `VideoDecoderOutput.format`
-is `.i420` when unset, or `.rgba` for four bytes a pixel, and every frame
-repeats the layout it was decoded to. `resize` is best effort: only NVDEC has a
-built-in scaler, and VideoToolbox is not it, so read each frame's own `width`
-and `height` rather than assuming it took.
+Each frame from `decodeVideo` owns its decoded picture until it is released,
+including after the consumer is cancelled. `frame.pixels(format:)` converts it
+on demand: `.i420`, or `.rgba` for four bytes a pixel. Release frames promptly,
+since held frames hold decoder buffers. `resize` is best effort: only NVDEC has
+a built-in scaler, and VideoToolbox is not it, so read each frame's own
+`width()` and `height()` rather than assuming it took.
 
 ## Connection stats
 

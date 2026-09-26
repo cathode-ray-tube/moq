@@ -69,6 +69,8 @@ _ = broadcast.Announce(moq.Route{})
 broadcast.Finish()   // keep the producer reachable while publishing, then finish explicitly
 ```
 
+For locally encoded media, call `MediaProducer.Flush(timestampUs)` after `WriteFrame` with the same broadcast-clock PTS. It measures catalog jitter at the transport handoff. File, pipe, and network imports should omit `Flush`; built-in encoders observe their own output.
+
 The three advertising operations: `client.CreateBroadcast(path)` (or
 `origin.CreateBroadcast`) returns an unannounced producer, invisible to everyone;
 `broadcast.Announce(route)` / `broadcast.Unannounce()` own that exact-path
@@ -78,6 +80,8 @@ while the claim should stay advertised, and reject the requests you will not
 serve. A route is a capability, not an inventory. `Announced(options)` combines
 a literal prefix with an optional relative pattern; `ann.Prefix()` stays
 relative to the origin and `ann.Captures()` reports the wildcard matches.
+Paths with a `.`-prefixed segment below the prefix are [hidden](/concept/moq-lite#hidden-broadcasts) unless
+`Hidden: true`.
 
 Every call that can block takes a `context.Context` first. Cancelling it
 returns `ctx.Err()` promptly and tears the in-flight native work down, so a
@@ -111,11 +115,12 @@ one: `FetchGroup`/`FetchMediaGroup`, `Dynamic()` with `Requests(ctx)`,
 `AppendDatagram`/`Datagrams(ctx)`, `SetCatalogSection`, `Demand()` for `Used`/`Unused`,
 `Session().Stats()`. `moq.IsAuthError` and `moq.IsShutdown` classify errors. `moq.ProtocolError(err)` is the structured protocol failure (scope, verbatim code, kind) when the peer sent one.
 
-`DecodeVideo` picks the decoded CPU pixel layout: `VideoDecoderOutput.Format`
-is I420 when nil, or `VideoPixelFormatRgba` for four bytes a pixel, and every
-`VideoDecodedFrame` repeats the layout it was decoded to. `Resize` is best
-effort: only NVDEC has a built-in scaler, so read each frame's own `Width` and
-`Height` rather than assuming it took.
+Each `VideoDecodedFrame` from `DecodeVideo` owns its decoded picture until
+`Close`, including after the consumer is cancelled. `Pixels(format)` converts it
+on demand: `VideoPixelFormatI420`, or `VideoPixelFormatRgba` for four bytes a
+pixel. Close frames promptly, since held frames hold decoder buffers. `Resize`
+is best effort: only NVDEC has a built-in scaler, so read each frame's own
+`Width()` and `Height()` rather than assuming it took.
 
 ## Connection stats
 
