@@ -15,7 +15,9 @@ impl From<moq_secure::error::MoqSecureError> for EncryptionError {
         use moq_secure::error::MoqSecureError;
 
         match error {
-            MoqSecureError::InvalidMagic => Self::InvalidFrame,
+            MoqSecureError::InvalidMagic => {
+                Self::InvalidFrame
+            }
 
             MoqSecureError::UnsupportedVersion(version) => {
                 Self::UnsupportedVersion(version)
@@ -25,7 +27,9 @@ impl From<moq_secure::error::MoqSecureError> for EncryptionError {
                 Self::UnsupportedAlgorithm(algorithm)
             }
 
-            MoqSecureError::TruncatedFrame => Self::TruncatedFrame,
+            MoqSecureError::TruncatedFrame => {
+                Self::TruncatedFrame
+            }
 
             MoqSecureError::CiphertextTooShort => {
                 Self::CiphertextTooShort
@@ -51,6 +55,18 @@ impl From<moq_secure::error::MoqSecureError> for EncryptionError {
                 Self::SigningMismatch
             }
 
+            MoqSecureError::MissingSigSlot => {
+                Self::MissingSigSlot
+            }
+
+            MoqSecureError::SignatureNotAllowedByNSigned => {
+                Self::SignatureNotAllowedByNSigned
+            }
+
+            MoqSecureError::DecryptFailed => {
+                Self::DecryptionFailed
+            }
+
             MoqSecureError::InvalidKeyId(key_id) => {
                 Self::InvalidKeyId(key_id)
             }
@@ -74,8 +90,6 @@ pub struct MoqSecureEncrypter {
 
 impl MoqSecureEncrypter {
     /// Creates a ChaCha20-Poly1305 encrypter.
-    ///
-    /// This preserves the previous adapter behavior.
     pub fn new(
         key_store: Arc<dyn KeyStore>,
         signing_key: SigningKey,
@@ -98,11 +112,6 @@ impl MoqSecureEncrypter {
     }
 
     /// Creates an encrypter using the requested wire-level algorithm.
-    ///
-    /// Supported values are:
-    ///
-    /// - `1`: ChaCha20-Poly1305
-    /// - `2`: AES-256-GCM
     pub fn new_with_encryption_type(
         key_store: Arc<dyn KeyStore>,
         signing_key: SigningKey,
