@@ -55,7 +55,7 @@ The application supports:
 
 - ChaCha20-Poly1305 encryption.
 - AES-256-GCM encryption.
-- A configurable initial encryption counter.
+- A configurable initial encryption counter (useful to simulate a restart and restore ctr from a saved value, via a file, for example).
 - Optional Ed25519 frame signing.
 - Hexadecimal preview output.
 - Raw binary output.
