@@ -26,6 +26,9 @@ const READ_BUFFER_SIZE: usize = 64 * 1024;
 const DEFAULT_KEY_ID: u8 = 0;
 const PREVIEW_BYTES: usize = 150;
 
+const ENCRYPTION_CHACHA20_POLY1305: u8 = 1;
+const ENCRYPTION_AES_256_GCM: u8 = 2;
+
 #[derive(Debug)]
 struct Options {
     input: PathBuf,
@@ -33,6 +36,8 @@ struct Options {
     broadcast_name: String,
     track_name: String,
     raw: bool,
+    encryption_type: u8,
+    initial_counter: u64,
 }
 
 impl Options {
@@ -47,6 +52,8 @@ impl Options {
         let mut broadcast_name = "stream.hang".to_owned();
         let mut track_name = "0.m4s".to_owned();
         let mut raw = false;
+        let mut encryption_type = ENCRYPTION_CHACHA20_POLY1305;
+        let mut initial_counter = 0u64;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -72,6 +79,44 @@ impl Options {
                         .ok_or_else(|| anyhow!("--track requires a track name"))?;
                 }
 
+                "--encryption" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "--encryption requires \
+                                 chacha20-poly1305 or aes-256-gcm"
+                            )
+                        })?;
+
+                    encryption_type = match value.to_ascii_lowercase().as_str() {
+                        "chacha20-poly1305" | "chacha20" | "chacha" => {
+                            ENCRYPTION_CHACHA20_POLY1305
+                        }
+
+                        "aes-256-gcm" | "aes256-gcm" | "aes256" => {
+                            ENCRYPTION_AES_256_GCM
+                        }
+
+                        other => {
+                            return Err(anyhow!(
+                                "unsupported encryption algorithm `{other}`; \
+                                 expected chacha20-poly1305 or aes-256-gcm"
+                            ));
+                        }
+                    };
+                }
+
+                "--counter" | "--initial-counter" => {
+                    let value = args.next().ok_or_else(|| {
+                        anyhow!("{arg} requires an unsigned integer")
+                    })?;
+
+                    initial_counter = value.parse::<u64>().with_context(|| {
+                        format!("invalid counter value `{value}`")
+                    })?;
+                }
+
                 "-h" | "--help" => {
                     println!(
                         "usage: publish_encrypted_fmp4 <input.mp4> [options]\n\
@@ -80,6 +125,8 @@ impl Options {
                            --relay <url>       relay URL\n\
                            --broadcast <name>  broadcast name\n\
                            --track <name>      track name\n\
+                           --encryption <alg>  chacha20-poly1305 or aes-256-gcm\n\
+                           --counter <number>  initial encryption counter\n\
                            --raw               write binary encrypted frames\n\
                          \n\
                          environment:\n\
@@ -102,6 +149,8 @@ impl Options {
             broadcast_name,
             track_name,
             raw,
+            encryption_type,
+            initial_counter,
         })
     }
 }
@@ -146,14 +195,31 @@ async fn main() -> Result<()> {
         }
     };
 
-    let encrypter = MoqSecureEncrypter::new(
+    let algorithm_name = match options.encryption_type {
+        ENCRYPTION_CHACHA20_POLY1305 => "ChaCha20-Poly1305",
+        ENCRYPTION_AES_256_GCM => "AES-256-GCM",
+        _ => unreachable!(),
+    };
+
+    eprintln!(
+        "using encryption algorithm: {algorithm_name}; initial counter: {}",
+        options.initial_counter
+    );
+
+    let encrypter = MoqSecureEncrypter::new_with_encryption_type(
         key_store,
         signing_key,
         key_id,
         0,
         false,
         0,
-        0,
+        options.initial_counter,
+        options.encryption_type,
+    );
+
+    eprintln!(
+        "encrypter initialized with algorithm ID {}",
+        encrypter.encryption_type()
     );
 
     eprintln!("connecting to relay: {}", options.relay_url);
@@ -347,7 +413,6 @@ async fn run_publisher(
         .context("announcing broadcast")?;
 
     eprintln!("broadcast created locally: `{broadcast_name}`");
-
     eprintln!("creating catalog");
 
     let catalog = moq_mux::catalog::Producer::new(&mut broadcast)?;
@@ -485,9 +550,7 @@ async fn run_subscriber(
 
                 match broadcast.track(&track_name) {
                     Ok(track) => match track.subscribe(None).await {
-                        Ok(track) => {
-                            break Ok::<_, anyhow::Error>(track);
-                        }
+                        Ok(track) => break Ok::<_, anyhow::Error>(track),
 
                         Err(error) => {
                             eprintln!(
@@ -599,8 +662,6 @@ async fn consume_raw_track(
                                  skipping stale group"
                             );
 
-                            // Do not terminate the subscriber. Continue
-                            // waiting for the next available group.
                             continue 'groups;
                         }
 
@@ -638,7 +699,6 @@ async fn consume_raw_track(
         }
     }
 }
-
 
 // -------------------------------------------------------------------------
 // Key decoding and output
@@ -704,11 +764,8 @@ fn print_encrypted_frame(payload: &[u8], raw: bool) -> Result<()> {
         }
     }
 
-    writeln!(stdout)
-        .context("writing frame newline")?;
-
-    stdout.flush()
-        .context("flushing frame output")?;
+    writeln!(stdout).context("writing frame newline")?;
+    stdout.flush().context("flushing frame output")?;
 
     Ok(())
 }
