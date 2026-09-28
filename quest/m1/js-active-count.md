@@ -21,7 +21,3 @@ the count instead of the quiet timer.
   land without waiting out the quiet gap.
 
 Public API: none. Wire: the extension, already specified.
-
-## Required
-
-- [JS caught up](/quest/m1/js-announce-caught-up.md) - the per-source guard the count lands
