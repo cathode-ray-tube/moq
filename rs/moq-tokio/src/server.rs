@@ -1470,6 +1470,14 @@ impl Request {
 		request_ref!(self, r => r.peer_hop())
 	}
 
+	/// The credential a moq-transport client presented in its SETUP's `AUTHORIZATION
+	/// TOKEN` option, unverified. moq-lite sessions return `None`.
+	///
+	/// Like [`query`](Self::query), it can hold a credential. Avoid logging it.
+	pub fn token(&self) -> Option<&moq_net::setup::Token> {
+		request_ref!(self, r => r.token())
+	}
+
 	/// The client certificate chain the peer presented, if any, validated
 	/// against a configured [`crate::tls::Listen::root`] during the handshake.
 	///
@@ -1490,10 +1498,8 @@ mod tests {
 	async fn next_update(announced: &mut moq_net::announce::Consumer) -> Option<(moq_net::announce::Announce, bool)> {
 		loop {
 			return match announced.next().await? {
-				moq_net::announce::Event::Announced(route) | moq_net::announce::Event::Updated(route) => {
-					Some((route, true))
-				}
-				moq_net::announce::Event::Retracted(route) => Some((route, false)),
+				moq_net::announce::Event::Start(route) | moq_net::announce::Event::Update(route) => Some((route, true)),
+				moq_net::announce::Event::End(route) => Some((route, false)),
 				moq_net::announce::Event::Live => continue,
 			};
 		}

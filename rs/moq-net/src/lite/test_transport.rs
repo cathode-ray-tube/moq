@@ -133,7 +133,8 @@ impl poll::SendStream for SinkSend {
 		Poll::Ready(Ok(buf.len()))
 	}
 
-	fn set_priority(&mut self, order: u8) {
+	fn set_priority(&mut self, order: i32) {
+		let order = u8::try_from(order).expect("moq-net sends u8 send orders");
 		self.log.priorities.lock().unwrap().push(order);
 	}
 
@@ -672,6 +673,12 @@ impl ScriptedSession {
 			eof: true,
 			..Self::per_stream(scripts)
 		}
+	}
+
+	/// Append to the shared script: the peer sending more on a stream it already opened.
+	/// Nothing is woken, so the test re-polls the reader itself.
+	pub fn push(&self, bytes: &[u8]) {
+		self.script.lock().unwrap().extend_from_slice(bytes);
 	}
 
 	/// Answer each stream from `scripts`, but only once the gate opens: a peer that

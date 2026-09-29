@@ -143,14 +143,16 @@ async function withPublisher<T>(relay: RelayFixture, path: string, run: () => Pr
 	const broadcast = origin.createBroadcast(Moq.Path.from(path));
 	const track = broadcast.createTrack(TRACK);
 	const missing = broadcast.createTrack("missing");
+	const used = track.demand().used;
+	const missingUsed = missing.demand().used;
 	broadcast.announce();
 	const connection = await Moq.Connection.connect({ url: new URL(relay.url), publish: origin.consume() });
 
 	let stopped = false;
 	const writer = (async () => {
 		while (!stopped && track.closed.peek() === undefined) {
-			if (!track.used.peek()) {
-				await Promise.race([track.used.changed(), track.closed]);
+			if (!used.peek()) {
+				await Promise.race([used.changed(), track.closed]);
 				continue;
 			}
 			const group = track.appendGroup();
@@ -158,15 +160,15 @@ async function withPublisher<T>(relay: RelayFixture, path: string, run: () => Pr
 				group.writeFrame({ payload: frame, timestamp: Moq.Time.Timestamp.now() });
 			}
 			group.close();
-			await Promise.race([sleep(GROUP_INTERVAL_MS), track.used.changed(), track.closed]);
+			await Promise.race([sleep(GROUP_INTERVAL_MS), used.changed(), track.closed]);
 		}
 		track.close();
 	})();
 	const rejecting = (async () => {
-		while (!missing.used.peek() && missing.closed.peek() === undefined) {
-			await Promise.race([missing.used.changed(), missing.closed]);
+		while (!missingUsed.peek() && missing.closed.peek() === undefined) {
+			await Promise.race([missingUsed.changed(), missing.closed]);
 		}
-		if (missing.used.peek()) missing.close(new Error("no such track: missing"));
+		if (missingUsed.peek()) missing.close(new Error("no such track: missing"));
 	})();
 
 	try {
@@ -354,7 +356,74 @@ const CASES: Case[] = [
 			});
 		},
 	},
+	{
+		// Freeing a session closes it, so a call still waiting on it has to reject
+		// rather than hang or take the page's wasm down with it.
+		name: "free() rejects a pending consume",
+		run: async (wasm, relay) => {
+			const session = await connect(wasm, relay);
+			const pending = session.consume(`wasm-test/${relay.name}-never-announced`);
+			session.free();
+			const resolved = await pending.then(
+				(broadcast) => {
+					broadcast?.free();
+					return true;
+				},
+				() => false,
+			);
+			if (resolved) throw new Error("consume resolved after the session was freed, want a rejection");
+			await expectUsable(wasm, relay);
+		},
+	},
+	{
+		// Freeing a handle cancels its pending call, even one that could finish
+		// right away, and releases what the call held; the page keeps working.
+		name: "free() cancels a pending read",
+		run: async (wasm, relay) => {
+			const path = `wasm-test/${relay.name}-free`;
+			await withPublisher(relay, path, async () => {
+				await withSession(wasm, relay, async (session) => {
+					const broadcast = await consume(session, path);
+					const track = await broadcast.subscribe(TRACK);
+					const pendingTrack = broadcast.subscribe(TRACK);
+					broadcast.free();
+					await expectCancelled("subscribe", pendingTrack, (track) => track.free());
+
+					const group = await track.recvGroup();
+					if (!group) throw new Error("track ended before its first group");
+					const pendingGroup = track.recvGroup();
+					track.free();
+					await expectCancelled("recvGroup", pendingGroup, (group) => group?.free());
+
+					const frame = group.readFrame();
+					group.free();
+					await expectCancelled("readFrame", frame, () => {});
+				});
+			});
+			await expectUsable(wasm, relay);
+		},
+	},
 ];
+
+/** Fail unless `pending` rejects, releasing whatever it resolved with instead. */
+async function expectCancelled<T>(what: string, pending: Promise<T>, release: (value: T) => void): Promise<void> {
+	const resolved = await pending.then(
+		(value) => {
+			release(value);
+			return true;
+		},
+		() => false,
+	);
+	if (resolved) throw new Error(`${what} resolved after its handle was freed, want a rejection`);
+}
+
+/** Fail unless a fresh session still works, which a corrupted wasm heap would not. */
+async function expectUsable(wasm: Wasm, relay: RelayFixture): Promise<void> {
+	await withSession(wasm, relay, async (session) => {
+		const version = session.version();
+		if (version !== relay.version) throw new Error(`version is "${version}", want "${relay.version}"`);
+	});
+}
 
 /** Run every case against every relay, sequentially, and report each outcome. */
 async function run(config: Config): Promise<CaseResult[]> {

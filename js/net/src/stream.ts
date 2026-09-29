@@ -3,8 +3,20 @@ import { fromTransport, StreamCode, StreamError, toStreamCode, toTransport } fro
 import type { IetfVersion } from "./ietf/version.ts";
 import { Version } from "./ietf/version.ts";
 import { TimeoutError, withTimeout } from "./util/timeout.ts";
+import { POW32, toBigInt, toNumber, U64 } from "./util/u64.ts";
 import { decodeUtf8 } from "./util/utf8.ts";
-import * as Varint from "./varint.ts";
+import {
+	lengthLeadingOnes,
+	lengthQuic,
+	parts,
+	peekLeadingOnes,
+	peekQuic,
+	readLeadingOnes,
+	readQuic,
+	split,
+	writeLeadingOnes,
+	writeQuic,
+} from "./util/varint.ts";
 
 // Decode raw transport errors before mapping so they cannot bypass the negotiated
 // registry. Ordinary errors already send 0 and retain their local identity.
@@ -180,10 +192,16 @@ export class Stream {
 // Reader wraps a stream and provides convience methods for reading pieces from a stream
 // Unfortunately we can't use a BYOB reader because it's not supported with WebTransport+WebWorkers yet.
 export class Reader {
+	// Contiguous unread bytes, followed by chunks not yet joined onto it. Joining only once a
+	// read needs the bytes keeps a frame arriving in N chunks linear rather than quadratic.
 	#buffer: Uint8Array;
+	#chunks: Uint8Array[] = [];
+	#chunked = 0; // bytes across #chunks
 	#stream?: ReadableStream<Uint8Array>; // if undefined, the buffer is consumed then EOF
 	#reader?: ReadableStreamDefaultReader<Uint8Array>;
 	#closed?: Promise<void>;
+	// The decode that last ran short and how far, so a retry can wait for those bytes.
+	#short?: { decode: (c: Cursor) => unknown; err: Short };
 	version?: IetfVersion;
 
 	// Either stream or buffer MUST be provided.
@@ -216,16 +234,8 @@ export class Reader {
 			throw new Error("unexpected empty chunk");
 		}
 
-		const buffer = result.value;
-
-		if (this.#buffer.byteLength === 0) {
-			this.#buffer = new Uint8Array(buffer);
-		} else {
-			const temp = new Uint8Array(this.#buffer.byteLength + buffer.byteLength);
-			temp.set(this.#buffer);
-			temp.set(buffer, this.#buffer.byteLength);
-			this.#buffer = temp;
-		}
+		this.#chunks.push(result.value);
+		this.#chunked += result.value.byteLength;
 
 		return true;
 	}
@@ -236,11 +246,36 @@ export class Reader {
 			throw new Error(`read size ${size} exceeds max size ${MAX_READ_SIZE}`);
 		}
 
-		while (this.#buffer.byteLength < size) {
+		if (this.#buffer.byteLength >= size) return;
+
+		while (this.#buffer.byteLength + this.#chunked < size) {
 			if (!(await this.#fill())) {
 				throw new Error("unexpected end of stream");
 			}
 		}
+
+		this.#join();
+	}
+
+	// Move every pending chunk into the buffer, copying only when there's more than one piece.
+	#join() {
+		if (this.#chunks.length === 0) return;
+
+		if (this.#buffer.byteLength === 0 && this.#chunks.length === 1) {
+			this.#buffer = this.#chunks[0];
+		} else {
+			const joined = new Uint8Array(this.#buffer.byteLength + this.#chunked);
+			joined.set(this.#buffer);
+			let offset = this.#buffer.byteLength;
+			for (const chunk of this.#chunks) {
+				joined.set(chunk, offset);
+				offset += chunk.byteLength;
+			}
+			this.#buffer = joined;
+		}
+
+		this.#chunks = [];
+		this.#chunked = 0;
 	}
 
 	// Consumes the first size bytes of the buffer.
@@ -255,125 +290,102 @@ export class Reader {
 		return result;
 	}
 
+	/**
+	 * Run a synchronous decode over the buffered bytes and consume what it read.
+	 *
+	 * Returns undefined and consumes nothing when the decode ran past the buffered bytes, so a
+	 * caller can drain every complete message already here without waiting on the stream.
+	 */
+	tryDecode<T extends NonNullable<unknown>>(decode: (c: Cursor) => T): T | undefined {
+		const result = this.#try(decode);
+		return result instanceof Short ? undefined : result;
+	}
+
+	/** Run a synchronous decode, filling from the stream until it has the bytes it needs. */
+	async decode<T>(decode: (c: Cursor) => T): Promise<T> {
+		for (;;) {
+			const result = this.#try(decode);
+			if (!(result instanceof Short)) return result;
+			await this.#fillTo(result.need);
+		}
+	}
+
+	/** Like {@link decode}, but returns undefined if the stream ends cleanly first. */
+	async decodeMaybe<T>(decode: (c: Cursor) => T): Promise<T | undefined> {
+		if (await this.done()) return undefined;
+		return this.decode(decode);
+	}
+
+	#try<T>(decode: (c: Cursor) => T): T | Short {
+		// A retry of the decode that last ran short, before the bytes it needs have arrived,
+		// would only throw again. Every decode reads at least a byte, so none can succeed on
+		// an empty buffer either.
+		const available = this.#buffer.byteLength + this.#chunked;
+		if (available === 0) return EMPTY;
+		if (decode === this.#short?.decode && available < this.#short.err.need) return this.#short.err;
+
+		this.#join();
+		const cursor = new Cursor(this.#buffer, this.version);
+		try {
+			const result = decode(cursor);
+			this.#slice(cursor.offset);
+			this.#short = undefined;
+			return result;
+		} catch (err: unknown) {
+			if (!(err instanceof Short)) throw err;
+			// Filling could never satisfy it, so retrying would spin.
+			if (err.need <= this.#buffer.byteLength) throw new Error("decode ran short of bytes it already had");
+			this.#short = { decode, err };
+			return err;
+		}
+	}
+
 	async read(size: number): Promise<Uint8Array> {
 		if (size === 0) return new Uint8Array();
-
-		await this.#fillTo(size);
-		return this.#slice(size);
+		return this.decode((c) => c.read(size));
 	}
 
 	async readAll(): Promise<Uint8Array> {
 		while (await this.#fill()) {
 			// keep going
 		}
+		this.#join();
 		return this.#slice(this.#buffer.byteLength);
 	}
 
 	async string(): Promise<string> {
-		const length = await this.u53();
-		const buffer = await this.read(length);
-		return decodeUtf8(buffer);
+		return this.decode(STRING);
 	}
 
 	async bool(): Promise<boolean> {
-		const v = await this.u8();
-		if (v === 0) return false;
-		if (v === 1) return true;
-		throw new Error("invalid bool value");
+		return this.decode(BOOL);
 	}
 
 	async u8(): Promise<number> {
-		await this.#fillTo(1);
-		return this.#slice(1)[0];
+		return this.decode(U8);
 	}
 
 	async u16(): Promise<number> {
-		await this.#fillTo(2);
-		const view = new DataView(this.#buffer.buffer, this.#buffer.byteOffset, 2);
-		const result = view.getUint16(0);
-		this.#slice(2);
-		return result;
+		return this.decode(U16);
 	}
 
 	// Returns a Number using 53-bits, the max Javascript can use for integer math.
 	async u53(): Promise<number> {
-		const v = await this.u62();
-		if (v > Varint.MAX_U53) {
-			throw new Error(`value larger than 53-bits: ${v.toString()}`);
-		}
-
-		return Number(v);
+		return this.decode(U53);
 	}
 
 	// NOTE: Returns a bigint instead of a number since it may be larger than 53-bits
 	async u62(): Promise<bigint> {
-		if (isLeadingOnes(this.version)) {
-			return this.#readLeadingOnes();
-		}
-		return this.#readQuicVarint();
+		return this.decode(U62);
 	}
 
-	async #readQuicVarint(): Promise<bigint> {
-		await this.#fillTo(1);
-		const size = (this.#buffer[0] & 0xc0) >> 6;
-
-		if (size === 0) {
-			const first = this.#slice(1)[0];
-			return BigInt(first) & 0x3fn;
-		}
-		if (size === 1) {
-			await this.#fillTo(2);
-			const slice = this.#slice(2);
-			const view = new DataView(slice.buffer, slice.byteOffset, slice.byteLength);
-
-			return BigInt(view.getUint16(0)) & 0x3fffn;
-		}
-		if (size === 2) {
-			await this.#fillTo(4);
-			const slice = this.#slice(4);
-			const view = new DataView(slice.buffer, slice.byteOffset, slice.byteLength);
-
-			return BigInt(view.getUint32(0)) & 0x3fffffffn;
-		}
-		await this.#fillTo(8);
-		const slice = this.#slice(8);
-		const view = new DataView(slice.buffer, slice.byteOffset, slice.byteLength);
-
-		return view.getBigUint64(0) & 0x3fffffffffffffffn;
-	}
-
-	async #readLeadingOnes(): Promise<bigint> {
-		await this.#fillTo(1);
-		const b = this.#buffer[0];
-
-		// Count leading 1-bits
-		let ones = 0;
-		for (let bit = 7; bit >= 0; bit--) {
-			if (b & (1 << bit)) ones++;
-			else break;
-		}
-
-		// 1111110x is a 7-byte form. Draft-17 rejects it; draft-18+ allows it per #1595.
-		if (ones === 6 && this.version === Version.DRAFT_17) {
-			throw new Error("invalid leading-ones varint: 1111110x prefix is reserved on draft-17");
-		}
-
-		let totalSize: number;
-		if (ones <= 5) totalSize = ones + 1;
-		else if (ones === 6) totalSize = 7;
-		else if (ones === 7) totalSize = 8;
-		else totalSize = 9; // ones === 8
-
-		await this.#fillTo(totalSize);
-		const slice = this.#slice(totalSize);
-
-		const [value] = Varint.decodeLeadingOnes(slice);
-		return value;
+	async varint(): Promise<U64> {
+		return this.decode(VARINT);
 	}
 
 	// Returns false if there is more data to read, blocking if it hasn't been received yet.
 	async done(): Promise<boolean> {
-		if (this.#buffer.byteLength > 0) return false;
+		if (this.#buffer.byteLength > 0 || this.#chunked > 0) return false;
 		return !(await this.#fill());
 	}
 
@@ -391,14 +403,192 @@ export class Reader {
 	}
 }
 
+// Thrown by a Cursor read that runs past the buffered bytes, carrying how many bytes from the
+// start of the buffer the decode needs. Not an Error: it ends every chunk, so it must not
+// capture a stack.
+class Short {
+	readonly need: number;
+
+	constructor(need: number) {
+		this.need = need;
+	}
+}
+
+const EMPTY = new Short(1);
+
+/**
+ * A synchronous view over a {@link Reader}'s buffered bytes, handed to {@link Reader.decode}.
+ *
+ * A read past the buffered bytes throws an internal signal that the Reader catches: it consumes
+ * nothing, fills, and runs the decode again from the start. A decode must therefore not mutate
+ * anything before its last read, must not swallow what it throws, and must read at least a byte.
+ */
+export class Cursor {
+	readonly version?: IetfVersion;
+	#buffer: Uint8Array;
+	#offset = 0;
+	// Resolved once, since every varint read branches on it.
+	#leadingOnes: boolean;
+	// First bytes below this are a whole 1-byte varint, and below this + 0x40 a 2-byte one whose
+	// value is the low 6 bits and the next byte. Both formats share that shape; only the bound moves.
+	#short: number;
+	// First bytes below this are a varint of at most 4 bytes: 0xc0 for QUIC, 0xf0 for leading-ones.
+	#word: number;
+
+	constructor(buffer: Uint8Array, version?: IetfVersion) {
+		this.#buffer = buffer;
+		this.version = version;
+		this.#leadingOnes = isLeadingOnes(version);
+		this.#short = this.#leadingOnes ? 0x80 : 0x40;
+		this.#word = this.#leadingOnes ? 0xf0 : 0xc0;
+	}
+
+	/** How many bytes have been read. */
+	get offset(): number {
+		return this.#offset;
+	}
+
+	/** How many buffered bytes are left to read. */
+	get remaining(): number {
+		return this.#buffer.byteLength - this.#offset;
+	}
+
+	/**
+	 * Decode the next `size` bytes on their own. Running past them, or leaving any unread, is
+	 * malformed rather than a reason to wait for more.
+	 */
+	exact<T>(size: number, decode: (c: Cursor) => T): T {
+		const inner = new Cursor(this.read(size), this.version);
+		let result: T;
+		try {
+			result = decode(inner);
+		} catch (err: unknown) {
+			if (err instanceof Short) throw new Error(`message is shorter than its fields: ${size} bytes`);
+			throw err;
+		}
+		if (inner.remaining > 0) throw new Error(`message has ${inner.remaining} unread bytes`);
+		return result;
+	}
+
+	#ensure(size: number) {
+		const need = this.#offset + size;
+		// Checked here too, and on the whole decode like the fill, since bytes that are already
+		// buffered never reach the fill.
+		if (need > MAX_READ_SIZE) throw new Error(`read size ${need} exceeds max size ${MAX_READ_SIZE}`);
+		if (need > this.#buffer.byteLength) throw new Short(need);
+	}
+
+	/** Read `size` bytes, as a view onto the buffer rather than a copy. */
+	read(size: number): Uint8Array {
+		this.#ensure(size);
+		const start = this.#offset;
+		this.#offset += size;
+		return this.#buffer.subarray(start, this.#offset);
+	}
+
+	string(): string {
+		return decodeUtf8(this.read(this.u53()));
+	}
+
+	bool(): boolean {
+		const v = this.u8();
+		if (v === 0) return false;
+		if (v === 1) return true;
+		throw new Error("invalid bool value");
+	}
+
+	u8(): number {
+		this.#ensure(1);
+		return this.#buffer[this.#offset++];
+	}
+
+	u16(): number {
+		this.#ensure(2);
+		const b = this.#buffer;
+		const o = this.#offset;
+		this.#offset += 2;
+		return (b[o] << 8) | b[o + 1];
+	}
+
+	/** Read a varint as a `number`, throwing if it is above `Number.MAX_SAFE_INTEGER`. */
+	u53(): number {
+		// Most varints are 1 or 2 bytes, which skip the general decode.
+		this.#ensure(1);
+		const b = this.#buffer;
+		const o = this.#offset;
+		const first = b[o];
+		if (first < this.#short) {
+			this.#offset = o + 1;
+			return first;
+		}
+		if (first < this.#short + 0x40) {
+			this.#ensure(2);
+			this.#offset = o + 2;
+			return ((first & 0x3f) << 8) | b[o + 1];
+		}
+		// Up to 4 bytes still fits 28 (leading-ones) or 30 (QUIC) bits, with no upper half.
+		if (first < this.#word) {
+			const size = this.#leadingOnes ? peekLeadingOnes(first) : 4;
+			this.#ensure(size);
+			this.#offset = o + size;
+			if (size === 3) return ((first & 0x1f) << 16) | (b[o + 1] << 8) | b[o + 2];
+			return ((first & (this.#leadingOnes ? 0x0f : 0x3f)) << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3];
+		}
+		const lo = this.#varint();
+		return toNumber(parts.hi, lo);
+	}
+
+	/** Read a varint as a bigint. A leading-ones varint may exceed 62 bits. */
+	u62(): bigint {
+		const lo = this.#varint();
+		return toBigInt(parts.hi, lo);
+	}
+
+	/** Read a varint. */
+	varint(): U64 {
+		const lo = this.#varint();
+		return new U64(parts.hi, lo);
+	}
+
+	// Decode the next varint in the version's format, returning its lower half and leaving the upper in `parts`.
+	#varint(): number {
+		this.#ensure(1);
+		const b = this.#buffer;
+		const o = this.#offset;
+		let size: number;
+		if (this.#leadingOnes) {
+			size = peekLeadingOnes(b[o]);
+			// 1111110x is a 7-byte form. Draft-17 rejects it; draft-18+ allows it per #1595.
+			if (size === 7 && this.version === Version.DRAFT_17) {
+				throw new Error("invalid leading-ones varint: 1111110x prefix is reserved on draft-17");
+			}
+			this.#ensure(size);
+			this.#offset += size;
+			return readLeadingOnes(b, o, size);
+		}
+		size = peekQuic(b[o]);
+		this.#ensure(size);
+		this.#offset += size;
+		return readQuic(b, o, size);
+	}
+}
+
+// Shared decodes for the Reader's async primitives, so a read allocates no closure.
+const STRING = (c: Cursor) => c.string();
+const BOOL = (c: Cursor) => c.bool();
+const U8 = (c: Cursor) => c.u8();
+const U16 = (c: Cursor) => c.u16();
+const U53 = (c: Cursor) => c.u53();
+const U62 = (c: Cursor) => c.u62();
+const VARINT = (c: Cursor) => c.varint();
+
 // Writer wraps a stream and writes chunks of data
 export class Writer {
 	#writer: WritableStreamDefaultWriter<Uint8Array>;
 	#stream: WritableStream<Uint8Array>;
 	#closed?: Promise<void>;
 
-	// Scratch buffer for writing varints.
-	// Fixed at 9 bytes (leading-ones max).
+	// Scratch buffer for each primitive write, sized for the longest (a 9-byte leading-ones varint).
 	#scratch: ArrayBuffer;
 
 	version?: IetfVersion;
@@ -444,7 +634,7 @@ export class Writer {
 			throw new Error(`overflow, value larger than 32-bits: ${v.toString()}`);
 		}
 
-		// We don't use a VarInt, so it always takes 4 bytes.
+		// We don't use a varint, so it always takes 4 bytes.
 		// This could be improved but nothing is standardized yet.
 		await this.write(setInt32(this.#scratch, v));
 	}
@@ -453,19 +643,28 @@ export class Writer {
 		if (!Number.isSafeInteger(v) || v < 0) {
 			throw new RangeError(`invalid u53: ${v}`);
 		}
-		if (isLeadingOnes(this.version)) {
-			await this.write(Varint.encodeLeadingOnesTo(this.#scratch, v));
-		} else {
-			await this.write(Varint.encodeTo(this.#scratch, v));
-		}
+		await this.#varint(Math.floor(v / POW32), v >>> 0);
 	}
 
 	async u62(v: bigint) {
+		const lo = split(v);
+		await this.#varint(parts.hi, lo);
+	}
+
+	async varint(v: U64) {
+		await this.#varint(v.hi, v.lo);
+	}
+
+	#varint(hi: number, lo: number): Promise<void> {
+		let buf: Uint8Array;
 		if (isLeadingOnes(this.version)) {
-			await this.write(Varint.encodeLeadingOnesTo(this.#scratch, v));
+			buf = new Uint8Array(this.#scratch, 0, lengthLeadingOnes(hi, lo));
+			writeLeadingOnes(buf, hi, lo, buf.length);
 		} else {
-			await this.write(Varint.encodeTo(this.#scratch, v));
+			buf = new Uint8Array(this.#scratch, 0, lengthQuic(hi, lo));
+			writeQuic(buf, hi, lo, buf.length);
 		}
+		return this.write(buf);
 	}
 
 	async write(v: Uint8Array) {

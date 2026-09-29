@@ -387,6 +387,16 @@ func (f *VideoDecodedFrame) Pixels(format VideoPixelFormat) ([]byte, error) {
 	return f.inner.Pixels(format)
 }
 
+// Surface borrows the decoder's surface, or returns nil when the frame is in CPU
+// memory. Only a DecodeVideo with VideoDecoderOutput.Surface set produces one,
+// and it stays valid until Close.
+func (f *VideoDecodedFrame) Surface() VideoSurface {
+	if surface := f.inner.Surface(); surface != nil {
+		return *surface
+	}
+	return nil
+}
+
 // Close releases the frame's surface back to the decoder.
 func (f *VideoDecodedFrame) Close() {
 	f.inner.Destroy()

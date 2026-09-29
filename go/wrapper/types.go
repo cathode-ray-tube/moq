@@ -50,15 +50,15 @@ type (
 	// Route serving it. It carries no broadcast; resolve a path with
 	// [OriginConsumer.RequestBroadcast].
 	Announce = ffi.MoqAnnounce
-	// AnnounceEvent is what an AnnounceConsumer yields: AnnounceEventAnnounced,
-	// AnnounceEventUpdated, AnnounceEventRetracted, or AnnounceEventLive.
+	// AnnounceEvent is what an AnnounceConsumer yields: AnnounceEventStart,
+	// AnnounceEventUpdate, AnnounceEventEnd, or AnnounceEventLive.
 	AnnounceEvent = ffi.MoqAnnounceEvent
-	// AnnounceEventAnnounced reports a route now covering a prefix that had none.
-	AnnounceEventAnnounced = ffi.MoqAnnounceEventAnnounced
-	// AnnounceEventUpdated reports the route covering a prefix changing hops or cost.
-	AnnounceEventUpdated = ffi.MoqAnnounceEventUpdated
-	// AnnounceEventRetracted reports that no route covers a prefix any more, carrying its last route.
-	AnnounceEventRetracted = ffi.MoqAnnounceEventRetracted
+	// AnnounceEventStart reports a route now covering a prefix that had none.
+	AnnounceEventStart = ffi.MoqAnnounceEventStart
+	// AnnounceEventUpdate reports the route covering a prefix changing hops or cost.
+	AnnounceEventUpdate = ffi.MoqAnnounceEventUpdate
+	// AnnounceEventEnd reports that no route covers a prefix any more, carrying its last route.
+	AnnounceEventEnd = ffi.MoqAnnounceEventEnd
 	// AnnounceEventLive reports that every route live at subscribe time has been
 	// delivered; what follows is live changes. Yielded once.
 	AnnounceEventLive = ffi.MoqAnnounceEventLive
@@ -70,8 +70,12 @@ type (
 	Video = ffi.MoqVideo
 	// VideoHint supplies catalog fields a video stream can't reveal itself, such as bitrate, filling only the gaps.
 	VideoHint = ffi.MoqVideoHint
-	// VideoDecoderOutput configures what DecodeVideo delivers: an optional resize, a max age, and whether frames keep the decoder's native surface.
+	// VideoDecoderOutput configures what DecodeVideo delivers: an optional resize, a max age, and whether frames keep the decoder's surface (macOS only; refused elsewhere).
 	VideoDecoderOutput = ffi.MoqVideoDecoderOutput
+	// VideoSurface is a decoded frame's platform surface, from VideoDecodedFrame.Surface: VideoSurfacePixelBuffer on macOS.
+	VideoSurface = ffi.MoqVideoSurface
+	// VideoSurfacePixelBuffer is a macOS CVPixelBufferRef (IOSurface-backed NV12), as the address in Pointer.
+	VideoSurfacePixelBuffer = ffi.MoqVideoSurfacePixelBuffer
 	// AudioFormat is a single audio codec an importer can parse.
 	AudioFormat = ffi.MoqAudioFormat
 	// VideoFormat is a single video codec an importer can parse.

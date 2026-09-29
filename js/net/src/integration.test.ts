@@ -104,14 +104,14 @@ async function runPublishSubscribeFlow(protocol: string, version?: number) {
 	const entry = await nextRoute(announced);
 	if (!entry) throw new Error("expected entry");
 	expect(entry.prefix).toBe("test" as Path.Valid);
-	expect(entry.kind).toBe("announced");
+	expect(entry.kind).toBe("start");
 
 	// Scoped discovery only echoes the suffix on the wire, but presents the whole path.
 	const prefixed = client.announced(Path.Pattern.subtree(Path.from("root")));
 	const prefixedEntry = await nextRoute(prefixed);
 	if (!prefixedEntry) throw new Error("expected prefixed entry");
 	expect(prefixedEntry.prefix).toBe("root/child" as Path.Valid);
-	expect(prefixedEntry.kind).toBe("announced");
+	expect(prefixedEntry.kind).toBe("start");
 
 	// Client consumes the broadcast and subscribes to a track
 	const remote = wireOf(client).consume(Path.from("test"));
@@ -388,28 +388,28 @@ test("integration: lite draft-06 announce lifecycle", async () => {
 	let entry = await nextRoute(announced);
 	if (!entry) throw new Error("expected announce");
 	expect(entry.prefix).toBe("first" as Path.Valid);
-	expect(entry.kind).toBe("announced");
+	expect(entry.kind).toBe("start");
 
 	// A live announce.
 	const second = publish(origin, Path.from("second"));
 	entry = await nextRoute(announced);
 	if (!entry) throw new Error("expected announce");
 	expect(entry.prefix).toBe("second" as Path.Valid);
-	expect(entry.kind).toBe("announced");
+	expect(entry.kind).toBe("start");
 
 	// Unannounce: retracted by announce id on the wire.
 	second.close();
 	entry = await nextRoute(announced);
 	if (!entry) throw new Error("expected unannounce");
 	expect(entry.prefix).toBe("second" as Path.Valid);
-	expect(entry.kind).toBe("retracted");
+	expect(entry.kind).toBe("end");
 
 	// Re-announce the same path: a fresh announce assigning a fresh id.
 	const secondAgain = publish(origin, Path.from("second"));
 	entry = await nextRoute(announced);
 	if (!entry) throw new Error("expected re-announce");
 	expect(entry.prefix).toBe("second" as Path.Valid);
-	expect(entry.kind).toBe("announced");
+	expect(entry.kind).toBe("start");
 
 	// Cleanup
 	first.close();
@@ -1236,12 +1236,12 @@ async function runSubscriberTeardown(protocol: string, version?: number) {
 	expect(await sub.readString()).toBe("hello");
 
 	// The publisher now has a live downstream reader for the track.
-	await waitUntil(() => video.used.peek());
+	await waitUntil(() => video.demand().used.peek());
 
 	// Closing the only subscriber must tear the wire subscription down, so demand drops on the
 	// publisher rather than the relay serving groups to nobody.
 	sub.close();
-	await waitUntil(() => !video.used.peek());
+	await waitUntil(() => !video.demand().used.peek());
 
 	broadcast.close();
 	remote.close();
@@ -1287,11 +1287,11 @@ test("integration: ietf draft-14 subscriber teardown on last unsubscribe", async
 	const remote = wireOf(client).consume(Path.from("test"));
 	const sub = remote.track("video").subscribe().ordered();
 	expect(await sub.readString()).toBe("hello");
-	await waitUntil(() => served?.used.peek() === true);
+	await waitUntil(() => served?.demand().used.peek() === true);
 
 	// Closing the subscriber sends Unsubscribe and tears the subscription down, so demand drops.
 	sub.close();
-	await waitUntil(() => served?.used.peek() === false);
+	await waitUntil(() => served?.demand().used.peek() === false);
 
 	broadcast.close();
 	await serving;
@@ -1360,17 +1360,17 @@ test("integration: lite fan-out keeps the upstream until the last subscriber lea
 	const b = remote.track("video").subscribe().ordered();
 	expect(await a.readString()).toBe("hello");
 	expect(await b.readString()).toBe("hello");
-	await waitUntil(() => video.used.peek());
+	await waitUntil(() => video.demand().used.peek());
 
 	// Closing one leaves the shared upstream serving the other.
 	a.close();
 	video.writeString("more");
 	expect(await b.readString()).toBe("more");
-	expect(video.used.peek()).toBe(true);
+	expect(video.demand().used.peek()).toBe(true);
 
 	// The last close tears it down.
 	b.close();
-	await waitUntil(() => !video.used.peek());
+	await waitUntil(() => !video.demand().used.peek());
 
 	broadcast.close();
 	remote.close();
@@ -1397,10 +1397,10 @@ test("integration: lite re-subscribe re-opens the upstream after each teardown",
 		video.writeString(`hello-${i}`);
 		const sub = remote.track("video").subscribe().ordered();
 		expect(await sub.readString()).toBe(`hello-${i}`);
-		await waitUntil(() => video.used.peek());
+		await waitUntil(() => video.demand().used.peek());
 
 		sub.close();
-		await waitUntil(() => !video.used.peek());
+		await waitUntil(() => !video.demand().used.peek());
 	}
 
 	broadcast.close();
@@ -1442,6 +1442,50 @@ test("integration: lite coalesced fetch stays until every reader abandons the op
 	await waitUntil(() => !group.used.peek());
 
 	group.close();
+	broadcast.close();
+	remote.close();
+	client.close();
+	server.close();
+});
+
+// A fetch that coalesces after the last reader left, but before the FETCH is cancelled, re-arms
+// the demand watch. The frame read in flight across that re-arm must still reach the group. The
+// window is a few microtasks wide, so the late reader arrives after every delay across it.
+test("integration: lite fetch re-armed by a late reader keeps every frame", async () => {
+	const pair = createMockTransportPair(Lite.ALPN_06);
+	const origin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	const broadcast = publish(origin, Path.from("test"));
+	const video = broadcast.createTrack("video");
+	const remote = wireOf(client).consume(Path.from("test"));
+
+	for (let delay = 0; delay <= 12; delay++) {
+		const group = video.appendGroup(); // open
+		group.writeString("hello");
+
+		const f1 = await remote.track("video").fetchGroup(group.sequence);
+		expect(await f1.readString()).toBe("hello");
+
+		f1.close();
+		for (let i = 0; i < delay; i++) await Promise.resolve();
+		const f2 = await remote.track("video").fetchGroup(group.sequence);
+		expect(await f2.readString()).toBe("hello");
+
+		group.writeString("more");
+		const more = await Promise.race([
+			f2.readString(),
+			new Promise<string>((resolve) => setTimeout(() => resolve("dropped"), 500)),
+		]);
+		expect(`${delay}: ${more}`).toBe(`${delay}: more`);
+
+		f2.close();
+		group.close();
+	}
+
 	broadcast.close();
 	remote.close();
 	client.close();
@@ -1913,7 +1957,7 @@ async function runOriginFlow(protocol: string, version?: number) {
 	// The announcement lands in the client's origin.
 	const reader = clientOrigin.consume();
 	const announced = reader.announced();
-	expect(await nextRoute(announced)).toMatchObject({ prefix: Path.from("test"), kind: "announced" });
+	expect(await nextRoute(announced)).toMatchObject({ prefix: Path.from("test"), kind: "start" });
 
 	// Consuming through the origin reaches the wire.
 	const remote = await routed(reader, Path.from("test"));
@@ -1923,7 +1967,7 @@ async function runOriginFlow(protocol: string, version?: number) {
 
 	// Unpublishing retracts the entry over the wire and out of the origin.
 	broadcast.close();
-	expect(await nextRoute(announced)).toMatchObject({ prefix: Path.from("test"), kind: "retracted" });
+	expect(await nextRoute(announced)).toMatchObject({ prefix: Path.from("test"), kind: "end" });
 	await until(() => !wireOf(reader).routes(Path.from("test")));
 
 	await serving;
@@ -2274,7 +2318,7 @@ test("create then announce is discoverable on the wire", async () => {
 	broadcast.announce();
 	const entry = await pending;
 	expect(entry?.prefix).toBe("later" as Path.Valid);
-	expect(entry?.kind).toBe("announced");
+	expect(entry?.kind).toBe("start");
 
 	announced.close();
 	broadcast.close();
@@ -2304,7 +2348,7 @@ test("a handle serves a request under live/** over the wire", async () => {
 	const announced = client.announced();
 	const entry = await nextRoute(announced);
 	expect(entry?.prefix).toBe("live" as Path.Valid);
-	expect(entry?.kind).toBe("announced");
+	expect(entry?.kind).toBe("start");
 
 	const remote = wireOf(client).consume(Path.from("live/cam"));
 	const track = remote.track("chat").subscribe().ordered();
@@ -2438,7 +2482,7 @@ async function caughtUp(protocol: string, version: number | undefined, paths: st
 		const event = await withTimeout(announced.next(), 2000, `${protocol || version}: never caught up`);
 		if (!event) throw new Error("announcements ended");
 		if (event.kind === "live") break;
-		if (event.kind !== "announced") throw new Error(`only announcements before the marker: got ${event.kind}`);
+		if (event.kind !== "start") throw new Error(`only announcements before the marker: got ${event.kind}`);
 		seen.push(event.prefix);
 	}
 

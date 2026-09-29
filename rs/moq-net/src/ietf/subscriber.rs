@@ -1883,6 +1883,7 @@ where
 		}
 
 		let mut fetch_done = fetching.is_none();
+		let demand = track.demand();
 		let cancelled = {
 			let mut done = std::pin::pin!(Self::read_publish_done(&mut stream.reader, self.version));
 			loop {
@@ -1893,7 +1894,7 @@ where
 					{
 						fetch_done = true;
 					}
-					if track.poll_unused(waiter).is_ready() {
+					if demand.poll_unused(waiter).is_ready() {
 						return Poll::Ready(End::Unused);
 					}
 					waiter.poll_future(done.as_mut()).map(End::Done)

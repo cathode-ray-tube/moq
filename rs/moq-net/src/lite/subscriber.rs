@@ -219,14 +219,14 @@ impl<S: crate::transport::poll::Session> Subscriber<S> {
 			lite::AnnounceBroadcast::Ended { suffix, .. } => {
 				let path = prefix.join(&suffix);
 				tracing::debug!(broadcast = %self.log_path(&path), "unannounced");
-				run.announced.retire(&path);
+				run.announced.withdraw(&path);
 			}
 			lite::AnnounceBroadcast::EndedId { id } => {
 				// Resolve and retire the id; an unknown or already-retired id is a
 				// protocol violation.
 				let path = prefix.join(&run.decoder.end(id)?);
 				tracing::debug!(broadcast = %self.log_path(&path), "unannounced");
-				run.announced.retire(&path);
+				run.announced.withdraw(&path);
 			}
 			lite::AnnounceBroadcast::Restart { id, hops, cost } => {
 				// Resolve the id; it stays live (the replacement reuses it). An unknown
@@ -368,13 +368,9 @@ impl<S: crate::transport::poll::Session> Subscriber<S> {
 
 	/// Handle a RESTART (an explicit restart status, or a duplicate ANNOUNCE on lite-05).
 	///
-	/// The first hop of the chain identifies the original publisher. When it matches
-	/// the prior advertisement and is a real identity, the broadcast is the same
-	/// content on a new path: this session's route metadata updates in place,
-	/// in-flight tracks keep flowing, and the origin only hands over if the winner
-	/// changed. Consumers observe nothing. When the first hop differs, or is
-	/// [`Hop::UNKNOWN`](crate::Hop::UNKNOWN), the old route detaches gracefully
-	/// and a fresh one attaches, so downstream sees a real Ended + Active.
+	/// A restart carries no content claim, so this session's route re-prices in
+	/// place whatever the new chain says: in-flight tracks keep flowing and the
+	/// origin only hands over if the winner changed.
 	/// The advertisement is already live, so this can attach a route even when the
 	/// original advertisement was declined locally.
 	///
@@ -2701,7 +2697,7 @@ mod tests {
 			.unwrap();
 		cursor.assert_next_active("room/host");
 		assert!(announced.contains(&path.clone()), "the announce was not recorded");
-		announced.retire(&path.clone());
+		announced.withdraw(&path);
 		cursor.assert_next_ended("room/host");
 	}
 
@@ -2815,8 +2811,8 @@ struct SubStream<S: crate::transport::poll::Session> {
 	tail: kio::Producer<Tail>,
 	/// The first group the publisher serves (SUBSCRIBE_START), once declared.
 	served: Option<u64>,
-	/// The track's exclusive end (SUBSCRIBE_END), once declared.
-	end: Option<u64>,
+	/// The track's exclusive end and stream count (SUBSCRIBE_END), once declared.
+	end: Option<lite::SubscribeEnd>,
 }
 
 impl<S: crate::transport::poll::Session> SubStream<S> {
@@ -2825,7 +2821,7 @@ impl<S: crate::transport::poll::Session> SubStream<S> {
 	/// `None` when nothing says which: drafts before SUBSCRIBE_END only have the FIN.
 	/// Without a SUBSCRIBE_START the publisher served no group at all.
 	fn owed(&self, requested_end: Option<u64>) -> Option<std::ops::Range<u64>> {
-		let end = self.end?;
+		let end = self.end.as_ref()?.group;
 		let end = requested_end.map_or(end, |requested| requested.min(end));
 		Some(self.served.unwrap_or(end)..end)
 	}
@@ -2889,9 +2885,12 @@ impl Announced {
 		self.routes.get_mut(path)?.as_mut()
 	}
 
-	fn retire(&mut self, path: &PathOwned) {
-		// Dropping the route closes its sources.
-		self.routes.remove(path);
+	/// Retire this session's advertisement without invalidating another live
+	/// session from the same peer. Dropping its sources closes their requests.
+	fn withdraw(&mut self, path: &PathOwned) {
+		if let Some(Some(entry)) = self.routes.remove(path) {
+			entry.dynamic.withdrawn();
+		}
 	}
 
 	/// Serve queued requests on every ready route: mint a source per requested
@@ -3578,6 +3577,8 @@ struct ServeLoop<S: crate::transport::poll::Session> {
 	/// through the producer's aggregate, sliced to this segment's bounds
 	/// (including the resume floor after a source change).
 	serving: track::Producer,
+	/// Watches `serving`'s subscribers, to release the copy once nobody reads it.
+	demand: track::Demand,
 	/// Serve on-demand fetches of uncached groups from this session.
 	dynamic: track::Dynamic,
 	sub: Sub<S>,
@@ -3602,11 +3603,13 @@ enum ServeMode<S: crate::transport::poll::Session> {
 	/// exactly like the old inline await.
 	Establish(Establish<S>),
 	/// The upstream FIN'd, so the track is over, but QUIC does not order streams: keep
-	/// the subscription routable until every group it owes is accounted for (a stream's
-	/// header or a SUBSCRIBE_DROP), or the grace gives up on one reset before its header.
+	/// the subscription routable until the counted headers arrive (lite-07), or every
+	/// owed group is accounted for (older drafts). The grace bounds a stream reset
+	/// before its header arrived.
 	Tail {
 		settle: Settle,
 		owed: Option<std::ops::Range<u64>>,
+		streams: Option<u64>,
 	},
 }
 
@@ -3624,6 +3627,7 @@ impl<S: crate::transport::poll::Session> ServeLoop<S> {
 		};
 		let serving = request.accept(info);
 		Self {
+			demand: serving.demand(),
 			serving,
 			dynamic,
 			sub: Sub::None,
@@ -3653,15 +3657,18 @@ impl<S: crate::transport::poll::Session> ServeLoop<S> {
 						}
 					}
 				}
-				ServeMode::Tail { settle, owed } => {
+				ServeMode::Tail { settle, owed, streams } => {
 					let _ = self.fetches.poll(waiter);
 					if settle
-						.poll(waiter, |tail| owed.clone().is_some_and(|owed| tail.covers(owed)))
+						.poll(waiter, |tail| match streams {
+							Some(streams) => tail.streams() >= *streams,
+							None => owed.clone().is_some_and(|owed| tail.covers(owed)),
+						})
 						.is_ready()
 					{
 						return Poll::Ready(ServeEnd::Finished);
 					}
-					if self.fetches.is_empty() && self.serving.poll_unused(waiter).is_ready() {
+					if self.fetches.is_empty() && self.demand.poll_unused(waiter).is_ready() {
 						return Poll::Ready(ServeEnd::Idle);
 					}
 					let mut cx = std::task::Context::from_waker(waiter.waker());
@@ -3738,7 +3745,7 @@ impl<S: crate::transport::poll::Session> ServeLoop<S> {
 					// state (and its TRACK_INFO) for a reader that may never return.
 					// In-flight fetches keep it alive: work already accepted still
 					// gets finished.
-					if self.fetches.is_empty() && self.serving.poll_unused(waiter).is_ready() {
+					if self.fetches.is_empty() && self.demand.poll_unused(waiter).is_ready() {
 						return Poll::Ready(ServeEnd::Idle);
 					}
 
@@ -3769,7 +3776,7 @@ impl<S: crate::transport::poll::Session> ServeLoop<S> {
 										if let Err(err) = self.serving.finish_at(end.group) {
 											tracing::warn!(track = %serve.name, group = end.group, %err, "invalid subscribe end");
 										}
-										active.end = Some(end.group);
+										active.end = Some(end.clone());
 									}
 									// SUBSCRIBE_START names the first group this feed serves:
 									// the publisher skipped everything below it (e.g. it could
@@ -3831,6 +3838,11 @@ impl<S: crate::transport::poll::Session> ServeLoop<S> {
 								self.mode = ServeMode::Tail {
 									settle: Settle::new(&serve.subscriber.runtime, active.tail.consume(), grace),
 									owed: active.owed(requested_end),
+									streams: active
+										.end
+										.as_ref()
+										.filter(|_| serve.subscriber.version.has_stream_count())
+										.map(|end| end.streams),
 								};
 								continue;
 							}

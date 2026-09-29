@@ -144,7 +144,7 @@ impl poll::SendStream for MockSendStream {
 		)
 	}
 
-	fn set_priority(&mut self, _order: u8) {}
+	fn set_priority(&mut self, _order: i32) {}
 
 	fn finish(&mut self) -> Result<(), Self::Error> {
 		if self.tx.is_some() {
@@ -506,6 +506,22 @@ impl MockSession {
 	/// holding.
 	pub fn release_unis(&self) {
 		for stream in self.side.held.lock().unwrap().take().unwrap_or_default() {
+			let _ = self.side.peer_uni.try_push(stream);
+		}
+	}
+
+	/// Deliver the held uni streams newest first, and stop holding.
+	pub fn release_unis_reversed(&self) {
+		for stream in self
+			.side
+			.held
+			.lock()
+			.unwrap()
+			.take()
+			.unwrap_or_default()
+			.into_iter()
+			.rev()
+		{
 			let _ = self.side.peer_uni.try_push(stream);
 		}
 	}

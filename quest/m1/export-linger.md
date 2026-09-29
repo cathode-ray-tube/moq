@@ -27,12 +27,13 @@ once and exits 1 with `json: dropped`, even while `moq_tokio` is mid-reconnect
   restart refuses a non-zero `--linger` at startup.
 - `drive()` currently maps every clean task end and every error the same way;
   thread the FIN versus drop distinction through to the exit code.
+- The fixed-layout exporters report a track that finished before the catalog
+  as removed: TS as `TS track layout changed ... removed` (reproducible with
+  `test/ts/run.sh --pair`), FLV as `FLV track ... removed mid-stream`. A clean
+  end can exit 1 before linger applies. A finished track is not a removed
+  one; tell them apart in both, with a regression test each (#3926).
 - `doc/bin/cli.md`: document `--linger` and the exit codes next to
   `export --max-age`.
 - Tests: a relay-backed CLI test that restarts the publisher within the linger
   and sees output resume, one that lets it expire and checks exit 1, and a
   clean FIN that exits 0.
-
-## Closes
-
-- [#3926](https://github.com/moq-dev/moq/issues/3926) - close this issue when the quest finishes

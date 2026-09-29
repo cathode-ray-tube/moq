@@ -18,6 +18,15 @@ import (
 // job instead of hanging it.
 const testTimeout = 10 * time.Second
 
+// newOrigin returns an origin that lasts the whole test. An OriginProducer has
+// no Close: the collector ends its origin once nothing reaches an owner, even
+// while consumers made from it are still in use.
+func newOrigin(t *testing.T) *moq.OriginProducer {
+	origin := moq.NewOriginProducer()
+	t.Cleanup(func() { runtime.KeepAlive(origin) })
+	return origin
+}
+
 // opusHead builds a valid OpusHead init buffer (RFC 7845): 48 kHz, 2 channels.
 func opusHead() []byte {
 	buf := []byte("OpusHead")
@@ -30,7 +39,7 @@ func opusHead() []byte {
 }
 
 func TestOriginLifecycle(t *testing.T) {
-	origin := moq.NewOriginProducer()
+	origin := newOrigin(t)
 	_ = origin.Consume()
 	dynamic, err := origin.Dynamic("", moq.Route{})
 	if err != nil {
@@ -43,7 +52,7 @@ func TestDynamicBroadcastRequest(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	origin := moq.NewOriginProducer()
+	origin := newOrigin(t)
 	dynamic, err := origin.Dynamic("", moq.Route{})
 	if err != nil {
 		t.Fatal(err)
@@ -258,12 +267,18 @@ func TestVideoPropertiesUseDefaultedFields(t *testing.T) {
 
 // TestDecodeVideoFrame pins a decoded frame owning its picture: it converts to
 // either CPU layout on demand and stays readable after its consumer is
-// cancelled, until Close.
+// cancelled, until Close. A surface decode also exposes the platform surface,
+// and is refused where no surface variant exists.
 func TestDecodeVideoFrame(t *testing.T) {
+	t.Run("cpu", func(t *testing.T) { testDecodeVideoFrame(t, false) })
+	t.Run("surface", func(t *testing.T) { testDecodeVideoFrame(t, true) })
+}
+
+func testDecodeVideoFrame(t *testing.T, surface bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	origin := moq.NewOriginProducer()
+	origin := newOrigin(t)
 	broadcast, err := origin.CreateBroadcast("video-decode-frame")
 	if err != nil {
 		t.Fatal(err)
@@ -309,7 +324,13 @@ func TestDecodeVideoFrame(t *testing.T) {
 		t.Fatalf("catalog has no %q rendition: %v", track, catalog.Video)
 	}
 
-	decoder, err := bc.DecodeVideo(ctx, track, rendition, moq.VideoDecoderOutput{})
+	decoder, err := bc.DecodeVideo(ctx, track, rendition, moq.VideoDecoderOutput{Surface: surface})
+	if surface && runtime.GOOS != "darwin" {
+		if !errors.Is(err, moq.ErrUnsupported) {
+			t.Fatalf("surface decode off macOS: err = %v, want ErrUnsupported", err)
+		}
+		return
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -330,6 +351,14 @@ func TestDecodeVideoFrame(t *testing.T) {
 	}
 	defer frame.Close()
 	decoder.Cancel()
+
+	if !surface {
+		if got := frame.Surface(); got != nil {
+			t.Fatalf("CPU decode surface = %#v, want nil", got)
+		}
+	} else if pb, ok := frame.Surface().(moq.VideoSurfacePixelBuffer); !ok || pb.Pointer == 0 {
+		t.Fatalf("surface = %#v, want a non-null VideoSurfacePixelBuffer", frame.Surface())
+	}
 
 	i420, err := frame.Pixels(moq.VideoPixelFormatI420)
 	if err != nil {
@@ -454,7 +483,7 @@ func TestLocalPublishConsumeAudio(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	origin := moq.NewOriginProducer()
+	origin := newOrigin(t)
 	broadcast, err := origin.CreateBroadcast("live")
 	if err != nil {
 		t.Fatal(err)
@@ -1029,7 +1058,7 @@ func TestConsumerCancelConcurrent(t *testing.T) {
 // dynamic handler, then proves the origin still resolves: the cancel has to abort
 // that one request rather than the consumer it was made on.
 func TestRequestBroadcastCancelKeepsTheOrigin(t *testing.T) {
-	origin := moq.NewOriginProducer()
+	origin := newOrigin(t)
 	dynamic, err := origin.Dynamic("", moq.Route{})
 	if err != nil {
 		t.Fatal(err)
@@ -1286,7 +1315,7 @@ func TestBroadcastIsReachableOnlyWhileAnnounced(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	origin := moq.NewOriginProducer()
+	origin := newOrigin(t)
 	broadcast, err := origin.CreateBroadcast("live")
 	if err != nil {
 		t.Fatal(err)
@@ -1316,7 +1345,7 @@ func TestBroadcastIsReachableOnlyWhileAnnounced(t *testing.T) {
 		t.Fatal(err)
 	}
 	event := nextRoute(t, ctx, announced)
-	if retracted, ok := event.(moq.AnnounceEventRetracted); !ok || retracted.Announce.Prefix != "live" {
+	if retracted, ok := event.(moq.AnnounceEventEnd); !ok || retracted.Announce.Prefix != "live" {
 		t.Fatalf("unannounce: event=%+v", event)
 	}
 	if _, err := consumer.RequestBroadcast(ctx, "live"); err == nil {
@@ -1339,7 +1368,7 @@ func TestAnnouncedPatternCaptures(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	origin := moq.NewOriginProducer()
+	origin := newOrigin(t)
 	filter := "*/chat"
 	announced, err := origin.Consume().Announced(moq.AnnounceOptions{Prefix: "room", Filter: &filter})
 	if err != nil {
@@ -1377,7 +1406,7 @@ func TestAnnouncedExactFilterCapturesEmpty(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	origin := moq.NewOriginProducer()
+	origin := newOrigin(t)
 	filter := ""
 	announced, err := origin.Consume().Announced(moq.AnnounceOptions{Prefix: "room/alice/chat", Filter: &filter})
 	if err != nil {
@@ -1408,7 +1437,7 @@ func TestAnnouncedYieldsLiveOnceCaughtUp(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	origin := moq.NewOriginProducer()
+	origin := newOrigin(t)
 	consumer := origin.Consume()
 
 	empty, err := consumer.Announced(moq.AnnounceOptions{})
@@ -1448,7 +1477,7 @@ func TestAnnouncedYieldsLiveOnceCaughtUp(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if a, ok := event.(moq.AnnounceEventAnnounced); ok {
+		if a, ok := event.(moq.AnnounceEventStart); ok {
 			listed = append(listed, a.Announce.Prefix)
 		}
 		if _, ok := event.(moq.AnnounceEventLive); ok {
@@ -1483,7 +1512,7 @@ func nextAnnounced(t *testing.T, ctx context.Context, announced *moq.AnnounceCon
 	t.Helper()
 
 	event := nextRoute(t, ctx, announced)
-	announcedEvent, ok := event.(moq.AnnounceEventAnnounced)
+	announcedEvent, ok := event.(moq.AnnounceEventStart)
 	if !ok {
 		t.Fatalf("expected an announcement, got %+v", event)
 	}
@@ -1494,7 +1523,7 @@ func TestDynamicServesARequestUnderAPrefix(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	origin := moq.NewOriginProducer()
+	origin := newOrigin(t)
 	dynamic, err := origin.Dynamic("live", moq.Route{})
 	if err != nil {
 		t.Fatal(err)

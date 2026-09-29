@@ -256,8 +256,8 @@ impl MoqBroadcastProducer {
 	/// Retract this broadcast's exact-path advertisement, if any.
 	///
 	/// Local consumers and peers alike stop discovering and requesting it;
-	/// tracks already in flight carry on. Announcing again brings it back. Errors
-	/// with `Closed` on a standalone broadcast (no origin to announce on).
+	/// tracks already in flight carry on. Announcing again brings it back. A no-op
+	/// on a standalone broadcast.
 	pub fn unannounce(&self) -> Result<(), MoqError> {
 		let _guard = crate::ffi::enter();
 		self.with_state(|state| {
@@ -708,7 +708,7 @@ impl MoqTrackProducer {
 	/// Prefer [`demand`](Self::demand), a handle that can wait without borrowing this producer.
 	pub async fn used(&self) -> Result<(), MoqError> {
 		let track = self.inner.lock().unwrap().as_ref().ok_or(MoqError::Closed)?.clone();
-		crate::ffi::detached(async move { track.used().await }).await
+		crate::ffi::detached(async move { track.demand().used().await }).await
 	}
 
 	/// Wait until this track has no active consumers.
@@ -716,7 +716,7 @@ impl MoqTrackProducer {
 	/// Prefer [`demand`](Self::demand), a handle that can wait without borrowing this producer.
 	pub async fn unused(&self) -> Result<(), MoqError> {
 		let track = self.inner.lock().unwrap().as_ref().ok_or(MoqError::Closed)?.clone();
-		crate::ffi::detached(async move { track.unused().await }).await
+		crate::ffi::detached(async move { track.demand().unused().await }).await
 	}
 
 	/// Create a consumer that reads from this producer's track.
@@ -980,7 +980,8 @@ impl MoqMediaProducer {
 
 	/// Mark a timeline break and restart handoff measurement without lowering advertised jitter.
 	///
-	/// Publishes a discontinuity marker; resumed frames must continue the broadcast media clock.
+	/// Publishes a discontinuity marker; resumed frames must continue the broadcast media clock,
+	/// and video must resume on a keyframe.
 	pub fn discontinuity(&self) -> Result<(), MoqError> {
 		let _guard = crate::ffi::enter();
 		let mut guard = self.inner.lock().unwrap();

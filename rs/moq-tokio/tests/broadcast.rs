@@ -1000,7 +1000,7 @@ async fn broadcast_route_migration() {
 	// active metadata updates (the standby's chain taking over).
 	while let Some(event) = announcements.try_next() {
 		assert!(
-			!matches!(event, moq_net::announce::Event::Retracted(_)),
+			!matches!(event, moq_net::announce::Event::End(_)),
 			"failover must not retract the route"
 		);
 	}
@@ -1114,7 +1114,7 @@ async fn rejoin_skips_a_stale_warm_cache(version: &str) {
 	drop(sub);
 
 	// The front parks the track and cancels upstream, while the publisher moves on.
-	tokio::time::timeout(TIMEOUT, live.unused())
+	tokio::time::timeout(TIMEOUT, live.demand().unused())
 		.await
 		.expect("upstream never canceled")
 		.expect("track open");
@@ -1261,7 +1261,7 @@ async fn rejoin_replays_a_current_warm_cache(version: &str, open: bool) {
 		drop(reading);
 		drop(sub);
 		// The front parks the track and cancels upstream before the next round rejoins.
-		tokio::time::timeout(TIMEOUT, live.unused())
+		tokio::time::timeout(TIMEOUT, live.demand().unused())
 			.await
 			.unwrap_or_else(|_| panic!("{ctx}: upstream never canceled"))
 			.expect("track open");
@@ -3695,10 +3695,8 @@ async fn abort_carries_its_code_to_the_peer() {
 async fn next_update(announced: &mut moq_net::announce::Consumer) -> Option<(moq_net::announce::Announce, bool)> {
 	loop {
 		return match announced.next().await? {
-			moq_net::announce::Event::Announced(route) | moq_net::announce::Event::Updated(route) => {
-				Some((route, true))
-			}
-			moq_net::announce::Event::Retracted(route) => Some((route, false)),
+			moq_net::announce::Event::Start(route) | moq_net::announce::Event::Update(route) => Some((route, true)),
+			moq_net::announce::Event::End(route) => Some((route, false)),
 			moq_net::announce::Event::Live => continue,
 		};
 	}

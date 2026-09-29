@@ -3,9 +3,18 @@ import * as Container from "@moq/hang/container";
 import * as Util from "@moq/hang/util";
 import type * as Moq from "@moq/net";
 import { Time } from "@moq/net";
-import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
+import {
+	type Computed,
+	Effect,
+	type Getter,
+	getter,
+	type Inputs,
+	type Readonlys,
+	readonlys,
+	Signal,
+} from "@moq/signals";
 import type { Broadcast } from "../broadcast";
-import { RenditionJitter } from "../jitter";
+import { type Baseline, Estimator } from "../jitter";
 import type { AudioFrame, Capture, Format } from "./capture";
 import { Gain } from "./gain";
 import { Resampler } from "./resampler";
@@ -169,8 +178,19 @@ export class Encoder {
 	// reconfiguring it would be a retry, so the rendition stays down for the life of this encoder.
 	#fatal = new Signal<Error | undefined>(undefined);
 
+	// How many resolution runs threw for their current inputs (e.g. invalid codec settings), so no
+	// config is coming until one reruns.
+	#failures = new Signal(0);
+
+	/**
+	 * @internal Whether the catalog config resolved, or can't until something outside the encoder
+	 * changes: a failed encoder or capture, invalid codec settings, or a capture waiting on the page's
+	 * first gesture. `<moq-publish>` holds its first announce until this is set.
+	 */
+	readonly settled: Computed<boolean>;
+
 	#signals = new Effect();
-	#jitter = new RenditionJitter();
+	#estimator = new Estimator();
 
 	constructor(name: string, props?: EncoderProps) {
 		// `source` moved to Audio.Capture, which renditions share. TypeScript catches this, but a
@@ -197,9 +217,28 @@ export class Encoder {
 			effect.proxy(this.#out.root, capture.out.root);
 		});
 
+		this.settled = this.#signals.computed((effect) => {
+			if (effect.get(this.#out.catalog) !== undefined) return true;
+			if (effect.get(this.#fatal) !== undefined || effect.get(this.#failures) > 0) return true;
+			const capture = effect.get(this.in.capture);
+			return capture !== undefined && !!effect.get(capture.blocked);
+		});
+
 		this.#signals.run(this.#runCapture.bind(this));
-		this.#signals.run(this.#runConfig.bind(this));
-		this.#signals.run(this.#runCatalog.bind(this));
+
+		// Every step that resolves the config counts a throw as a failure, so a bad input settles the
+		// gate instead of holding the announce forever.
+		for (const run of [this.#runConfig, this.#runCatalog]) {
+			this.#signals.run((effect) => {
+				try {
+					run.call(this, effect);
+				} catch (err) {
+					this.#failures.update((n) => n + 1);
+					effect.cleanup(() => this.#failures.update((n) => n - 1));
+					throw err;
+				}
+			});
+		}
 		this.#signals.run(this.#runRegister.bind(this));
 	}
 
@@ -266,7 +305,7 @@ export class Encoder {
 			const fatal = effect.get(this.#fatal);
 			if (!enabled || !format || fatal) return;
 
-			this.#encode(rendition.track, format, effect);
+			this.#encode(rendition.track, broadcast.baseline, format, effect);
 		});
 
 		// When demand disappears, end the epoch with a discontinuity marker (see
@@ -314,7 +353,7 @@ export class Encoder {
 			effect.subscribe(this.#config, (config) => {
 				const bitrate = config?.catalog.bitrate;
 				if (bitrate === undefined) return;
-				if (!reservation) reservation = allocator.reserve(track, bitrate);
+				if (!reservation) reservation = allocator.reserve(track.demand(), bitrate);
 				else reservation.update(bitrate);
 			});
 			effect.cleanup(() => reservation?.close());
@@ -350,7 +389,7 @@ export class Encoder {
 		const catalog = decoder?.config === config ? { ...config, description: decoder.description } : config;
 		effect.set(this.#out.catalog, {
 			...catalog,
-			jitter: this.#jitter.current ? Catalog.u53(this.#jitter.current) : undefined,
+			...this.#estimator.estimate,
 		});
 	}
 
@@ -371,7 +410,7 @@ export class Encoder {
 
 	// Encode captured audio frames into whichever track producer is live. The broadcast owns the
 	// track's lifetime, so this never closes it; a fatal encoder error is reported through #fatal.
-	#encode(track: Getter<Moq.Track.Producer | undefined>, format: Format, effect: Effect): void {
+	#encode(track: Getter<Moq.Track.Producer | undefined>, baseline: Baseline, format: Format, effect: Effect): void {
 		effect.spawn(async () => {
 			// We're using an async polyfill temporarily for Safari support.
 			await Util.Libav.polyfill();
@@ -423,10 +462,9 @@ export class Encoder {
 							payload: Container.Legacy.encodeFrame(frame, frame.timestamp as Time.Micro),
 							timestamp: Time.Timestamp.fromMicros(frame.timestamp as Time.Micro),
 						});
-						const jitter = this.#jitter.observe(frame.timestamp);
-						if (jitter !== undefined) {
+						if (this.#estimator.flush(frame.timestamp, baseline)) {
 							const catalog = this.#out.catalog.peek();
-							if (catalog) this.#out.catalog.set({ ...catalog, jitter: Catalog.u53(jitter) });
+							if (catalog) this.#out.catalog.set({ ...catalog, ...this.#estimator.estimate });
 						}
 					},
 					error: (err) => {

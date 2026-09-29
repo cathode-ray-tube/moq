@@ -21,8 +21,8 @@ against the re-anchored clock for the full distance between the two timelines.
   audio decoder does (`js/watch/src/audio/decoder.ts:374-376`). WebCodecs
   `reset()` discards queued outputs, so stale frames never surface.
 - Keep the post-await guard. `reset()` cannot cancel a callback that already
-  holds a frame and is parked in `Promise.race([wait, effect.cancel])`
-  (`decoder.ts:332-334`); `sync.reset()` releases exactly that wait, and the
+  holds a frame and is parked in `effect.race(wait)`
+  (`decoder.ts:360`); `sync.reset()` releases exactly that wait, and the
   guard is what stops it writing `timestamp` and `frame` after the reset.
 - The regression needs a real WebCodecs decoder, so it lives in a browser
   harness rather than a bun unit test.
@@ -30,6 +30,19 @@ against the re-anchored clock for the full distance between the two timelines.
 The container signals a playhead generation, not a codec reset: native decode
 stops flushing on it. This quest is whether watch still calls `decoder.reset()`
 to drop in-flight WebCodecs chunks when that generation bumps.
+
+Reproduce before fixing; this is likely a false positive. Since
+[#3711](https://github.com/moq-dev/moq/pull/3711) timelines only move
+forward: a discontinuity continues from the live edge and the Rust consumer
+refuses a rewind (`TimestampRewind`), so every chunk queued before the bump is
+stamped below the new group, not against a distant new timeline. A
+`decoder.reset()` would also contradict the documented "not a decoder flush"
+contract of the discontinuity counter (`container::Consumer::discontinuity`,
+and `continuous` in `js/hang/src/container/consumer.ts`), and the same
+finding was ruled a false positive for native play in
+[#4374](https://github.com/moq-dev/moq/pull/4374). If a stale frame cannot be
+made to surface in a browser harness, close #3056 with that evidence and
+delete this quest instead of adding the reset.
 
 ## Closes
 

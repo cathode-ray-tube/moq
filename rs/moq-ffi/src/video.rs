@@ -585,22 +585,26 @@ pub struct MoqVideoDecoderOutput {
 	#[uniffi(default = None)]
 	pub max_age_us: Option<u64>,
 	/// Keep each frame in the surface its decoder produced, for
-	/// [`MoqVideoDecodedFrame::native`]. `false`, the default, downloads every
+	/// [`MoqVideoDecodedFrame::surface`]. `false`, the default, downloads every
 	/// frame to CPU memory as it is decoded, so
 	/// [`MoqVideoDecodedFrame::pixels`] never meets a surface it cannot read.
+	///
+	/// Only a platform with a [`MoqVideoSurface`] variant accepts it (macOS
+	/// today); [`decode_video`](MoqBroadcastConsumer::decode_video) fails with
+	/// [`MoqError::Unsupported`] elsewhere.
 	#[uniffi(default = false)]
-	pub native: bool,
+	pub surface: bool,
 }
 
 /// A borrowed platform handle to a decoded frame's surface, from
-/// [`MoqVideoDecodedFrame::native`].
+/// [`MoqVideoDecodedFrame::surface`].
 ///
 /// The handle is valid while the frame it came from is alive and no longer.
 /// Keep the frame until every GPU command reading the surface has completed:
 /// the surface belongs to the decoder's pool, and releasing the frame is what
 /// lets the decoder reuse it.
 #[derive(Clone, Copy, uniffi::Enum)]
-pub enum MoqVideoNative {
+pub enum MoqVideoSurface {
 	/// A macOS `CVPixelBufferRef` from VideoToolbox, IOSurface-backed NV12.
 	PixelBuffer { pointer: u64 },
 }
@@ -640,9 +644,7 @@ impl MoqVideoDecodedFrame {
 	/// (`width * height * 3 / 2` bytes); RGBA is `width * height * 4` bytes.
 	/// Neither has row padding.
 	///
-	/// A native surface is downloaded first. Fails for a surface with no CPU
-	/// path, which only a [`native`](MoqVideoDecoderOutput::native) decode can
-	/// deliver.
+	/// A retained surface is downloaded first.
 	pub fn pixels(&self, format: MoqVideoPixelFormat) -> Result<Vec<u8>, MoqError> {
 		let surface = &self.frame.surface;
 		match format {
@@ -655,13 +657,13 @@ impl MoqVideoDecodedFrame {
 	}
 
 	/// A borrowed handle to the decoder's surface, or `None` when the frame is
-	/// in CPU memory or this platform's surface has no view here yet.
+	/// in CPU memory.
 	///
-	/// Only a [`native`](MoqVideoDecoderOutput::native) decode produces one.
-	pub fn native(&self) -> Option<MoqVideoNative> {
+	/// Only a [`surface`](MoqVideoDecoderOutput::surface) decode produces one.
+	pub fn surface(&self) -> Option<MoqVideoSurface> {
 		match &self.frame.surface {
 			#[cfg(target_os = "macos")]
-			moq_video::Surface::PixelBuffer(pixels) => Some(MoqVideoNative::PixelBuffer {
+			moq_video::Surface::PixelBuffer(pixels) => Some(MoqVideoSurface::PixelBuffer {
 				pointer: std::ptr::from_ref(pixels.buffer()).addr() as u64,
 			}),
 			_ => None,
@@ -733,6 +735,21 @@ fn video_config(catalog_video: crate::media::MoqVideo) -> Result<hang::catalog::
 	Ok(config)
 }
 
+/// Whether [`MoqVideoSurface`] has a variant on this platform, so a frame can retain its surface.
+const HAS_SURFACE: bool = cfg!(target_os = "macos");
+
+/// Where the decoder puts each picture. A caller that did not ask for the surface reads CPU
+/// pixels, so let a backend that can decode straight to system memory do that rather than hand
+/// out a surface to download later. A surface the platform has no variant for is refused, since
+/// the caller could neither view it through `surface()` nor always read it through `pixels()`.
+fn decoder_output(surface: bool, has_surface: bool) -> Result<moq_video::Output, MoqError> {
+	match (surface, has_surface) {
+		(false, _) => Ok(moq_video::Output::Cpu),
+		(true, true) => Ok(moq_video::Output::Native),
+		(true, false) => Err(MoqError::Unsupported),
+	}
+}
+
 #[uniffi::export]
 impl MoqBroadcastConsumer {
 	/// Subscribe to a video track and decode it inside the bindings.
@@ -740,7 +757,8 @@ impl MoqBroadcastConsumer {
 	/// `catalog_video` comes from the catalog (see
 	/// [`MoqCatalogConsumer::next`](crate::consumer::MoqCatalogConsumer::next)); the codec is read
 	/// from it. Errors if no native backend handles that codec, rather than failing on the first
-	/// frame.
+	/// frame. Also fails with [`MoqError::Unsupported`] when
+	/// [`surface`](MoqVideoDecoderOutput::surface) is set on a platform with no surface to expose.
 	///
 	/// A rendition whose [`broadcast`](crate::media::MoqVideo::broadcast) names another broadcast
 	/// is subscribed there, so `name` is always read from the broadcast the catalog points at.
@@ -750,21 +768,14 @@ impl MoqBroadcastConsumer {
 		catalog_video: crate::media::MoqVideo,
 		output: MoqVideoDecoderOutput,
 	) -> Result<Arc<MoqVideoConsumer>, MoqError> {
-		// Reject the codec before resolving: resolving reaches the origin, which can invoke a
-		// dynamic handler and open an upstream subscription we would immediately drop.
+		// Reject the codec and output before resolving: resolving reaches the origin, which can
+		// invoke a dynamic handler and open an upstream subscription we would immediately drop.
 		let reference = catalog_video.broadcast.clone();
 		let cfg = video_config(catalog_video)?;
+		let mut options = moq_video::decode::Options::default();
+		options.decoder.output = decoder_output(output.surface, HAS_SURFACE)?;
 		let broadcast = self.resolve_inner(reference.as_deref()).await?;
 
-		let mut options = moq_video::decode::Options::default();
-		// A portable caller reads CPU pixels anyway, so let a backend that can
-		// decode straight to system memory do that rather than hand out a surface
-		// to download later, which a tiled VAAPI DMA-BUF could not do at all.
-		options.decoder.output = if output.native {
-			moq_video::Output::Native
-		} else {
-			moq_video::Output::Cpu
-		};
 		options.decoder.scale_hint = output.resize.map(|size| moq_video::Size::new(size.width, size.height));
 		options.max_age = output
 			.max_age_us
@@ -808,6 +819,15 @@ mod decode_tests {
 		assert_eq!(config.coded_width, Some(1280));
 		assert_eq!(config.coded_height, Some(720));
 		assert_eq!(config.framerate, Some(30.0));
+	}
+
+	#[test]
+	fn surface_is_refused_where_no_variant_exists() {
+		assert!(matches!(decoder_output(true, false), Err(MoqError::Unsupported)));
+		assert_eq!(decoder_output(true, true).unwrap(), moq_video::Output::Native);
+		// The CPU path never depends on a surface variant.
+		assert_eq!(decoder_output(false, false).unwrap(), moq_video::Output::Cpu);
+		assert_eq!(decoder_output(false, true).unwrap(), moq_video::Output::Cpu);
 	}
 
 	#[test]

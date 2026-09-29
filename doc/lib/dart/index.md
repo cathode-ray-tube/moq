@@ -30,7 +30,7 @@ final moq = await Moq.connect('https://relay.example.com');
 moq.announcements(
   options: const AnnounceOptions(prefix: 'live/', filter: '*/camera'),
 ).listen((event) {
-  if (event is AnnounceEventAnnounced) {
+  if (event is AnnounceEventStart) {
     print(event.announce.prefix);
     print(event.announce.captures);
   } else if (event is AnnounceEventLive) {
@@ -76,7 +76,7 @@ every path beneath it (`''` for everything; Dart spells the origin method
 claim should stay advertised, and reject the requests you will not serve. A
 route is a capability, not an inventory. `announcements(options:)` takes a
 literal prefix plus an optional relative pattern and yields `AnnounceEvent`s:
-`AnnounceEventAnnounced`, `AnnounceEventUpdated`, or `AnnounceEventRetracted`
+`AnnounceEventStart`, `AnnounceEventUpdate`, or `AnnounceEventEnd`
 carrying an `Announce`, whose `prefix` stays origin-relative and whose
 `captures` reports the wildcard matches, or `AnnounceEventLive` once every route
 live at subscribe time has been delivered. Paths with
@@ -117,7 +117,7 @@ catalog and container types are there, so already-encoded frames flow through
 
 `MediaProducer.flush(timestampUs: ...)` records the handoff of a locally encoded frame on the broadcast media clock. Call it after `writeFrame` only for live encoder output; file, pipe, and network imports stay clock-free. `MediaProducer` aliases the generated FFI object, so its method is available directly.
 
-Call `media.discontinuity()` when the source seeks, pauses, or changes its time base. It publishes a timeline marker and restarts handoff measurement without lowering advertised jitter. Resume with timestamps that continue forward on the broadcast media clock; this does not permit timestamp rewinds.
+Call `media.discontinuity()` when the source seeks, pauses, or changes its time base. It publishes a timeline marker and restarts handoff measurement without lowering advertised jitter. Resume with timestamps that continue forward on the broadcast media clock; this does not permit timestamp rewinds. On a video track, resume with a keyframe: a delta frame before it fails.
 
 ## Connection stats
 

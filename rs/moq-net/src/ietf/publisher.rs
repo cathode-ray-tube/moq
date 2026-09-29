@@ -1779,10 +1779,16 @@ where
 		// erroring, which would look fatal to the peer.
 		// The wire prefix decodes as a literal path; convert it explicitly to its
 		// subtree grant, refusing anything that cannot be a subtree.
+		// The cursor is rooted at the prefix so every update arrives named as its
+		// wire suffix, a route covering the prefix included: that one presents at
+		// the root, as the empty suffix.
 		let scope = crate::Pattern::subtree(prefix.as_str())
-			.map(crate::Patterns::from)
+			.map(|subtree| subtree.rebase(prefix.as_str()))
 			.unwrap_or_default();
-		let origin = self.origin.scope("", &scope).unwrap_or_else(|_| self.origin.empty());
+		let origin = self
+			.origin
+			.scope(&prefix, &scope)
+			.unwrap_or_else(|_| self.origin.empty());
 
 		// The extension changes what an advertisement carries, so nothing can be
 		// sent until the peer's SETUP says whether it speaks it. The same SETUP says
@@ -1881,10 +1887,10 @@ where
 		let mut initial = std::collections::BTreeMap::new();
 		while let Some(event) = announced.try_next() {
 			match event {
-				crate::announce::Event::Announced(update) | crate::announce::Event::Updated(update) => {
+				crate::announce::Event::Start(update) | crate::announce::Event::Update(update) => {
 					initial.insert(update.prefix.clone(), update);
 				}
-				crate::announce::Event::Retracted(update) => {
+				crate::announce::Event::End(update) => {
 					initial.remove(&update.prefix);
 				}
 				crate::announce::Event::Live => {}
@@ -1941,12 +1947,10 @@ where
 					while let Poll::Ready(next) = announced.poll_next(waiter) {
 						match next {
 							Some(crate::announce::Event::Live) => continue,
-							Some(
-								crate::announce::Event::Announced(update) | crate::announce::Event::Updated(update),
-							) => {
+							Some(crate::announce::Event::Start(update) | crate::announce::Event::Update(update)) => {
 								return Poll::Ready(NamespaceEvent::Update(Some((update, true))));
 							}
-							Some(crate::announce::Event::Retracted(update)) => {
+							Some(crate::announce::Event::End(update)) => {
 								return Poll::Ready(NamespaceEvent::Update(Some((update, false))));
 							}
 							None => return Poll::Ready(NamespaceEvent::Update(None)),
@@ -2011,11 +2015,8 @@ where
 		update: crate::announce::Announce,
 		active: bool,
 	) -> Result<(), Error> {
-		let path = update.prefix;
-		let suffix = path
-			.strip_prefix(prefix)
-			.expect("origin returned invalid prefix")
-			.to_owned();
+		let suffix = update.prefix;
+		let path = prefix.join(&suffix);
 
 		if active {
 			// A repeat for a live suffix is a metadata update: keep the
@@ -2112,7 +2113,7 @@ impl<S: crate::transport::poll::Session> TrackServe<S> {
 		let mut stream = std::future::poll_fn(|cx| self.session.poll_open_uni(cx))
 			.await
 			.map_err(Error::from_transport)?;
-		stream.set_priority(priority);
+		stream.set_priority(priority.into());
 
 		let mut writer = Writer::new(stream, self.version);
 		writer.buffer(&ietf::GroupHeader {
@@ -2303,7 +2304,7 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 					};
 					self.opened.fetch_add(1, Ordering::Relaxed);
 					let mut stream = stream;
-					stream.set_priority(self.priority);
+					stream.set_priority(self.priority.into());
 
 					let mut writer = Writer::new(stream, self.version);
 					if let Err(err) = writer.buffer(&self.msg) {

@@ -272,9 +272,7 @@ export class Producer {
 		this.#recordFrame(timestamp);
 	}
 
-	/**
-	 * Encode the complete legacy payload first, then encrypt it.
-	 */
+	/** Encode the complete legacy payload first, then encrypt it. */
 	async #encodeEncryptedFrame(
 		data: Uint8Array | Source,
 		timestamp: Time.Micro,
@@ -321,7 +319,8 @@ export class Producer {
 	}
 
 	/**
-	 * Flush and close the current group, then mark a break in the timeline.
+	 * Close the current group and mark a break in the timeline: whatever comes
+	 * next does not continue it.
 	 *
 	 * @deprecated Use cut() instead.
 	 */
@@ -329,13 +328,13 @@ export class Producer {
 		return this.cut(end);
 	}
 
-	/**
-	 * Flush and close the current plaintext group, then write a marker group.
-	 */
+	/** Flush and close the current plaintext group, then write a marker group. */
 	#cutPlaintext(end?: Time.Micro): void {
-		this.#close(end);
+		if (end === undefined) {
+			this.#interval = undefined;
+		}
 
-		// Nothing is measured across the break.
+		this.#close(end);
 		this.#interval = undefined;
 
 		const timestamp = end ?? this.#liveEdge;
@@ -424,9 +423,7 @@ export class Producer {
 		this.#marked = true;
 	}
 
-	/**
-	 * Close the current group without writing a marker group.
-	 */
+	/** Close the current group without writing a marker group. */
 	#close(end?: Time.Micro): void {
 		if (!this.#group) {
 			return;

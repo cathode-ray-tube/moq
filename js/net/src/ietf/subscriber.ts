@@ -7,7 +7,7 @@ import * as netGroup from "../group.ts";
 import { Cost, type Route, routesEqual, UNKNOWN_HOP } from "../hop.ts";
 import { hiddenBelow, hooks, scopeCaptures, scopeHead, scopeOverlaps } from "../internal.ts";
 import * as Path from "../path.ts";
-import type { Reader, Stream } from "../stream.ts";
+import type { Cursor, Reader, Stream } from "../stream.ts";
 import { TAIL_GRACE_MS, Tail } from "../tail.ts";
 import { Milli, type Timescale, Timestamp } from "../time.ts";
 import type * as track from "../track.ts";
@@ -204,7 +204,7 @@ export class Subscriber {
 			announced.append({
 				prefix: active,
 				captures: scopeCaptures(scope, active),
-				kind: "announced",
+				kind: "start",
 				route: info.route,
 			});
 		}
@@ -234,13 +234,13 @@ export class Subscriber {
 		for (const [consumer, filter] of this.#announcedConsumers) {
 			if (!sees(filter, path)) continue;
 			const scope = filter.scope;
-			consumer.append({ prefix: path, captures: scopeCaptures(scope, path), kind: "announced", route });
+			consumer.append({ prefix: path, captures: scopeCaptures(scope, path), kind: "start", route });
 		}
 	}
 
 	/**
 	 * Replace the stored route for a path that is already announced. A no-op when the
-	 * hops and cost did not change; otherwise consumers hear `updated` so a forwarder
+	 * hops and cost did not change; otherwise consumers hear `update` so a forwarder
 	 * can reprice without retracting.
 	 */
 	#updateAnnounce(path: Path.Valid, route: Route) {
@@ -251,7 +251,7 @@ export class Subscriber {
 		for (const [consumer, filter] of this.#announcedConsumers) {
 			if (!sees(filter, path)) continue;
 			const scope = filter.scope;
-			consumer.append({ prefix: path, captures: scopeCaptures(scope, path), kind: "updated", route });
+			consumer.append({ prefix: path, captures: scopeCaptures(scope, path), kind: "update", route });
 		}
 	}
 
@@ -280,7 +280,7 @@ export class Subscriber {
 				consumer.append({
 					prefix: path,
 					captures: scopeCaptures(scope, path),
-					kind: "retracted",
+					kind: "end",
 					route: existing.route,
 				});
 			} catch {
@@ -533,14 +533,15 @@ export class Subscriber {
 		// would miss the local side going away and leave it serving a track nobody reads.
 		// Demand returning before we commit is not abandonment, matching the serving loop.
 		const waitAbandoned = async (): Promise<null> => {
+			const demand = producer.demand();
 			// An info-only lookup attaches no subscriber yet still waits on SUBSCRIBE_OK for
 			// the track info, so only demand that arrived and then left is abandonment.
-			while (!producer.used.peek() && producer.closed.peek() === undefined) {
-				await Signal.race(producer.used, producer.closed);
+			while (!demand.used.peek() && demand.closed.peek() === undefined) {
+				await Signal.race(demand.used, demand.closed);
 			}
 			for (;;) {
-				await producer.unused();
-				if (producer.closed.peek() !== undefined || !producer.used.peek()) return null;
+				await demand.unused();
+				if (demand.closed.peek() !== undefined || !demand.used.peek()) return null;
 			}
 		};
 
@@ -627,9 +628,10 @@ export class Subscriber {
 			// wake is level-triggered: re-check demand so a subscriber that returns before we tear
 			// down resumes on the same stream.
 			let terminal = localEnded;
+			const demand = producer.demand();
 			for (;;) {
-				const reason = await race([done, producer.unused().then(() => idle)]);
-				if (reason === idle && producer.closed.peek() === undefined && producer.used.peek()) continue;
+				const reason = await race([done, demand.unused().then(() => idle)]);
+				if (reason === idle && demand.closed.peek() === undefined && demand.used.peek()) continue;
 				terminal = reason;
 				break;
 			}
@@ -1062,18 +1064,18 @@ export class Subscriber {
 			// header priority inherits it (draft-21 section 10.4).
 			if (!group.flags.hasPriority) group.publisherPriority = toWire((await track.info()).priority);
 
+			const decode = (c: Cursor) => Frame.decode(c, group.flags, this.#timescales.get(group.trackAlias));
 			for (;;) {
-				// Only the group's own stream ends it: a track that closes first has already
-				// closed (or aborted) this group through its cache.
-				const done = await (producer ? race([stream.done(), producer.closed]) : stream.done());
-				if (done !== false) break;
-
-				const frame = await Frame.decode(
-					stream,
-					group.flags,
-					this.#timescales.get(group.trackAlias),
-					this.#session.version,
-				);
+				// Every object already buffered is written without an await, so the reader wakes
+				// once per batch rather than once per object. Only the group's own stream ends it:
+				// a track that closes first has already closed (or aborted) this group through its
+				// cache.
+				const frame =
+					stream.tryDecode(decode) ??
+					(await (producer
+						? race([stream.decodeMaybe(decode), producer.closed])
+						: stream.decodeMaybe(decode)));
+				if (!frame || frame instanceof Error) break;
 
 				if (frame.endOfTrack) {
 					// No object at or past this location exists: after the group's last object

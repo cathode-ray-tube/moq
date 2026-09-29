@@ -610,7 +610,7 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 		let Some(stream) = self.video.get_mut(&track_id) else {
 			return Ok(());
 		};
-		let demand = stream.track.track().is_used();
+		let demand = stream.track.demand().is_used();
 		if demand {
 			stream.last_source.get_or_insert_with(Instant::now);
 		} else {

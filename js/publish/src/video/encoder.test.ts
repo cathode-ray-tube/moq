@@ -2,6 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import * as Container from "@moq/hang/container";
 import * as Moq from "@moq/net";
 import { Signal } from "@moq/signals";
+import { Baseline } from "../jitter";
 import { Encoder } from "./encoder";
 
 class FakeVideoEncoder {
@@ -63,7 +64,7 @@ test("encoding tracks encoder config in its child effect", async () => {
 		track: new Signal<Moq.Track.Producer | undefined>(track),
 		close: () => track.close(),
 	};
-	const broadcast = { video: () => rendition };
+	const broadcast = { video: () => rendition, baseline: new Baseline() };
 	const capture = {
 		in: { source: new Signal(undefined) },
 		out: {
@@ -110,7 +111,7 @@ test("a demand gap marks a discontinuity and leaves the broadcast-owned track op
 	};
 	const encoder = new Encoder("video", {
 		enabled: true,
-		broadcast: { video: () => rendition } as never,
+		broadcast: { video: () => rendition, baseline: new Baseline() } as never,
 		capture: capture as never,
 	});
 
@@ -167,7 +168,7 @@ test("a bandwidth estimate updates the bitrate without blanking the config or re
 
 	const encoder = new Encoder("video", {
 		enabled: true,
-		broadcast: { video: () => rendition } as never,
+		broadcast: { video: () => rendition, baseline: new Baseline() } as never,
 		capture: capture as never,
 		bandwidth,
 	});
@@ -248,7 +249,7 @@ test("every published config was probed for its own codec and dimensions", async
 
 	const encoder = new Encoder("video", {
 		enabled: true,
-		broadcast: { video: () => rendition } as never,
+		broadcast: { video: () => rendition, baseline: new Baseline() } as never,
 		capture: capture as never,
 		bandwidth,
 	});
@@ -306,6 +307,7 @@ test("hardware encoding takes priority over software H.264", async () => {
 		await settle();
 		expect(encoder.out.resolved.peek()?.hardwareAcceleration).toBe("prefer-hardware");
 		expect(probe.mock.calls.every(([config]) => config.hardwareAcceleration === "prefer-hardware")).toBe(true);
+		expect(encoder.settled.peek()).toBe(true);
 	} finally {
 		encoder.close();
 		probe.mockRestore();
@@ -329,9 +331,39 @@ test("software-only AV1 is refused even when explicitly requested", async () => 
 		expect(probe.mock.calls.some(([config]) => config.hardwareAcceleration === "prefer-software")).toBe(false);
 		expect(encoder.out.resolved.peek()).toBeUndefined();
 		expect(error).toHaveBeenCalled();
+		// No codec fits, so `<moq-publish>` must stop waiting on this rendition to announce.
+		expect(encoder.settled.peek()).toBe(true);
 	} finally {
 		encoder.close();
 		probe.mockRestore();
+		error.mockRestore();
+	}
+});
+
+// Regression: only the codec probe and `maxScale` settled the encoder on failure, so a knob that broke
+// resolution later (a negative bitrate) held `<moq-publish>`'s announce forever.
+test("an invalid knob settles the encoder without a config", async () => {
+	using _videoEncoder = installFakeVideoEncoder();
+	const error = spyOn(console, "error").mockImplementation(() => {});
+	const capture = {
+		in: { source: new Signal({ getSettings: () => ({ frameRate: 30 }), getConstraints: () => ({}) }) },
+		out: { display: new Signal({ width: 1920, height: 1080 }) },
+	};
+	const config = new Signal<{ bitrateScale?: number } | undefined>({ bitrateScale: -1 });
+	const encoder = new Encoder("video", { enabled: true, capture: capture as never, config });
+	try {
+		await settle();
+		expect(encoder.out.catalog.peek()).toBeUndefined();
+		expect(encoder.settled.peek()).toBe(true);
+		expect(error).toHaveBeenCalled();
+
+		// Fixing the knob clears the failure and resolves a config.
+		config.set(undefined);
+		await settle();
+		expect(encoder.out.catalog.peek()).toBeDefined();
+		expect(encoder.settled.peek()).toBe(true);
+	} finally {
+		encoder.close();
 		error.mockRestore();
 	}
 });
@@ -509,7 +541,7 @@ test.each(["encoder lag", "quiet startup"])("marks a rendition stalled for %s", 
 	};
 	const encoder = new Encoder("video/hd", {
 		enabled: true,
-		broadcast: { video: () => rendition } as never,
+		broadcast: { video: () => rendition, baseline: new Baseline() } as never,
 		capture: capture as never,
 	});
 

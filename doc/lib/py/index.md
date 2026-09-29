@@ -24,8 +24,8 @@ async def main():
     async with moq.Client("https://cdn.moq.dev/anon") as client:
         # The filter is relative to the literal prefix; prefixes stay origin-relative.
         async for event in client.announced("live/", filter="*/camera"):
-            if not isinstance(event, moq.AnnounceEventAnnounced):
-                continue  # AnnounceEventUpdated, AnnounceEventRetracted, or AnnounceEventLive
+            if not isinstance(event, moq.AnnounceEventStart):
+                continue  # AnnounceEventUpdate, AnnounceEventEnd, or AnnounceEventLive
             announcement = event.announce
             print(announcement.captures)  # what * matched, or None for a partial overlap
             broadcast = await client.request_broadcast(announcement.prefix)
@@ -74,7 +74,7 @@ asyncio.run(main())
 
 For already-encoded live output, call `audio.flush(timestamp_us)` after each `audio.write_frame` with the same broadcast-clock PTS. It samples the transport handoff for catalog jitter. File, pipe, and network imports should omit `flush`; raw-pixel and PCM encoders inside the binding measure their own output.
 
-Call `audio.discontinuity()` when the source seeks, pauses, or changes its time base. It publishes a timeline marker and restarts handoff measurement without lowering advertised jitter. Resume with timestamps that continue forward on the broadcast media clock; this does not permit timestamp rewinds.
+Call `audio.discontinuity()` when the source seeks, pauses, or changes its time base. It publishes a timeline marker and restarts handoff measurement without lowering advertised jitter. Resume with timestamps that continue forward on the broadcast media clock; this does not permit timestamp rewinds. On a track from `publish_video` or `publish_video_on_track`, resume with a keyframe: a delta frame before it fails.
 
 The three advertising operations, as the other bindings spell them:
 `client.create_broadcast(path)` (or `OriginProducer.create_broadcast`) returns
@@ -86,7 +86,7 @@ an unannounced producer, invisible to everyone; `broadcast.announce(route)` /
 advertised, and reject the requests you will not serve. A route is a
 capability, not an inventory. `announced(prefix, filter=...)` combines a literal
 root with an optional relative pattern and yields `AnnounceEvent`s:
-`AnnounceEventAnnounced`, `AnnounceEventUpdated`, or `AnnounceEventRetracted`
+`AnnounceEventStart`, `AnnounceEventUpdate`, or `AnnounceEventEnd`
 carrying an `Announce` as `.announce`, whose `.prefix` stays relative to the
 origin and whose `.captures` reports what the pattern wildcards matched, or
 `AnnounceEventLive` once every route live at subscribe time has been delivered.
@@ -125,7 +125,9 @@ including after the consumer is cancelled. `frame.pixels(format)` converts it on
 demand: `VideoPixelFormat.I420`, or `VideoPixelFormat.RGBA` for four bytes a
 pixel. Drop frames promptly, since held frames hold decoder buffers. `resize`
 is best effort: only NVDEC has a built-in scaler, so read each frame's own
-`width()` and `height()` rather than assuming it took.
+`width()` and `height()` rather than assuming it took. `VideoDecoderOutput(surface=True)`
+keeps the decoder's surface for `frame.surface()` instead of downloading it. Only macOS
+has one, so `decode_video` fails as unsupported elsewhere.
 
 ## Connection stats
 

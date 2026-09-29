@@ -502,7 +502,7 @@ impl<E: CatalogExt> Driver<E> {
 					.as_mut()
 					.and_then(Track::producer)
 					.expect("the layout is discovered before capture runs");
-				let mut demand = TrackDemand { track };
+				let mut demand = track.demand();
 				let mut output = EncoderOutput {
 					producer,
 					clock: &self.clock,
@@ -784,13 +784,9 @@ trait Demand {
 	async fn unused(&mut self) -> bool;
 }
 
-struct TrackDemand<'a> {
-	track: &'a moq_net::track::Producer,
-}
-
-impl Demand for TrackDemand<'_> {
+impl Demand for moq_net::track::Demand {
 	async fn used(&mut self) -> bool {
-		match self.track.used().await {
+		match moq_net::track::Demand::used(self).await {
 			Ok(()) => true,
 			Err(err) => {
 				log_track_ended(err);
@@ -800,7 +796,7 @@ impl Demand for TrackDemand<'_> {
 	}
 
 	async fn unused(&mut self) -> bool {
-		match self.track.unused().await {
+		match moq_net::track::Demand::unused(self).await {
 			Ok(()) => true,
 			Err(err) => {
 				log_track_ended(err);

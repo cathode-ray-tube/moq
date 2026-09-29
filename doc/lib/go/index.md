@@ -37,9 +37,9 @@ for event, err := range announced.All(ctx) {
         if moq.IsShutdown(err) { break }
         log.Fatal(err)
     }
-    ann, ok := event.(moq.AnnounceEventAnnounced)
+    ann, ok := event.(moq.AnnounceEventStart)
     if !ok {
-        continue // AnnounceEventUpdated, AnnounceEventRetracted, or AnnounceEventLive
+        continue // AnnounceEventUpdate, AnnounceEventEnd, or AnnounceEventLive
     }
     // Prefix stays origin-relative; Captures reports what each wildcard matched.
     fmt.Printf("captures: %v\n", ann.Announce.Captures)
@@ -75,7 +75,7 @@ broadcast.Close()    // keep the producer reachable while publishing, then close
 
 For locally encoded media, call `MediaProducer.Flush(timestampUs)` after `WriteFrame` with the same broadcast-clock PTS. It measures catalog jitter at the transport handoff. File, pipe, and network imports should omit `Flush`; built-in encoders observe their own output.
 
-Call `media.Discontinuity()` when the source seeks, pauses, or changes its time base. It publishes a timeline marker and restarts handoff measurement without lowering advertised jitter. Resume with timestamps that continue forward on the broadcast media clock; this does not permit timestamp rewinds.
+Call `media.Discontinuity()` when the source seeks, pauses, or changes its time base. It publishes a timeline marker and restarts handoff measurement without lowering advertised jitter. Resume with timestamps that continue forward on the broadcast media clock; this does not permit timestamp rewinds. On a video track, resume with a keyframe: a delta frame before it fails.
 
 The three advertising operations: `client.CreateBroadcast(path)` (or
 `origin.CreateBroadcast`) returns an unannounced producer, invisible to everyone;
@@ -86,13 +86,19 @@ path beneath it (`""` for everything). Hold the returned `OriginDynamic`
 while the claim should stay advertised, and reject the requests you will not
 serve. A route is a capability, not an inventory. `Announced(options)` combines
 a literal prefix with an optional relative pattern and yields an `AnnounceEvent`:
-`AnnounceEventAnnounced`, `AnnounceEventUpdated`, or `AnnounceEventRetracted`
+`AnnounceEventStart`, `AnnounceEventUpdate`, or `AnnounceEventEnd`
 carrying an `Announce`, whose `Prefix` stays relative to the origin and whose
 `Captures` reports the wildcard matches, or `AnnounceEventLive` once every route
 live at subscribe time has been delivered. Break on `AnnounceEventLive` to list
 what is live and stop.
 Paths with a `.`-prefixed segment below the prefix are [hidden](/concept/moq-lite#hidden-broadcasts) unless
 `Hidden: true`.
+
+An `OriginProducer` from `moq.NewOriginProducer` has no `Close`: its origin
+ends when the garbage collector reaches the last owner (each producer, published
+broadcast, and `OriginDynamic`), and every consumer made from it then fails with
+`moq.ErrClosed`. Keep an owner reachable (a field on a long-lived struct, or
+`runtime.KeepAlive`) for as long as the origin should serve.
 
 Every call that can block takes a `context.Context` first. Cancelling it
 returns `ctx.Err()` promptly and tears the in-flight native work down, so a
@@ -131,7 +137,10 @@ Each `VideoDecodedFrame` from `DecodeVideo` owns its decoded picture until
 on demand: `VideoPixelFormatI420`, or `VideoPixelFormatRgba` for four bytes a
 pixel. Close frames promptly, since held frames hold decoder buffers. `Resize`
 is best effort: only NVDEC has a built-in scaler, so read each frame's own
-`Width()` and `Height()` rather than assuming it took.
+`Width()` and `Height()` rather than assuming it took. `VideoDecoderOutput{Surface: true}`
+keeps the decoder's surface for `frame.Surface()` instead of downloading it: a
+`VideoSurfacePixelBuffer` whose `Pointer` is the `CVPixelBufferRef`, valid until
+`Close`. Only macOS has one, so `DecodeVideo` fails with `ErrUnsupported` elsewhere.
 
 ## Connection stats
 

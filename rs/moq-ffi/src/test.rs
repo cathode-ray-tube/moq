@@ -2,12 +2,12 @@ use super::origin::*;
 use super::producer::*;
 use super::server::MoqServer;
 use super::session::{MoqClient, MoqSession};
-use crate::binary::MoqBinaryConfig;
 use crate::consumer::MoqBroadcastConsumer;
 use crate::consumer::MoqFetchGroupOptions;
 use crate::consumer::MoqSubscription;
 use crate::consumer::MoqTrackConsumer;
 use crate::error::MoqError;
+use crate::flate::MoqFlateConfig;
 use crate::json::{MoqJsonSnapshotConfig, MoqJsonStreamConfig};
 use crate::media::{MoqAudioFormat, MoqAudioInit, MoqFrame, MoqVideoFormat, MoqVideoInit};
 use crate::session::{MoqBackoff, MoqConnectionStatus};
@@ -205,7 +205,7 @@ async fn next_announced(announced: &MoqAnnounceConsumer) -> MoqAnnounce {
 	loop {
 		match next_event(announced).await {
 			MoqAnnounceEvent::Live => continue,
-			MoqAnnounceEvent::Announced { announce } => return announce,
+			MoqAnnounceEvent::Start { announce } => return announce,
 			other => panic!("expected an announcement, got {other:?}"),
 		}
 	}
@@ -332,7 +332,7 @@ async fn announced_route_keeps_cold_cost_on_reannounce() {
 	// own `{warm: 0, cold: 0}`.
 	let announced = consumer.announced(MoqAnnounceConfig::default()).unwrap();
 	let route = loop {
-		if let MoqAnnounceEvent::Announced { announce } | MoqAnnounceEvent::Updated { announce } =
+		if let MoqAnnounceEvent::Start { announce } | MoqAnnounceEvent::Update { announce } =
 			next_event(&announced).await
 			&& announce.prefix == "cold-route"
 		{
@@ -1502,7 +1502,7 @@ async fn create_broadcast_is_invisible_until_announced() {
 		.expect("announce reaches the cursor")
 		.expect("the cursor is still open");
 	assert!(
-		matches!(&update, MoqAnnounceEvent::Announced { announce } if announce.prefix == "live"),
+		matches!(&update, MoqAnnounceEvent::Start { announce } if announce.prefix == "live"),
 		"{update:?}"
 	);
 	broadcast.close().unwrap();
@@ -1671,7 +1671,7 @@ async fn announced_yields_live_once_caught_up() {
 	let announced = consumer.announced(MoqAnnounceConfig::default()).unwrap();
 	let first = next_event(&announced).await;
 	assert!(
-		matches!(&first, MoqAnnounceEvent::Announced { announce } if announce.prefix == "cam"),
+		matches!(&first, MoqAnnounceEvent::Start { announce } if announce.prefix == "cam"),
 		"{first:?}"
 	);
 	assert_eq!(next_event(&announced).await, MoqAnnounceEvent::Live);
@@ -1776,8 +1776,8 @@ async fn announce_and_unannounce_toggles_discovery() {
 	async fn wait_live(announced: &MoqAnnounceConsumer, active: bool) {
 		loop {
 			match next_event(announced).await {
-				MoqAnnounceEvent::Announced { announce } if active && announce.prefix == "live" => return,
-				MoqAnnounceEvent::Retracted { announce } if !active && announce.prefix == "live" => return,
+				MoqAnnounceEvent::Start { announce } if active && announce.prefix == "live" => return,
+				MoqAnnounceEvent::End { announce } if !active && announce.prefix == "live" => return,
 				_ => {}
 			}
 		}
@@ -2054,10 +2054,10 @@ async fn video_raw_publish_consume() {
 }
 
 /// A decoded frame owns its surface and converts on demand: one frame yields
-/// both CPU layouts, a portable decode has no native view, and the frame stays
+/// both CPU layouts, a portable decode has no surface view, and the frame stays
 /// readable after its consumer is cancelled and dropped and the track is gone.
-/// A native decode keeps whatever surface the picked backend produced (CUDA
-/// where NVDEC is present, CPU from openh264) and still downloads on demand.
+/// A surface decode keeps the decoder's pixel buffer and still downloads on
+/// demand, where the platform has one (macOS) and is refused where it has none.
 #[cfg(feature = "video")]
 #[tokio::test]
 async fn video_decode_frame_ownership() {
@@ -2112,17 +2112,21 @@ async fn video_decode_frame_ownership() {
 		.decode_video(track.clone(), rendition.clone(), MoqVideoDecoderOutput::default())
 		.await
 		.unwrap();
-	let native = broadcast_consumer
-		.decode_video(
-			track.clone(),
-			rendition.clone(),
-			MoqVideoDecoderOutput {
-				native: true,
-				..Default::default()
-			},
-		)
-		.await
-		.unwrap();
+	let surface_output = MoqVideoDecoderOutput {
+		surface: true,
+		..Default::default()
+	};
+	let retaining = broadcast_consumer
+		.decode_video(track.clone(), rendition.clone(), surface_output)
+		.await;
+	// A platform with no surface variant refuses the opt-in up front, rather than
+	// decoding to a surface the caller can neither view nor always download.
+	let retaining = if cfg!(target_os = "macos") {
+		Some(retaining.unwrap())
+	} else {
+		assert!(matches!(retaining, Err(MoqError::Unsupported)));
+		None
+	};
 
 	// Keep the encoder fed so both decoders see frames after they joined.
 	for i in 10..40u64 {
@@ -2142,23 +2146,34 @@ async fn video_decode_frame_ownership() {
 			.expect("expected a frame")
 	};
 	let frame = next(&portable).await;
-	let retained = next(&native).await;
+	let retained = match &retaining {
+		Some(decoder) => Some(next(decoder).await),
+		None => None,
+	};
 
 	// Release everything upstream of the frames before reading them.
 	portable.cancel();
-	native.cancel();
-	drop((portable, native));
+	if let Some(decoder) = &retaining {
+		decoder.cancel();
+	}
+	drop((portable, retaining));
 	video.finish().unwrap();
 	broadcast.close().unwrap();
 
-	assert_eq!((retained.width(), retained.height()), (320, 240));
-	assert_eq!(
-		retained.pixels(MoqVideoPixelFormat::I420).unwrap().len(),
-		320 * 240 * 3 / 2
-	);
+	if let Some(retained) = retained {
+		assert_eq!((retained.width(), retained.height()), (320, 240));
+		assert!(
+			matches!(retained.surface(), Some(MoqVideoSurface::PixelBuffer { pointer }) if pointer != 0),
+			"a surface decode on macOS retains the pixel buffer"
+		);
+		assert_eq!(
+			retained.pixels(MoqVideoPixelFormat::I420).unwrap().len(),
+			320 * 240 * 3 / 2
+		);
+	}
 
 	assert_eq!((frame.width(), frame.height()), (320, 240));
-	assert!(frame.native().is_none(), "a portable decode holds CPU pixels");
+	assert!(frame.surface().is_none(), "a portable decode holds CPU pixels");
 
 	let i420 = frame.pixels(MoqVideoPixelFormat::I420).unwrap();
 	assert_eq!(i420.len(), 320 * 240 * 3 / 2);
@@ -2543,25 +2558,33 @@ async fn dynamic_serves_a_request_under_a_prefix() {
 	served.close().unwrap();
 }
 
-/// Tearing the origin down ends every handler with `Closed`. A parked request
-/// keeps the origin's driver alive (its front is lifecycle work the driver
-/// drains before resolving), so the teardown never runs underneath one; the
-/// case that does happen is a live handler with nothing parked.
+/// A dynamic handler keeps its origin alive: dropping (or GC-finalizing) the
+/// last `MoqOriginProducer` leaves the route serving, and a consumer made
+/// earlier still resolves through it.
 #[tokio::test]
-async fn origin_teardown_closes_dynamic_handlers() {
+async fn dynamic_keeps_the_origin_alive() {
 	let origin = MoqOriginProducer::new(MoqOriginConfig::default());
+	let consumer = origin.consume();
 	let dynamic = serve(&origin, "");
-
-	// The last producer handle: the origin's driver resolves and tears it down.
 	drop(origin);
-	match tokio::time::timeout(TIMEOUT, dynamic.requested_broadcast())
+
+	let request_broadcast = {
+		let consumer = consumer.clone();
+		tokio::spawn(async move { consumer.request_broadcast("live".into()).await })
+	};
+	let request = tokio::time::timeout(TIMEOUT, dynamic.requested_broadcast())
 		.await
-		.expect("the handler must observe the teardown")
-	{
-		Err(MoqError::Closed) => {}
-		Err(err) => panic!("unexpected error: {err:?}"),
-		Ok(_) => panic!("a request was handed out after the teardown"),
-	}
+		.expect("the handler must still receive requests")
+		.unwrap();
+	let served = MoqBroadcastProducer::new().unwrap();
+	request.accept(&served).unwrap();
+	tokio::time::timeout(TIMEOUT, request_broadcast)
+		.await
+		.expect("timed out waiting for the request to resolve")
+		.expect("request task panicked")
+		.expect("the handler served the path");
+
+	served.close().unwrap();
 }
 
 /// Cancelling a handler retracts its route before returning.
@@ -3274,7 +3297,7 @@ fn without_runtime() {
 		let announcement = loop {
 			match pollster::block_on(announced.next()).unwrap().unwrap() {
 				MoqAnnounceEvent::Live => continue,
-				MoqAnnounceEvent::Announced { announce } => break announce,
+				MoqAnnounceEvent::Start { announce } => break announce,
 				other => panic!("expected an announcement, got {other:?}"),
 			}
 		};
@@ -4546,23 +4569,23 @@ async fn json_tracks_are_advertised_in_the_catalog() {
 	assert!(published_catalog(&broadcast).json.tracks.is_empty());
 }
 
-/// Binary tracks carry their mode and (optional) media type in the catalog.
+/// Flate tracks carry their mode and (optional) media type in the catalog.
 #[tokio::test]
-async fn binary_tracks_are_advertised_in_the_catalog() {
+async fn flate_tracks_are_advertised_in_the_catalog() {
 	let broadcast = MoqBroadcastProducer::new().unwrap();
 	let thumb = broadcast
-		.publish_binary_snapshot(
+		.publish_flate_snapshot(
 			"thumbnail".into(),
-			MoqBinaryConfig {
+			MoqFlateConfig {
 				compression: false,
 				mime: Some("image/jpeg".into()),
 			},
 		)
 		.unwrap();
 	let log = broadcast
-		.publish_binary_stream(
+		.publish_flate_stream(
 			"log".into(),
-			MoqBinaryConfig {
+			MoqFlateConfig {
 				compression: false,
 				mime: None,
 			},
@@ -4604,9 +4627,9 @@ async fn data_track_names_cannot_collide() {
 		.unwrap();
 	assert!(
 		broadcast
-			.publish_binary_stream(
+			.publish_flate_stream(
 				"state".into(),
-				MoqBinaryConfig {
+				MoqFlateConfig {
 					compression: false,
 					mime: None,
 				},

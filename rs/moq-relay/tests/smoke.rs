@@ -214,7 +214,7 @@ async fn announced_until(announcements: &mut moq_net::announce::Consumer, until:
 			.await
 			.expect("announcement timeout")
 			.expect("origin closed");
-		if let moq_net::announce::Event::Announced(announce) | moq_net::announce::Event::Updated(announce) = event {
+		if let moq_net::announce::Event::Start(announce) | moq_net::announce::Event::Update(announce) = event {
 			seen.push(announce.prefix.as_str().to_owned());
 		}
 	}
@@ -579,7 +579,7 @@ async fn two_publish_only_clients_coexist() {
 
 /// Run the relay's accept loop over the given server config, the same path
 /// `main.rs` uses. Authenticates through the shared [`Auth`], here with fully
-/// public access (`--auth-public ""`) so no-JWT clients get the root.
+/// public access (`--auth-public "**"`) so no-JWT clients get the root.
 ///
 /// Returns the QUIC and TCP sockets the server bound, when it has them, so a
 /// caller that asked for an ephemeral port can dial it.
@@ -628,7 +628,7 @@ async fn spawn_internal_relay() -> (u16, tokio::task::JoinHandle<()>) {
 	let mut config = moq_tokio::listen::Config::default();
 	config.tcp.bind = Some("127.0.0.1:0".parse().expect("parse addr"));
 
-	// Public Simple([""]) lets any no-JWT stream client through at the root.
+	// Public `**` lets any no-JWT stream client through at the root.
 	let mut auth_config = auth::Config::default();
 	auth_config.public = vec![moq_auth::Pattern::all()];
 
@@ -730,7 +730,7 @@ async fn spawn_internal_unix_relay() -> (std::path::PathBuf, tokio::task::JoinHa
 	let mut config = moq_tokio::listen::Config::default();
 	config.unix.bind = Some(path.clone());
 
-	// Public Simple([""]) lets any no-JWT stream client through at the root.
+	// Public `**` lets any no-JWT stream client through at the root.
 	let mut auth_config = auth::Config::default();
 	auth_config.public = vec![moq_auth::Pattern::all()];
 
@@ -1115,10 +1115,8 @@ async fn connect_once(
 async fn next_update(announced: &mut moq_net::announce::Consumer) -> Option<(moq_net::announce::Announce, bool)> {
 	loop {
 		return match announced.next().await? {
-			moq_net::announce::Event::Announced(route) | moq_net::announce::Event::Updated(route) => {
-				Some((route, true))
-			}
-			moq_net::announce::Event::Retracted(route) => Some((route, false)),
+			moq_net::announce::Event::Start(route) | moq_net::announce::Event::Update(route) => Some((route, true)),
+			moq_net::announce::Event::End(route) => Some((route, false)),
 			moq_net::announce::Event::Live => continue,
 		};
 	}

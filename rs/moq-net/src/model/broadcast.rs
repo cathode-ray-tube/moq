@@ -412,6 +412,29 @@ impl Producer {
 		}
 	}
 
+	/// Remove the spliced track `producer` from under `name`, unless it has a reader.
+	///
+	/// Returns false only when a reader holds it: lookups hand out readers under the
+	/// same lock, so one arriving after the caller decided is never cut off. Anything
+	/// else (removed, or already replaced under the name) is gone as far as the caller
+	/// is concerned.
+	pub(crate) fn forget_spliced(&self, name: &str, producer: &super::resume::Producer) -> bool {
+		let mut state = self.state.lock();
+		let Some(spliced) = state.spliced.as_mut() else {
+			return true;
+		};
+		match spliced.tracks.get(name) {
+			Some(current) if current.is_clone(producer) => {
+				if current.is_used() {
+					return false;
+				}
+				spliced.tracks.remove(name);
+				true
+			}
+			_ => true,
+		}
+	}
+
 	/// Create a consumer of this one publisher's broadcast.
 	///
 	/// A view of this broadcast object, not of its path: a new publisher at the same
@@ -767,11 +790,12 @@ impl Consumer {
 			// the time, not a property of the name: a publisher that had not yet
 			// created the track may have it now. Drop it so this request reaches a
 			// source again, exactly as the plain lookup below reclaims a closed
-			// entry. A *finished* one stays, since its cache is still readable.
+			// entry. A *finished* one stays, since its cache is still readable,
+			// until the front forgets it after going unread for its linger.
 			//
-			// So a name, once finished, never comes back here: a publisher that
-			// finishes a track and publishes it again is serving new content, not
-			// resuming this one, and a subscriber has to re-read the catalog and
+			// So a name, once finished, is never spliced onto again: a publisher
+			// that finishes a track and publishes it again is serving new content,
+			// not resuming this one, and a subscriber has to re-read the catalog and
 			// re-initialize rather than be spliced onto it. Resuming the same
 			// content across routes is the transparent case, and that is what
 			// `resume::Producer` already does. Publish new content under a new
@@ -1325,7 +1349,7 @@ mod test {
 
 		// The producer should NOT be unused yet because there's a consumer.
 		assert!(
-			producer1.unused().now_or_never().is_none(),
+			producer1.demand().unused().now_or_never().is_none(),
 			"track producer should be used"
 		);
 
@@ -1335,13 +1359,13 @@ mod test {
 
 		drop(consumer1);
 		assert!(
-			producer1.unused().now_or_never().is_none(),
+			producer1.demand().unused().now_or_never().is_none(),
 			"track producer should be used"
 		);
 
 		drop(consumer2);
 		assert!(
-			producer1.unused().now_or_never().is_some(),
+			producer1.demand().unused().now_or_never().is_some(),
 			"track producer should be unused after all consumers are dropped"
 		);
 
@@ -1362,7 +1386,7 @@ mod test {
 		let consumer4 = c4_fut.await.unwrap();
 		drop(consumer4);
 		assert!(
-			producer2.unused().now_or_never().is_some(),
+			producer2.demand().unused().now_or_never().is_some(),
 			"new track producer should be unused after its consumer is dropped"
 		);
 	}
@@ -1611,7 +1635,7 @@ mod test {
 		let track = producer.create_track("video", None).unwrap();
 
 		// The unused wake a teardown acts on.
-		assert!(track.poll_unused(&kio::Waiter::noop()).is_ready());
+		assert!(track.demand().poll_unused(&kio::Waiter::noop()).is_ready());
 
 		// Demand returns in the gap before it commits.
 		let viewer = consumer.track("video").unwrap();
@@ -1642,9 +1666,9 @@ mod test {
 		let consumer = producer.consume();
 		let track = producer.create_track("video", None).unwrap();
 		let _viewer = consumer.track("video").unwrap();
-		assert!(track.is_used());
+		assert!(track.demand().is_used());
 		track.clone().abort(Error::Cancel).unwrap();
-		assert!(!track.is_used());
+		assert!(!track.demand().is_used());
 		assert!(track.abort_unused(Error::Cancel).is_ok());
 		producer.close();
 	}

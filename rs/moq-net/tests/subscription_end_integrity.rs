@@ -106,7 +106,7 @@ async fn round(drop_session: bool) -> (Vec<Vec<u8>>, Option<moq_net::Error>) {
 		}
 	});
 
-	tokio::time::timeout(TIMEOUT, track.used())
+	tokio::time::timeout(TIMEOUT, track.demand().used())
 		.await
 		.expect("no subscriber appeared")
 		.unwrap();
@@ -235,7 +235,7 @@ async fn killed(version: &str) -> Option<moq_net::Error> {
 		}
 	});
 
-	track.used().await.expect("no subscriber appeared");
+	track.demand().used().await.expect("no subscriber appeared");
 	let mut group = track.append_group().unwrap();
 	group.write_frame(Timestamp::ZERO, HEAD[0]).unwrap();
 	settle().await;

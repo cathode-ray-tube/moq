@@ -617,7 +617,6 @@ export class Effect {
 	#stack?: string;
 	#scheduled = false;
 
-	#stopped: PromiseWithResolvers<void>;
 	#closed: PromiseWithResolvers<void>;
 
 	#abort: AbortController = new AbortController();
@@ -640,7 +639,6 @@ export class Effect {
 			this.#stack = new Error().stack;
 		}
 
-		this.#stopped = Promise.withResolvers();
 		this.#closed = Promise.withResolvers();
 
 		if (fn) {
@@ -664,9 +662,8 @@ export class Effect {
 		if (this.#dispose === undefined) return; // closed, no error because this is a microtask
 
 		// The next run's scope is created when that run starts, not here, so a spawn task
-		// resuming in between still sees its own run's state: aborted and cancelled.
+		// resuming in between still sees its own run's state: aborted.
 		this.#stale = true;
-		this.#stopped.resolve();
 		this.#abort.abort();
 
 		// Unsubscribe from all signals.
@@ -729,7 +726,6 @@ export class Effect {
 
 		// Open this run's scope. Anything still holding the previous one keeps seeing it torn down.
 		this.#stale = false;
-		this.#stopped = Promise.withResolvers();
 		this.#abort = new AbortController();
 		this.#abortUsed = false;
 
@@ -1124,7 +1120,6 @@ export class Effect {
 		this.#dispose = undefined;
 
 		this.#closed.resolve();
-		this.#stopped.resolve();
 		this.#abort.abort();
 
 		this.#drain(dispose);
@@ -1142,15 +1137,6 @@ export class Effect {
 	/** Resolves when the effect is closed. */
 	get closed(): Promise<void> {
 		return this.#closed.promise;
-	}
-
-	/**
-	 * Resolves when the current run is about to be torn down, by a rerun or close.
-	 *
-	 * @internal Racing it adds a reaction per call that lives until the run ends; use {@link race}.
-	 */
-	get cancel(): Promise<void> {
-		return this.#stopped.promise;
 	}
 
 	/**

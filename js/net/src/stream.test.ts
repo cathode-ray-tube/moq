@@ -11,8 +11,9 @@ import {
 	StreamError,
 } from "./error.ts";
 import { Version } from "./ietf/version.ts";
-import { Reader, Stream, Writer } from "./stream.ts";
+import { type Cursor, Reader, Stream, Writer } from "./stream.ts";
 import { TimeoutError } from "./util/timeout.ts";
+import { U64 } from "./util/u64.ts";
 
 // Helper to create a writable stream that captures written data
 function createTestWritableStream(): { stream: WritableStream<Uint8Array>; written: Uint8Array[] } {
@@ -238,22 +239,18 @@ test("Reader u53 rejects integers that cannot be represented exactly", async () 
 	const wireValues = [firstUnsafe, firstUnsafe + 1n];
 	expect(Number(wireValues[0])).toBe(Number(wireValues[1]));
 
-	const { stream, written } = createTestWritableStream();
-	const writer = new Writer(stream);
-
 	for (const value of wireValues) {
+		const { stream, written } = createTestWritableStream();
+		const writer = new Writer(stream);
 		await writer.u62(value);
-	}
+		writer.close();
+		await writer.closed;
 
-	writer.close();
-	await writer.closed;
-
-	const reader = new Reader(undefined, concatChunks(written));
-	for (const value of wireValues) {
+		// A failed decode consumes nothing; the stream is unusable after it anyway.
+		const reader = new Reader(undefined, concatChunks(written));
 		await expect(reader.u53()).rejects.toThrow(`value larger than 53-bits: ${value}`);
+		expect(await reader.done()).toBe(false);
 	}
-
-	expect(await reader.done()).toBe(true);
 });
 
 test("Reader u62 varint decoding", async () => {
@@ -350,7 +347,7 @@ test("Reader stream with partial reads", async () => {
 	expect(await reader.done()).toBe(true);
 });
 
-test("Reader owns streamed chunks and preserves returned views across fills", async () => {
+test("Reader preserves returned views across fills", async () => {
 	const first = new Uint8Array([99, 1, 2, 99]);
 	const second = new Uint8Array([99, 3, 4, 5, 99]);
 	const stream = new ReadableStream<Uint8Array>({
@@ -362,14 +359,42 @@ test("Reader owns streamed chunks and preserves returned views across fills", as
 	});
 	const reader = new Reader(stream);
 	const head = await reader.read(1);
-	first.fill(0);
 	expect(head).toEqual(new Uint8Array([1]));
 	const joined = await reader.read(3);
-	second.fill(0);
 	expect(joined).toEqual(new Uint8Array([2, 3, 4]));
 	joined.fill(0);
 	expect(head).toEqual(new Uint8Array([1]));
 	expect(await reader.read(1)).toEqual(new Uint8Array([5]));
+	expect(await reader.done()).toBe(true);
+});
+
+test("Reader returns a view of a chunk that already holds the read", async () => {
+	const chunk = new Uint8Array([1, 2, 3, 4]);
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(chunk);
+			controller.close();
+		},
+	});
+	const reader = new Reader(stream);
+	const read = await reader.read(3);
+	expect(read.buffer).toBe(chunk.buffer);
+	expect(read).toEqual(new Uint8Array([1, 2, 3]));
+	expect(await reader.readAll()).toEqual(new Uint8Array([4]));
+});
+
+test("Reader joins every chunk a read spans", async () => {
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			for (let value = 0; value < 100; value++) controller.enqueue(new Uint8Array([value]));
+			controller.close();
+		},
+	});
+	const reader = new Reader(stream);
+	expect(await reader.u8()).toBe(0);
+	expect(await reader.read(98)).toEqual(Uint8Array.from({ length: 98 }, (_, index) => index + 1));
+	expect(await reader.done()).toBe(false);
+	expect(await reader.readAll()).toEqual(new Uint8Array([99]));
 	expect(await reader.done()).toBe(true);
 });
 
@@ -384,6 +409,54 @@ test("Reader u53 decodes two-byte stream type prefixes", async () => {
 	const reader = new Reader(undefined, concatChunks(written));
 	expect(await reader.u53()).toBe(0x40);
 	expect(await reader.done()).toBe(true);
+});
+
+/** A length-prefixed payload. */
+const sized = (c: Cursor) => c.read(c.u53());
+
+test("Reader tryDecode drains every buffered message, then consumes nothing from a partial one", async () => {
+	let controller!: ReadableStreamDefaultController<Uint8Array>;
+	const reader = new Reader(new ReadableStream<Uint8Array>({ start: (c) => (controller = c) }));
+	controller.enqueue(new Uint8Array([1, 0xa, 2, 0xb, 0xc, 3, 0xd]));
+	expect(await reader.done()).toBe(false);
+
+	expect(reader.tryDecode(sized)).toEqual(new Uint8Array([0xa]));
+	expect(reader.tryDecode(sized)).toEqual(new Uint8Array([0xb, 0xc]));
+	expect(reader.tryDecode(sized)).toBeUndefined();
+	expect(reader.tryDecode(sized)).toBeUndefined();
+
+	const pending = reader.decode(sized);
+	controller.enqueue(new Uint8Array([0xe]));
+	controller.enqueue(new Uint8Array([0xf]));
+	expect(await pending).toEqual(new Uint8Array([0xd, 0xe, 0xf]));
+	controller.close();
+	expect(await reader.decodeMaybe(sized)).toBeUndefined();
+});
+
+test("Reader tryDecode holds only the decode that ran short to the bytes it needs", () => {
+	const reader = new Reader(undefined, new Uint8Array([2, 0xa]));
+	expect(reader.tryDecode(sized)).toBeUndefined();
+	expect(reader.tryDecode((c) => c.u8())).toBe(2);
+});
+
+test("Reader decode rejects a stream that ends inside a message", async () => {
+	const reader = new Reader(undefined, new Uint8Array([3, 0xa]));
+	expect(reader.tryDecode(sized)).toBeUndefined();
+	await expect(reader.decode(sized)).rejects.toThrow("unexpected end of stream");
+});
+
+test("Reader refuses an oversized value even when it is already buffered", async () => {
+	const size = 64 * 1024 * 1024 + 1;
+	const buffer = new Uint8Array(4 + size);
+	buffer.set([0x84, 0x00, 0x00, 0x01]); // the 4-byte varint for size
+	await expect(new Reader(undefined, buffer).string()).rejects.toThrow("exceeds max size");
+	await expect(new Reader(undefined, buffer.subarray(4)).read(size)).rejects.toThrow("exceeds max size");
+});
+
+test("Reader refuses a buffered decode whose fields together exceed the max size", async () => {
+	const half = 32 * 1024 * 1024;
+	const reader = new Reader(undefined, new Uint8Array(2 * half + 1));
+	await expect(reader.decode((c) => [c.read(half), c.read(half + 1)])).rejects.toThrow("exceeds max size");
 });
 
 /** A stream reset as a transport delivers one: the peer's code, and nothing else useful. */
@@ -724,3 +797,55 @@ for (const [version, tooFarBehind] of [
 		if (version !== undefined) expect((err as StreamError).message).toContain("70");
 	});
 }
+
+test("Writer and Reader varint round-trip every size in both formats", async () => {
+	const values = [0n, 63n, 64n, 127n, 128n, 2n ** 14n, 2n ** 21n, 2n ** 28n, 2n ** 30n, 2n ** 32n, 2n ** 35n];
+	values.push(2n ** 42n, 2n ** 49n, 2n ** 53n, 2n ** 56n, 2n ** 62n - 1n);
+	for (const version of [undefined, Version.DRAFT_16, Version.DRAFT_17, Version.DRAFT_19]) {
+		// Only leading-ones varints reach past 62 bits.
+		const all =
+			version === Version.DRAFT_17 || version === Version.DRAFT_19
+				? [...values, 2n ** 62n, 2n ** 64n - 1n]
+				: values;
+		const { stream, written } = createTestWritableStream();
+		const writer = new Writer(stream, version);
+		for (const value of all) await writer.varint(U64.fromBigInt(value));
+		writer.close();
+		await writer.closed;
+
+		const reader = new Reader(undefined, concatChunks(written), version);
+		for (const value of all) expect((await reader.varint()).toBigInt()).toBe(value);
+		expect(await reader.done()).toBe(true);
+	}
+});
+
+test("Writer varint refuses a QUIC varint past 62 bits before emitting bytes", async () => {
+	const { stream, written } = createTestWritableStream();
+	const writer = new Writer(stream);
+	await expect(writer.varint(U64.fromBigInt(2n ** 62n))).rejects.toThrow(/larger than 62-bits/);
+	await expect(writer.varint(U64.MAX)).rejects.toThrow(/larger than 62-bits/);
+	expect(written).toEqual([]);
+});
+
+test("Reader u53 decodes every size in both formats, one byte per chunk", async () => {
+	const values = [0, 63, 64, 127, 128, 16383, 16384, 2 ** 21, 2 ** 28 - 1, 2 ** 28, 2 ** 30 - 1, 2 ** 30];
+	values.push(2 ** 35, 2 ** 42, 2 ** 49, Number.MAX_SAFE_INTEGER);
+	for (const version of [undefined, Version.DRAFT_17]) {
+		const { stream, written } = createTestWritableStream();
+		const writer = new Writer(stream, version);
+		for (const value of values) await writer.u53(value);
+		writer.close();
+		await writer.closed;
+
+		const bytes = concatChunks(written);
+		const chunked = new ReadableStream<Uint8Array>({
+			start(controller) {
+				for (const byte of bytes) controller.enqueue(new Uint8Array([byte]));
+				controller.close();
+			},
+		});
+		const reader = new Reader(chunked, undefined, version);
+		for (const value of values) expect(await reader.u53()).toBe(value);
+		expect(await reader.done()).toBe(true);
+	}
+});

@@ -38,18 +38,18 @@ typealias AnnouncedBroadcast = uniffi.moq.MoqAnnouncedBroadcast
 /** A route over a prefix: its origin-relative path, wildcard captures, and route metadata. */
 typealias Announce = uniffi.moq.MoqAnnounce
 /**
- * What an [AnnounceConsumer] yields: [AnnounceEventAnnounced], [AnnounceEventUpdated],
- * [AnnounceEventRetracted], or [AnnounceEventLive].
+ * What an [AnnounceConsumer] yields: [AnnounceEventStart], [AnnounceEventUpdate],
+ * [AnnounceEventEnd], or [AnnounceEventLive].
  */
 typealias AnnounceEvent = uniffi.moq.MoqAnnounceEvent
 // Kotlin cannot reach a sealed class's subtypes through its typealias, so each
 // variant gets its own.
 /** A route now covers the prefix; the stream had none there. */
-typealias AnnounceEventAnnounced = uniffi.moq.MoqAnnounceEvent.Announced
+typealias AnnounceEventStart = uniffi.moq.MoqAnnounceEvent.Start
 /** The route covering the prefix changed hops or cost. */
-typealias AnnounceEventUpdated = uniffi.moq.MoqAnnounceEvent.Updated
+typealias AnnounceEventUpdate = uniffi.moq.MoqAnnounceEvent.Update
 /** No route covers the prefix any more; carries its last route. */
-typealias AnnounceEventRetracted = uniffi.moq.MoqAnnounceEvent.Retracted
+typealias AnnounceEventEnd = uniffi.moq.MoqAnnounceEvent.End
 /** Every route live at subscribe time has been delivered; what follows is live changes. */
 typealias AnnounceEventLive = uniffi.moq.MoqAnnounceEvent.Live
 // Broadcast / track / group producers and consumers.
@@ -155,7 +155,7 @@ typealias AudioCodec = uniffi.moq.MoqAudioCodec
 typealias AudioSampleFormat = uniffi.moq.MoqAudioSampleFormat
 /** The PCM layout an [AudioConsumer] should decode to. */
 typealias AudioDecoderOutput = uniffi.moq.MoqAudioDecoderOutput
-/** What a [VideoConsumer] decodes to: an optional resize, a latency budget, and whether frames keep the decoder's native surface. */
+/** What a [VideoConsumer] decodes to: an optional resize, a latency budget, and whether frames keep the decoder's surface (macOS only; refused elsewhere). */
 typealias VideoDecoderOutput = uniffi.moq.MoqVideoDecoderOutput
 /** One decoded video frame, owning the decoder's surface until closed; `pixels(format)` converts it to packed CPU pixels. */
 typealias VideoDecodedFrame = uniffi.moq.MoqVideoDecodedFrame

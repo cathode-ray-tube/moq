@@ -1276,17 +1276,34 @@ impl Cluster {
 	/// Passed by reference to [`moq_net::Server::with_publisher`] (or the
 	/// equivalent per-request setter), which derives the read handle.
 	pub fn subscriber(&self, token: &auth::Token) -> Option<origin::Producer> {
-		self.origin.scope(&token.root, &token.subscribe).ok()
+		self.mounted(token)?.scope(&token.root, &token.subscribe).ok()
 	}
 
 	/// Returns an [`origin::Producer`] scoped to this session's publish permissions,
 	/// marked [`origin::Producer::peer`] when the grant names a cluster peer.
+	/// Nothing is published beneath the grant's mounts.
 	pub fn publisher(&self, token: &auth::Token) -> Option<origin::Producer> {
-		let publisher = self.origin.scope(&token.root, &token.publish).ok()?;
+		let publisher = self.mounted(token)?.scope(&token.root, &token.publish).ok()?;
 		Some(match token.peer {
 			true => publisher.peer(),
 			false => publisher,
 		})
+	}
+
+	/// The origin with the grant's mounts applied, before it is scoped to the
+	/// session. A mount the origin refuses (overlapping another) admits nothing.
+	fn mounted(&self, token: &auth::Token) -> Option<origin::Producer> {
+		let mut origin = self.origin.clone();
+		for (at, target) in &token.mounts {
+			origin = match origin.mount(token.root.join(at), target) {
+				Ok(origin) => origin,
+				Err(err) => {
+					tracing::warn!(root = %token.root, %at, %target, %err, "grant mount refused");
+					return None;
+				}
+			};
+		}
+		Some(origin)
 	}
 
 	/// Resolve whether gossip is on and which URL this relay advertises, from
@@ -1664,8 +1681,8 @@ impl Cluster {
 			tokio::select! {
 				ann = announced.next() => {
 					let (update, active) = match ann {
-						Some(moq_net::announce::Event::Announced(update) | moq_net::announce::Event::Updated(update)) => (update, true),
-						Some(moq_net::announce::Event::Retracted(update)) => (update, false),
+						Some(moq_net::announce::Event::Start(update) | moq_net::announce::Event::Update(update)) => (update, true),
+						Some(moq_net::announce::Event::End(update)) => (update, false),
 						Some(moq_net::announce::Event::Live) => continue,
 						None => return,
 					};
@@ -2308,10 +2325,8 @@ mod tests {
 	async fn next_update(announced: &mut moq_net::announce::Consumer) -> Option<(moq_net::announce::Announce, bool)> {
 		loop {
 			return match announced.next().await? {
-				moq_net::announce::Event::Announced(route) | moq_net::announce::Event::Updated(route) => {
-					Some((route, true))
-				}
-				moq_net::announce::Event::Retracted(route) => Some((route, false)),
+				moq_net::announce::Event::Start(route) | moq_net::announce::Event::Update(route) => Some((route, true)),
+				moq_net::announce::Event::End(route) => Some((route, false)),
 				moq_net::announce::Event::Live => continue,
 			};
 		}
@@ -2321,7 +2336,7 @@ mod tests {
 	fn try_next_announced(announced: &mut moq_net::announce::Consumer) -> Option<moq_net::announce::Announce> {
 		loop {
 			return match announced.try_next()? {
-				moq_net::announce::Event::Announced(route) => Some(route),
+				moq_net::announce::Event::Start(route) => Some(route),
 				moq_net::announce::Event::Live => continue,
 				other => panic!("expected an announcement: got {other:?}"),
 			};
@@ -2330,6 +2345,57 @@ mod tests {
 
 	fn new_cluster(config: Config) -> anyhow::Result<Cluster> {
 		Cluster::new(Options::new(config))
+	}
+
+	/// A grant's mount reaches the target for subscribe and refuses publish, both
+	/// named from the session's root.
+	#[tokio::test]
+	async fn session_handles_apply_grant_mounts() {
+		let cluster = new_cluster(Config::default()).expect("cluster");
+		let everything = || moq_net::Patterns::from(moq_net::Pattern::all());
+		let mut grant = moq_auth::Grant::new(everything(), everything());
+		grant.mounts.insert(".svc".into(), ".svc/pid".into());
+		let token = auth::Token::new("/pid", &grant);
+
+		let _worker = cluster
+			.origin
+			.publish(".svc/pid/foo", origin::Route::default())
+			.expect("publish at the fleet path");
+		let subscriber = cluster.subscriber(&token).expect("subscribe grant").consume();
+		let broadcast = subscriber
+			.request_broadcast(".svc/foo")
+			.await
+			.expect("resolves through the mount");
+		assert_eq!(broadcast.info().path.as_str(), ".svc/foo");
+
+		let publisher = cluster.publisher(&token).expect("publish grant");
+		assert!(publisher.create_broadcast(".svc/foo").is_err());
+		publisher.create_broadcast("cam").expect("publish outside the mount");
+
+		// A mount the origin refuses admits nothing rather than half a grant.
+		grant.mounts.insert(".svc/x".into(), ".other".into());
+		let token = auth::Token::new("/pid", &grant);
+		assert!(cluster.subscriber(&token).is_none());
+		assert!(cluster.publisher(&token).is_none());
+	}
+
+	/// A grant whose mounts chain, or whose mount point is a wildcard, admits
+	/// nothing. Mounts apply in key order, so the chain is written with the
+	/// mount point on the target sorting last.
+	#[tokio::test]
+	async fn session_handles_refuse_invalid_grant_mounts() {
+		let cluster = new_cluster(Config::default()).expect("cluster");
+		let everything = || moq_net::Patterns::from(moq_net::Pattern::all());
+		let invalid: [&[(&str, &str)]; 2] = [&[(".a", "pid/.z"), (".z", "secret")], &[("*", ".svc/pid")]];
+		for mounts in invalid {
+			let mut grant = moq_auth::Grant::new(everything(), everything());
+			for (at, target) in mounts {
+				grant.mounts.insert((*at).into(), (*target).into());
+			}
+			let token = auth::Token::new("/pid", &grant);
+			assert!(cluster.subscriber(&token).is_none(), "{mounts:?}");
+			assert!(cluster.publisher(&token).is_none(), "{mounts:?}");
+		}
 	}
 
 	/// The publish task holds only a `Weak` to its producer, so it stops when the
@@ -3121,7 +3187,7 @@ mod tests {
 		// The self-registration route must be visible on the origin.
 		// The watcher subscribed to an empty origin, so its marker comes first.
 		assert!(matches!(watcher.try_next(), Some(moq_net::announce::Event::Live)));
-		let Some(moq_net::announce::Event::Announced(update)) = watcher.try_next() else {
+		let Some(moq_net::announce::Event::Start(update)) = watcher.try_next() else {
 			panic!("self-registration must be published");
 		};
 		assert_eq!(update.prefix.as_str(), ".internal/origins/rendezvous.example.com:4443");

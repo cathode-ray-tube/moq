@@ -14,10 +14,13 @@ are renamed.
   nested TLS, QUIC, and backoff records. Validate in `new`. Resolve defaults
   in Rust, since Go gets none; Option fields keep additions additive. This
   also retires Kotlin `Moq.connect`'s twelve named parameters.
+- The client config carries the protocol versions to offer, as moq-c's
+  `moq_client_config.versions` already does (`rs/moq-c/src/api.rs`), so every
+  binding can pin or restrict versions. moq-ffi has no version setter today.
 - Objects that are only getters become records.
   Handles with verbs (`Request`, `TrackRequest`, `GroupRequest`) stay objects.
 - An enum whose variants a wrapper must name spells each variant
-  `<Enum><Variant>` (`AnnounceEventAnnounced`, `AnnounceEventLive`) in Go,
+  `<Enum><Variant>` (`AnnounceEventStart`, `AnnounceEventEnd`) in Go,
   Kotlin, Dart, and Python, whatever the generated name. Swift keeps its
   generated `<Enum>.<variant>` cases, since it cannot alias a case.
 - `TrackProducer` drops `name`/`is_used`/`used`/`unused` for `demand()`.
@@ -40,9 +43,7 @@ are renamed.
   this line removes, but dropping it costs every quick-start a hop (raised in
   #3959).
 
-moq-c's affected symbols follow.
-
-Public API: breaking in every binding and moq-c. Wire: none.
+Public API: breaking in every binding. Wire: none.
 
 ## Required
 

@@ -22,6 +22,15 @@ set working-directory := '.'
 default:
     @just --justfile {{ justfile() }} --list test
 
+# Port isolation across private temp roots and keyboard activation under a canvas.
+# The browser check is not `*.test.ts`: plain `bun test` runs lack Playwright Chromium,
+# which this recipe installs, as the interop and wasm harnesses do.
+harness:
+    ./lib/harness.test.sh
+    cd .. && bun install --frozen-lockfile
+    cd interop/clients/js && bunx playwright install chromium
+    cd interop/clients/js && bun test ./harness.browser.ts
+
 # Cross-language media interop test, built from this checkout. Stands up a
 # relay and runs the publisher x subscriber matrix. Default: rust only (fast
 # sanity check). `interop --all` runs the full matrix: rust + python + go +
@@ -29,9 +38,11 @@ default:
 # client, and the GStreamer moqsrc plugin). --timeout 30 gives headless Chromium
 # cold-start headroom. Other flags pass through, e.g.
 # `just test interop --publishers rust,python --subscribers rust,c`.
+# Both runs first check js/net's varints against moq-net's encoder at every size boundary.
 interop *args:
     #!/usr/bin/env bash
     set -euo pipefail
+    just rs test -p moq-net --lib varint_interop --run-ignored all
     if [[ "${1:-}" == --all ]]; then
         shift
         ./interop/interop.sh --publishers rust,python,go,js --subscribers rust,python,go,js,js-native-node,js-native-bun,c,gst --timeout 30 "$@"

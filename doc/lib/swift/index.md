@@ -29,7 +29,7 @@ let client = Client()
 let session = try await client.connect(to: "https://relay.example.com")
 
 for try await event in try session.consume.announced(prefix: "live/", filter: "*/camera") {
-    guard case .announced(let announcement) = event else { continue } // .updated, .retracted, or .live
+    guard case .start(let announcement) = event else { continue } // .update, .end, or .live
     // Prefixes stay origin-relative; captures reports what each wildcard matched.
     print(announcement.captures ?? [])
     let broadcast = try await session.consume.requestBroadcast(path: announcement.prefix)
@@ -58,7 +58,7 @@ session.shutdown()
 
 For already-encoded live output, call `audio.flush(timestampUs:)` after `writeFrame` with the same broadcast-clock PTS. It measures catalog jitter at the transport handoff. File, pipe, and network imports should omit `flush`; built-in encoders observe their own output.
 
-Call `audio.discontinuity()` when the source seeks, pauses, or changes its time base. It publishes a timeline marker and restarts handoff measurement without lowering advertised jitter. Resume with timestamps that continue forward on the broadcast media clock; this does not permit timestamp rewinds.
+Call `audio.discontinuity()` when the source seeks, pauses, or changes its time base. It publishes a timeline marker and restarts handoff measurement without lowering advertised jitter. Resume with timestamps that continue forward on the broadcast media clock; this does not permit timestamp rewinds. On a track from `publishVideo`, resume with a keyframe: a delta frame before it fails.
 
 The three advertising operations: `session.publish.createBroadcast(path:)`
 returns an unannounced producer, invisible to everyone; `broadcast.announce(route:)` /
@@ -69,7 +69,7 @@ beneath it (`""` for everything). Hold the returned `OriginDynamic` while the
 claim should stay advertised, and reject the requests you will not serve. A
 route is a capability, not an inventory. `announced(prefix:filter:)` combines a
 literal root with an optional relative pattern and yields `AnnounceEvent`s:
-`.announced`, `.updated`, or `.retracted` carrying an `Announce`, whose `prefix`
+`.start`, `.update`, or `.end` carrying an `Announce`, whose `prefix`
 stays relative to the origin and whose `captures` reports what the wildcards
 matched, or `.live` once every route live at subscribe time has been delivered.
 Paths with a `.`-prefixed segment below the prefix are [hidden](/concept/moq-lite#hidden-broadcasts) unless
@@ -109,7 +109,9 @@ including after the consumer is cancelled. `frame.pixels(format:)` converts it
 on demand: `.i420`, or `.rgba` for four bytes a pixel. Release frames promptly,
 since held frames hold decoder buffers. `resize` is best effort: only NVDEC has
 a built-in scaler, and VideoToolbox is not it, so read each frame's own
-`width()` and `height()` rather than assuming it took.
+`width()` and `height()` rather than assuming it took. `VideoDecoderOutput(surface: true)`
+keeps the decoder's surface for `frame.surface()` instead of downloading it. Only macOS
+has one, so `decodeVideo` fails as unsupported elsewhere.
 
 ## Connection stats
 

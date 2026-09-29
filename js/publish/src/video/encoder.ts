@@ -13,7 +13,7 @@ import {
 	Signal,
 } from "@moq/signals";
 import type { Broadcast } from "../broadcast";
-import { RenditionJitter } from "../jitter";
+import { type Baseline, Estimator } from "../jitter";
 import { hardwareReliable } from "../support/video";
 import type { Capture } from "./capture";
 import { normalizeSource, type Source } from "./types";
@@ -150,13 +150,23 @@ export class Encoder {
 	// A keyframe asked for by {@link cut} and not yet encoded.
 	#cut = false;
 
+	// How many resolution runs threw for their current inputs (no supported codec, an invalid knob),
+	// so no config is coming until one reruns.
+	#failures = new Signal(0);
+
+	/**
+	 * @internal Whether the catalog config resolved, or failed and won't until an input changes.
+	 * `<moq-publish>` holds its first announce until this is set.
+	 */
+	readonly settled: Computed<boolean>;
+
 	#signals = new Effect();
 	#stalled = new Catalog.Stalled.Detector();
 	#firstCaptured?: Time.Micro;
 	#lastCaptured?: Time.Micro;
 	#lastAccepted?: Time.Micro;
 	#lastCaptureWall?: number;
-	#jitter = new RenditionJitter();
+	#estimator = new Estimator();
 
 	constructor(name: string, props?: EncoderProps) {
 		this.name = name;
@@ -168,12 +178,29 @@ export class Encoder {
 		};
 		this.config = Signal.from(props?.config);
 		this.#codecFilter = this.#signals.computed((effect) => effect.get(this.config)?.codec ?? "");
+		this.settled = this.#signals.computed(
+			(effect) => effect.get(this.#out.catalog) !== undefined || effect.get(this.#failures) > 0,
+		);
 
-		this.#signals.run(this.#runCatalog.bind(this));
-		this.#signals.run(this.#runCodec.bind(this));
-		this.#signals.run(this.#runResolved.bind(this));
-		this.#signals.run(this.#runDimensions.bind(this));
+		// Every step that resolves the config counts a throw as a failure, so a bad input settles the
+		// gate instead of holding the announce forever.
+		for (const run of [this.#runCatalog, this.#runCodec, this.#runResolved, this.#runDimensions]) {
+			this.#signals.run((effect) => {
+				try {
+					run.call(this, effect);
+				} catch (err) {
+					this.#fail(effect);
+					throw err;
+				}
+			});
+		}
 		this.#signals.run(this.#runRegister.bind(this));
+	}
+
+	// Count a failure until `effect` reruns with new inputs.
+	#fail(effect: Effect): void {
+		this.#failures.update((n) => n + 1);
+		effect.cleanup(() => this.#failures.update((n) => n - 1));
 	}
 
 	// Register the rendition on the broadcast and drive its catalog + encode loop. Re-registers cleanly
@@ -198,7 +225,7 @@ export class Encoder {
 				return;
 			}
 
-			this.#encode(track, effect);
+			this.#encode(track, broadcast.baseline, effect);
 		});
 
 		// Reserve against the connection for as long as this track is live. Wait
@@ -215,7 +242,7 @@ export class Encoder {
 			effect.subscribe(this.#ceiling, (ceiling) => {
 				if (ceiling === undefined) return;
 				if (!reservation) {
-					reservation = allocator.reserve(track, ceiling);
+					reservation = allocator.reserve(track.demand(), ceiling);
 					this.#reservation.set(reservation);
 				} else {
 					reservation.update(ceiling);
@@ -229,7 +256,7 @@ export class Encoder {
 	}
 
 	// Encode captured frames into the track producer, reconfiguring when the resolved config changes.
-	#encode(track: Moq.Track.Producer, effect: Effect): void {
+	#encode(track: Moq.Track.Producer, baseline: Baseline, effect: Effect): void {
 		const capture = effect.get(this.in.capture);
 		if (!capture) {
 			this.#observe({ demand: true, idle: true });
@@ -266,10 +293,9 @@ export class Encoder {
 					}));
 
 					producer.encode(frame, frame.timestamp as Time.Micro, key);
-					const jitter = this.#jitter.observe(frame.timestamp);
-					if (jitter !== undefined) {
+					if (this.#estimator.flush(frame.timestamp, baseline)) {
 						const catalog = this.#out.catalog.peek();
-						if (catalog) this.#out.catalog.set({ ...catalog, jitter: Catalog.u53(jitter) });
+						if (catalog) this.#out.catalog.set({ ...catalog, ...this.#estimator.estimate });
 					}
 					this.#lastAccepted = frame.timestamp as Time.Micro;
 					this.#observe({ demand: true, idle: false, frame: true });
@@ -404,7 +430,7 @@ export class Encoder {
 			codedHeight: Catalog.u53(config.height),
 			optimizeForLatency: true,
 			container: { kind: "legacy" } as const,
-			jitter: this.#jitter.current ? Catalog.u53(this.#jitter.current) : undefined,
+			...this.#estimator.estimate,
 			stalled: this.#stalled.flag(),
 		};
 
@@ -423,10 +449,15 @@ export class Encoder {
 		const required = effect.get(this.#codecFilter) ?? "";
 
 		effect.spawn(async () => {
-			const detected = await this.#bestCodec(required, dimensions);
-			if (!detected) return;
+			try {
+				const detected = await this.#bestCodec(required, dimensions);
+				if (!detected) return;
 
-			effect.set(this.#codec, { ...detected, required, ...dimensions });
+				effect.set(this.#codec, { ...detected, required, ...dimensions });
+			} catch (err) {
+				this.#fail(effect);
+				throw err;
+			}
 		});
 	}
 

@@ -729,10 +729,10 @@ describe("Effect", () => {
 		}
 	});
 
-	test("a spawn that outlived its run sees that run aborted and cancelled", async () => {
+	test("a spawn that outlived its run sees that run aborted", async () => {
 		// The scope a stale task reads has to be its own, not the incoming run's: an abort
-		// signal that never fires would scope its listeners to the next run, and a cancel
-		// promise that never resolves would park it forever.
+		// signal that never fires would scope its listeners to the next run, and a race that
+		// never settles would park it forever.
 		const tick = new Signal(0);
 		const target = new EventTarget();
 		let events = 0;
@@ -750,7 +750,7 @@ describe("Effect", () => {
 				await gate.promise;
 				aborted = e.abort.aborted;
 				e.event(target, "ping", () => events++);
-				await e.cancel;
+				await e.race();
 				cancelled = true;
 			});
 		});

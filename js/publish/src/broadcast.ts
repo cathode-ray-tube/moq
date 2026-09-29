@@ -3,6 +3,7 @@ import * as Container from "@moq/hang/container";
 import * as Moq from "@moq/net";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, Signal } from "@moq/signals";
 import { CatalogProducer } from "./catalog";
+import { Baseline } from "./jitter";
 import { type Kind, Rendition } from "./rendition";
 
 // Signals the broadcast reads. Whoever owns the backing Signal (the element, or another component
@@ -17,7 +18,8 @@ export type BroadcastInput = {
 
 	// Whether to announce the broadcast. Defaults to true. Until it is announced nobody can
 	// see or subscribe to it. The flip rather than a gate on creating it: tracks can be
-	// populated while this is false, then announced once ready.
+	// populated while this is false, then announced once ready. The catalog is served only while
+	// announced, so its first snapshot is the one current at announce time.
 	announce: Getter<boolean>;
 
 	// The broadcast name.
@@ -69,6 +71,12 @@ export class Broadcast {
 	// catalog/audio/video, e.g. `net.createTrack("meta.json")` plus a matching `catalog` section.
 	// Reacquire it via an effect, since a rename swaps in a fresh producer.
 	readonly net = new Signal<Moq.Broadcast.Producer | undefined>(undefined);
+
+	/**
+	 * @internal The recent minimum flush lateness across every rendition, which each encoder
+	 * measures its catalog `delay` against. Per broadcast, so a swapped one starts fresh.
+	 */
+	readonly baseline = new Baseline();
 
 	// The registered renditions keyed by full track name. A plain object so deep-equality detects a
 	// key add/remove; the Rendition values compare by identity, which is stable.
@@ -218,32 +226,38 @@ export class Broadcast {
 		const broadcast = origin.createBroadcast(name);
 		effect.cleanup(() => broadcast.close());
 
-		effect.run((inner) => {
-			if (inner.get(this.in.announce)) broadcast.announce();
-			else broadcast.unannounce();
-		});
-
 		// Expose it before serving so an application reacting to `net` can insert its own tracks.
 		this.net.set(broadcast);
 		effect.cleanup(() => {
 			if (this.net.peek() === broadcast) this.net.set(undefined);
 		});
 
-		// Catalog tracks are shared across every subscriber and always hold the latest value.
-		for (const [name, compression] of [
-			[Broadcast.CATALOG_TRACK, false],
-			[Broadcast.CATALOG_TRACK_COMPRESSED, true],
-		] as const) {
-			// A catalog may publish once and stay unchanged for the broadcast's whole life. Keep
-			// that sole closed snapshot replayable so a viewer arriving after the ordinary media
-			// retention window can still bootstrap.
-			const track = broadcast.createTrack(name, {
-				maxAge: Moq.Time.Milli(Number.MAX_SAFE_INTEGER),
-				priority: Catalog.PRIORITY.catalog,
-			});
-			effect.cleanup(() => track.close());
-			this.catalog.serve(track, effect, { compression });
-		}
+		effect.run((inner) => {
+			if (!inner.get(this.in.announce)) {
+				broadcast.unannounce();
+				return;
+			}
+
+			// Serve the catalog only while announced. Nobody can find the broadcast before then, so an
+			// earlier catalog would only leave a stale first snapshot behind; this way the first one is
+			// whatever the catalog holds at announce time.
+			for (const [name, compression] of [
+				[Broadcast.CATALOG_TRACK, false],
+				[Broadcast.CATALOG_TRACK_COMPRESSED, true],
+			] as const) {
+				// A catalog may publish once and stay unchanged for the broadcast's whole life. Keep
+				// that sole closed snapshot replayable so a viewer arriving after the ordinary media
+				// retention window can still bootstrap.
+				const track = broadcast.createTrack(name, {
+					maxAge: Moq.Time.Milli(Number.MAX_SAFE_INTEGER),
+					priority: Catalog.PRIORITY.catalog,
+				});
+				inner.cleanup(() => track.close());
+				this.catalog.serve(track, inner, { compression });
+			}
+
+			broadcast.announce();
+		});
 
 		// Static tracks fan out to every subscriber. Keep the encoder-facing handle demand-gated
 		// so capture and encoding still stop when the final subscriber leaves.
@@ -261,7 +275,7 @@ export class Broadcast {
 				);
 				tracks.cleanup(() => track.close());
 				tracks.run((demand) => {
-					demand.set(signal, demand.get(track.used) ? track : undefined);
+					demand.set(signal, demand.get(track.demand().used) ? track : undefined);
 				});
 			}
 		});

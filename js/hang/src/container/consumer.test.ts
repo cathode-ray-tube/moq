@@ -218,6 +218,24 @@ test("Legacy Producer rejects a backwards discontinuity without closing the grou
 	expect(timestamps).toEqual([20_000, 30_000, 35_000]);
 });
 
+test("Legacy Producer keeps the cadence after rejecting a backwards discontinuity", async () => {
+	const track = new Track.Producer("test");
+	const subscriber = track.subscribe({ maxAge: Time.Milli(30_000) });
+	const producer = new LegacyProducer(track, new LegacyFormat("video"));
+	producer.encode(new Uint8Array([1]), 20_000 as Time.Micro, true);
+	producer.encode(new Uint8Array([2]), 30_000 as Time.Micro, false);
+	expect(() => producer.discontinuity(10_000 as Time.Micro)).toThrow();
+	producer.close();
+	const group = await subscriber.recvGroup();
+	const timestamps = [];
+	for (;;) {
+		const frame = await group?.readFrame();
+		if (!frame) break;
+		timestamps.push(Varint.decode(frame.payload)[0]);
+	}
+	expect(timestamps).toEqual([20_000, 30_000, 40_000]);
+});
+
 test("Legacy Producer refuses a keyframe that rewinds the timeline", () => {
 	const track = new Track.Producer("test");
 	const producer = new LegacyProducer(track, new LegacyFormat("video"));
@@ -281,6 +299,32 @@ test("Legacy Producer discontinuity marks the break at the caller's end", async 
 			],
 		],
 		[1, [[33_000, 0]]],
+	]);
+});
+
+test("Legacy Producer discontinuity writes no end estimated from the cadence", async () => {
+	const track = new Track.Producer("test");
+	const subscriber = replay(track);
+	const producer = new LegacyProducer(track, new LegacyFormat("video"));
+	for (const [index, timestamp] of [0, 33_000, 66_000].entries()) {
+		producer.encode(new Uint8Array([1]), timestamp as Time.Micro, index === 0);
+	}
+	producer.discontinuity();
+	// The capture swap resumes sooner than one frame later: no end past it, so no rewind.
+	producer.encode(new Uint8Array([1]), 80_000 as Time.Micro, true);
+	producer.close();
+
+	expect(await readGroups(subscriber, 2)).toEqual([
+		[
+			0,
+			[
+				[0, 1],
+				[33_000, 1],
+				[66_000, 1],
+			],
+		],
+		[1, [[66_000, 0]]],
+		[2, [[80_000, 1]]],
 	]);
 });
 
@@ -1652,3 +1696,8 @@ for (const end of [
 		}
 	});
 }
+
+test("LegacyFormat rejects a timestamp past 2^53 - 1 instead of rounding", () => {
+	const frame = Varint.encode(2n ** 53n + 1n);
+	expect(() => new LegacyFormat("video").decode(frame)).toThrow(/larger than 53-bits/);
+});
