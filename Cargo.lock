@@ -4543,12 +4543,8 @@ dependencies = [
  "futures",
  "h264-parser",
  "hang",
-<<<<<<< HEAD
  "hex",
- "kio 0.6.0",
-=======
  "kio 0.6.1",
->>>>>>> upstream/dev
  "memchr",
  "moq-flate",
  "moq-json",
