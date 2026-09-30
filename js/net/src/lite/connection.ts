@@ -8,6 +8,7 @@ import { type Hop, randomHop } from "../hop.ts";
 import type { Consumer as OriginConsumer } from "../origin.ts";
 import type * as Path from "../path.ts";
 import { type Reader, Readers, Stream, Writer } from "../stream.ts";
+import { withTimeout } from "../util/timeout.ts";
 import { registerWire } from "../wire.ts";
 import { AnnounceRequest } from "./announce.ts";
 import { Fetch } from "./fetch.ts";
@@ -48,6 +49,7 @@ export interface ConnectionProps {
  * @public
  */
 export class Connection implements Established {
+	#closing?: Promise<void>;
 	// The URL of the connection.
 	readonly url: URL;
 
@@ -131,10 +133,16 @@ export class Connection implements Established {
 		void this.#run();
 	}
 
-	/**
-	 * Closes the connection.
-	 */
-	close() {
+	/** Withdraw announcements and wait up to one second for delivery before closing. */
+	close(): Promise<void> {
+		this.#closing ??= withTimeout(this.#publisher.withdraw(), 1000, "session close timed out").finally(() =>
+			this.abort(),
+		);
+		return this.#closing;
+	}
+
+	/** End the session immediately without waiting for delivery. */
+	abort(): void {
 		this.#publisher.close();
 		this.#subscriber.close();
 
@@ -172,7 +180,7 @@ export class Connection implements Established {
 			// The session died under every track it was receiving, so they end with its
 			// error. A deliberate close() already ended them cleanly, which makes this a no-op.
 			this.#subscriber.close(fatal ?? (await closeError(this.#quic)));
-			this.close();
+			this.abort();
 		}
 	}
 

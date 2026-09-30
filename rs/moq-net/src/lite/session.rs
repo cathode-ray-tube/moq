@@ -252,6 +252,11 @@ where
 		Poll::Ready(res)
 	}
 
+	/// Start withdrawing this session's announcements.
+	pub(crate) fn close(&self) {
+		self.publisher.close();
+	}
+
 	/// Whether no stream still owes the peer data, for a draining close.
 	pub(crate) fn drained(&self) -> bool {
 		self.publisher.drained()

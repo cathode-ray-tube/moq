@@ -1,5 +1,6 @@
 import { type Dispose, type Getter, race, Signal } from "@moq/signals";
 import type * as broadcast from "../broadcast.ts";
+import { Withdrawal } from "../connection/withdrawal.ts";
 import { controlTimeout, error, reason, StreamCode, StreamError } from "../error.ts";
 import type * as group from "../group.ts";
 import type { Route } from "../hop.ts";
@@ -162,6 +163,11 @@ interface RunFill {
  * @internal
  */
 export class Publisher {
+	#withdrawal = new Withdrawal();
+
+	withdraw(): Promise<void> {
+		return this.#withdrawal.close();
+	}
 	#quic: WebTransport;
 	#session: Session;
 	#requiresSolicitation: boolean;
@@ -728,13 +734,24 @@ export class Publisher {
 	 *
 	 * @internal
 	 */
-	async runSubscribeNamespace(msg: SubscribeNamespace, stream: Stream) {
+	runSubscribeNamespace(msg: SubscribeNamespace, stream: Stream): Promise<void> {
+		return this.#withdrawal.track(this.#runSubscribeNamespace(msg, stream));
+	}
+
+	async #runSubscribeNamespace(msg: SubscribeNamespace, stream: Stream) {
+		if (this.#withdrawal.closing.peek()) return;
 		const version = this.#session.version;
 		const prefix = msg.namespace;
 		const legacy = version === Version.DRAFT_14 || version === Version.DRAFT_15;
 
 		// Draft-14/15: the open PUBLISH_NAMESPACE request per advertised suffix.
 		const requests = new Map<Path.Valid, { path: Path.Valid; requestId: bigint; stream: Stream }>();
+		// Drains the requests map, so calling it twice is safe and the second is a no-op.
+		const withdrawAll = async () => {
+			for (const path of [...requests.keys()]) {
+				await this.#withdraw(path, requests);
+			}
+		};
 
 		try {
 			// Send OK response
@@ -851,22 +868,30 @@ export class Publisher {
 
 				// Wait for the next change, or for the peer to unsubscribe.
 				const next = await (retry
-					? race([changed, stream.reader.closed, retryAfter(retry).then(() => advertised)])
-					: race([changed, stream.reader.closed]));
+					? race([
+							changed,
+							this.#withdrawal.closing,
+							stream.reader.closed,
+							retryAfter(retry).then(() => advertised),
+						])
+					: race([changed, this.#withdrawal.closing, stream.reader.closed]));
 				dispose();
-				if (!next) break;
+				if (!next || next === true) break;
 			}
 
+			// Withdraw before the ask stream FINs, as Rust does: a peer that reads that
+			// FIN as the subscription ending can drop the DONEs still in flight.
+			await withdrawAll();
 			stream.close();
+			await stream.writer.closed;
 		} catch (err: unknown) {
 			const e = error(err);
 			console.debug(`subscribe_namespace stream error: ${reason(e)}`);
 			stream.abort(e);
+			if (this.#withdrawal.closing.peek()) throw e;
 		} finally {
 			// This subscription's advertisements die with it.
-			for (const path of [...requests.keys()]) {
-				await this.#withdraw(path, requests);
-			}
+			await withdrawAll();
 		}
 	}
 
@@ -882,7 +907,12 @@ export class Publisher {
 	 *
 	 * @internal
 	 */
-	async runPublishNamespaces() {
+	runPublishNamespaces(): Promise<void> {
+		return this.#withdrawal.track(this.#runPublishNamespaces());
+	}
+
+	async #runPublishNamespaces() {
+		if (this.#withdrawal.closing.peek()) return;
 		if (this.#requiresSolicitation) {
 			// The peer asked to be told on request; runSubscribeNamespace answers it.
 			return;
@@ -979,15 +1009,16 @@ export class Publisher {
 
 				// Wait for the next change, which has already fired if one landed above.
 				const next = await (retry
-					? race([changed, closed, retryAfter(retry).then(() => advertised)])
-					: race([changed, closed]));
+					? race([changed, this.#withdrawal.closing, closed, retryAfter(retry).then(() => advertised)])
+					: race([changed, this.#withdrawal.closing, closed]));
 				dispose?.();
-				if (!next) break;
+				if (!next || next === true) break;
 			}
 		} catch (err: unknown) {
 			// Nothing restarts this loop, so whatever got us here cost the session its
 			// discovery. Not a debug-level event.
 			console.warn(`publish_namespace loop failed: ${reason(error(err))}`);
+			if (this.#withdrawal.closing.peek()) throw err;
 		} finally {
 			dispose?.();
 			// Close out every open PUBLISH_NAMESPACE request.
@@ -1131,6 +1162,7 @@ export class Publisher {
 				// Stream might already be closed
 			}
 			request.stream.close();
+			await request.stream.writer.closed;
 			return;
 		}
 		request.stream.close();

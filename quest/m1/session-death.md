@@ -44,4 +44,3 @@ clean end needs a public method.
 ## Related
 
 - [Track tail hardening](/quest/m1/track-tail-hardening.md) - the tail rules this must not mask
-- [Graceful session close](/quest/m1/session-close.md) - what a local close sends the peer

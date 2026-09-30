@@ -44,10 +44,14 @@ final broadcast = await moq.requestBroadcast('live/camera');
 // Publish. bytes comes from your encoder or application source.
 final mine = moq.createBroadcast('live/camera');
 final track = mine.publishTrack(name: 'video', info: null);
-track.appendGroup().writeFrame(frame: Frame(payload: bytes));
+final group = track.appendGroup();
+group.writeFrame(frame: Frame(payload: bytes));
+group.finish();
 mine.announce(route: MoqRoute());
+track.finish();
+mine.close();
 
-moq.close();
+await moq.close();
 ```
 
 ```dart
@@ -143,3 +147,5 @@ not the same as zero. `rttUs` is microseconds; the `rtt` extension reads it as a
 - Packages: [moq](https://pub.dev/packages/moq), [moq\_ffi](https://pub.dev/packages/moq_ffi)
 
 Raw track publisher metadata has an optional maximum age. Omitting it imposes no publisher age limit; zero keeps the live edge. Local cache limits still apply, and media imports explicitly retain 30 seconds. See [publisher retention](/concept/moq-lite).
+
+Await `session.shutdown()` or `moq.close()` to drain finished tracks before disconnecting. These futures fail if delivery has not completed within one second. `session.cancel(code: 0)` remains immediate. Finish or abort live tracks before shutdown. IETF media streams are not drained yet.

@@ -68,6 +68,11 @@ async def main():
         status.update({"state": "live", "viewers": 42})
 
         broadcast.announce()
+        audio.finish()
+        video.finish()
+        events.finish()
+        status.finish()
+        broadcast.close()
 
 asyncio.run(main())
 ```
@@ -153,3 +158,5 @@ not the same as zero.
 - Raw bindings: [`moq-ffi`](https://pypi.org/project/moq-ffi/) on PyPI, for the unwrapped API
 
 Raw track publisher metadata has an optional maximum age. Omitting it imposes no publisher age limit; zero keeps the live edge. Local cache limits still apply, and media imports explicitly retain 30 seconds. See [publisher retention](/concept/moq-lite).
+
+Await `session.shutdown()` to drain finished tracks before disconnecting. It raises if delivery has not completed within one second. `cancel(code)` stays immediate. Session and client async context managers await shutdown on a clean exit and cancel on an error, so the body's exception survives; finish or abort live tracks first. IETF media streams are not drained yet.

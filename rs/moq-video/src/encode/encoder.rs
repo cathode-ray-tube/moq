@@ -158,6 +158,12 @@ impl Config {
 	/// Fails when this machine cannot encode the config at all, which makes it a fail-fast check:
 	/// better here than on the first frame of a track that is already advertised.
 	pub async fn probe(&self) -> Result<hang::catalog::VideoConfig, Error> {
+		Ok(self.probe_sink().await?.0)
+	}
+
+	/// [`probe`](Self::probe), handing back the throwaway encoder so the caller can ask it more
+	/// before dropping it.
+	pub(crate) async fn probe_sink(&self) -> Result<(hang::catalog::VideoConfig, super::Sink), Error> {
 		// A `Sink` rather than an `Encoder`: this runs on whatever executor thread the caller is on,
 		// and the Windows backend's COM apartment has to be opened and closed on one thread.
 		let mut sink = super::Sink::open(self).await?;
@@ -191,7 +197,7 @@ impl Config {
 		// rides in an optional VUI. Fill them from the config that produced the rest.
 		rendition.bitrate.get_or_insert(self.resolved_bitrate().as_bps());
 		rendition.framerate.get_or_insert(self.framerate.as_f64());
-		Ok(rendition)
+		Ok((rendition, sink))
 	}
 
 	/// Resolved input color space: explicit override, or the size-based guess
@@ -333,11 +339,17 @@ impl Encoder {
 	/// the caller decides whether that layout is acceptable rather than finding
 	/// out from the stream.
 	pub fn cut(&mut self) -> Result<(), Error> {
-		if !self.backend.can_cut() {
-			return Err(Error::CutUnsupported(self.backend.name()));
-		}
+		self.check_cut()?;
 		self.pending_cut = true;
 		Ok(())
+	}
+
+	/// What [`cut`](Self::cut) would answer, without queueing anything.
+	pub(crate) fn check_cut(&self) -> Result<(), Error> {
+		match self.backend.can_cut() {
+			true => Ok(()),
+			false => Err(Error::CutUnsupported(self.backend.name())),
+		}
 	}
 
 	/// Encode one raw [`Frame`], whether it came from capture, a decoder (the

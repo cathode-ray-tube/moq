@@ -8237,7 +8237,7 @@ abstract class MoqSessionInterface {
   MoqOriginConsumer consume();
   int epoch();
   MoqOriginProducer publish();
-  void shutdown();
+  Future<void> shutdown();
   MoqConnectionStats stats();
   Future<MoqConnectionStatus> status();
 }
@@ -8330,13 +8330,15 @@ class MoqSession implements MoqSessionInterface {
     );
   }
 
-  void shutdown() {
-    return rustCall((status) {
-      uniffi_moq_ffi_fn_method_moqsession_shutdown(
-        uniffiClonePointer(),
-        status,
-      );
-    }, null);
+  Future<void> shutdown() {
+    return uniffiRustCallAsync(
+      () => uniffi_moq_ffi_fn_method_moqsession_shutdown(uniffiClonePointer()),
+      ffi_moq_ffi_rust_future_poll_void,
+      ffi_moq_ffi_rust_future_complete_void,
+      ffi_moq_ffi_rust_future_free_void,
+      (_) {},
+      moqExceptionErrorHandler,
+    );
   }
 
   MoqConnectionStats stats() {
@@ -11751,12 +11753,9 @@ external Pointer<Void> uniffi_moq_ffi_fn_method_moqsession_publish(
   Pointer<RustCallStatus> uniffiStatus,
 );
 
-@Native<Void Function(Pointer<Void>, Pointer<RustCallStatus>)>(
-  assetId: _uniffiAssetId,
-)
-external void uniffi_moq_ffi_fn_method_moqsession_shutdown(
+@Native<Pointer<Void> Function(Pointer<Void>)>(assetId: _uniffiAssetId)
+external Pointer<Void> uniffi_moq_ffi_fn_method_moqsession_shutdown(
   Pointer<Void> ptr,
-  Pointer<RustCallStatus> uniffiStatus,
 );
 
 @Native<RustBuffer Function(Pointer<Void>, Pointer<RustCallStatus>)>(
@@ -13243,7 +13242,7 @@ void _checkApiChecksums() {
   if (uniffi_moq_ffi_checksum_method_moqsession_publish() != 37960) {
     throw UniffiInternalError.panicked("UniFFI API checksum mismatch");
   }
-  if (uniffi_moq_ffi_checksum_method_moqsession_shutdown() != 820) {
+  if (uniffi_moq_ffi_checksum_method_moqsession_shutdown() != 64390) {
     throw UniffiInternalError.panicked("UniFFI API checksum mismatch");
   }
   if (uniffi_moq_ffi_checksum_method_moqsession_stats() != 44305) {

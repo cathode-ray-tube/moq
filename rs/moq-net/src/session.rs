@@ -169,7 +169,9 @@ impl Session {
 	/// the session's terminal error if it ended some other way first. A track that
 	/// is still live never finishes, so finish or abort tracks before closing.
 	///
-	/// moq-transport (IETF) sessions close without waiting.
+	/// Both protocols withdraw this session's announcements and wait for their
+	/// delivery. IETF drafts 14 through 16 send withdrawals without waiting, and
+	/// IETF media streams are not drained yet.
 	pub async fn close(self) -> Result<(), Error> {
 		if let Ok(mut close) = self.close.write()
 			&& close.is_none()
@@ -423,6 +425,10 @@ impl<S: crate::transport::poll::Session> Supervisor<S> {
 		Poll::Pending
 	}
 
+	pub(crate) fn draining(&self) -> bool {
+		matches!(self.drain, Drain::Waiting(_))
+	}
+
 	/// Finish a requested drain once the protocol owes the peer nothing, or at
 	/// the deadline. Returns whether this closed the transport.
 	///
@@ -535,3 +541,45 @@ const _: () = {
 	const fn assert_send_sync<T: Send + Sync>() {}
 	assert_send_sync::<Session>();
 };
+
+/// Session-local advertisement withdrawal; the source origin remains shared.
+#[derive(Clone, Default)]
+pub(crate) struct Withdrawal(kio::Shared<WithdrawalState>);
+
+#[derive(Default)]
+struct WithdrawalState {
+	closing: bool,
+	active: usize,
+}
+
+impl Withdrawal {
+	pub(crate) fn begin(&self) {
+		self.0.lock().closing = true;
+	}
+
+	pub(crate) fn poll(&self, waiter: &kio::Waiter) -> Poll<()> {
+		self.0
+			.poll(
+				waiter,
+				|state| if state.closing { Poll::Ready(()) } else { Poll::Pending },
+			)
+			.map(|_| ())
+	}
+
+	pub(crate) fn drained(&self) -> bool {
+		self.0.read().active == 0
+	}
+
+	pub(crate) fn register(&self) -> Withdrawing {
+		self.0.lock().active += 1;
+		Withdrawing(self.clone())
+	}
+}
+
+pub(crate) struct Withdrawing(Withdrawal);
+
+impl Drop for Withdrawing {
+	fn drop(&mut self) {
+		self.0.0.lock().active -= 1;
+	}
+}

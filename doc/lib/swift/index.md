@@ -52,8 +52,11 @@ let video = try broadcast.encodeVideo(
 )
 try video.write(VideoFrame(timestampUs: pts, data: rgba))
 try broadcast.announce()
+try audio.finish()
+try video.finish()
+try broadcast.close()
 
-session.shutdown()
+try await session.shutdown()
 ```
 
 For already-encoded live output, call `audio.flush(timestampUs:)` after `writeFrame` with the same broadcast-clock PTS. It measures catalog jitter at the transport handoff. File, pipe, and network imports should omit `flush`; built-in encoders observe their own output.
@@ -137,3 +140,5 @@ not the same as zero.
 - Packages SPM resolves: [moq-dev/moq-swift](https://github.com/moq-dev/moq-swift), [moq-dev/moq-swift-ffi](https://github.com/moq-dev/moq-swift-ffi)
 
 Raw track publisher metadata has an optional maximum age. Omitting it imposes no publisher age limit; zero keeps the live edge. Local cache limits still apply, and media imports explicitly retain 30 seconds. See [publisher retention](/concept/moq-lite).
+
+Use `try await session.shutdown()` to drain finished tracks before disconnecting. It throws if delivery has not completed within one second. `session.cancel(code: 0)` remains immediate. Finish or abort live tracks before shutdown. IETF media streams are not drained yet.

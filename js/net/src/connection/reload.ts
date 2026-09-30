@@ -330,7 +330,7 @@ export class Reload {
 				});
 
 				// Hand the connection to the effect, which closes it now if this run is already over.
-				effect.cleanup(() => connection.close());
+				effect.cleanup(() => connection.abort());
 				if (signal.aborted) return;
 
 				effect.set(this.established, connection);

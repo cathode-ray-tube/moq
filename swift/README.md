@@ -49,7 +49,7 @@ for try await event in announced {
     }
 }
 
-session.shutdown()
+try await session.shutdown()
 ```
 
 To publish through the auto-created origin:
@@ -60,7 +60,7 @@ let broadcast = try session.publish.createBroadcast(path: "my-stream")
 try broadcast.announce() // unannounced broadcasts are invisible
 ```
 
-Cancelling the surrounding Swift `Task` propagates through to the underlying `cancel()` calls on each consumer. `session.shutdown()` is an alias for `cancel(code: 0)` (code 0 means "no error").
+Cancelling the surrounding Swift `Task` propagates through to the underlying `cancel()` calls on each consumer. `try await session.shutdown()` drains finished tracks within one second and throws on delivery failure. `cancel(code: 0)` remains immediate.
 
 A note on enum casing: `MoqError` keeps Rust's PascalCase variants, each carrying `message: String` (e.g. `MoqError.Closed(message: "...")`); plain enums round-trip to lowerCamelCase (`AudioSampleFormat.s16`). Audio codecs are objects with constructors (`AudioCodec.opus()`).
 

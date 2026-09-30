@@ -88,6 +88,12 @@ impl Sink {
 		self.0.cut().await
 	}
 
+	/// What [`cut`](Self::cut) would answer, without queueing anything.
+	#[cfg(feature = "capture")]
+	pub(crate) async fn check_cut(&mut self) -> Result<(), Error> {
+		self.0.check_cut().await
+	}
+
 	/// Encode one frame, waiting for its access units.
 	///
 	/// Otherwise [`Encoder::encode`](super::Encoder::encode): zero or more access
@@ -158,6 +164,9 @@ mod threaded {
 		/// refusal has to reach the caller, since the alternative is a group
 		/// boundary that silently never happens.
 		Cut { resp: oneshot::Sender<Result<(), Error>> },
+		/// Report whether a cut would be refused, queueing nothing.
+		#[cfg(feature = "capture")]
+		CheckCut { resp: oneshot::Sender<Result<(), Error>> },
 		/// Retune to a new bitrate, reporting whether the backend took it so the
 		/// caller can stop adapting against an encoder that can't. The round trip
 		/// is affordable because the rate control policy only sends one of these
@@ -205,6 +214,10 @@ mod threaded {
 				Request::Cut { resp } => {
 					let _ = resp.send(encoder.cut());
 				}
+				#[cfg(feature = "capture")]
+				Request::CheckCut { resp } => {
+					let _ = resp.send(encoder.check_cut());
+				}
 				Request::SetBitrate { bitrate, resp } => {
 					let _ = resp.send(encoder.set_bitrate(bitrate));
 				}
@@ -241,6 +254,11 @@ mod threaded {
 
 		pub async fn cut(&mut self) -> Result<(), Error> {
 			self.0.request(|resp| Request::Cut { resp }).await
+		}
+
+		#[cfg(feature = "capture")]
+		pub async fn check_cut(&mut self) -> Result<(), Error> {
+			self.0.request(|resp| Request::CheckCut { resp }).await
 		}
 
 		pub async fn encode(&mut self, frame: Arc<Frame>) -> Result<Vec<Encoded>, Error> {
@@ -292,6 +310,11 @@ mod inline {
 		/// to, so it runs inline. The same holds for the calls below.
 		pub async fn cut(&mut self) -> Result<(), Error> {
 			self.0.cut()
+		}
+
+		#[cfg(feature = "capture")]
+		pub async fn check_cut(&mut self) -> Result<(), Error> {
+			self.0.check_cut()
 		}
 
 		pub async fn encode(&mut self, frame: Arc<Frame>) -> Result<Vec<Encoded>, Error> {

@@ -113,6 +113,13 @@ literal head on the wire. Paths with a `.`-prefixed segment below that head
 are [hidden](/concept/moq-lite#hidden-broadcasts) unless `announced(scope, { hidden: true })` opts in;
 `broadcasts(scope, { hidden: true })` takes the same option.
 
+An established connection's `await connection.close()` withdraws its
+announcements and waits up to one second for delivery before disconnecting.
+It rejects if delivery fails or times out, and closes the transport either way.
+Use `connection.abort()` for immediate shutdown. Reconnecting connection
+handles keep their synchronous `close()` disposal behavior. IETF drafts 14
+through 16 send their withdrawals without waiting.
+
 Examples in
 [`js/net/examples/`](https://github.com/moq-dev/moq/tree/main/js/net/examples).
 Runs in the browser and, over WebSocket, in Node, Bun, and Deno; see

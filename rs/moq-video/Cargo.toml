@@ -248,4 +248,6 @@ h264-reader = "0.9.0"
 libc = { workspace = true }
 # Driving `encode::Sink` from a plain test thread, the way an FFI caller does.
 pollster = { workspace = true }
+# `start_paused`, so the capture driver tests run on mocked time.
+tokio = { workspace = true, features = ["test-util"] }
 tracing-test = { workspace = true }

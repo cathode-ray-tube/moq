@@ -58,18 +58,20 @@ moq --connect https://relay.example.com/anon --broadcast my-stream.hang export t
 moq --connect "https://relay.example.com/rooms/1?jwt=$TOKEN" --broadcast alice.hang import ts
 ```
 
-The `ts`, `fmp4`, and `flv` imports publish on the broadcast clock the catalog
-advertises, not the input's own timestamps. The first frame is stamped when it
-arrives, every track keeps its offset from the others, and an input that
-restarts its timestamps, such as a restarted encoder, continues forward
-after the real gap rather than rewinding. So a feed whose PTS starts hours in,
-or whose first frame arrives late, still names the right wall time.
+The `ts`, `fmp4`, and `flv` imports publish the input's own timestamps, and
+the catalog clock maps the first frame to the time it arrived. So a feed whose
+PTS starts hours in still names the right wall time, and every track keeps its
+offset from the others. A group starting before the previous group's start,
+such as a restarted encoder or a looping file wrapping to the top, ends the
+import with an error; run it again to publish anew. A keyframe that merely
+overlaps the previous group's last frame is not a rewind.
 
 MPEG-TS import carries H.264/H.265 and AAC/MP2/AC-3/E-AC-3, passes SCTE-35 and
 subtitle PIDs through as tracks, and round-trips the service tables. A
 `discontinuity_indicator` on the program's PCR PID is a system time-base reset,
 so it breaks every track's timeline and the exported clock declares the break in
-turn. The same flag on an elementary PID other than the program PCR PID, a
+turn. A new timeline whose first group starts before the previous group's start
+ends the import like any other rewind. The same flag on an elementary PID other than the program PCR PID, a
 continuity-counter gap, and the 33-bit timestamp rollover move no clock and
 declare nothing. FLV covers H.264 + AAC.
 

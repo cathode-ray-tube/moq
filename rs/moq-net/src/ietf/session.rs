@@ -66,7 +66,19 @@ pub struct Config<S: crate::transport::poll::Session> {
 	pub peer_declared: Option<peer::Peer>,
 }
 
-pub fn start<S>(config: Config<S>) -> Result<(MaybeSendBox<'static, Result<(), Error>>, crate::goaway::Handle), Error>
+pub(crate) struct Driver {
+	pub task: MaybeSendBox<'static, Result<(), Error>>,
+	pub withdrawal: crate::session::Withdrawal,
+}
+
+impl std::future::Future for Driver {
+	type Output = Result<(), Error>;
+	fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+		self.task.as_mut().poll(cx)
+	}
+}
+
+pub fn start<S>(config: Config<S>) -> Result<(Driver, crate::goaway::Handle), Error>
 where
 	S: crate::transport::poll::Boxable,
 {
@@ -96,6 +108,8 @@ where
 	// scope is what we may ask for, and it is not the origin's root.
 	let namespaces = subscribe.as_ref().map(subscribe_prefixes).unwrap_or_default();
 
+	let withdrawal = crate::session::Withdrawal::default();
+	let closing = withdrawal.clone();
 	let driver = async move {
 		// Our own Hop ID, taken from whichever origin the caller actually supplied so
 		// every session out of this process stamps the same one and cross-session loop
@@ -134,7 +148,7 @@ where
 				let control = Control::new(request_id_max, client);
 				let adapter = ControlStreamAdapter::new(session.clone(), control.clone(), version);
 
-				let publisher = Publisher::new(
+				let mut publisher = Publisher::new(
 					runtime.clone(),
 					adapter.clone(),
 					publish,
@@ -144,6 +158,8 @@ where
 					version,
 				);
 				let (tasks, mut task_set) = TaskSet::new();
+				publisher.withdrawal = closing.clone();
+
 				let subscriber = Subscriber::new(
 					runtime.clone(),
 					adapter.clone(),
@@ -287,7 +303,7 @@ where
 				};
 
 				let control = Control::new(None, client);
-				let publisher = Publisher::new(
+				let mut publisher = Publisher::new(
 					runtime.clone(),
 					session.clone(),
 					publish,
@@ -297,6 +313,8 @@ where
 					version,
 				);
 				let (tasks, mut task_set) = TaskSet::new();
+				publisher.withdrawal = closing.clone();
+
 				let subscriber = Subscriber::new(
 					runtime.clone(),
 					session.clone(),
@@ -427,7 +445,13 @@ where
 	}
 	.maybe_boxed();
 
-	Ok((driver, goaway_handle))
+	Ok((
+		Driver {
+			task: driver,
+			withdrawal,
+		},
+		goaway_handle,
+	))
 }
 
 /// What a peer's SETUP told us, beyond the stream it arrived on.

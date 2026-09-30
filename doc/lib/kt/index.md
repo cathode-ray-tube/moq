@@ -49,6 +49,10 @@ Moq.connect("https://relay.example.com").use { moq ->
     )
     video.write(VideoFrame(timestampUs = pts, data = rgba))
     broadcast.announce(Route())
+    audio.finish()
+    video.finish()
+    broadcast.end()
+    moq.shutdown()
 }
 ```
 
@@ -137,3 +141,5 @@ reads it as a `kotlin.time.Duration`.
 - Artifacts: [dev.moq:moq](https://central.sonatype.com/artifact/dev.moq/moq), [dev.moq:moq-ffi](https://central.sonatype.com/artifact/dev.moq/moq-ffi)
 
 Raw track publisher metadata has an optional maximum age. Omitting it imposes no publisher age limit; zero keeps the live edge. Local cache limits still apply, and media imports explicitly retain 30 seconds. See [publisher retention](/concept/moq-lite).
+
+Call suspending `session.shutdown()` or `moq.shutdown()` to drain finished tracks before disconnecting. They throw if delivery has not completed within one second. Finish or abort live tracks first. `cancel(0u)` and synchronous `Moq.close()` remain immediate; `use { }` therefore cancels on exit. IETF media streams are not drained yet.

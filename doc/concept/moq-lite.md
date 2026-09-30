@@ -86,6 +86,15 @@ without that declaration fails the subscription with `ProtocolViolation`; older
 moq-lite versions use FIN alone. moq-transport requires `PUBLISH_DONE` before FIN.
 moq-transport sessions behave the same when a namespace is withdrawn.
 
+A graceful session close withdraws its announcements and waits up to one
+second for transport acknowledgement before disconnecting. Rust uses
+`session.close().await`; JavaScript uses `await connection.close()` on an
+established connection. An abort skips the withdrawal and ends immediately.
+The source origin remains usable by other sessions. Acknowledgement confirms
+transport delivery, not that the peer application has finished processing it.
+IETF drafts 14 through 16 send their withdrawals on the shared control stream
+without waiting, since it has no FIN to acknowledge.
+
 ### Hidden broadcasts
 
 A path segment starting with `.` hides a route from discovery, the way a

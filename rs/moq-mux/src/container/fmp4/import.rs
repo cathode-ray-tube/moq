@@ -91,6 +91,7 @@ pub struct Import<E: crate::catalog::hang::CatalogExt = ()> {
 	// Only the timeline report is anchored. Each fragment still carries its own timestamp on the
 	// wire, and `Recorder::end` still reports real content time.
 	segment_start: Option<Timestamp>,
+<<<<<<< HEAD
 
 
 	encrypter: Option<Box<dyn FrameEncrypter + Send>>,
@@ -98,6 +99,8 @@ pub struct Import<E: crate::catalog::hang::CatalogExt = ()> {
 	// The source's mapping onto the broadcast clock, set by `live`. `None` publishes the source's
 	// decode times verbatim.
 	anchor: Option<crate::clock::Anchor>,
+=======
+>>>>>>> upstream/dev
 }
 
 /// The catalog entry for one imported track, whichever section it lives in.
@@ -140,9 +143,6 @@ struct Fmp4Track<E: crate::catalog::hang::CatalogExt> {
 
 	// Sequence to use for the next group, set by `Import::seek`.
 	pending_sequence: Option<u64>,
-
-	// This track's position on the source's broadcast-clock mapping.
-	lane: crate::clock::Lane,
 
 	// The segment this track's open group belongs to. A mismatch with `Import::segment` rolls the
 	// group, which is what keeps audio on the same boundaries as video.
@@ -212,6 +212,10 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 		self.anchor = Some(crate::clock::Anchor::new(self.catalog.clock()));
 		self
 	}
+
+		}
+	}
+
 
 	/// Declare that the next fragment starts a new segment, for callers that know the source's
 	/// segmentation out of band (e.g. an HLS import following its playlist).
@@ -393,7 +397,6 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 					last_decode_time: None,
 					sample_duration: None,
 					pending_sequence: None,
-					lane: Default::default(),
 					estimator: Estimator::new(),
 					claim: crate::catalog::Claim::new(self.catalog.bandwidth()),
 				},
@@ -754,15 +757,7 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 
 			let tfdt = traf.tfdt.as_ref().ok_or(Error::MissingTfdt)?;
 			let timescale = moq_net::Timescale::new(trak.mdia.mdhd.timescale as u64)?;
-			// The decode time this fragment is published at, and so rewritten into its `tfdt`.
-			let base_decode_time = match self.anchor.as_mut() {
-				Some(anchor) => {
-					let source = Timestamp::new(tfdt.base_media_decode_time, timescale)?;
-					anchor.translate(&mut track.lane, source)?.value()
-				}
-				None => tfdt.base_media_decode_time,
-			};
-			let mut dts = base_decode_time;
+			let mut dts = tfdt.base_media_decode_time;
 
 			// Every fragment restates its decode time, so a stale one puts two different samples
 			// on the same timestamp, which reads downstream as an undeclared hole.
@@ -908,9 +903,6 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			// and ensuring trun.data_offset is Some(...) reserves 4 bytes per trun.
 			for traf_mut in &mut adjusted_moof.traf {
 				traf_mut.tfhd.base_data_offset = None;
-				traf_mut.tfdt = Some(mp4_atom::Tfdt {
-					base_media_decode_time: base_decode_time,
-				});
 				// A zero default/sample duration is "unknown", not "instantaneous": drop it so
 				// the re-emitted fragment carries no bogus zero that a decoder would honor.
 				if traf_mut.tfhd.default_sample_duration == Some(0) {
@@ -963,6 +955,13 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 
 			let fragment_bytes = Bytes::from(moof_buf);
 
+			// Carry the fragment's earliest presentation time as the frame timestamp,
+			// in the track's native timescale. The relay reads it off the wire; the
+			// consumer still drives playback from the fragment's internal timing.
+			let timestamp = min_timestamp.ok_or(Error::MissingTrun)?;
+			// The first fragment of the import is live on arrival.
+			self.catalog.anchor(timestamp)?;
+
 			// Write the per-track fragment as a single MoQ frame (passthrough). The group rolls
 			// once per segment, so a group is a segment and the fragments inside it are frames.
 			// The keyframe bit no longer decides that: audio flags every sample a sync sample, so
@@ -981,11 +980,6 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			} else {
 				track.group.take().ok_or(Error::NoKeyframe)?
 			};
-
-			// Carry the fragment's earliest presentation time as the frame timestamp,
-			// in the track's native timescale. The relay reads it off the wire; the
-			// consumer still drives playback from the fragment's internal timing.
-			let timestamp = min_timestamp.ok_or(Error::MissingTrun)?;
 
 			if start_group {
 				// A group just opened; report it so the broadcast's timeline can index the segment
@@ -1045,10 +1039,6 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			track.group = Some(g);
 			track.estimator.write(timestamp, fragment_len);
 			let end = max_end.ok_or(Error::MissingTrun)?;
-			if let Some(anchor) = self.anchor.as_mut() {
-				// A restart continues after this fragment's last sample, not merely its start.
-				anchor.extend(end);
-			}
 			if let Some(recorder) = track.recorder.as_mut() {
 				recorder.end(end);
 			}
@@ -1090,7 +1080,9 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	/// Close the current group on every track and open the next one at `sequence`.
 	///
 	/// Broadcast-wide: every track inside this fMP4 import advances together; per-track
-	/// control is intentionally not exposed.
+	/// control is intentionally not exposed. Skipping sequences is not a new timeline, so the
+	/// next fragment must still advance past the last decode time; see
+	/// [`discontinuity`](Self::discontinuity).
 	pub fn seek(&mut self, sequence: u64) -> Result<()> {
 		for track in self.tracks.values_mut() {
 			track.estimator.cut(None);
@@ -1099,10 +1091,16 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 				g.finish()?;
 			}
 			track.pending_sequence = Some(sequence);
-			track.last_decode_time = None;
-			track.lane.restart();
 		}
 		Ok(())
+	}
+
+	/// The source signalled a new timeline (an HLS `EXT-X-DISCONTINUITY`), so the next
+	/// fragment's decode time is not compared with the last one on each track.
+	pub fn discontinuity(&mut self) {
+		for track in self.tracks.values_mut() {
+			track.last_decode_time = None;
+		}
 	}
 }
 

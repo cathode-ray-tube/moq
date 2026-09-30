@@ -514,7 +514,7 @@ test("a malformed PUBLISH_NAMESPACE update closes the session", async () => {
 		]);
 	} finally {
 		logged.mockRestore();
-		connection.close();
+		connection.abort();
 	}
 });
 

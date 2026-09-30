@@ -27,8 +27,8 @@ integer.
 Use byte-accounted deficit round robin, or an equivalent bounded-quantum
 algorithm, between backlogged groups at equal priority. Round robin by stream
 count is insufficient because audio, video, and data streams have different
-sizes. Within the chosen group, order streams by the MoQ group order: newest
-first, fixed by the draft and never inverted. A blocked stream must not consume
+sizes. Within the chosen group, order streams by the subscription's group order
+(newest first by default). A blocked stream must not consume
 the group's turn, and opening newer groups must not reset its accumulated
 fair-share credit.
 

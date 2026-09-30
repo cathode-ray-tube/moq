@@ -22,6 +22,9 @@ ffplay srt://localhost:9000
 moq --connect https://relay.example.com/anon --broadcast event.hang import srt --connect 'srt://encoder.example.com:9000?streamid=live/cam'
 ```
 
+Import publishes the feed's own PTS and anchors the catalog clock on its first
+frame, as [`import ts`](/bin/cli) does.
+
 `--latency` sets the SRT receive buffer and doubles as the skip threshold on
 export. Export paces each SRT payload on the media clock, and re-anchors that
 pacing on a declared marker, so a restarted timeline plays out from the

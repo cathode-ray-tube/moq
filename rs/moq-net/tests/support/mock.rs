@@ -13,7 +13,10 @@
 //! its earlier data is read.
 
 use std::{
-	sync::{Arc, Mutex},
+	sync::{
+		Arc, Mutex,
+		atomic::{AtomicBool, AtomicUsize, Ordering},
+	},
 	task::{Context, Poll},
 };
 
@@ -156,6 +159,7 @@ impl poll::SendStream for MockSendStream {
 			}
 			self.tx = None;
 			pushed?;
+			self.conn.finishes.fetch_add(1, Ordering::Relaxed);
 		}
 		Ok(())
 	}
@@ -169,7 +173,9 @@ impl poll::SendStream for MockSendStream {
 
 	fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
 		let waiter = self.park.hold(cx);
-		if let Poll::Ready(result) = self.closed.result.poll(waiter, is_set) {
+		if !self.conn.hold_fins.load(Ordering::Relaxed)
+			&& let Poll::Ready(result) = self.closed.result.poll(waiter, is_set)
+		{
 			return Poll::Ready(result.clone().expect("set"));
 		}
 		drop(std::task::ready!(self.conn.close_state.poll(waiter, is_set)));
@@ -330,6 +336,8 @@ fn new_stream_pair(conn: &Arc<ConnectionState>) -> (MockSendStream, MockRecvStre
 /// This struct models that: a close on either side is visible to both.
 #[derive(Default)]
 struct ConnectionState {
+	finishes: AtomicUsize,
+	hold_fins: AtomicBool,
 	/// Set once by whichever side closes first.
 	/// Setting it wakes both sides.
 	close_state: kio::Shared<Option<(u32, String)>>,
@@ -492,6 +500,16 @@ impl poll::Session for MockSession {
 // Only some test binaries steer delivery.
 #[allow(dead_code)]
 impl MockSession {
+	/// Streams whose FIN was sent before the connection closed.
+	pub fn finished_streams(&self) -> usize {
+		self.side.conn.finishes.load(Ordering::Relaxed)
+	}
+
+	/// Withhold FIN acknowledgements while continuing to deliver stream data.
+	pub fn hold_fin_acknowledgements(&self) {
+		self.side.conn.hold_fins.store(true, Ordering::Relaxed);
+	}
+
 	/// Hold back the uni streams this side opens from now on.
 	///
 	/// The peer's transport has them, so a FIN is acknowledged at once, but its application

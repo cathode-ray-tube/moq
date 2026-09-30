@@ -382,53 +382,21 @@ impl Export {
 	}
 
 	fn bind_video(&mut self, catalog: &Catalog) -> anyhow::Result<()> {
-		let renditions: Vec<_> = if self.multitrack {
-			// Name order (the catalog is a BTreeMap), so each keeps a stable track id.
-			catalog.video.renditions.iter().collect()
-		} else {
-			// The best rendition FLV can carry, whatever the names. The rest follow in
-			// rank order so a catalog with nothing FLV carries fails on its best one.
-			let mut ranked: Vec<_> = catalog.video.ranked().collect();
-			ranked.sort_by_key(|(_, config)| {
-				video_flavor(config).is_err() || !matches!(config.container, Container::Legacy | Container::Loc)
-			});
-			ranked
-		};
+    let renditions: Vec<_> = if self.multitrack {
+        catalog.video.renditions.iter().collect()
+    } else {
+        let mut ranked: Vec<_> = catalog.video.ranked().collect();
+        ranked.sort_by_key(|(_, config)| {
+            video_flavor(config).is_err()
+                || !matches!(config.container, Container::Legacy | Container::Loc)
+        });
+        ranked
+    };
 
-		for (name, config) in renditions {
-			if !self.multitrack && !self.video.is_empty() {
-				break;
-			}
-			if self.video.iter().any(|t| &t.name == name) {
-				continue;
-			}
-			let flavor = video_flavor(config)?;
-			ensure_legacy(&config.container, "video", name)?;
-			// AV1's av1C is optional in the catalog; synthesize one from the codec
-			// struct so the enhanced SequenceStart tag always has a config record.
-			let fallback_description = match (&config.codec, config.description.as_ref()) {
-				(VideoCodec::AV1(av1), None) => Some(Bytes::copy_from_slice(&av1c_bytes(av1))),
-				_ => None,
-			};
-			let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age)? else {
-				continue;
-			};
-			let track_id = u8::try_from(self.video.len()).context("too many FLV video tracks")?;
-			self.video.push(FlvTrack {
-				name: name.clone(),
-				track_id,
-				source,
-				pending: None,
-				finished: false,
-				flavor,
-				fallback_description,
-				dts_reserve: dts_reserve(config),
-				last_dts: None,
-			});
-		}
-		Ok(())
-	}
-
+    for (name, config) in renditions {
+        if !self.multitrack && !self.video.is_empty() {
+            break;
+        }
 
         if self.video.iter().any(|t| &t.name == name) {
             continue;
