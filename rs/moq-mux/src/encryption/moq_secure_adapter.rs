@@ -8,6 +8,8 @@ use moq_secure::key_store::KeyStore;
 use super::EncryptionError;
 use crate::container::{FrameDecrypter, FrameEncrypter};
 
+#[allow(dead_code)]
+const ENCRYPTION_UNENCRYPTED: u8 = 0;
 const ENCRYPTION_CHACHA20_POLY1305: u8 = 1;
 const ENCRYPTION_AES_256_GCM: u8 = 2;
 
