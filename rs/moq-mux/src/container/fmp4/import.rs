@@ -213,9 +213,6 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 		self
 	}
 
-		}
-	}
-
 
 	/// Declare that the next fragment starts a new segment, for callers that know the source's
 	/// segmentation out of band (e.g. an HLS import following its playlist).
