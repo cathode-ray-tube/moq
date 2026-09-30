@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -15,9 +16,7 @@ impl From<moq_secure::error::MoqSecureError> for EncryptionError {
         use moq_secure::error::MoqSecureError;
 
         match error {
-            MoqSecureError::InvalidMagic => {
-                Self::InvalidFrame
-            }
+            MoqSecureError::InvalidMagic => Self::InvalidFrame,
 
             MoqSecureError::UnsupportedVersion(version) => {
                 Self::UnsupportedVersion(version)
@@ -27,17 +26,13 @@ impl From<moq_secure::error::MoqSecureError> for EncryptionError {
                 Self::UnsupportedAlgorithm(algorithm)
             }
 
-            MoqSecureError::TruncatedFrame => {
-                Self::TruncatedFrame
-            }
+            MoqSecureError::TruncatedFrame => Self::TruncatedFrame,
 
             MoqSecureError::CiphertextTooShort => {
                 Self::CiphertextTooShort
             }
 
-            MoqSecureError::InvalidPadLength => {
-                Self::InvalidPadLength
-            }
+            MoqSecureError::InvalidPadLength => Self::InvalidPadLength,
 
             MoqSecureError::InvalidSigFlag(flag) => {
                 Self::InvalidSigFlag(flag)
@@ -69,6 +64,10 @@ impl From<moq_secure::error::MoqSecureError> for EncryptionError {
 
             MoqSecureError::InvalidKeyId(key_id) => {
                 Self::InvalidKeyId(key_id)
+            }
+
+            MoqSecureError::ReplayDetected => {
+                Self::ReplayDetected
             }
         }
     }
@@ -218,13 +217,115 @@ impl MoqSecureDecryptionConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackMode {
+    Live,
+    Rewind,
+}
+
+#[derive(Debug, Default)]
+struct CounterState {
+    /// Highest counter accepted while in live mode.
+    live_max_ctr: Option<u64>,
+
+    /// Highest counter accepted during the current rewind invocation.
+    playback_ctr: Option<u64>,
+}
+
+#[derive(Debug)]
+struct DecryptionState {
+    /// Shared signing lease.
+
+    ///
+    /// This is deliberately not stored per encryption key. The signing
+    /// lease permits unsigned frames after a signed frame and is separate
+    /// from encryption-key replay tracking.
+    lease_remaining: u8,
+
+    /// Encryption replay state, tracked independently for each key ID.
+    counters: HashMap<u8, CounterState>,
+
+    mode: PlaybackMode,
+}
+
+impl DecryptionState {
+    fn new(lease_remaining: u8) -> Self {
+        Self {
+            lease_remaining,
+            counters: HashMap::new(),
+            mode: PlaybackMode::Live,
+        }
+    }
+
+    fn begin_live(&mut self) {
+        self.mode = PlaybackMode::Live;
+    }
+
+    fn begin_rewind(&mut self) {
+        self.mode = PlaybackMode::Rewind;
+
+        // Each rewind invocation gets a fresh playback cursor.
+        //
+        // live_max_ctr is intentionally retained so that live replay
+        // protection survives mode changes.
+        for state in self.counters.values_mut() {
+            state.playback_ctr = None;
+        }
+    }
+
+    fn check_counter(
+        &self,
+        key_id: u8,
+        ctr: u64,
+    ) -> Result<(), EncryptionError> {
+        let Some(state) = self.counters.get(&key_id) else {
+            return Ok(());
+        };
+
+        let replayed = match self.mode {
+            PlaybackMode::Live => {
+                state
+                    .live_max_ctr
+                    .is_some_and(|max| ctr <= max)
+            }
+
+            PlaybackMode::Rewind => {
+                state
+                    .playback_ctr
+                    .is_some_and(|cursor| ctr <= cursor)
+            }
+        };
+
+        if replayed {
+            return Err(EncryptionError::ReplayDetected);
+        }
+
+        Ok(())
+    }
+
+    fn record_counter(&mut self, key_id: u8, ctr: u64) {
+        let state = self.counters.entry(key_id).or_default();
+
+        match self.mode {
+            PlaybackMode::Live => {
+                state.live_max_ctr = Some(
+                    state.live_max_ctr.map_or(ctr, |max| max.max(ctr)),
+                );
+            }
+
+            PlaybackMode::Rewind => {
+                state.playback_ctr = Some(ctr);
+            }
+        }
+    }
+}
+
 /// Decrypts and verifies each frame using moq-secure.
 pub struct MoqSecureDecrypter {
     pub key_store: Arc<dyn KeyStore>,
     pub broadcaster_public_key: VerifyingKey,
 
-    /// Number of unsigned frames remaining in the current signature lease.
-    pub lease_remaining: u8,
+    state: DecryptionState,
 }
 
 impl MoqSecureDecrypter {
@@ -232,7 +333,7 @@ impl MoqSecureDecrypter {
         Self {
             key_store: Arc::clone(&config.key_store),
             broadcaster_public_key: config.broadcaster_public_key,
-            lease_remaining: 0,
+            state: DecryptionState::new(0),
         }
     }
 
@@ -244,16 +345,34 @@ impl MoqSecureDecrypter {
         Self {
             key_store,
             broadcaster_public_key,
-            lease_remaining,
+            state: DecryptionState::new(lease_remaining),
         }
     }
 
     pub fn lease_remaining(&self) -> u8 {
-        self.lease_remaining
+        self.state.lease_remaining
     }
 
     pub fn reset_lease(&mut self) {
-        self.lease_remaining = 0;
+        self.state.lease_remaining = 0;
+    }
+
+    pub fn playback_mode(&self) -> PlaybackMode {
+        self.state.mode
+    }
+
+    /// Signals that the player has entered live playback.
+    ///
+    /// Live counter maxima are retained.
+    pub fn begin_live(&mut self) {
+        self.state.begin_live();
+    }
+
+    /// Signals the beginning of a new rewind invocation.
+    ///
+    /// The rewind playback cursor is reset for every encryption key.
+    pub fn begin_rewind(&mut self) {
+        self.state.begin_rewind();
     }
 }
 
@@ -263,12 +382,30 @@ impl FrameDecrypter for MoqSecureDecrypter {
         _sequence_number: u64,
         ciphertext: &[u8],
     ) -> Result<Bytes, EncryptionError> {
+        // key_id and ctr are available in the unencrypted header.
+        // Frame::parse also validates the header structure.
+        let frame = moq_secure::wire::Frame::parse(ciphertext)?;
+
+        let key_id = frame.header.key_id;
+        let ctr = frame.header.ctr;
+
+        // Do not modify replay state during this check.
+        self.state.check_counter(key_id, ctr)?;
+
+        // decrypt_frame continues to manage the shared signing lease.
+        // The implementation shown earlier updates the lease only after
+        // signature verification, decryption, and padding validation
+        // succeed.
         let plaintext = moq_secure::wire::decrypt_frame(
             self.key_store.as_ref(),
             &self.broadcaster_public_key,
-            &mut self.lease_remaining,
+            &mut self.state.lease_remaining,
             ciphertext,
         )?;
+
+        // Commit the counter only after successful authentication and
+        // plaintext validation.
+        self.state.record_counter(key_id, ctr);
 
         Ok(Bytes::from(plaintext))
     }
