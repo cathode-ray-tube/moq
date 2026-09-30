@@ -52,4 +52,7 @@ pub enum EncryptionError {
 
     #[error("unsupported encryption algorithm: {0}")]
     UnsupportedAlgorithm(u8),
+
+	#[error("replay detected, ctr lower than previous high watermark")]
+    ReplayDetected(),
 }
