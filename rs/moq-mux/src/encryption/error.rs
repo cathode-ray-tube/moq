@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Error)]
 pub enum EncryptionError {
     #[error("encryption is not implemented")]
     NotImplemented,
@@ -49,6 +49,9 @@ pub enum EncryptionError {
 
     #[error("unsupported encryption version: {0}")]
     UnsupportedVersion(u8),
+
+    #[error("unsupported encryption algorithm: {0}")]
+    UnsupportedAlgorithm(u8),
 
     #[error("encryption backend error")]
     Backend(#[source] Box<dyn std::error::Error + Send + Sync>),
