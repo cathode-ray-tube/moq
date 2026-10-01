@@ -100,7 +100,9 @@ The fMP4, MPEG-TS, FLV, and MKV importers publish the source's own timestamps
 (MPEG-TS after unwrapping its 33-bit PTS; fMP4 passthrough keeps each `tfdt`)
 and anchor the catalog's broadcast clock instead: the first frame's timestamp
 maps to the time it arrived, and every track of the input, like every importer
-sharing the catalog, keeps that one mapping. A clock set with
+sharing the catalog, keeps that one mapping. Data tracks stamp on it too, even
+one created before that first frame, though anything it wrote earlier stays on
+the clock the catalog started with. A clock set with
 `Config::with_clock` is never re-anchored, for a recording whose zero names its
 real start.
 

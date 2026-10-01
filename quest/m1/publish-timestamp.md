@@ -58,5 +58,4 @@ Public API: breaking, on `dev`. Wire: none.
 
 ## Related
 
-- [Data track clock](/quest/m1/data-track-clock.md) - the moq-mux mapping this keeps reads the catalog's clock at write time
 - [JS publishing requires a timestamp](/quest/m1/js-publish-timestamp.md) - the same change in the JS packages
