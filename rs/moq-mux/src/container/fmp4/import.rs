@@ -193,19 +193,6 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 		self
 	}
 
-	/// Publish on the broadcast clock rather than the source's own decode times.
-	///
-	/// For a live feed with its own zero: the first fragment is live on arrival, every track
-	/// shares that one mapping, and a source that restarts its decode times continues forward
-	/// after the real idle gap instead of being refused. Each fragment's `tfdt` is rewritten to
-	/// match. Without this, decode times are published verbatim, which suits a source already on
-	/// the clock the catalog advertises ([`Config::with_clock`](crate::catalog::Config::with_clock)).
-	pub fn live(mut self) -> Self {
-		self.anchor = Some(crate::clock::Anchor::new(self.catalog.clock()));
-		self
-	}
-
-
 	/// Declare that the next fragment starts a new segment, for callers that know the source's
 	/// segmentation out of band (e.g. an HLS import following its playlist).
 	///
