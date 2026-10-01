@@ -91,16 +91,9 @@ pub struct Import<E: crate::catalog::hang::CatalogExt = ()> {
 	// Only the timeline report is anchored. Each fragment still carries its own timestamp on the
 	// wire, and `Recorder::end` still reports real content time.
 	segment_start: Option<Timestamp>,
-<<<<<<< HEAD
 
 
 	encrypter: Option<Box<dyn FrameEncrypter + Send>>,
-
-	// The source's mapping onto the broadcast clock, set by `live`. `None` publishes the source's
-	// decode times verbatim.
-	anchor: Option<crate::clock::Anchor>,
-=======
->>>>>>> upstream/dev
 }
 
 /// The catalog entry for one imported track, whichever section it lives in.
@@ -186,7 +179,6 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			segment: 0,
 			pending_timeline_cut: false,
 			segment_start: None,
-            anchor: None,
 			encrypter: None,
 		}
 	}
