@@ -167,7 +167,8 @@ impl Message for Fetch<'_> {
 				);
 
 				let subscriber_priority = subscriber_priority.unwrap_or(128);
-				let group_order = group_order.unwrap_or(GroupOrder::Descending);
+				// No preference: the publisher picks the order.
+				let group_order = group_order.unwrap_or(GroupOrder::Any);
 
 				Ok(Self {
 					request_id,
@@ -186,6 +187,9 @@ pub struct FetchOk {
 	pub group_order: GroupOrder,
 	pub end_of_track: bool,
 	pub end_location: Location,
+	/// The track's properties, as SUBSCRIBE_OK carries them: MAX_CACHE_DURATION from the
+	/// draft-14/15 parameters, the Track Properties block from draft-16 on.
+	pub properties: super::Properties,
 }
 impl Message for FetchOk {
 	const ID: u64 = 0x18;
@@ -212,6 +216,8 @@ impl Message for FetchOk {
 				self.end_of_track.encode(w, version)?;
 				self.end_location.encode(w, version)?;
 				encode_params!(w, version,);
+				// Track Properties are the final field, so nothing may follow.
+				self.properties.encode(w, version)?;
 			}
 		}
 		Ok(())
@@ -229,12 +235,19 @@ impl Message for FetchOk {
 				let group_order = GroupOrder::decode(buf, version)?;
 				let end_of_track = bool::decode(buf, version)?;
 				let end_location = Location::decode(buf, version)?;
-				let _params = Parameters::decode(buf, version)?;
+				let params = Parameters::decode(buf, version)?;
+				let properties = super::Properties {
+					max_cache_duration: params
+						.get_varint(super::ParameterVarInt::from(0x04))
+						.map(std::time::Duration::from_millis),
+					..Default::default()
+				};
 				Ok(Self {
 					request_id,
 					group_order,
 					end_of_track,
 					end_location,
+					properties,
 				})
 			}
 			_ => {
@@ -243,11 +256,15 @@ impl Message for FetchOk {
 				// GROUP_ORDER isn't legal here, but keep accepting it so a peer that still sends
 				// it doesn't have its session torn down over a hint.
 				decode_params!(buf, version,
+					0x04 => max_cache_duration: Option<u64>,
 					0x22 => group_order: Option<GroupOrder>,
 				);
-				// FETCH_OK may declare a timescale; we don't surface it yet, and a fetched
-				// object without an interpretable timestamp is stamped on arrival.
-				let _ = super::Properties::decode(buf, version)?;
+				// The timescale is read but not surfaced yet: a fetched object without an
+				// interpretable timestamp is stamped on arrival.
+				let mut properties = super::Properties::decode(buf, version)?;
+				if version == Version::Draft15 {
+					properties.max_cache_duration = max_cache_duration.map(std::time::Duration::from_millis);
+				}
 
 				let group_order = group_order.unwrap_or(GroupOrder::Descending);
 
@@ -256,6 +273,7 @@ impl Message for FetchOk {
 					group_order,
 					end_of_track,
 					end_location,
+					properties,
 				})
 			}
 		}
@@ -593,6 +611,7 @@ mod tests {
 			group_order: GroupOrder::Descending,
 			end_of_track: false,
 			end_location: Location { group: 5, object: 3 },
+			properties: Default::default(),
 		};
 
 		let encoded = encode_message(&msg, Version::Draft14);
@@ -652,6 +671,7 @@ mod tests {
 			group_order: GroupOrder::Descending,
 			end_of_track: false,
 			end_location: Location { group: 5, object: 3 },
+			properties: Default::default(),
 		};
 
 		let encoded = encode_message(&msg, Version::Draft15);
@@ -669,6 +689,7 @@ mod tests {
 			group_order: GroupOrder::Descending,
 			end_of_track: false,
 			end_location: Location { group: 5, object: 3 },
+			properties: Default::default(),
 		};
 
 		let encoded = encode_message(&msg, Version::Draft16);
@@ -686,6 +707,7 @@ mod tests {
 			group_order: GroupOrder::Descending,
 			end_of_track: false,
 			end_location: Location { group: 5, object: 3 },
+			properties: Default::default(),
 		};
 
 		let encoded = encode_message(&msg, Version::Draft17);
@@ -724,6 +746,7 @@ mod tests {
 			group_order: GroupOrder::Descending,
 			end_of_track: false,
 			end_location: Location { group: 5, object: 3 },
+			properties: Default::default(),
 		};
 
 		let encoded = encode_message(&msg, Version::Draft18);
@@ -744,6 +767,7 @@ mod tests {
 			group_order: GroupOrder::Descending,
 			end_of_track: false,
 			end_location: Location { group: 5, object: 3 },
+			properties: Default::default(),
 		};
 
 		#[rustfmt::skip]
@@ -864,5 +888,44 @@ mod object_tests {
 		// 0x8D, one past End of Non-Existent Range, in the draft-17+ leading-ones form.
 		let mut bytes = bytes::Bytes::from_static(&[0x80, 0x8D, 0x00, 0x00]);
 		assert!(FetchObject::decode(&mut bytes, VERSION).is_err());
+	}
+}
+
+#[cfg(test)]
+mod cache_duration_tests {
+	use super::*;
+	use std::time::Duration;
+
+	/// FETCH_OK carries MAX_CACHE_DURATION where SUBSCRIBE_OK does, so a track fetched with no
+	/// subscription still learns its retention window.
+	#[test]
+	fn max_cache_duration_is_read_in_each_drafts_field() {
+		for version in [
+			Version::Draft14,
+			Version::Draft15,
+			Version::Draft16,
+			Version::Draft17,
+			Version::Draft18,
+			Version::Draft19,
+			Version::Draft20,
+			Version::Draft21,
+			Version::Draft22,
+		] {
+			for age in [0u64, 30_000] {
+				let mut payload = match version {
+					Version::Draft14 => vec![0, 1, 0, 0, 0, 1, 4],
+					Version::Draft15 => vec![0, 0, 0, 0, 1, 4],
+					Version::Draft16 => vec![0, 0, 0, 0, 0, 4],
+					_ => vec![0, 0, 0, 0, 4],
+				};
+				age.encode(&mut payload, version).unwrap();
+				let got = FetchOk::decode_msg(&mut payload.as_slice(), version).unwrap();
+				assert_eq!(
+					got.properties.max_cache_duration,
+					Some(Duration::from_millis(age)),
+					"{version}"
+				);
+			}
+		}
 	}
 }

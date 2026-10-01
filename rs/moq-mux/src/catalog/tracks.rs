@@ -296,11 +296,13 @@ impl<E: CatalogExt> RenditionConfig<E> for hang::catalog::VideoConfig {
 			.with_jitter(self.jitter)
 			.with_bitrate(self.bitrate)
 			.with_delay(self.delay)
+			.with_framerate(self.framerate)
 	}
 	fn set_estimate(&mut self, estimate: Estimate) {
 		self.jitter = estimate.jitter;
 		self.bitrate = estimate.bitrate;
 		self.delay = estimate.delay;
+		self.framerate = estimate.framerate;
 	}
 }
 
@@ -600,6 +602,9 @@ impl<E: CatalogExt, C: RenditionConfig<E>> Rendition<E, C> {
 		}
 		if estimate.delay.is_none() {
 			estimate.delay = detected.delay;
+		}
+		if estimate.framerate.is_none() {
+			estimate.framerate = detected.framerate;
 		}
 		estimate
 	}
@@ -923,6 +928,7 @@ mod tests {
 		let config = snapshot.video.renditions.get("v").unwrap();
 		assert!(config.jitter.is_some(), "absent jitter should be auto-detected");
 		assert!(config.bitrate.is_some(), "absent bitrate should be auto-detected");
+		assert_eq!(config.framerate, Some(25.0), "absent framerate should be auto-detected");
 	}
 
 	#[test]
@@ -992,6 +998,7 @@ mod tests {
 
 		let hint = VideoHint {
 			bitrate: Some(456),
+			framerate: Some(30.0),
 			..Default::default()
 		};
 		let mut config = config(None, None);
@@ -1003,6 +1010,11 @@ mod tests {
 		let snapshot = catalog.snapshot();
 		let config = snapshot.video.renditions.get("v").unwrap();
 		assert_eq!(config.bitrate, Some(456), "a hinted bitrate must not be overwritten");
+		assert_eq!(
+			config.framerate,
+			Some(30.0),
+			"a hinted framerate must not be overwritten"
+		);
 		assert!(config.jitter.is_some(), "the unhinted jitter should still be detected");
 	}
 

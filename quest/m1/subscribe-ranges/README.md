@@ -44,7 +44,7 @@ relay bounds a sparse FETCH only if the model can request ranges:
 - Ranges are frame-precise (`Position`), not whole groups. The IETF joining
   FETCH for a mid-group SUBSCRIBE's uncached prefix stays, because today's
   bridge relies on it (maintainer, 09-29).
-- The relay half of [fetch-span](/quest/m1/moxygen/README.md) (#4558) moves
+- The relay half of fetch-span (#4558, from the finished Moxygen line) moves
   here; #4558 lands only the no-handler skip.
 
 This line owns the end-to-end test: a relay with a sparse cache answers a

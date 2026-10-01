@@ -40,7 +40,3 @@ Extend the existing session-death tests (Rust
 integration cases) with a local close and with a group reader, on lite and
 IETF. Behavior change, no signature change on either side unless the Rust
 clean end needs a public method.
-
-## Related
-
-- [Track tail hardening](/quest/m1/track-tail-hardening.md) - the tail rules this must not mask

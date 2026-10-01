@@ -79,7 +79,6 @@ impl Connection {
 	/// Admits and serves this connection until it closes.
 	#[tracing::instrument("conn", skip_all, fields(id = self.id, remote = self.request.remote_addr().map(tracing::field::display), session = tracing::field::Empty))]
 	pub async fn run(self) -> anyhow::Result<()> {
-		let peer_hop = self.request.peer_hop();
 		let (admitted, registration) = match self.admit().await {
 			Ok(admitted) => admitted,
 			Err(err) => {
@@ -116,7 +115,6 @@ impl Connection {
 			request = request.with_subscriber(publisher);
 		}
 		let session = request.ok().await?;
-		let _node_connection = peer_hop.map(|origin| self.cluster.nodes.connect_inbound(self.id, origin));
 
 		tracing::info!(version = %session.version(), %transport, "negotiated");
 

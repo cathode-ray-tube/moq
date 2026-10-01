@@ -30,14 +30,15 @@ keyframes included, may dip below the previous group's content (B-frames, or
 a keyframe overlapping its last frame), so an estimated end is never a hard
 edge. A group may start at the same timestamp as the previous one; strictly
 increasing starts are not enforced. Group IDs never move backwards. A group
-starting before the previous group's start is a restart, a new broadcast. The Rust `moq-mux` producer and
-consumer enforce this since #4543.
+starting before the previous group's start is a restart, a new broadcast.
+The Rust `moq-mux` producer and consumer enforce this on `dev` since #4543.
 
 - Reproduce with a mocked clock: cut a group, then resume with a keyframe
   between the last frame and the estimated end.
 - Align `js/hang/src/container/consumer.ts` (and the JS producer, if it
   differs) to "group starts monotonic", matching `rs/moq-mux/src/container`.
+- Target `dev`, where the #4543 rule lives.
 
 ## Related
 
-- [More tests under load](/quest/m1/test-flakes-2.md) - other load-only failures, fixed at the cause
+- [More tests under load](/quest/m1/test-flakes-2/README.md) - other load-only failures, fixed at the cause
