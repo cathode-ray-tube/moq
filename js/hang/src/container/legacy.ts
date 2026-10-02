@@ -139,11 +139,12 @@ export class Producer {
 
 	/** The newest timestamp written. */
 	#end?: Time.Micro;
-
-	/** Exclusive presentation end of finished groups. */
+	// Furthest timestamp in finished groups, used only for discontinuity markers.
 	#liveEdge?: Time.Micro;
-
-	/** Gap between consecutive timestamps. */
+	// The current group start and the previous group start, which bounds its frames.
+	#start?: Time.Micro;
+	#floor?: Time.Micro;
+	// Gap between consecutive timestamps, used to close the last group when no successor exists.
 	#interval?: Time.Micro;
 
 	/**
@@ -171,17 +172,14 @@ export class Producer {
 		return this;
 	}
 
-	/**
-	 * Encode and append a frame; a keyframe starts a new group.
-	 *
-	 * With no encrypter, the returned operation is synchronous.
-	 * With an encrypter, the returned promise resolves after encryption.
-	 */
-	encode(
-		data: Uint8Array | Source,
-		timestamp: Time.Micro,
-		keyframe: boolean,
-	): void | Promise<void> {
+
+	/** Encode and append a frame; a keyframe starts a new group. Throws if the first frame is not a keyframe, a group start goes backwards, or a frame is below the previous group start. */
+	encode(data: Uint8Array | Source, timestamp: Time.Micro, keyframe: boolean) {
+		const floor = keyframe ? this.#start : this.#floor;
+		if (floor !== undefined && timestamp < floor) {
+			throw new Error("frame timestamp is below the previous group start");
+		}
+
 		this.#marked = false;
 
 		if (!this.#encrypter) {
@@ -203,22 +201,15 @@ export class Producer {
 
 			this.#close(rewound ? undefined : timestamp);
 
-			if (rewound) {
-				this.#interval = undefined;
-			}
-
-			this.#refuse(timestamp);
+			if (rewound) this.#interval = undefined;
 			this.#group = this.#track.appendGroup();
+			this.#floor = this.#start;
+			this.#start = timestamp;
+			// Report the group the moment it opens: its start is this keyframe's timestamp.
+			this.#timeline?.record(this.#group.sequence, timestamp, true);
 
-			this.#timeline?.record(
-				this.#group.sequence,
-				timestamp,
-				true,
-			);
 		} else if (!this.#group) {
 			throw new Error("must start with a keyframe");
-		} else {
-			this.#refuse(timestamp);
 		}
 
 		this.#group.writeFrame({
@@ -530,16 +521,6 @@ export class Producer {
 		this.#reordered = false;
 	}
 
-	#refuse(timestamp: Time.Micro): void {
-		if (
-			this.#liveEdge !== undefined &&
-			timestamp < this.#liveEdge
-		) {
-			throw new Error(
-				"frame timestamp is below the live edge",
-			);
-		}
-	}
 
 	/** Close the track and current group, optionally with an error. */
 	close(err?: Error): void | Promise<void> {
