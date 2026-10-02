@@ -180,7 +180,6 @@ impl MoqSecureEncrypter {
 impl FrameEncrypter for MoqSecureEncrypter {
     fn encrypt(
         &mut self,
-        _sequence_number: u64,
         plaintext: &[u8],
     ) -> Result<Bytes, EncryptionError> {
         let ctr = self.take_counter()?;
@@ -237,7 +236,6 @@ struct CounterState {
 #[derive(Debug)]
 struct DecryptionState {
     /// Shared signing lease.
-
     ///
     /// This is deliberately not stored per encryption key. The signing
     /// lease permits unsigned frames after a signed frame and is separate
@@ -381,7 +379,6 @@ impl MoqSecureDecrypter {
 impl FrameDecrypter for MoqSecureDecrypter {
     fn decrypt(
         &mut self,
-        _sequence_number: u64,
         ciphertext: &[u8],
     ) -> Result<Bytes, EncryptionError> {
         // key_id and ctr are available in the unencrypted header.
@@ -395,9 +392,8 @@ impl FrameDecrypter for MoqSecureDecrypter {
         self.state.check_counter(key_id, ctr)?;
 
         // decrypt_frame continues to manage the shared signing lease.
-        // The implementation shown earlier updates the lease only after
-        // signature verification, decryption, and padding validation
-        // succeed.
+        // The implementation updates the lease only after signature
+        // verification, decryption, and padding validation succeed.
         let plaintext = moq_secure::wire::decrypt_frame(
             self.key_store.as_ref(),
             &self.broadcaster_public_key,
