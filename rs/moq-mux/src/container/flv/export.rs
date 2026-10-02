@@ -258,81 +258,201 @@ impl Export {
 		kio::wait(|waiter| self.poll_next(waiter)).await
 	}
 
-	fn bind_video(&mut self, catalog: &Catalog) -> anyhow::Result<()> {
-	    let renditions: Vec<_> = if self.multitrack {
-	        catalog.video.renditions.iter().collect()
-	    } else {
-	        let mut ranked: Vec<_> = catalog.video.ranked().collect();
+	/// Poll for the next byte chunk.
+	pub fn poll_next(&mut self, waiter: &kio::Waiter) -> Poll<anyhow::Result<Option<Bytes>>> {
+		// 1. Drain catalog updates to discover the track layout.
+		while let Some(catalog) = self.catalog.as_mut() {
+			match catalog.poll_next(waiter)? {
+				Poll::Ready(Some(snapshot)) => self.update_catalog(snapshot.media())?,
+				Poll::Ready(None) => {
+					self.catalog = None;
+					break;
+				}
+				Poll::Pending => break,
+			}
+		}
 
-	        ranked.sort_by_key(|(_, config)| {
-	            video_flavor(config).is_err()
-	                || !matches!(config.container, Container::Legacy | Container::Loc)
-	        });
+		// 2. Pull frames from each track into `pending`. Pre-header, drop slices
+		// that arrived before the track's codec config is ready: a mid-GOP joiner
+		// can't render them, and parking would block polling for the next SPS/PPS.
+		let waiting_for_header = !self.header_emitted;
+		for track in self.video.iter_mut().chain(self.audio.iter_mut()) {
+			if track.pending.is_some() || track.finished {
+				continue;
+			}
+			loop {
+				match track.source.poll_read(waiter)? {
+					Poll::Ready(Some(frame)) => {
+						if waiting_for_header && !track.source.header_ready() {
+							continue;
+						}
+						track.pending = Some(frame);
+						break;
+					}
+					Poll::Ready(None) => {
+						track.finished = true;
+						break;
+					}
+					Poll::Pending => break,
+				}
+			}
+		}
 
-	        ranked
-	    };
+		// 3. Emit the header once every track's codec config has resolved.
+		if !self.header_emitted {
+			if self.header_ready() {
+				let header = self.build_header()?;
+				self.header_emitted = true;
+				return Poll::Ready(Ok(Some(header)));
+			}
+			// The catalog closed and nothing more can resolve a codec config (no
+			// tracks arrived, or every bound track ended first): there's no header.
+			if self.catalog.is_none() && (!self.has_tracks() || self.tracks().all(|t| t.finished)) {
+				return Poll::Ready(Ok(None));
+			}
+			return Poll::Pending;
+		}
 
-	    // Before the header, a single-track stream follows the best rendition.
-	    // If the best rendition changes, drop the previous binding so it can be
-	    // replaced. No frames from it have been emitted yet.
-	    if !self.multitrack
-	        && let Some((best, _)) = renditions.first()
-	        && self.video.first().is_some_and(|track| &track.name != *best)
-	    {
-	        self.video.clear();
-	    }
+		// 4. Emit the smallest FLV tag timestamp as one tag.
+		if let Some((is_video, index)) = self.pick_next_track()? {
+			let track = if is_video {
+				&mut self.video[index]
+			} else {
+				&mut self.audio[index]
+			};
+			let frame = track.pending.take().unwrap();
+			let chunk = self.encode_frame(is_video, index, frame)?;
+			return Poll::Ready(Ok(Some(chunk)));
+		}
 
-	    for (name, config) in renditions {
-	        if !self.multitrack && !self.video.is_empty() {
-	            break;
-	        }
+		// 5. End-of-stream once every subscribed track is drained.
+		if self.has_tracks() && self.tracks().all(|t| t.finished && t.pending.is_none()) {
+			if self.catalog.is_none() {
+				return Poll::Ready(Ok(None));
+			}
+		} else if self.catalog.is_none() && !self.has_tracks() {
+			return Poll::Ready(Ok(None));
+		}
 
-	        if self.video.iter().any(|track| &track.name == name) {
-	            continue;
-	        }
-
-	        let flavor = video_flavor(config)?;
-	        ensure_legacy(&config.container, "video", name)?;
-
-	        // AV1's av1C is optional in the catalog; synthesize one from the
-	        // codec structure so the enhanced SequenceStart tag has a config.
-	        let fallback_description = match (&config.codec, config.description.as_ref()) {
-	            (VideoCodec::AV1(av1), None) => {
-	                Some(Bytes::copy_from_slice(&av1c_bytes(av1)))
-	            }
-	            _ => None,
-	        };
-
-	        let decrypter = self.new_decrypter();
-
-	        let Some(source) = ExportSource::for_video(
-	            &self.source,
-	            name,
-	            config,
-	            self.max_age,
-	            decrypter,
-	        )? else {
-	            continue;
-	        };
-
-	        let track_id =
-	            u8::try_from(self.video.len()).context("too many FLV video tracks")?;
-
-	        self.video.push(FlvTrack {
-	            name: name.clone(),
-	            track_id,
-	            source,
-	            pending: None,
-	            finished: false,
-	            flavor,
-	            fallback_description,
-	            dts_reserve: dts_reserve(config),
-	            last_dts: None,
-	        });
-	    }
-
-	    Ok(())
+		Poll::Pending
 	}
+
+	/// Iterate the subscribed tracks (video first, then audio).
+	fn tracks(&self) -> impl Iterator<Item = &FlvTrack> {
+		self.video.iter().chain(self.audio.iter())
+	}
+
+	fn has_tracks(&self) -> bool {
+		!self.video.is_empty() || !self.audio.is_empty()
+	}
+
+	fn update_catalog(&mut self, mut catalog: Catalog) -> anyhow::Result<()> {
+		self.source.retain_valid_media(&mut catalog);
+		if let Some(select) = &self.select {
+			select.retain(&mut catalog);
+		}
+
+		// A single-track FLV stream binds one rendition of each kind; multitrack
+		// binds them all.
+		//
+		// Only bind before the header is emitted: the sequence-header (config) tags
+		// go out with the header, and there's no in-band way to introduce a new
+		// track's config mid-stream, so a rendition first seen afterward is left
+		// unmuxed rather than emitted as undecodable config-less frames. Until then a
+		// single-track stream rebinds to a better-ranked video rendition.
+		if !self.header_emitted {
+			self.bind_video(&catalog)?;
+			self.bind_audio(&catalog)?;
+		} else if self.multitrack
+			&& (catalog.video.renditions.len() > self.video.len() || catalog.audio.renditions.len() > self.audio.len())
+		{
+			tracing::warn!("ignoring FLV rendition that appeared after the stream header");
+		}
+
+		// A bound track leaving the catalog is read to its own end rather than refused. A
+		// publisher retires a rendition as its track finishes or drops, and the catalog
+		// update races that end on another stream, so only the track's end can say which it
+		// was: a finish ends it cleanly, and a drop is the error the export reports.
+		Ok(())
+	}
+	fn bind_video(&mut self, catalog: &Catalog) -> anyhow::Result<()> {
+		let renditions: Vec<_> = if self.multitrack {
+			catalog.video.renditions.iter().collect()
+		} else {
+			let mut ranked: Vec<_> = catalog.video.ranked().collect();
+
+			ranked.sort_by_key(|(_, config)| {
+				video_flavor(config).is_err()
+					|| !matches!(config.container, Container::Legacy | Container::Loc)
+			});
+
+			ranked
+		};
+
+		if !self.multitrack {
+			let should_rebind = match (renditions.first(), self.video.first()) {
+				(Some((best_name, _)), Some(current)) => {
+					current.name.as_str() != best_name.as_str()
+				}
+				_ => false,
+			};
+
+			if should_rebind {
+				self.video.clear();
+			}
+		}
+
+		for (name, config) in renditions {
+			if !self.multitrack && !self.video.is_empty() {
+				break;
+			}
+
+			if self.video.iter().any(|track| &track.name == name) {
+				continue;
+			}
+
+			let flavor = video_flavor(config)?;
+			ensure_legacy(&config.container, "video", name)?;
+
+			let fallback_description = match (&config.codec, config.description.as_ref()) {
+				(VideoCodec::AV1(av1), None) => {
+					Some(Bytes::copy_from_slice(&av1c_bytes(av1)))
+				}
+				_ => None,
+			};
+
+			let decrypter = self.new_decrypter();
+
+			let Some(source) = ExportSource::for_video(
+				&self.source,
+				name,
+				config,
+				self.max_age,
+				decrypter,
+			)? else {
+				continue;
+			};
+
+			let track_id =
+				u8::try_from(self.video.len()).context("too many FLV video tracks")?;
+
+			self.video.push(FlvTrack {
+				name: name.clone(),
+				track_id,
+				source,
+				pending: None,
+				finished: false,
+				flavor,
+				fallback_description,
+				dts_reserve: dts_reserve(config),
+				last_dts: None,
+			});
+		}
+
+		Ok(())
+	}
+
+
 
 	fn bind_audio(
 		&mut self,

@@ -1235,33 +1235,71 @@ impl<E: catalog::Catalog> Export<E> {
 		Ok(())
 	}
 
-	/// Point each stale track this snapshot lists at the returned broadcast.
+		/// Point each stale track this snapshot lists at the returned broadcast.
 	///
 	/// The PIDs and PMT stay as announced. A track the returned catalog does not list stays
 	/// finished, silent on its PID.
-	fn resubscribe(&mut self, catalog: &Catalog<E>, mpegts: &catalog::Mpegts) -> anyhow::Result<()> {
+	fn resubscribe(
+		&mut self,
+		catalog: &Catalog<E>,
+		mpegts: &catalog::Mpegts,
+	) -> anyhow::Result<()> {
+		let source = self.source.clone();
+		let max_age = self.max_age;
+		let decrypter_factory = self.decrypter_factory.as_ref();
+
 		for (name, track) in self.tracks.iter_mut() {
 			if !self.stale.contains(name) {
 				continue;
 			}
-			let source = if let Some(config) = catalog.video.renditions.get(name) {
-				ExportSource::for_video(&self.source, name, config, self.max_age)?
+
+			let decrypter = || {
+				decrypter_factory.and_then(|factory| factory())
+			};
+
+			let new_source = if let Some(config) = catalog.video.renditions.get(name) {
+				ExportSource::for_video(
+					&source,
+					name,
+					config,
+					max_age,
+					decrypter(),
+				)?
 			} else if let Some(config) = catalog.audio.renditions.get(name) {
-				ExportSource::for_audio(&self.source, name, config, self.max_age)?
-			} else if mpegts.tracks.get(name).is_some_and(|t| t.verbatim.is_some()) {
-				Some(ExportSource::for_stream(&self.source, name, self.max_age)?)
+				ExportSource::for_audio(
+					&source,
+					name,
+					config,
+					max_age,
+					decrypter(),
+				)?
+			} else if mpegts
+				.tracks
+				.get(name)
+				.is_some_and(|track| track.verbatim.is_some())
+			{
+				Some(ExportSource::for_stream(
+					&source,
+					name,
+					max_age,
+					decrypter(),
+				)?)
 			} else {
 				None
 			};
-			let Some(source) = source else {
+
+			let Some(new_source) = new_source else {
 				continue;
 			};
+
 			self.stale.remove(name);
-			track.source = source;
+			track.source = new_source;
 			track.finished = false;
 		}
+
 		Ok(())
 	}
+
 
 	/// Insert a freshly created export track.
 	fn insert_track(

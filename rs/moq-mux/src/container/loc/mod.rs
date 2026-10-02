@@ -5,14 +5,11 @@
 //! timescale) followed by the codec bitstream. Defaults to microsecond
 //! timestamps. See [draft-ietf-moq-loc-04](https://www.ietf.org/archive/id/draft-ietf-moq-loc-04.html).
 
-use std::task::Poll;
+use std::task::{ready, Poll};
 
 use moq_net::{Timescale, Timestamp};
 
-use crate::container::{Container, Frame, FrameWriter, FrameReader, Kind};
-
-use std::task::ready;
-
+use crate::container::{Container, Frame, FrameReader, FrameWriter, Kind};
 use crate::Error;
 
 /// LOC's catalog convention: timestamps are in microseconds when no per-frame
@@ -21,118 +18,124 @@ const DEFAULT_TIMESCALE: Timescale = Timescale::MICRO;
 
 /// LOC wire format configured for the track's media role.
 pub struct Wire(
-	/// The kind of content carried by the track.
-	pub Kind,
+    /// The kind of content carried by the track.
+    pub Kind,
 );
 
 impl Container for Wire {
-	type Error = crate::Error;
+    type Error = crate::Error;
 
-	fn write<W>(&self, output: &mut W, frames: &[Frame]) -> Result<(), Self::Error>
-	where
-		W: FrameWriter<Error = Self::Error>,
-	{
-		for frame in frames {
-			// LOC uses microsecond timestamps by convention when no per-frame
-			// timescale property is present.
-			let timestamp = frame.timestamp.convert(DEFAULT_TIMESCALE).map_err(hang::Error::from)?;
+    fn write<W>(&self, output: &mut W, frames: &[Frame]) -> Result<(), Self::Error>
+    where
+        W: FrameWriter<Error = Self::Error>,
+    {
+        for frame in frames {
+            // LOC uses microsecond timestamps by convention when no per-frame
+            // timescale property is present.
+            let timestamp = frame
+                .timestamp
+                .convert(DEFAULT_TIMESCALE)
+                .map_err(hang::Error::from)?;
 
-			let payload = moq_loc::encode(timestamp.value(), &frame.payload)?;
+            let payload = moq_loc::encode(timestamp.value(), &frame.payload)?;
 
-			// The LOC timestamp is encoded inside the payload using the
-			// default timescale. The outer MoQ frame keeps the original
-			// track timestamp.
-			output.write_frame(frame.timestamp, payload)?;
-		}
+            // The LOC timestamp is encoded inside the payload using the
+            // default timescale. The outer MoQ frame keeps the original
+            // track timestamp.
+            output.write_frame(frame.timestamp, payload)?;
+        }
 
-		Ok(())
-	}
+        Ok(())
+    }
 
-	fn poll_read_frames<R>(
-    &self,
-    reader: &mut R,
-    waiter: &kio::Waiter,
-	) -> Poll<Result<Option<Vec<Frame>>, Self::Error>>
-	where
-	    R: FrameReader<Error = Error>,
-	{
-	    let Some(data) = ready!(reader.poll_read_frame(waiter)?) else {
-	        return Poll::Ready(Ok(None));
-	    };
-	
-	    let hang_frame = hang::container::Frame::decode(data.payload)?;
-	
-	    Poll::Ready(Ok(Some(vec![Frame {
-	        // Prefer the timestamp from the wire frame if it is available
-	        // outside the encrypted payload.
-	        timestamp: data.timestamp,
-	        payload: hang_frame.payload,
-	        keyframe: false,
-	        duration: None,
-	    }])))
-	}
+    fn poll_read_frames<R>(
+        &self,
+        reader: &mut R,
+        waiter: &kio::Waiter,
+    ) -> Poll<Result<Option<Vec<Frame>>, Self::Error>>
+    where
+        R: FrameReader<Error = Error>,
+    {
+        let Some(data) = ready!(reader.poll_read_frame(waiter)?) else {
+            return Poll::Ready(Ok(None));
+        };
 
-	fn poll_read(
-		&self,
-		group: &mut moq_net::group::Consumer,
-		waiter: &kio::Waiter,
-	) -> Poll<Result<Option<Vec<Frame>>, Self::Error>> {
-		use std::task::ready;
+        let hang_frame = hang::container::Frame::decode(data.payload)?;
 
-		let Some(frame) = ready!(group.poll_read_frame(waiter)?) else {
-			return Poll::Ready(Ok(None));
-		};
+        Poll::Ready(Ok(Some(vec![Frame {
+            // Prefer the timestamp from the wire frame if it is available
+            // outside the encrypted payload.
+            timestamp: data.timestamp,
+            payload: hang_frame.payload,
+            keyframe: false,
+            duration: None,
+        }])))
+    }
 
-		let loc = moq_loc::decode(frame.payload)?;
+    fn poll_read(
+        &self,
+        group: &mut moq_net::group::Consumer,
+        waiter: &kio::Waiter,
+    ) -> Poll<Result<Option<Vec<Frame>>, Self::Error>> {
+        let Some(frame) = ready!(group.poll_read_frame(waiter)?) else {
+            return Poll::Ready(Ok(None));
+        };
 
-		// `loc.timescale == Some(0)` is malformed and is rejected by
-		// `moq_loc::decode`. Any remaining Some(_) value is non-zero.
-		let scale = loc
-			.timescale
-			.and_then(|s| Timescale::new(s).ok())
-			.unwrap_or(DEFAULT_TIMESCALE);
+        let loc = moq_loc::decode(frame.payload)?;
 
-		let timestamp = Timestamp::new(loc.timestamp, scale).map_err(hang::Error::from)?;
+        // `loc.timescale == Some(0)` is malformed and is rejected by
+        // `moq_loc::decode`. Any remaining Some(_) value is non-zero.
+        let scale = loc
+            .timescale
+            .and_then(|s| Timescale::new(s).ok())
+            .unwrap_or(DEFAULT_TIMESCALE);
 
-		Poll::Ready(Ok(Some(vec![Frame {
-			timestamp,
-			payload: loc.payload,
+        let timestamp =
+            Timestamp::new(loc.timestamp, scale).map_err(hang::Error::from)?;
 
-			// LOC does not carry the keyframe bit on the wire; the wrapping
-			// Consumer fills it in from group position.
-			keyframe: false,
+        Poll::Ready(Ok(Some(vec![Frame {
+            timestamp,
+            payload: loc.payload,
 
-			// LOC carries no per-frame duration.
-			duration: None,
-		}])))
-	}
+            // LOC does not carry the keyframe bit on the wire; the wrapping
+            // Consumer fills it in from group position.
+            keyframe: false,
 
-	fn kind(&self) -> Kind {
-		self.0
-	}
+            // LOC carries no per-frame duration.
+            duration: None,
+        }])))
+    }
 
-	fn end(&self, frame: &Frame) -> Option<moq_net::Timestamp> {
-		(self.0 != Kind::Data && frame.payload.is_empty()).then_some(frame.timestamp)
-	}
+    fn kind(&self) -> Kind {
+        self.0
+    }
 
-	fn finish_group(
-		&self,
-		group: &mut moq_net::group::Producer,
-		end: Option<moq_net::Timestamp>,
-	) -> Result<(), Self::Error> {
-		if self.0 == Kind::Video
-			&& let Some(timestamp) = end
-		{
-			self.write(
-				group,
-				&[Frame {
-					timestamp,
-					payload: bytes::Bytes::new(),
-					keyframe: false,
-					duration: None,
-				}],
-			)?;
-		}
-		Ok(())
-	}
+    fn end(&self, frame: &Frame) -> Option<moq_net::Timestamp> {
+        (self.0 != Kind::Data && frame.payload.is_empty()).then_some(frame.timestamp)
+    }
+
+    fn finish_group<W>(
+        &self,
+        group: &mut W,
+        end: Option<moq_net::Timestamp>,
+    ) -> Result<(), Self::Error>
+    where
+        W: FrameWriter<Error = Self::Error>,
+    {
+        if self.0 == Kind::Video
+            && let Some(timestamp) = end
+        {
+            self.write(
+                group,
+                &[Frame {
+                    timestamp,
+                    payload: bytes::Bytes::new(),
+                    keyframe: false,
+                    duration: None,
+                }],
+            )?;
+        }
+
+        Ok(())
+    }
 }
