@@ -253,8 +253,10 @@ impl<F: Container<Error = crate::error::Error>> Consumer<F> {
 					Poll::Ready(Ok(Some(Event::Frame(frame)))) => {
 						let seq = group.group.sequence;
 						let ts = frame.timestamp;
-						if self.floor.is_some_and(|floor| ts.as_micros() < floor.as_micros()) {
-							return Poll::Ready(Err(TimestampRewind.into()));
+						if let Some(floor) = self.floor
+							&& ts.as_micros() < floor.as_micros()
+						{
+							return Poll::Ready(Err(TimestampRewind { timestamp: ts, floor }.into()));
 						}
 						if self.start.is_none_or(|(start, _)| start != seq) {
 							self.start = Some((seq, ts));
@@ -494,7 +496,7 @@ impl<F: Container<Error = crate::error::Error>> Consumer<F> {
 	// A later group with a media timestamp below the latest delivered group's start is malformed:
 	// group starts never go backwards. Markers have no media timestamp, so they are not this check.
 	fn poll_malformed(&mut self, waiter: &kio::Waiter) -> Result<(), F::Error> {
-		let Some((prev_group, edge)) = self.start else {
+		let Some((prev_group, floor)) = self.start else {
 			return Ok(());
 		};
 
@@ -502,10 +504,11 @@ impl<F: Container<Error = crate::error::Error>> Consumer<F> {
 			if group.group.sequence <= prev_group {
 				continue;
 			}
+
 			if let Poll::Ready(Ok(min)) = group.poll_min_timestamp(waiter, &self.format, &mut self.decrypter,)
-				&& min.as_micros() < edge.as_micros()
+				&& min.as_micros() < floor.as_micros()
 			{
-				return Err(TimestampRewind.into());
+				return Err(TimestampRewind { timestamp: min, floor }.into());
 			}
 		}
 
@@ -1271,7 +1274,15 @@ mod tests {
 		write_group(&mut track, 1, &[ts(0)]);
 		track.finish().unwrap();
 		let err = consumer.read().await.unwrap_err();
-		assert!(matches!(err, crate::Error::TimestampRewind(_)));
+		assert!(matches!(
+			err,
+			crate::Error::TimestampRewind(TimestampRewind { timestamp, floor })
+				if timestamp == ts(0) && floor == ts(100_000)
+		));
+		assert_eq!(
+			err.to_string(),
+			"frame timestamp 0 µs is below the previous group's start 100000 µs"
+		);
 	}
 
 	#[tokio::test]
@@ -1412,7 +1423,15 @@ mod tests {
 		track.finish().unwrap();
 		assert_eq!(consumer.read().await.unwrap().unwrap().timestamp, ts(200_000));
 		let err = consumer.read().await.unwrap_err();
-		assert!(matches!(err, crate::Error::TimestampRewind(_)));
+		assert!(matches!(
+			err,
+			crate::Error::TimestampRewind(TimestampRewind { timestamp, floor })
+				if timestamp == ts(50_000) && floor == ts(100_000)
+		));
+		assert_eq!(
+			err.to_string(),
+			"frame timestamp 50000 µs is below the previous group's start 100000 µs"
+		);
 	}
 
 	// ---- Empty payloads ----
@@ -1720,6 +1739,91 @@ mod tests {
 
 		let frames = read_all(&mut consumer).await.unwrap();
 		assert!(frames.len() >= 4, "Expected >= 4 frames, got {}", frames.len());
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn truncated_spliced_group_skips_to_the_next_clean_group() {
+		let origin = crate::source::produce_origin();
+		let hops = moq_net::Hops::try_from(vec![moq_net::Hop::new(10).unwrap()]).unwrap();
+		let first_route = origin
+			.dynamic(
+				"live",
+				moq_net::origin::Route::default().with_hops(hops.clone()).with_cost(5),
+			)
+			.unwrap();
+		let pending = origin.consume().request_broadcast("live");
+		let first = moq_net::broadcast::Info::new().produce();
+		let info = hang::container::track_info(hang::catalog::PRIORITY.video);
+		let first_track = first.create_track("video", info.clone()).unwrap();
+		first_route.requested_broadcast().await.unwrap().accept(&first);
+		let broadcast = pending.await.unwrap();
+		let track = broadcast
+			.track("video")
+			.unwrap()
+			.subscribe(moq_net::track::Subscription::default().with_max_age(Duration::from_secs(2)))
+			.await
+			.unwrap();
+		let format = Container::Legacy(crate::container::Kind::Data);
+		let mut consumer = Consumer::new(track, Container::Legacy(crate::container::Kind::Data));
+
+		let mut open = first_track.create_group(0u64.into()).unwrap();
+		format
+			.write(
+				&mut open,
+				&[Frame {
+					timestamp: ts(0),
+					payload: Bytes::from_static(&[0xDE, 0xAD]),
+					keyframe: true,
+					duration: None,
+				}],
+			)
+			.unwrap();
+
+		// Each cheaper route advances beyond the seam without serving its continuation.
+		// Enough takeovers prune every route that could still cover group 0.
+		let mut routes = Vec::new();
+		let mut sources = Vec::new();
+		for sequence in 1..=4 {
+			let route = origin
+				.dynamic(
+					"live",
+					moq_net::origin::Route::default()
+						.with_hops(hops.clone())
+						.with_cost(5 - sequence),
+				)
+				.unwrap();
+			let source = moq_net::broadcast::Info::new().produce();
+			let mut track = source.create_track("video", info.clone()).unwrap();
+			route.requested_broadcast().await.unwrap().accept(&source);
+			track.demand().used().await.unwrap();
+			if sequence == 1 {
+				assert_eq!(consumer.read().await.unwrap().unwrap().timestamp, ts(0));
+			}
+			write_group(&mut track, sequence, &[ts(sequence * 100_000)]);
+			routes.push(route);
+			sources.push((source, track));
+		}
+
+		let waiter = kio::Waiter::noop();
+
+		// Group 1 was never handed out before its segment was pruned. An abort
+		// skips straight to the retained successor; a short clean group emits GroupEnd.
+		let event = consumer.poll_event(&waiter);
+		let Poll::Ready(Ok(Some(Event::Frame(frame)))) = event else {
+			panic!(
+				"expected a successor frame, current={}; pending={}",
+				consumer.current,
+				event.is_pending()
+			);
+		};
+		assert_eq!(frame.timestamp, ts(200_000));
+		assert!(frame.keyframe);
+		assert_eq!(consumer.current, 2);
+		assert!(
+			matches!(consumer.poll_event(&waiter), Poll::Ready(Ok(Some(Event::GroupEnd)))),
+			"the complete successor still emits its clean boundary"
+		);
+		assert_eq!(consumer.read().await.unwrap().unwrap().timestamp, ts(300_000));
 	}
 
 	// ---- Eviction recovery (pause/resume) ----
