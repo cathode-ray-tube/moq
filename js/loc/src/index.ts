@@ -16,8 +16,10 @@ import type { FrameEncrypter } from "../secure/encrypter.js";
 export interface Frame {
 	/** The codec bitstream payload, with the LOC property block stripped. */
 	payload: Uint8Array;
+
 	/** Presentation timestamp in microseconds. */
 	timestamp: Time.Micro;
+
 	/** True if this frame can be decoded without any preceding frames. */
 	keyframe: boolean;
 }
@@ -25,10 +27,10 @@ export interface Frame {
 const PROP_TIMESCALE = 0x08;
 const PROP_TIMESTAMP = 0x10;
 
-// The Timestamp id from draft-ietf-moq-loc-03, accepted on decode only. Draft-03's
-// body text and its IANA table disagreed (0x0A vs 0x06); this is the table's value,
-// which is what shipped. Draft-04 assigns 0x0A to Secure Objects private properties,
-// so it is not accepted here.
+// The Timestamp id from draft-ietf-moq-loc-03, accepted on decode only.
+// Draft-03's body text and its IANA table disagreed (0x0A vs 0x06);
+// this is the table's value, which is what shipped. Draft-04 assigns
+// 0x0A to Secure Objects private properties, so it is not accepted here.
 const PROP_TIMESTAMP_DRAFT03 = 0x06;
 
 const DEFAULT_TIMESCALE = 1_000_000;
@@ -106,21 +108,30 @@ export class Format implements ContainerFormat {
 			prevType = abs;
 			cursor = afterDelta;
 
-
-			if (abs === PROP_TIMESTAMP || abs === PROP_TIMESTAMP_DRAFT03) {
+			if (
+				abs === PROP_TIMESTAMP ||
+				abs === PROP_TIMESTAMP_DRAFT03
+			) {
 				[timestamp, cursor] = Moq.Varint.decode(cursor);
 			} else if (abs === PROP_TIMESCALE) {
 				let value: number;
+
 				[value, cursor] = Moq.Varint.decode(cursor);
+
 				if (value === 0) {
-					throw new Error("loc: timescale property must be non-zero");
+					throw new Error(
+						"loc: timescale property must be non-zero",
+					);
 				}
+
 				timescale = value;
 			} else if (abs % 2 === 0) {
-				// An unknown varint property may use all 62 bits, which a number can't hold; skip it.
+				// An unknown varint property may use all 62 bits,
+				// which a number cannot hold; skip it.
 				cursor = Moq.Varint.decodeBigInt(cursor)[1];
 			} else {
-				const [len, afterLenInner] = Moq.Varint.decode(cursor);
+				const [len, afterLenInner] =
+					Moq.Varint.decode(cursor);
 
 				if (afterLenInner.byteLength < len) {
 					throw new Error(
@@ -151,12 +162,7 @@ export class Format implements ContainerFormat {
 	}
 
 	async #decodeEncrypted(frame: Uint8Array): Promise<Frame[]> {
-		/*
-		 * LOC frames do not currently carry a container sequence number.
-		 * The secure-frame interface still requires one, so use zero,
-		 * matching the legacy-container implementation.
-		 */
-		const plaintext = await this.#decrypter!.decrypt(0, frame);
+		const plaintext = await this.#decrypter!.decrypt(frame);
 
 		return this.#decodePlaintext(plaintext);
 	}
@@ -166,6 +172,7 @@ export class Format implements ContainerFormat {
 export interface Source {
 	/** Size in bytes of the payload. */
 	byteLength: number;
+
 	/** Copy the payload into the provided buffer. */
 	copyTo(buffer: Uint8Array): void;
 }
@@ -252,11 +259,7 @@ export class Producer {
 		}
 
 		const plaintext = this.#encode(data, timestamp);
-
-		const payload = await this.#encrypter!.encrypt(
-			this.#group.sequence,
-			plaintext,
-		);
+		const payload = await this.#encrypter!.encrypt(plaintext);
 
 		this.#group.writeFrame({
 			payload,
@@ -276,6 +279,7 @@ export class Producer {
 	): Uint8Array {
 		const propTypeBytes = Moq.Varint.encode(PROP_TIMESTAMP);
 		const propValueBytes = Moq.Varint.encode(timestamp);
+
 		const propsLen =
 			propTypeBytes.byteLength + propValueBytes.byteLength;
 
@@ -284,6 +288,7 @@ export class Producer {
 		const payloadSize = source.byteLength;
 		const total =
 			propsLenBytes.byteLength + propsLen + payloadSize;
+
 		const out = new Uint8Array(total);
 
 		let offset = 0;
