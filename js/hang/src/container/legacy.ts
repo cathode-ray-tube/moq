@@ -78,11 +78,7 @@ export class Format implements ContainerFormat {
 	}
 
 	async #decodeEncrypted(frame: Uint8Array): Promise<Frame[]> {
-		/*
-		 * Legacy-format frames do not use a CMAF sequence number.
-		 * The secure-frame interface still requires one, so use zero.
-		 */
-		const plaintext = await this.#decrypter!.decrypt(0, frame);
+		const plaintext = await this.#decrypter!.decrypt(frame);
 
 		return this.#decodePlaintext(plaintext);
 	}
@@ -139,11 +135,14 @@ export class Producer {
 
 	/** The newest timestamp written. */
 	#end?: Time.Micro;
+
 	// Furthest timestamp in finished groups, used only for discontinuity markers.
 	#liveEdge?: Time.Micro;
+
 	// The current group start and the previous group start, which bounds its frames.
 	#start?: Time.Micro;
 	#floor?: Time.Micro;
+
 	// Gap between consecutive timestamps, used to close the last group when no successor exists.
 	#interval?: Time.Micro;
 
@@ -172,10 +171,19 @@ export class Producer {
 		return this;
 	}
 
-
-	/** Encode and append a frame; a keyframe starts a new group. Throws if the first frame is not a keyframe, a group start goes backwards, or a frame is below the previous group start. */
-	encode(data: Uint8Array | Source, timestamp: Time.Micro, keyframe: boolean) {
+	/**
+	 * Encode and append a frame; a keyframe starts a new group.
+	 *
+	 * Throws if the first frame is not a keyframe, a group start goes
+	 * backwards, or a frame is below the previous group start.
+	 */
+	encode(
+		data: Uint8Array | Source,
+		timestamp: Time.Micro,
+		keyframe: boolean,
+	) {
 		const floor = keyframe ? this.#start : this.#floor;
+
 		if (floor !== undefined && timestamp < floor) {
 			throw new Error("frame timestamp is below the previous group start");
 		}
@@ -201,13 +209,20 @@ export class Producer {
 
 			this.#close(rewound ? undefined : timestamp);
 
-			if (rewound) this.#interval = undefined;
+			if (rewound) {
+				this.#interval = undefined;
+			}
+
 			this.#group = this.#track.appendGroup();
 			this.#floor = this.#start;
 			this.#start = timestamp;
-			// Report the group the moment it opens: its start is this keyframe's timestamp.
-			this.#timeline?.record(this.#group.sequence, timestamp, true);
 
+			// Report the group the moment it opens: its start is this keyframe's timestamp.
+			this.#timeline?.record(
+				this.#group.sequence,
+				timestamp,
+				true,
+			);
 		} else if (!this.#group) {
 			throw new Error("must start with a keyframe");
 		}
@@ -270,10 +285,7 @@ export class Producer {
 	): Promise<Uint8Array> {
 		const plaintext = encodeFrame(data, timestamp);
 
-		return this.#encrypter!.encrypt(
-			this.#group!.sequence,
-			plaintext,
-		);
+		return this.#encrypter!.encrypt(plaintext);
 	}
 
 	#recordFrame(timestamp: Time.Micro): void {
@@ -392,7 +404,6 @@ export class Producer {
 		this.#timeline?.end(timestamp);
 
 		const payload = await this.#encrypter!.encrypt(
-			group.sequence,
 			encodeFrame(new Uint8Array(), timestamp),
 		);
 
@@ -458,10 +469,7 @@ export class Producer {
 			end,
 		);
 
-		const payload = await this.#encrypter!.encrypt(
-			this.#group!.sequence,
-			plaintext,
-		);
+		const payload = await this.#encrypter!.encrypt(plaintext);
 
 		this.#group!.writeFrame({
 			payload,
@@ -521,7 +529,6 @@ export class Producer {
 		this.#reordered = false;
 	}
 
-
 	/** Close the track and current group, optionally with an error. */
 	close(err?: Error): void | Promise<void> {
 		if (err) {
@@ -551,5 +558,13 @@ export class Producer {
 
 		this.#group?.close();
 		this.#track.close();
+	}
+
+	#refuse(timestamp: Time.Micro): void {
+		const floor = this.#start;
+
+		if (floor !== undefined && timestamp < floor) {
+			throw new Error("frame timestamp is below the previous group start");
+		}
 	}
 }
