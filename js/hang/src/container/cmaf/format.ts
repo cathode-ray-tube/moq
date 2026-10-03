@@ -46,11 +46,7 @@ export class Format implements ContainerFormat {
 	}
 
 	async #decodeEncrypted(frame: Uint8Array): Promise<Frame[]> {
-		/*
-		 * Use zero for now. If CMAF decryption later requires a sequence
-		 * number, this can be changed without altering the decode structure.
-		 */
-		const plaintext = await this.#decrypter!.decrypt(0, frame);
+		const plaintext = await this.#decrypter!.decrypt(frame);
 
 		return this.#decodeDataSegment(plaintext);
 	}
