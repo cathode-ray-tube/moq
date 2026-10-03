@@ -3,18 +3,13 @@ use std::task::Poll;
 
 use crate::{encryption::EncryptionError, error::Error};
 
-pub type Decrypter =
-    Box<dyn FrameDecrypter + Send + Sync>;
+pub type Decrypter = Box<dyn FrameDecrypter + Send + Sync>;
 
-pub type DecrypterFactory =
-    Box<dyn Fn() -> Option<Decrypter> + Send + Sync>;
+pub type DecrypterFactory = Box<dyn Fn() -> Option<Decrypter> + Send + Sync>;
 
 /// A frame returned by an underlying MoQ frame reader.
 #[derive(Debug, Clone)]
 pub struct ReadFrame {
-    /// Frame number within the current MoQ group.
-    pub sequence_number: u32,
-
     pub timestamp: moq_net::Timestamp,
 
     /// Encoded payload as received from the underlying stream.
@@ -34,20 +29,12 @@ pub trait FrameReader {
         &mut self,
         waiter: &kio::Waiter,
     ) -> Poll<Result<Option<ReadFrame>, Self::Error>>;
-
-    /// Returns the sequence number that will be assigned to the next frame.
-    fn next_sequence_number(&self) -> u32;
 }
 
 /// Transforms an encoded payload after it is read.
 pub trait FrameDecrypter {
-    /// `sequence_number` is the MoQ frame number within the current group.
-    ///
-    /// A decrypter may ignore it when the protected wire format contains
-    /// its own authenticated counter.
     fn decrypt(
         &mut self,
-        sequence_number: u64,
         ciphertext: &[u8],
     ) -> Result<Bytes, EncryptionError>;
 }
@@ -59,10 +46,9 @@ where
 {
     fn decrypt(
         &mut self,
-        sequence_number: u64,
         ciphertext: &[u8],
     ) -> Result<Bytes, EncryptionError> {
-        (**self).decrypt(sequence_number, ciphertext)
+        (**self).decrypt(ciphertext)
     }
 }
 
@@ -73,13 +59,11 @@ where
 {
     fn decrypt(
         &mut self,
-        sequence_number: u64,
         ciphertext: &[u8],
     ) -> Result<Bytes, EncryptionError> {
-        (**self).decrypt(sequence_number, ciphertext)
+        (**self).decrypt(ciphertext)
     }
 }
-
 
 /// A [`FrameReader`] decorator that decrypts each payload before returning it.
 pub struct ProtectedFrame<R, D> {
@@ -129,10 +113,7 @@ where
             Poll::Ready(Ok(Some(frame))) => frame,
         };
 
-        let plaintext = match self.decrypter.decrypt(
-            u64::from(frame.sequence_number),
-            &frame.payload,
-        ) {
+        let plaintext = match self.decrypter.decrypt(&frame.payload) {
             Ok(plaintext) => plaintext,
 
             Err(error) => {
@@ -145,8 +126,5 @@ where
             ..frame
         })))
     }
-
-    fn next_sequence_number(&self) -> u32 {
-        self.inner.next_sequence_number()
-    }
 }
+
