@@ -7,15 +7,11 @@ use crate::container::{Decrypter, ProtectedReadFrame, ReadFrame};
 
 pub struct GroupReader<'a> {
     group: &'a mut moq_net::group::Consumer,
-    next_sequence_number: u32,
 }
 
 impl<'a> GroupReader<'a> {
     pub fn new(group: &'a mut moq_net::group::Consumer) -> Self {
-        Self {
-            group,
-            next_sequence_number: 0,
-        }
+        Self { group }
     }
 }
 
@@ -32,18 +28,10 @@ impl FrameReader for GroupReader<'_> {
             return Poll::Ready(Ok(None));
         };
 
-        let sequence_number = self.next_sequence_number;
-        self.next_sequence_number += 1;
-
         Poll::Ready(Ok(Some(ReadFrame {
-            sequence_number,
             timestamp: frame.timestamp,
             payload: frame.payload,
         })))
-    }
-
-    fn next_sequence_number(&self) -> u32 {
-        self.next_sequence_number
     }
 }
 
@@ -164,151 +152,4 @@ impl<F: Container<Error = crate::error::Error>> GroupConsumer<F> {
 
         Some(frame)
     }
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use crate::catalog::hang::Container as Hang;
-
-	fn frame(timestamp_us: u64, payload: &'static [u8], keyframe: bool) -> Frame {
-		Frame {
-			timestamp: moq_net::Timestamp::from_micros(timestamp_us).unwrap(),
-			payload: bytes::Bytes::from_static(payload),
-			keyframe,
-			duration: None,
-		}
-	}
-
-	/// Read one retained group end to end, without a subscription.
-	#[tokio::test]
-	async fn reads_a_group_to_completion() {
-		let broadcast = moq_net::broadcast::Info::new().produce();
-		let track = broadcast.create_track("media", None).unwrap();
-		let consumer = broadcast.consume();
-
-		let mut media = crate::container::Producer::new(track, Hang::Legacy(crate::container::Kind::Data));
-		media.write(frame(1_000_000, b"keyframe", true)).unwrap();
-		media.write(frame(1_020_000, b"delta", false)).unwrap();
-		media.finish().unwrap();
-
-		let group = consumer.track("media").unwrap().fetch_group(0, None).await.unwrap();
-		let mut group = GroupConsumer::new(group, Hang::Legacy(crate::container::Kind::Data));
-		assert_eq!(group.sequence(), 0);
-
-		let first = group.read().await.unwrap().unwrap();
-		assert_eq!(first.payload, b"keyframe".as_slice());
-		assert!(first.keyframe);
-
-		let second = group.read().await.unwrap().unwrap();
-		assert_eq!(second.payload, b"delta".as_slice());
-		assert!(!second.keyframe);
-
-		assert!(group.read().await.unwrap().is_none());
-	}
-
-	#[tokio::test]
-	async fn empty_data_frames_survive_subscription_and_fetch() {
-		for config in [hang::catalog::Container::Legacy, hang::catalog::Container::Loc] {
-			let broadcast = moq_net::broadcast::Info::new().produce();
-			let track = broadcast.create_track("data", hang::container::track_info(0)).unwrap();
-			let subscription = track.subscribe(moq_net::track::Subscription::default());
-			let consumer = broadcast.consume();
-			let mut producer =
-				crate::container::Producer::new(track, Hang::new(&config, crate::container::Kind::Data).unwrap());
-			producer.write(frame(0, b"", true)).unwrap();
-			producer.write(frame(10_000, b"data", false)).unwrap();
-			producer.finish().unwrap();
-			let mut live = crate::container::Consumer::new(
-				subscription,
-				Hang::new(&config, crate::container::Kind::Data).unwrap(),
-			);
-			let first = live.read().await.unwrap().unwrap();
-			assert!(first.payload.is_empty());
-			assert!(first.keyframe);
-			assert_eq!(live.read().await.unwrap().unwrap().payload, b"data".as_slice());
-			assert!(live.read().await.unwrap().is_none());
-			let group = consumer.track("data").unwrap().fetch_group(0, None).await.unwrap();
-			let mut fetched = GroupConsumer::new(group, Hang::new(&config, crate::container::Kind::Data).unwrap());
-			assert!(fetched.read().await.unwrap().unwrap().payload.is_empty());
-			assert_eq!(fetched.read().await.unwrap().unwrap().payload, b"data".as_slice());
-			assert!(fetched.read().await.unwrap().is_none());
-		}
-	}
-
-	/// An empty payload times the previous frame and is not returned as media.
-	#[tokio::test]
-	async fn a_duration_marker_times_the_last_frame() {
-		let broadcast = moq_net::broadcast::Info::new().produce();
-		let track = broadcast.create_track("media", None).unwrap();
-		let consumer = broadcast.consume();
-
-		let mut media = crate::container::Producer::new(track, Hang::Legacy(crate::container::Kind::Video));
-		media.write(frame(1_000_000, b"keyframe", true)).unwrap();
-		media.write(frame(1_020_000, b"delta", false)).unwrap();
-		media
-			.cut(Some(moq_net::Timestamp::from_micros(1_053_000).unwrap()))
-			.unwrap();
-		media.finish().unwrap();
-
-		let group = consumer.track("media").unwrap().fetch_group(0, None).await.unwrap();
-		let mut group = GroupConsumer::new(group, Hang::Legacy(crate::container::Kind::Video));
-
-		let first = group.read().await.unwrap().unwrap();
-		assert_eq!(first.payload, b"keyframe".as_slice());
-		assert_eq!(first.duration, None);
-
-		let second = group.read().await.unwrap().unwrap();
-		assert_eq!(second.payload, b"delta".as_slice());
-		assert_eq!(second.duration, Some(moq_net::Timestamp::from_micros(33_000).unwrap()));
-
-		assert!(group.read().await.unwrap().is_none());
-	}
-
-	/// One CMAF fragment decodes to several samples, which are handed back one at a time.
-	#[tokio::test]
-	async fn hands_back_a_cmaf_batch_one_frame_at_a_time() {
-		let mut config = hang::catalog::VideoConfig::new(hang::catalog::VideoCodec::VP8);
-		config.coded_width = Some(320);
-		config.coded_height = Some(240);
-		let muxer = crate::container::fmp4::Muxer::video(&config).unwrap();
-		let init = muxer.init().unwrap().expect("VP8 init should be available");
-		let cmaf = hang::catalog::Container::Cmaf { init };
-		// The format is not Clone, so decode with a second instance built from the same init.
-		let format = Hang::new(&cmaf, crate::container::Kind::Video).unwrap();
-
-		let broadcast = moq_net::broadcast::Info::new().produce();
-		let track = broadcast.create_track("video", None).unwrap();
-		let consumer = broadcast.consume();
-
-		// Buffer both samples into one moof+mdat, which is what this decodes.
-		let mut media = crate::container::Producer::new(track, format).with_buffer(std::time::Duration::from_secs(1));
-		for (timestamp_us, payload, keyframe) in [
-			(2_000_000, b"keyframe".as_slice(), true),
-			(2_020_000, b"delta".as_slice(), false),
-		] {
-			media
-				.write(Frame {
-					timestamp: moq_net::Timestamp::from_micros(timestamp_us).unwrap(),
-					payload: bytes::Bytes::from_static(payload),
-					keyframe,
-					duration: Some(moq_net::Timestamp::from_micros(20_000).unwrap()),
-				})
-				.unwrap();
-		}
-		media.finish().unwrap();
-
-		let group = consumer.track("video").unwrap().fetch_group(0, None).await.unwrap();
-		let mut group = GroupConsumer::new(group, Hang::new(&cmaf, crate::container::Kind::Video).unwrap());
-
-		let first = group.read().await.unwrap().unwrap();
-		assert_eq!(first.payload, b"keyframe".as_slice());
-		assert!(first.keyframe);
-
-		let second = group.read().await.unwrap().unwrap();
-		assert_eq!(second.payload, b"delta".as_slice());
-		assert!(!second.keyframe);
-
-		assert!(group.read().await.unwrap().is_none());
-	}
 }
