@@ -65,11 +65,11 @@ second, for finished tracks to deliver their last groups and FIN, returning
 `Error::Timeout` if it gave up. Finish or abort live tracks before calling it.
 Both protocols withdraw the session's announcements and wait for delivery
 under that same deadline. IETF drafts 14 through 16 send withdrawals without
-waiting, and IETF media streams are not drained yet. Dropping the driver
-cancels the session. `moq-tokio` and `moq-wasm` drive sessions for their
-callers. A deliberate local session close ends received tracks cleanly after
-their delivered groups. A peer close ends received tracks and open group
-readers with the session error, preserving its close code.
+waiting. Dropping the driver cancels the session. `moq-tokio` and `moq-wasm`
+drive sessions for their callers. A deliberate local session close ends
+received tracks cleanly after their delivered groups. A peer close ends
+received tracks and open group readers with the session error, preserving its
+close code.
 
 `origin::Producer::new` returns a driver with the same `time::Driver`
 interface. It calls `cache::Pool::gc(now)` after each poll and folds the next
@@ -178,3 +178,17 @@ subscription's upstream request.
 
 Inside a group, `set_frames(...)` applies the same range syntax to frame
 indices.
+
+## Subscriber demand
+
+Track producers, pending track requests, and dynamic track handlers return a
+`track::Demand` from `demand()`. Group producers and pending group requests
+return `group::Demand`; broadcast producers return `broadcast::Demand`.
+Watch `used()` / `unused()` (or `poll_used` / `poll_unused`) on these handles,
+or take a snapshot with `is_used()`. Demand handles cannot write or abort and
+do not keep a producer or request alive. A pending group request counts every
+caller sharing its fetch, so one caller leaving does not cancel the others.
+The last caller to leave withdraws the fetch, so a later fetch of that group
+starts a fresh request; a handler that sees the request unused just drops it.
+Use the producer's `abort_unused` to atomically end an idle track; observing
+unused demand alone does not protect against a new subscriber arriving.

@@ -76,38 +76,45 @@ config through `AsMut`.
 ```rust
 #[derive(Serialize, Deserialize, Clone)]
 struct Mavlink {
-    #[serde(flatten)]
-    binary: hang::catalog::BinaryConfig, // mode, compression, bitrate, ...
+    config: hang::catalog::BinaryConfig, // mode, compression, bitrate, ...
     sysid: u8,
 }
 
 impl AsMut<hang::catalog::BinaryConfig> for Mavlink {
     fn as_mut(&mut self) -> &mut hang::catalog::BinaryConfig {
-        &mut self.binary
+        &mut self.config
     }
 }
 
 // Plus `RenditionConfig<Ext>` writing to `catalog.ext.mavlink`, a map
 // serialized under the `com.example.mavlink` root key.
-let binary = hang::catalog::BinaryConfig::new(hang::catalog::Mode::Stream);
-let mut telemetry = catalog.binary_stream(track, Mavlink { binary, sysid: 1 })?;
+let config = hang::catalog::BinaryConfig::new(hang::catalog::Mode::Stream);
+let mut telemetry = catalog.binary_stream(track, Mavlink { config, sysid: 1 })?;
 telemetry.append(packet)?;
 ```
 
 The producer sets the entry's `mode` and encodes the track with its
 `compression`. Read it back from `Catalog<Ext>` and subscribe with
-`catalog::Entry::new(name, &entry.binary)`.
+`catalog::Entry::new(name, &entry.config)`.
 
-A payload that knows when it was captured (a datagram's arrival, a sensor read)
-carries that `Instant`. The producer maps it onto the broadcast clock and writes
-it as the frame timestamp, and the entry advertises `jitter` and `delay` the way
-a media rendition does, so telemetry lagging its video shows up as `delay`. An
-instant ahead of now is refused. A device's own clock is an unrelated epoch;
-keep it in the payload.
+A payload timed on the broadcast clock is written at that timestamp as given,
+and the entry advertises `jitter` and `delay` the way a media rendition does, so
+telemetry lagging its video shows up as `delay`. A capture `Instant` (a
+datagram's arrival, a sensor read) converts with `Clock::capture` on the
+catalog's clock, which refuses an instant ahead of now. A timestamp ahead of now
+is published anyway and measured as zero delay, so a source clock running
+slightly fast is not rejected.
 
 ```rust
-telemetry.append(moq_net::Timed::from(packet).at(received_at))?;
+let at = catalog.clock().capture(received_at)?;
+telemetry.append(moq_net::Timed::from(packet).at(at))?;
 ```
+
+A timestamp carried over from elsewhere is published unchanged too: a source's
+own timestamp on a catalog clock anchored to that source (KLV beside video from
+one MPEG-TS program), or the `at` of a consumed `Timed` the payload was derived
+from. It lines up with media only on a broadcast sharing the source's clock
+mapping. A device's own clock is an unrelated epoch; keep it in the payload.
 
 The fMP4, MPEG-TS, FLV, and MKV importers publish the source's own timestamps
 (MPEG-TS after unwrapping its 33-bit PTS; fMP4 passthrough keeps each `tfdt`)

@@ -494,7 +494,7 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 				config.container = container;
 				config
 			}
-			mp4_atom::Codec::Unknown(unknown) => return Err(Error::UnknownCodec(*unknown).into()),
+			mp4_atom::Codec::Unknown(unknown, _) => return Err(Error::UnknownCodec(*unknown).into()),
 			unsupported => return Err(Error::UnsupportedCodec(Box::new(unsupported.clone())).into()),
 		};
 
@@ -622,7 +622,7 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 				config.container = container;
 				config
 			}
-			mp4_atom::Codec::Unknown(unknown) => return Err(Error::UnknownCodec(*unknown).into()),
+			mp4_atom::Codec::Unknown(unknown, _) => return Err(Error::UnknownCodec(*unknown).into()),
 			unsupported => return Err(Error::UnsupportedCodec(Box::new(unsupported.clone())).into()),
 		};
 

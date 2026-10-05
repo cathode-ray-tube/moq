@@ -2,8 +2,8 @@
 
 ## Goal
 
-Routing info splits into two layers on the session's announce stream, in the
-wip lite version, for every session. A ROUTE advertises reachability of one
+Routing info splits into two layers on the session's announce stream, in
+lite-07 (the current wip version, decided 2026-10-05), for every session. A ROUTE advertises reachability of one
 origin node; an ANNOUNCE says a prefix lives at a route's node and carries no
 path. A link flap or relay loss sends one ROUTE change per origin whose best
 route changed, never a re-announce per broadcast; ending a broadcast reaches
@@ -27,7 +27,8 @@ Decided 2026-10-01 (see the [line's decisions](/quest/m1/cluster-routing/README.
   route stays up. An announce never changes its Route ID: another origin
   serving the same path is another ANNOUNCE. An ANNOUNCE naming an unknown
   Route ID is a protocol violation, and ROUTE_END ends that stream's
-  ANNOUNCEs on the route. The hop list leaves this version.
+  ANNOUNCEs on the route. The hop list leaves lite-07, and with it the
+  `Hop Base`/`Hop Keep` compression.
 
   ```text
   ROUTE_START  node=0x7a3f seqno=41 metric=12   -> route 0
@@ -53,8 +54,8 @@ Decided 2026-10-01 (see the [line's decisions](/quest/m1/cluster-routing/README.
 - The node id is global and opaque: a relay's `cluster.id` or a random id,
   and an app's handshake id. It is needed so routes from two neighbours to
   one origin are recognized as one, which carries loop freedom,
-  deduplication, the reply's serving node, and P2P dialing (an app maps an
-  announce's node to a roster peer).
+  deduplication, and P2P dialing (an app maps an announce's node to a roster
+  peer).
 - Loop freedom is Babel's feasibility condition (RFC 8966) keyed by node:
   accept a route if its seqno is newer, or equal with a metric below the
   feasibility distance. Only the origin advances its seqno. Retraction is an
@@ -70,11 +71,11 @@ Decided 2026-10-01 (see the [line's decisions](/quest/m1/cluster-routing/README.
   ([Upstream links](/quest/m1/cluster-routing/transit.md)).
 - A plain client with one link advertises a ROUTE for itself and the
   ANNOUNCEs it publishes; its node id is scoped to its session (shared
-  identity across sessions is [Route trust](/quest/m1/cluster-routing/route-trust.md)).
+  identity across sessions is [Route trust](/quest/m3/route-trust.md)).
   A relay advertising routes to a client sends them as usual; node ids reveal
   nothing about the backbone.
-- Every hop re-selects; SUBSCRIBE names no origin. The reply names the
-  serving node, which is the identity Selection's splice rule uses.
+- Every hop re-selects; SUBSCRIBE names no origin, and the reply names none
+  either: any route announcing a path resumes it.
 - Mixed versions: a lite-06 peer keeps today's path vector, translated at the
   relay that speaks both, for the rollout window only.
 
@@ -107,7 +108,7 @@ refused.
 
 Wire: `drafts/draft-lcurley-moq-lite.md` in the same PR, and `js/net`
 encodes, decodes, and resolves it (JS transit stays in
-[P2P](/quest/m2/p2p/README.md)). Public API: the route-change surface on
+[P2P](/quest/m3/p2p/README.md)). Public API: the route-change surface on
 `broadcast::Route` and its bindings will likely change; report it. This may
 split at start (Rust and draft, then JS), as long as both land in one
 release.

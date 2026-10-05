@@ -74,6 +74,7 @@ async function subscribed(version: Version, maxAge = GRACE, groups?: Groups) {
 		reader,
 		respond: (resp: SubscribeResponse) => encodeSubscribeResponse(sub.writer, resp, version),
 		fin: () => sub.writer.close(),
+		subscriberFin: () => sub.reader.done(),
 		reset: (error: Error) => sub.writer.reset(error),
 	};
 }
@@ -378,4 +379,28 @@ test("a subscribe stream reset preserves the publisher's failure", async () => {
 	expect(closed).toBeInstanceOf(StreamError);
 	expect((closed as StreamError).code).toBe(StreamCode.NotFound);
 	await expect(reader.recvGroup()).rejects.toThrow(StreamError);
+});
+
+test("lite-07 FIN waits for the skipped and reset final range to settle", async () => {
+	const { subscriber, reader, respond, fin, subscriberFin } = await subscribed(Version.DRAFT_07, Milli(60_000));
+	await respond({ start: new SubscribeStart(0) });
+	const first = groupStream(subscriber, 0);
+	first.finish();
+	await first.handled;
+	const last = groupStream(subscriber, 2);
+	last.write("tail");
+	await respond({ end: new SubscribeEnd(3, 2) });
+	await fin();
+	let finished = false;
+	const ack = subscriberFin().then(() => {
+		finished = true;
+	});
+	// Wait for SUBSCRIBE_END to be decoded without advancing any timers.
+	while (reader.final() !== 3) await Promise.resolve();
+	expect(finished).toBe(false);
+	last.reset();
+	await last.handled;
+	await ack;
+	expect(finished).toBe(true);
+	expect(await reader.closed).toBeNull();
 });

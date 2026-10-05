@@ -773,16 +773,6 @@ impl Producer {
 		self.close_aborted(err)
 	}
 
-	/// Abort with `err` unless another handle still owns the group, so a retained clone
-	/// lets go without the unfinished-drop warning and never cuts off a live writer.
-	/// Sound without a lock: only an existing handle can mint another.
-	pub(crate) fn abort_if_last(&self, err: Error) -> Result<()> {
-		if Arc::strong_count(&self.alive) > 1 {
-			return Ok(());
-		}
-		self.close_aborted(err)
-	}
-
 	/// Abort with `err` only while nothing consumes the group, returning whether it is
 	/// closed. Consumer creation and the check share a lock, so a reader arriving after
 	/// [`poll_unused`](Self::poll_unused) keeps the group alive instead of reading the abort.
@@ -852,7 +842,7 @@ impl Producer {
 
 	/// One past the last frame committed to an unfinished group, when that is past its
 	/// first: where a replacement route resumes. `None` once the group is finished, or
-	/// while it holds nothing a replacement could splice onto.
+	/// while it holds nothing a replacement could continue.
 	///
 	/// The *committed* count, not the written one: a route dying midway through a
 	/// chunked frame leaves that frame unusable, so the replacement has to send it
@@ -944,7 +934,7 @@ impl Producer {
 		Consumer {
 			info: self.info,
 			track: self.track.clone(),
-			inner: ConsumerKind::Plain(Plain {
+			cursor: Cursor {
 				state,
 				index: 0,
 				end: None,
@@ -952,15 +942,15 @@ impl Producer {
 				cache: self.cache.clone(),
 				access: self.alive.access.clone(),
 				refreshed: self.cache.pool().now(),
-			}),
+			},
 			// Untagged: a tagged track attaches the egress meter via `with_meter`
 			// when it hands the consumer to a subscriber/fetch.
 			stats: stats::Meter::default(),
-			stale_stats: stats::Meter::default(),
 			expiry: None,
 			expired: false,
 			ended: false,
 			stale_counted: Arc::default(),
+			recover: None,
 		}
 	}
 
@@ -988,14 +978,12 @@ impl Producer {
 		self.state.poll_closed(waiter).map(|()| self.abort_reason())
 	}
 
-	/// Block until there is at least one active consumer.
-	pub async fn used(&self) -> Result<()> {
-		self.state.used().await.map_err(|_| self.abort_reason())
-	}
-
-	/// Block until there are no active consumers.
-	pub async fn unused(&self) -> Result<()> {
-		self.state.unused().await.map_err(|_| self.abort_reason())
+	/// Watch reader demand without keeping the group alive.
+	pub fn demand(&self) -> Demand {
+		Demand {
+			sequence: self.info.sequence,
+			state: DemandSource::Group(self.state.weak()),
+		}
 	}
 
 	/// Poll for the group becoming unused (every consumer dropped).
@@ -1006,6 +994,86 @@ impl Producer {
 	/// The recorded abort reason, or [`Error::Dropped`] if the group closed without one.
 	fn abort_reason(&self) -> Error {
 		self.state.read().abort.clone().unwrap_or(Error::Dropped)
+	}
+}
+
+/// A cloneable, watch-only handle to a group's readers or pending fetch callers.
+#[derive(Clone)]
+pub struct Demand {
+	sequence: u64,
+	state: DemandSource,
+}
+
+#[derive(Clone)]
+enum DemandSource {
+	Group(kio::ProducerWeak<GroupState>),
+	Fetch(kio::ProducerWeak<track::FetchOutcome>),
+}
+
+impl Demand {
+	pub(crate) fn fetch(sequence: u64, state: kio::ProducerWeak<track::FetchOutcome>) -> Self {
+		Self {
+			sequence,
+			state: DemandSource::Fetch(state),
+		}
+	}
+
+	/// The group sequence this handle watches.
+	pub fn sequence(&self) -> u64 {
+		self.sequence
+	}
+
+	/// Whether the group or fetch is open and has readers right now.
+	pub fn is_used(&self) -> bool {
+		match &self.state {
+			DemandSource::Group(state) => !state.is_closed() && state.is_used(),
+			DemandSource::Fetch(state) => !state.is_closed() && state.is_used(),
+		}
+	}
+
+	/// Wait until at least one reader needs the group.
+	pub async fn used(&self) -> Result<()> {
+		kio::wait(|waiter| self.poll_used(waiter)).await
+	}
+
+	/// Wait until no reader needs the group.
+	pub async fn unused(&self) -> Result<()> {
+		kio::wait(|waiter| self.poll_unused(waiter)).await
+	}
+
+	/// Poll until at least one reader needs the group.
+	pub fn poll_used(&self, waiter: &kio::Waiter) -> Poll<Result<()>> {
+		match &self.state {
+			DemandSource::Group(state) => state.poll_used(waiter),
+			DemandSource::Fetch(state) => state.poll_used(waiter),
+		}
+		.map_err(|_| self.abort_reason())
+	}
+
+	/// Poll until no reader needs the group.
+	pub fn poll_unused(&self, waiter: &kio::Waiter) -> Poll<Result<()>> {
+		match &self.state {
+			DemandSource::Group(state) => state.poll_unused(waiter),
+			DemandSource::Fetch(state) => state.poll_unused(waiter),
+		}
+		.map_err(|_| self.abort_reason())
+	}
+
+	/// Wait until the group or fetch closes, returning its cause.
+	pub async fn closed(&self) -> Error {
+		match &self.state {
+			DemandSource::Group(state) => state.closed().await,
+			DemandSource::Fetch(state) => state.closed().await,
+		}
+		self.abort_reason()
+	}
+
+	fn abort_reason(&self) -> Error {
+		match &self.state {
+			DemandSource::Group(state) => state.read().abort.clone(),
+			DemandSource::Fetch(state) => state.read().rejected.clone(),
+		}
+		.unwrap_or(Error::Dropped)
 	}
 }
 
@@ -1093,12 +1161,8 @@ impl Drop for Prefetch {
 }
 
 /// Consume a group, frame-by-frame.
-///
-/// Usually a view of one [`Producer`], but a group served across a route change is
-/// *spliced*: it reads each contributing route's copy in turn, joined at the frame the
-/// takeover happened on, so the reader never sees the seam.
 pub struct Consumer {
-	inner: ConsumerKind,
+	cursor: Cursor,
 
 	// Immutable stream state.
 	info: Info,
@@ -1108,11 +1172,8 @@ pub struct Consumer {
 	track: track::Info,
 
 	// Egress payload meter, set by a tagged track via [`Self::with_meter`]. Empty
-	// (no-op) for an untagged group.
+	// (no-op) for an untagged group. Also owns unread content discarded by expiry.
 	stats: stats::Meter,
-	// The meter that owns unread content discarded by expiry. Route-specific
-	// cursors inside a spliced group inherit this without metering delivery twice.
-	stale_stats: stats::Meter,
 
 	// Subscriber-specific drift policy. A group can become stale after the track
 	// hands it out, while its reader is waiting for the first or next frame.
@@ -1126,6 +1187,9 @@ pub struct Consumer {
 	// Cloned cursors are parallel views of one handed-out delivery. Whichever
 	// observes expiry first records its unread tail; the others must not repeat it.
 	stale_counted: Arc<AtomicBool>,
+	// Handed out from a front's logical track: carries the read across route changes.
+	// Boxed: it is the rare case.
+	recover: Option<Box<super::resume::Recover>>,
 }
 
 /// Subscriber-specific policy for expiring a group after it was handed out.
@@ -1135,20 +1199,15 @@ pub struct Consumer {
 pub(crate) trait Expiry: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe {
 	/// Return whether the group is stale, registering `waiter` for anything that
 	/// could change the answer while the group remains live.
-	fn is_expired(&self, waiter: &kio::Waiter) -> bool;
+	/// A logical reader supplies its current budget after the original copy is gone.
+	fn is_expired(&self, max_age: Option<std::time::Duration>, waiter: &kio::Waiter) -> bool;
+
+	/// Keep the reader's budget and cap while following a replacement track's edge.
+	fn for_track(&self, track: &track::Consumer) -> Arc<dyn Expiry>;
 }
 
-// `Plain` is the hot path and carries an inline frame prefetch, so boxing it to even the
-// variants out would cost an allocation per group to save a pointer chase on the rare one.
-#[expect(clippy::large_enum_variant)]
-enum ConsumerKind {
-	Plain(Plain),
-	// Boxed: the spliced cursor set dwarfs the plain one, and splicing is the rare case.
-	Spliced(Box<super::resume::Group>),
-}
-
-/// The cursor state for a group backed by a single [`Producer`].
-struct Plain {
+/// The read cursor over a [`Producer`]'s shared state.
+struct Cursor {
 	// Shared state with the producer.
 	state: kio::Consumer<GroupState>,
 
@@ -1168,7 +1227,7 @@ struct Plain {
 	refreshed: u64,
 }
 
-impl Clone for Plain {
+impl Clone for Cursor {
 	fn clone(&self) -> Self {
 		// A clone shares the channel and inherits `index`, but starts with an empty
 		// prefetch: it re-reads its batch from the shared state, in parallel.
@@ -1187,20 +1246,17 @@ impl Clone for Plain {
 impl Clone for Consumer {
 	fn clone(&self) -> Self {
 		Self {
-			inner: match &self.inner {
-				ConsumerKind::Plain(plain) => ConsumerKind::Plain(plain.clone()),
-				ConsumerKind::Spliced(spliced) => ConsumerKind::Spliced(Box::new((**spliced).clone())),
-			},
+			cursor: self.cursor.clone(),
 			info: self.info,
 			track: self.track.clone(),
 			// Inherit the meter without re-counting the group: the original already
 			// counted it when the track handed it out.
 			stats: self.stats.clone(),
-			stale_stats: self.stale_stats.clone(),
 			expiry: self.expiry.clone(),
 			expired: self.expired,
 			ended: self.ended,
 			stale_counted: self.stale_counted.clone(),
+			recover: self.recover.clone(),
 		}
 	}
 }
@@ -1216,67 +1272,72 @@ impl std::ops::Deref for Consumer {
 impl Consumer {
 	/// Snapshot the content this cursor would discard if its group were skipped.
 	pub(crate) fn content(&self) -> stats::Content {
-		match &self.inner {
-			ConsumerKind::Plain(plain) => plain.state.read().content(),
-			// Drift is evaluated before a segment copy is wrapped as a spliced group.
-			// Keep the group count honest if a future caller reaches this fallback.
-			ConsumerKind::Spliced(_) => stats::Content {
-				groups: 1,
-				..Default::default()
-			},
-		}
-	}
-
-	/// Content not already attributed as delivered by this handed-out cursor.
-	fn unread_content(&self) -> stats::Content {
-		match &self.inner {
-			ConsumerKind::Plain(plain) => plain.unread_content(),
-			// Each route-specific plain cursor enforces expiry inside a spliced group.
-			ConsumerKind::Spliced(_) => stats::Content::default(),
-		}
-	}
-
-	/// Rebuild this consumer as the head of a group assembled across route changes,
-	/// keeping the group's identity and its track's properties. See [`super::resume`].
-	pub(crate) fn into_spliced(self, mut spliced: super::resume::Group) -> Self {
-		spliced.set_stale_meter(self.stale_stats.clone());
-		Self {
-			inner: ConsumerKind::Spliced(Box::new(spliced)),
-			info: self.info,
-			track: self.track,
-			stats: self.stats,
-			stale_stats: self.stale_stats,
-			// Each segment keeps its own route-specific expiry policy. Applying the
-			// head segment's policy to the assembled group would use the wrong edge
-			// after a takeover.
-			expiry: None,
-			expired: false,
-			ended: false,
-			stale_counted: self.stale_counted,
-		}
+		self.cursor.state.read().content()
 	}
 
 	/// Attach an egress payload meter, counting this as one delivered group.
 	/// Called by a tagged track when it hands the consumer to a subscriber or fetch.
 	pub(crate) fn with_meter(mut self, meter: stats::Meter) -> Self {
 		meter.group();
-		self.stats = meter.clone();
-		self.set_stale_meter(meter);
+		self.stats = meter;
 		self
-	}
-
-	/// Attach only the meter that owns content discarded by expiry.
-	pub(crate) fn set_stale_meter(&mut self, meter: stats::Meter) {
-		if let ConsumerKind::Spliced(spliced) = &mut self.inner {
-			spliced.set_stale_meter(meter.clone());
-		}
-		self.stale_stats = meter;
 	}
 
 	/// Keep applying this subscription's drift budget while the group is read.
 	pub(crate) fn with_expiry(mut self, expiry: Arc<dyn Expiry>) -> Self {
 		self.expiry = Some(expiry);
 		self
+	}
+
+	/// Carry this group across a front's route changes; see [`super::resume`].
+	pub(crate) fn with_recover(mut self, recover: super::resume::Recover) -> Self {
+		self.recover = Some(Box::new(recover));
+		self
+	}
+
+	/// Run `read`, and once this copy fails with its route, or stalls while a newer route
+	/// serves, continue from the serving route's copy at the same frame and read again.
+	fn poll_resumed<T>(
+		&mut self,
+		waiter: &kio::Waiter,
+		mut read: impl FnMut(&mut Self, &kio::Waiter) -> Poll<Result<Option<T>>>,
+	) -> Poll<Result<Option<T>>> {
+		loop {
+			let res = read(self, waiter);
+			// The reader's own budget gave up on it: that is no route's doing.
+			if self.expired || self.ended {
+				return res;
+			}
+			let Some(recover) = self.recover.as_mut() else {
+				return res;
+			};
+			let failed = match &res {
+				Poll::Ready(Ok(Some(_))) => return res,
+				// Read to its end: no route is needed for it any more.
+				Poll::Ready(Ok(None)) => {
+					self.recover = None;
+					return res;
+				}
+				Poll::Ready(Err(err)) => Some(err.clone()),
+				Poll::Pending => None,
+			};
+			if !recover.wants(failed.as_ref(), waiter) {
+				return res;
+			}
+			let replacement = match recover.poll(self.cursor.index as u64, failed.as_ref(), waiter) {
+				Poll::Ready(Ok(group)) => group,
+				Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+				Poll::Pending => return Poll::Pending,
+			};
+			// Same frames by index, so only the channel changes; read progress and the
+			// cap stay this cursor's.
+			let (index, end) = (self.cursor.index, self.cursor.end);
+			recover.adopt(&replacement);
+			self.expiry = self.expiry.as_ref().map(|expiry| expiry.for_track(&replacement.copy));
+			self.cursor = replacement.group.cursor;
+			self.cursor.index = index;
+			self.cursor.end = end;
+		}
 	}
 
 	/// Check the parent subscription while a wire publisher drains detached payload.
@@ -1319,7 +1380,7 @@ impl Consumer {
 	/// one that ended. A cursor that still holds unread content (a wire publisher with
 	/// buffered frames, a half-read payload) is genuinely truncated and reports it.
 	fn expired_truncates(&self) -> bool {
-		let unread = self.unread_content();
+		let unread = self.cursor.unread_content();
 		unread.frames > 0 || unread.bytes > 0
 	}
 
@@ -1327,11 +1388,13 @@ impl Consumer {
 	pub(crate) fn poll_expired_while_pending(&mut self, waiter: &kio::Waiter, pending: bool) -> bool {
 		if !self.expired
 			&& (pending || self.expiry_pending())
-			&& self.expiry.as_ref().is_some_and(|expiry| expiry.is_expired(waiter))
-		{
+			&& self.expiry.as_ref().is_some_and(|expiry| {
+				let budget = self.recover.as_ref().and_then(|recover| recover.poll_budget(waiter));
+				expiry.is_expired(budget, waiter)
+			}) {
 			self.expired = true;
 			if !self.stale_counted.swap(true, Ordering::Relaxed) {
-				self.stale_stats.stale(self.unread_content());
+				self.stats.stale(self.cursor.unread_content());
 			}
 		}
 		self.expired
@@ -1339,35 +1402,24 @@ impl Consumer {
 
 	/// Whether expiry can still discard content or unblock a group that may grow.
 	fn expiry_pending(&self) -> bool {
-		match &self.inner {
-			ConsumerKind::Plain(plain) => plain.expiry_pending(),
-			// The route-specific plain cursors own expiry for a spliced group.
-			ConsumerKind::Spliced(_) => false,
-		}
+		self.cursor.expiry_pending()
 	}
 
 	/// Whether this cursor failed because its subscription max age budget expired.
+	#[cfg(test)]
 	pub(crate) fn latency_expired(&self) -> bool {
 		self.expired
 	}
 
 	/// Whether the group has been aborted (including pool eviction); the abort
 	/// dropped the cached frames, so a held consumer has nothing left to read.
-	///
-	/// A spliced group spans several routes, so no single abort empties it; only a
-	/// plain cursor can answer.
 	pub(crate) fn is_aborted(&self) -> bool {
-		match &self.inner {
-			ConsumerKind::Plain(plain) => plain.state.read().abort.is_some(),
-			ConsumerKind::Spliced(_) => false,
-		}
+		self.cursor.state.read().abort.is_some()
 	}
 
 	/// Mark the group as still being read, so a slow batch drain does not expire it.
 	pub fn keep_alive(&self) {
-		if let ConsumerKind::Plain(plain) = &self.inner {
-			plain.state.read().charge.refresh();
-		}
+		self.cursor.state.read().charge.refresh();
 	}
 
 	/// Record a cache access from the consumer side: a parked group re-offered to
@@ -1376,18 +1428,11 @@ impl Consumer {
 		self.keep_alive();
 	}
 
-	/// Park `waiter` until the group closes (finish, abort, or eviction). Spliced
-	/// subscribers register on parked groups so an eviction wakes them; a group
-	/// that already closed cleanly can never abort, so no waiter is needed.
-	///
-	/// A spliced group reads as closed without registering anything: no single abort
-	/// empties it, so [`Self::is_aborted`] can never turn true and there is nothing
-	/// a wakeup would change.
+	/// Park `waiter` until the group closes (finish, abort, or eviction). Subscribers
+	/// register on parked groups so an eviction wakes them; a group that already closed
+	/// cleanly can never abort, so no waiter is needed.
 	pub(crate) fn poll_closed(&self, waiter: &kio::Waiter) -> Poll<()> {
-		match &self.inner {
-			ConsumerKind::Plain(plain) => plain.state.poll_closed(waiter),
-			ConsumerKind::Spliced(_) => Poll::Ready(()),
-		}
+		self.cursor.state.poll_closed(waiter)
 	}
 
 	/// The parent track's timescale.
@@ -1400,10 +1445,7 @@ impl Consumer {
 	/// Starts at 0, or at the group's first available frame once [`Self::set_frames`] has
 	/// clamped it, and advances by one per frame read.
 	pub fn index(&self) -> u64 {
-		match &self.inner {
-			ConsumerKind::Plain(plain) => plain.index as u64,
-			ConsumerKind::Spliced(spliced) => spliced.index(),
-		}
+		self.cursor.index as u64
 	}
 
 	/// Limit subsequent reads to these frame indices without rewinding read progress.
@@ -1427,10 +1469,7 @@ impl Consumer {
 	/// Only moves forward; a lower `index` is ignored, since the frames behind the
 	/// cursor may already have been handed out.
 	pub(crate) fn start_at(&mut self, index: u64) {
-		match &mut self.inner {
-			ConsumerKind::Plain(plain) => plain.start_at(index),
-			ConsumerKind::Spliced(spliced) => spliced.start_at(index),
-		}
+		self.cursor.start_at(index);
 	}
 
 	/// Advance the read cursor to `index`, skipping every frame below it.
@@ -1439,10 +1478,7 @@ impl Consumer {
 	/// never held. A [`Producer::start_at`] floor above `index` still surfaces as
 	/// [`Error::Lagged`].
 	pub fn skip_to(&mut self, index: u64) {
-		match &mut self.inner {
-			ConsumerKind::Plain(plain) => plain.skip_to(index),
-			ConsumerKind::Spliced(spliced) => spliced.start_at(index),
-		}
+		self.cursor.skip_to(index);
 	}
 
 	/// Stop reading at `end`, or remove the cap with `..`.
@@ -1453,24 +1489,14 @@ impl Consumer {
 	/// frames that are still cached.
 	pub(crate) fn end_at(&mut self, end: impl Into<Cap>) {
 		let end = end.into().exclusive();
-		match &mut self.inner {
-			ConsumerKind::Plain(plain) => {
-				plain.end = end.map(|end| usize::try_from(end).unwrap_or(usize::MAX));
-			}
-			ConsumerKind::Spliced(spliced) => spliced.end_at(end),
-		}
+		self.cursor.end = end.map(|end| usize::try_from(end).unwrap_or(usize::MAX));
 	}
 
 	/// The number of frames written so far (completed plus any in-flight), independent of
 	/// how many this consumer has read. The final total once the group is finished.
 	pub fn frame_count(&self) -> usize {
-		match &self.inner {
-			ConsumerKind::Plain(plain) => {
-				let state = plain.state.read();
-				state.fin.unwrap_or(state.next_index)
-			}
-			ConsumerKind::Spliced(spliced) => spliced.frame_count(),
-		}
+		let state = self.cursor.state.read();
+		state.fin.unwrap_or(state.next_index)
 	}
 
 	/// Return a consumer for the next frame for chunked reading.
@@ -1483,6 +1509,20 @@ impl Consumer {
 	/// Returns None if the group is finished and the index is out of range, or the cursor
 	/// passed the [`Self::set_frames`] cap.
 	pub fn poll_next_frame(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<frame::Consumer>>> {
+		if self.recover.is_none() {
+			return self.poll_next_frame_once(waiter);
+		}
+		let res = self.poll_resumed(waiter, Self::poll_next_frame_once);
+		match (res, &self.recover) {
+			// A frame read from a copy that may fail too carries on the same way.
+			(Poll::Ready(Ok(Some(frame))), Some(recover)) => Poll::Ready(Ok(Some(
+				frame.with_recover((**recover).clone(), self.cursor.index as u64 - 1),
+			))),
+			(res, _) => res,
+		}
+	}
+
+	fn poll_next_frame_once(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<frame::Consumer>>> {
 		if self.ended {
 			return Poll::Ready(Ok(None));
 		}
@@ -1493,19 +1533,8 @@ impl Consumer {
 		let expiry = self
 			.expiry
 			.as_ref()
-			.map(|policy| frame::Expiry::new(policy.clone(), self.stale_stats.clone(), self.stale_counted.clone()));
-		let res = match &mut self.inner {
-			ConsumerKind::Plain(plain) => plain.poll_next_frame(waiter, &stats, expiry),
-			ConsumerKind::Spliced(spliced) => {
-				// The per-route copies underneath are untagged, so meter the spliced
-				// stream here: it is the one the subscriber actually reads.
-				let res = ready!(spliced.poll_next_frame(waiter))?;
-				if res.is_some() {
-					stats.frames(1);
-				}
-				Poll::Ready(Ok(res.map(|frame| frame.with_meter(stats))))
-			}
-		};
+			.map(|policy| frame::Expiry::new(policy.clone(), stats.clone(), self.stale_counted.clone()));
+		let res = self.cursor.poll_next_frame(waiter, &stats, expiry);
 		match res.is_pending().then(|| self.poll_expired_if_blocked(waiter)).flatten() {
 			Some(true) => Poll::Ready(Err(Error::Old)),
 			Some(false) => Poll::Ready(Ok(None)),
@@ -1515,24 +1544,20 @@ impl Consumer {
 
 	/// Read the next frame (timestamp and payload) all at once, without blocking.
 	pub fn poll_read_frame(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<frame::Frame>>> {
+		if self.recover.is_none() {
+			return self.poll_read_frame_once(waiter);
+		}
+		self.poll_resumed(waiter, Self::poll_read_frame_once)
+	}
+
+	fn poll_read_frame_once(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<frame::Frame>>> {
 		if self.ended {
 			return Poll::Ready(Ok(None));
 		}
 		if self.expired {
 			return Poll::Ready(Err(Error::Old));
 		}
-		let stats = self.stats.clone();
-		let res = match &mut self.inner {
-			ConsumerKind::Plain(plain) => plain.poll_read_frame(waiter, &stats),
-			ConsumerKind::Spliced(spliced) => {
-				let res = ready!(spliced.poll_read_frame(waiter))?;
-				if let Some(frame) = &res {
-					stats.frames(1);
-					stats.bytes(frame.payload.len() as u64);
-				}
-				Poll::Ready(Ok(res))
-			}
-		};
+		let res = self.cursor.poll_read_frame(waiter, &self.stats);
 		match res.is_pending().then(|| self.poll_expired_if_blocked(waiter)).flatten() {
 			Some(true) => Poll::Ready(Err(Error::Old)),
 			Some(false) => Poll::Ready(Ok(None)),
@@ -1544,17 +1569,14 @@ impl Consumer {
 	pub async fn read_frame(&mut self) -> Result<Option<frame::Frame>> {
 		// A prefetched frame is already buffered, so the drift budget (which only judges
 		// a read that would park) can never apply to it.
+		// Serve from the prefetched batch without building a future or allocating a waker.
 		if !self.expired
-			&& let ConsumerKind::Plain(plain) = &mut self.inner
+			&& !self.cursor.capped()
+			&& let Some(frame) = self.cursor.prefetch.pop()
 		{
-			// Serve from the prefetched batch without building a future or allocating a waker.
-			if !plain.capped()
-				&& let Some(frame) = plain.prefetch.pop()
-			{
-				plain.refresh_if_stale();
-				plain.index += 1;
-				return Ok(Some(frame));
-			}
+			self.cursor.refresh_if_stale();
+			self.cursor.index += 1;
+			return Ok(Some(frame));
 		}
 		kio::wait(|waiter| self.poll_read_frame(waiter)).await
 	}
@@ -1604,21 +1626,27 @@ impl Consumer {
 
 	/// Poll until the group terminates, returning this cursor's next frame index.
 	pub fn poll_finished(&mut self, waiter: &kio::Waiter) -> Poll<Result<u64>> {
+		if self.recover.is_none() {
+			return self.poll_finished_once(waiter);
+		}
+		let res = self.poll_resumed(waiter, |this, waiter| {
+			this.poll_finished_once(waiter).map(|res| res.map(Some))
+		});
+		res.map(|res| res.map(|index| index.expect("finished with an index")))
+	}
+
+	fn poll_finished_once(&mut self, waiter: &kio::Waiter) -> Poll<Result<u64>> {
 		if self.ended {
 			return Poll::Ready(Ok(self.index()));
 		}
 		if self.expired {
 			return Poll::Ready(Err(Error::Old));
 		}
-		let res = match &mut self.inner {
-			ConsumerKind::Plain(plain) => {
-				let index = plain.index;
-				plain
-					.poll(waiter, |state| state.poll_end(index))
-					.map(|res| res.map(|()| index as u64))
-			}
-			ConsumerKind::Spliced(spliced) => spliced.poll_finished(waiter),
-		};
+		let index = self.cursor.index;
+		let res = self
+			.cursor
+			.poll(waiter, |state| state.poll_end(index))
+			.map(|res| res.map(|()| index as u64));
 		match res.is_pending().then(|| self.poll_expired_if_blocked(waiter)).flatten() {
 			Some(true) => Poll::Ready(Err(Error::Old)),
 			// The group ended where the cursor stands, so that is its frame count.
@@ -1638,7 +1666,7 @@ impl Consumer {
 	}
 }
 
-impl Plain {
+impl Cursor {
 	/// Whether this cursor still has unread content or may receive another frame.
 	fn expiry_pending(&self) -> bool {
 		if self.capped() {
@@ -1871,6 +1899,24 @@ mod test {
 	use crate::model::test_tracing::count_drop_warnings;
 	use bytes::Bytes;
 	use futures::FutureExt;
+
+	#[test]
+	fn demand_watches_readers_without_keeping_the_group_alive() {
+		let producer = Info { sequence: 7 }.produce();
+		let demand = producer.demand();
+		assert_eq!(demand.sequence(), 7);
+		assert!(!demand.is_used());
+		let first = producer.consume();
+		let second = first.clone();
+		assert!(demand.is_used());
+		drop(first);
+		assert!(demand.poll_unused(&kio::Waiter::noop()).is_pending());
+		drop(second);
+		assert!(matches!(demand.poll_unused(&kio::Waiter::noop()), Poll::Ready(Ok(()))));
+		drop(producer);
+		assert!(!demand.is_used());
+		assert!(matches!(demand.used().now_or_never(), Some(Err(Error::Dropped))));
+	}
 
 	/// [`FRAME_SLOTS`] is std's rounding, not ours, so measure it: a larger real value
 	/// would undercharge every cached group without touching a line of this crate.
@@ -2477,7 +2523,7 @@ mod test {
 		));
 	}
 
-	/// Seeking to the group's first available frame is how a spliced reader picks up
+	/// Seeking to the group's first available frame is how a front's pump picks up
 	/// the tail; a lower index clamps up rather than failing.
 	#[test]
 	fn start_at_clamps_up_to_the_first_frame() {
