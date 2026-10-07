@@ -470,23 +470,14 @@ mod tests {
 		// single-segment path, so its parent is the root and any `..` walks above it.
 		for reference in ["..", "../source", "../../elsewhere"] {
 			let config = video(Some(reference));
-<<<<<<< HEAD
-			escaping(ExportSource::for_video(&source, "video", &config, max_age, video_decrypter), reference);
+
+			escaping(ExportSource::for_video(&source, "video", &config, max_delay, video_decrypter), reference);
 			escaping(
-				ExportSource::for_video_raw(&source, "video", &config, max_age, video_decrypter),
+				ExportSource::for_video_raw(&source, "video", &config, max_delay, video_decrypter),
 				reference,
 			);
 			escaping(
-				ExportSource::for_audio(&source, "audio", &audio(Some(reference)), max_age, audio_decrypter),
-=======
-			escaping(ExportSource::for_video(&source, "video", &config, max_delay), reference);
-			escaping(
-				ExportSource::for_video_raw(&source, "video", &config, max_delay),
-				reference,
-			);
-			escaping(
-				ExportSource::for_audio(&source, "audio", &audio(Some(reference)), max_delay),
->>>>>>> upstream/main
+				ExportSource::for_audio(&source, "audio", &audio(Some(reference)), max_delay, audio_decrypter),
 				reference,
 			);
 		}
@@ -501,17 +492,10 @@ mod tests {
 		let max_delay = std::time::Duration::ZERO;
 
 		for reference in [None, Some(""), Some("./source"), Some("sub"), Some(".")] {
-<<<<<<< HEAD
-			ExportSource::for_video(&source, "video", &video(reference), max_age, video_decrypter)
+			ExportSource::for_video(&source, "video", &video(reference), max_delay, video_decrypter)
 				.unwrap_or_else(|err| panic!("{reference:?} should keep the rendition: {err:?}"))
 				.unwrap_or_else(|| panic!("{reference:?} should keep the rendition"));
-			ExportSource::for_audio(&source, "audio", &audio(reference), max_age, audio_decrypter)
-=======
-			ExportSource::for_video(&source, "video", &video(reference), max_delay)
-				.unwrap_or_else(|err| panic!("{reference:?} should keep the rendition: {err:?}"))
-				.unwrap_or_else(|| panic!("{reference:?} should keep the rendition"));
-			ExportSource::for_audio(&source, "audio", &audio(reference), max_delay)
->>>>>>> upstream/main
+			ExportSource::for_audio(&source, "audio", &audio(reference), max_delay, audio_decrypter)
 				.unwrap_or_else(|err| panic!("{reference:?} should keep the rendition: {err:?}"))
 				.unwrap_or_else(|| panic!("{reference:?} should keep the rendition"));
 		}
@@ -522,13 +506,8 @@ mod tests {
 	#[tokio::test]
 	async fn latency_is_sent_with_the_initial_subscription() {
 		let live = Live::avc3();
-<<<<<<< HEAD
-		let max_age = std::time::Duration::from_secs(10);
-		let mut export = ExportSource::for_video(&live.source(), live.track.name(), &video(None), max_age, video_decrypter)
-=======
 		let max_delay = std::time::Duration::from_secs(10);
-		let mut export = ExportSource::for_video(&live.source(), live.track.name(), &video(None), max_delay)
->>>>>>> upstream/main
+		let mut export = ExportSource::for_video(&live.source(), live.track.name(), &video(None), max_delay, video_decrypter)
 			.unwrap()
 			.expect("fixture should produce a video rendition");
 
