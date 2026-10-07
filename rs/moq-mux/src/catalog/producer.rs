@@ -634,14 +634,11 @@ pub fn is_claimed<R: super::RenditionConfig<E>>(&self, name: &str) -> bool {
 		}
 	}
 
-<<<<<<< HEAD
 /// Build the media [`container::Producer`](crate::container::Producer) for `track`,
-/// enrolling it in the broadcast's timeline so its groups are indexed into the
-/// aligned segments.
+/// enrolling it in the broadcast's timelines so its groups are indexed.
 ///
-/// The broadcast's one timeline track is created (and advertised in the
-/// catalog's root `archive` entry) on first use; see [`timeline`](crate::timeline)
-/// for the whole model.
+/// The track's timeline track is created and advertised in the catalog's root `archive`
+/// entry; see [`timeline`](crate::timeline) for the whole model.
 pub(super) fn media<C, R>(
     &self,
     track: moq_net::track::Producer,
@@ -650,17 +647,16 @@ pub(super) fn media<C, R>(
     config: Option<R>,
 ) -> crate::Result<crate::container::Producer<C, R>>
 where
-    C: crate::container::Container<Error = crate::error::Error>,
+    C: crate::container::Container,
     R: super::RenditionConfig<E>,
     crate::Error: From<C::Error>,
 {
     let mut catalog = self.clone();
     let recorder = catalog.enroll(track.name())?;
 
-    let mut producer =
-        crate::container::Producer::with_rendition(track, container, rendition)
-            .with_recorder(recorder)
-            .with_bandwidth(self.bandwidth.clone());
+    let mut producer = crate::container::Producer::with_rendition(track, container, rendition)
+        .with_recorder(recorder)
+        .with_bandwidth(self.bandwidth.clone());
 
     if let Some(config) = config {
         producer.set(config)?;
@@ -677,7 +673,6 @@ pub(crate) fn media_raw<C>(
 ) -> crate::Result<crate::container::Producer<C>>
 where
     C: crate::container::Container<Error = crate::error::Error>,
-
 {
     let mut catalog = self.clone();
     let recorder = catalog.enroll(track.name())?;
@@ -687,35 +682,6 @@ where
         .with_bandwidth(self.bandwidth.clone()))
 }
 
-=======
-	/// Build the media [`container::Producer`](crate::container::Producer) for `track`,
-	/// enrolling it in the broadcast's timelines so its groups are indexed.
-	///
-	/// The track's timeline track is created and advertised in the catalog's root `archive`
-	/// entry; see [`timeline`](crate::timeline) for the whole model.
-	pub(super) fn media<C, R>(
-		&self,
-		track: moq_net::track::Producer,
-		container: C,
-		rendition: super::Rendition<E, R>,
-		config: Option<R>,
-	) -> crate::Result<crate::container::Producer<C, R>>
-	where
-		C: crate::container::Container,
-		R: super::RenditionConfig<E>,
-		crate::Error: From<C::Error>,
-	{
-		let mut catalog = self.clone();
-		let recorder = catalog.enroll(track.name())?;
-		let mut producer = crate::container::Producer::with_rendition(track, container, rendition)
-			.with_recorder(recorder)
-			.with_bandwidth(self.bandwidth.clone());
-		if let Some(config) = config {
-			producer.set(config)?;
-		}
-		Ok(producer)
-	}
->>>>>>> upstream/main
 
 
 	/// A fresh estimator whose `delay` is measured against this catalog's other renditions.

@@ -86,7 +86,6 @@ pub struct Frame {
 	/// presented, so it can advance to a newer group as soon as the gap is
 	/// covered instead of waiting out the max delay budget.
 	pub duration: Option<moq_net::Timestamp>,
->>>>>>> upstream/main
 
     /// Encoded codec payload.
     pub payload: Bytes,

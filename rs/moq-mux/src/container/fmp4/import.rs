@@ -977,40 +977,21 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 				track.estimator.cut(Some(timestamp));
 			}
 			let fragment_len = fragment_bytes.len();
-<<<<<<< HEAD
+{
+    let output = MoqFrameWriter { group: &mut g };
 
-			{
-				let output = MoqFrameWriter { group: &mut g };
+    match self.encrypter.as_mut() {
+        Some(encrypter) => {
+            let mut protected = ProtectedFrame::new(output, encrypter.as_mut());
+            protected.write_frame(timestamp, fragment_bytes)?;
+        }
+        None => {
+            let mut plain = output;
+            plain.write_frame(timestamp, fragment_bytes)?;
+        }
+    }
+}
 
-				match self.encrypter.as_mut() {
-					Some(encrypter) => {
-						let mut protected = ProtectedFrame::new(output, encrypter.as_mut());
-
-						protected.write_frame(timestamp, fragment_bytes)?;
-
-						eprintln!(
-						    "producer: protected frame written: plaintext={} bytes, \
-						     timestamp={:?}, new_group={}",
-						    fragment_len,
-						    timestamp,
-						    start_group,
-						);
-
-					}
-					None => {
-						let mut plain = output;
-						plain.write_frame(timestamp, fragment_bytes)?;
-					}
-				}
-			}
-=======
-			let mut frame = g.create_frame(moq_net::frame::Info {
-				size: fragment_bytes.len() as u64,
-				timestamp,
-			})?;
-			frame.write(fragment_bytes)?;
-			frame.finish()?;
->>>>>>> upstream/main
 
 			// Only once published, so a rejected fragment is never indexed. Audio is always
 			// independently decodable; video says whether this fragment really begins on an IDR,
