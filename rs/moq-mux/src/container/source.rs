@@ -2,12 +2,12 @@
 //! resolved codec configuration record.
 //!
 //! Exporters declare what wire shape they want their frames in (currently:
-//! avc1/hvc1 length-prefixed for H.264/H.265) and call [`ExportSource::poll_read`]
-//! to pull normalized frames. For Annex-B sources (catalog codec marked
-//! `inline: true` / `in_band: true`, empty `description`) the source attaches
-//! an [`Avc1`] / [`Hvc1`] transform that caches parameter sets, synthesizes
-//! the codec config record, and length-prefixes slice NALs. Frame emission is
-//! deferred until the transform has produced its config record.
+//! avc1/hvc1 length-prefixed for H.264/H.265) and call
+//! [`ExportSource::poll_event`] to pull normalized events. For Annex-B sources
+//! (catalog codec marked `inline: true` / `in_band: true`, empty
+//! `description`) the source attaches an [`Avc1`] / [`Hvc1`] transform that
+//! caches parameter sets, synthesizes the codec config record, and
+//! length-prefixes slice NALs.
 //!
 //! `description()` returns the resolved codec config: either the catalog's
 //! existing `description` (for already-out-of-band sources) or the synthesized
@@ -22,7 +22,7 @@ use super::consumer::Event;
 use crate::catalog::hang::Container as HangContainer;
 use crate::codec::h264::Avc1;
 use crate::codec::h265::Hvc1;
-use crate::container::{Consumer, Frame, Decrypter};
+use crate::container::{Consumer, Decrypter, Frame};
 
 /// Per-track video transform that bridges between codec shapes.
 pub(crate) enum VideoTransform {
@@ -48,16 +48,15 @@ impl VideoTransform {
 
 /// A subscription that resolves on first poll, then the live consumer.
 enum SourceState {
-	/// Waiting for the target broadcast (the catalog broadcast, or a cross-broadcast
-	/// reference) to resolve; the track (by name) is subscribed once it does.
+	/// Waiting for the target broadcast (the catalog broadcast, or a
+	/// cross-broadcast reference) to resolve; the track is subscribed once it
+	/// does.
 	Requesting(kio::Pending<moq_net::origin::Requesting>, String),
-	/// Waiting for the subscription to resolve (blocks on the publisher's SUBSCRIBE_OK).
 
+	/// Waiting for the subscription to resolve.
 	Subscribing(kio::Pending<moq_net::track::Subscribing>),
 
 	/// The resolved consumer, reading frames.
-	///
-	/// Boxed because it is much larger than the `Subscribing` variant.
 	Active(Box<Consumer<HangContainer>>),
 }
 
@@ -72,7 +71,7 @@ pub(crate) struct ExportSource {
 	max_delay: std::time::Duration,
 
 	transform: Option<VideoTransform>,
-	
+
 	/// Resolved codec configuration record (avcC / hvcC /
 	/// AudioSpecificConfig / OpusHead).
 	///
@@ -86,7 +85,7 @@ pub(crate) struct ExportSource {
 	/// Geometry resolved from the initial catalog or codec data received
 	/// afterward.
 	video_dimensions: Option<(u32, u32)>,
-	
+
 	decrypter: Option<Decrypter>,
 }
 
@@ -219,14 +218,11 @@ impl ExportSource {
 		})
 	}
 
-	// Keep the existing methods here unchanged.
-
 	pub fn poll_event(
 		&mut self,
 		waiter: &kio::Waiter,
 	) -> Poll<crate::Result<Option<Event>>> {
-		// Resolve a cross-broadcast reference into a broadcast before
-		// subscribing.
+		// Resolve the target broadcast before subscribing to the track.
 		if matches!(self.state, SourceState::Requesting(..)) {
 			let (broadcast, name) = {
 				let SourceState::Requesting(pending, name) = &self.state else {
@@ -243,13 +239,7 @@ impl ExportSource {
 				SourceState::Subscribing(broadcast.track(&name)?.subscribe(subscription));
 		}
 
-		// Keep the rest of the existing poll_event implementation unchanged.
-		// ...
-	}
-}
-
-
-		// Resolve the subscription before reading any frames.
+		// Resolve the subscription before reading frames.
 		if matches!(self.state, SourceState::Subscribing(_)) {
 			let track = {
 				let SourceState::Subscribing(pending) = &self.state else {
@@ -264,25 +254,18 @@ impl ExportSource {
 				.take()
 				.expect("media present until the subscription resolves");
 
-					// The decryptor is moved into Consumer exactly once. It remains
-			// alive for the lifetime of the active consumer, preserving any
-			// counters, replay windows, key epochs, or nonce state.
-			let decrypter = self.decrypter.take();
-			
+			// Move the decryptor into the consumer exactly once.
 			let consumer = Consumer::new(track, media);
-			
-			let consumer = match decrypter {
-			    Some(decrypter) => consumer.with_decrypter(decrypter),
-			    None => consumer,
+			let consumer = match self.decrypter.take() {
+				Some(decrypter) => consumer.with_decrypter(decrypter),
+				None => consumer,
 			};
-						
-			self.state = SourceState::Active(Box::new(consumer));
 
+			self.state = SourceState::Active(Box::new(consumer));
 		}
 
 		loop {
-			// Scope the consumer borrow to the poll so `self.transform` and
-			// `self.refresh_description` can borrow `self` afterward.
+			// End the consumer borrow before accessing the rest of `self`.
 			let frame = {
 				let SourceState::Active(consumer) = &mut self.state else {
 					unreachable!("subscription resolved into an Active consumer");
@@ -301,13 +284,11 @@ impl ExportSource {
 
 			match transform.transform(frame.payload.clone())? {
 				None => {
-					// Parameter set absorbed by the transform. Refresh the
-					// resolved description and pull the next frame.
+					// The transform consumed this frame, such as a parameter-set
+					// NAL. Keep polling until it emits a frame or needs to wait.
 					self.refresh_description();
 					self.resolve_video_dimensions(&frame.payload)?;
-					continue;
 				}
-
 				Some(payload) => {
 					self.refresh_description();
 					self.resolve_video_dimensions(&payload)?;
@@ -349,9 +330,7 @@ impl ExportSource {
 	}
 }
 
-pub(crate) fn catalog_dimensions(
-	config: &VideoConfig,
-) -> Option<(u32, u32)> {
+pub(crate) fn catalog_dimensions(config: &VideoConfig) -> Option<(u32, u32)> {
 	let dimensions = (config.coded_width?, config.coded_height?);
 
 	(dimensions.0 > 0 && dimensions.1 > 0).then_some(dimensions)
@@ -403,9 +382,7 @@ pub(crate) fn codec_dimensions(
 
 /// Build a video transform for an Annex-B source, or `None` if the catalog
 /// already provides an out-of-band description.
-pub(crate) fn build_video_transform(
-	config: &VideoConfig,
-) -> Option<VideoTransform> {
+pub(crate) fn build_video_transform(config: &VideoConfig) -> Option<VideoTransform> {
 	let needs_transform = config
 		.description
 		.as_ref()
@@ -422,6 +399,7 @@ pub(crate) fn build_video_transform(
 		_ => None,
 	}
 }
+
 
 
 #[cfg(test)]
