@@ -380,11 +380,9 @@ impl<R> Drop for Guard<'_, R> {
     }
 }
 
-impl<C: Container<Error = crate::error::Error>, R: Clone + Send + 'static>
-    Producer<C, R>
+impl<C: Container, R: Clone + Send + 'static> Producer<C, R>
 where
     crate::Error: From<C::Error>,
-     R: Clone + Send + 'static,
 {
 	#[cfg(test)]
 	fn bandwidth_ceiling(&self) -> Option<moq_net::bandwidth::Rate> {
@@ -540,7 +538,7 @@ where
 		if self.buffer_duration.is_zero() {
 	let (timestamp, duration, bytes) =
 		(frame.timestamp, frame.duration, frame.payload.len());
-	let (position, keyframe) = (position(group), frame.keyframe);
+	let (position, keyframe) = (position(self.group), frame.keyframe);
 
 	self.write_container(std::slice::from_ref(&frame))?;
 
@@ -788,7 +786,11 @@ where
 }
 
 let buffered = std::mem::take(&mut self.buffer);
-let position = position(group);
+let position = position(
+    self.group
+        .as_ref()
+        .expect("group must be open here"),
+);
 
 self.write_container(&buffered)?;
 
