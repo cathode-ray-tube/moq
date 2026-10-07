@@ -58,12 +58,97 @@ These land with the next breaking release, not the 2026-09-23 train.
   `SourceMap` (#4667) are gone, along with the importers' `live()`. Publish the
   source's own timestamps and let the catalog clock map them to wall time;
   pin that mapping with `Config::with_clock` when the source's zero is known.
+- **moq-net owns its transport traits.** `moq_net::web_transport_trait` is
+  gone, and `transport::poll::{Session, SendStream, RecvStream}` no longer
+  extend `web_transport_trait::poll`. They carry their own `poll_*` methods,
+  `transport::Error`, and `transport::Stats`, and `Error::from_transport` takes
+  a `transport::Error`. moq-tokio's `Client` and `Server` are unchanged. A
+  custom transport handed straight to moq-net implements these traits; a
+  `moq-uring` session is wrapped with `moq_uring::transport::Session::new`.
+- **`--cluster-mesh` and `--cluster-linger` are unknown flags.** moq-relay
+  0.17 refuses them by name; later relays reject them, and TOML `mesh` and
+  `linger`, like any unknown setting. `MOQ_CLUSTER_MESH` and
+  `MOQ_CLUSTER_LINGER` are no longer read, so drop them from the environment.
+  In Rust, `cluster::Config` has no `mesh` or `linger` field.
 - **moq-mux data producers take a broadcast-clock `Timestamp`.** `json` and
   `binary` `Snapshot::update` and `Stream::append` take `Timed<_, Timestamp>`
   instead of `Timed<_, Instant>`, and publish it as given. Convert a capture
   `Instant` with `.at(catalog.clock().capture(instant)?)`, reading
   `catalog.clock()` at write time, since an importer's first frame re-anchors
   it. A timestamp ahead of now is published rather than refused.
+- **moq-mux importers publish the catalog at their first frame.** The fMP4,
+  MKV, and MPEG-TS importers used to publish it at their init segment (`moov`,
+  `Tracks`, or the first PMT) on a provisional clock, then re-anchor it on the
+  first frame. They now hold it until that frame, as FLV already did, so the
+  first snapshot carries the final root `clock`. A reader waiting for the
+  catalog now waits for media of a selected track, not just the init segment:
+  a track `with_select` deselects doesn't release it, even if its media
+  arrives first. A `moov` or `Tracks` decoded after `finish()` is refused with
+  `fmp4::Error::MoovAfterFinish` or `mkv::Error::TracksAfterFinish`, since the
+  tracks it declares could never finish.
+- **fMP4 export fixes its track set at the init segment.** moq-mux's
+  `fmp4::Error` drops `MissingVideoTrack`, `MissingAudioTrack`, and
+  `NoCatalogSnapshot`, and adds `TrackAdded`, `TrackChanged`, `TrackRewound`,
+  and `TrackUndescribed`. `fmp4::Export` and `moq export fmp4` now end with one
+  of these where they used to write a track missing from the moov, and a
+  broadcast that ends with media queued behind an undescribed track is an error
+  rather than an empty `Ok(None)`. Restart the export to pick up a new
+  rendition.
+- **Subscriber staleness is max delay.** How far a group may fall behind the
+  live edge before a subscriber skips it is now `max_delay`, so it no longer
+  shares a name with a publisher's retention, which keeps `max_age`. In Rust,
+  `track::Subscription::max_age` and `with_max_age` are `max_delay` and
+  `with_max_delay`; moq-mux's `container::Consumer::set_max_age` and the fMP4,
+  MKV, FLV, H.264, and H.265 exports' `with_max_age` are `set_max_delay` and
+  `with_max_delay`; moq-audio's and moq-video's `decode::Options::max_age` is
+  `max_delay`, as is moq-audio's `decode::Consumer::max_age()`; and moq-rtmp's
+  `Play::with_max_age`, `Client::with_export_max_age`,
+  `listen::Config::export_max_age`, and `DEFAULT_MAX_AGE` are `with_max_delay`,
+  `with_export_max_delay`, `export_max_delay`, and `DEFAULT_MAX_DELAY`. In
+  TypeScript, `Track.Subscription`'s `maxAge` is `maxDelay`, as are
+  `Container.Consumer`'s `maxAge` prop and `@moq/watch`'s `Sync.out.maxAge`;
+  JavaScript refuses a `maxAge` key in subscription options or container consumer
+  props with a `TypeError` naming `maxDelay`, including when both keys are supplied
+  or `maxAge` is `undefined`. Untyped callers must rename it.
+  moq-ffi's `MoqSubscription`, `MoqAudioDecoderOutput`, and
+  `MoqVideoDecoderOutput` take `max_delay_us` (each binding in its own casing),
+  and so do C's `moq_subscription`, `moq_audio_decoder_output`,
+  `moq_video_decoder_output`, `moq_consume_video`, and `moq_consume_audio`.
+  `moq export fmp4`, `mkv`, `flv`, `h264`, `h265`, and `rtmp` take
+  `--max-delay`, and refuse `--max-age`. `track::Info::max_age`,
+  `MoqTrackInfo.max_age_us`, `moq import --max-age`, and `moq export ts --max-age` are unchanged, as is the wire.
+- **moq-relay auth takes the client-CA answer.** `auth::Config::validate` and
+  `init` take `client_ca: bool`, whether any listener verifies client
+  certificates, and `validate_client_ca` is gone. `moq --listen` with an
+  invalid auth config stops at startup instead of refusing every session.
+- **A client CA needs a QUIC listener.** A stream-only relay or `moq` listener
+  (TCP or Unix, no `--listen`) refuses to start with `listen.tls.root`, which
+  nothing verified; moq-tokio returns `Error::MtlsUnsupported` for it.
+- **moq-tokio's `Transport` names WebTransport.** `moq_tokio::server::Transport`
+  is `moq_tokio::Transport`, with no re-export. A WebTransport session reports
+  `Transport::WebTransport` (`"webtransport"` in logs) instead of `Quic`, which
+  now means raw QUIC only, and `Connection::transport()` reports the live
+  transport. The bindings' `MoqTransport` gains a `WebTransport` case, so an
+  exhaustive `switch` or `when` needs one more arm.
+- **moq-net has no `VarInt`.** Varints are plain `u64`s:
+  `VarInt::decode_quic(buf)?.into_inner()` is `moq_net::varint::decode_quic(buf)?`,
+  and `VarInt::try_from(v)?.encode_quic(buf)` is
+  `moq_net::varint::encode_quic(v, buf)`, which fails past
+  `varint::MAX_QUIC` (2^62 - 1).
+- **Opus mapping family lives only on `mapping`.**
+  `moq_mux::codec::opus::Config::mapping_family` is gone. Family 0 is
+  `mapping: None`; any other family is the mapping's own (`mapping.family()`).
+  Set `mapping` alone when building a surround head. The OpusHead bytes are
+  unchanged.
+- **moq-mux TS stats live in `ts::stats`.** `ts::Stats` is
+  `ts::stats::Snapshot` and `ts::StreamStats` is `ts::stats::Stream`, whose
+  `track` is an owned `String`. `ts::Export::stats` returns
+  `ts::stats::Export`, which carries only `streams`; feed it to
+  `stats::Log` with `.into()`. `ts::MultipleProgramsError` is
+  `#[non_exhaustive]`: recover it by downcast and read `programs`.
+- **@moq/publish drops `OpusConfig.usedtx`.** Chromium's DTX output shifts the
+  audio timeline, so Opus DTX is always off (the WebCodecs default). Remove the
+  field; a plain-JS caller still passing it is ignored.
 
 ## Wire
 

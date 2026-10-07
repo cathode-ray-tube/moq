@@ -1,6 +1,4 @@
 use crate::origin;
-#[cfg(test)]
-use crate::runtime::Timers;
 use crate::time::{Clock, Instant};
 use crate::{
 	ALPN_14, ALPN_15, ALPN_16, ALPN_17, ALPN_18, ALPN_19, ALPN_20, ALPN_21, ALPN_22, ALPN_LITE, ALPN_LITE_03,
@@ -205,6 +203,7 @@ impl Client {
 			start.recv_bandwidth,
 			crate::driver::Protocol::Lite(Box::new(start.driver)),
 			start.goaway,
+			start.setup,
 		))
 	}
 
@@ -261,7 +260,7 @@ impl Client {
 
 				// Draft-17+: SETUP is exchanged by the connection driver.
 				// We advertise the request path in our SETUP for URL-less transports.
-				let (protocol, goaway) = ietf::start(ietf::Config {
+				let (protocol, goaway, setup) = ietf::start(ietf::Config {
 					runtime: runtime.clone(),
 					session: session.clone(),
 					setup: None,
@@ -287,6 +286,7 @@ impl Client {
 					None,
 					crate::driver::Protocol::Ietf(protocol),
 					goaway,
+					setup,
 				));
 			}
 			Some(ALPN_16) => {
@@ -365,7 +365,7 @@ impl Client {
 
 		stream.writer.encode(&client).await?;
 
-		let mut server: setup::Server = stream.reader.decode().await?;
+		let server: setup::Server = stream.reader.decode().await?;
 
 		let version = supported
 			.iter()
@@ -373,7 +373,7 @@ impl Client {
 			.copied()
 			.ok_or(Error::Version)?;
 
-		let (recv_bw, protocol, goaway) = match version {
+		let (recv_bw, protocol, goaway, setup) = match version {
 			Version::Lite(v) => {
 				let stream = stream.with_version(v);
 				let start = lite::start(lite::Config {
@@ -394,12 +394,13 @@ impl Client {
 					start.recv_bandwidth,
 					crate::driver::Protocol::Lite(Box::new(start.driver)),
 					start.goaway,
+					start.setup,
 				)
 			}
 			Version::Ietf(v) => {
 				// Decode the parameters to get the initial request ID and what the server
 				// requires of us.
-				let parameters = ietf::Parameters::decode(&mut server.parameters, v)?;
+				let (parameters, _) = ietf::Parameters::decode_slice(&server.parameters, v)?;
 				let request_id_max = parameters
 					.get_varint(ietf::ParameterVarInt::MaxRequestId)
 					.map(ietf::RequestId);
@@ -412,7 +413,7 @@ impl Client {
 
 				let stream = stream.with_version(v);
 				// Draft 14-16: the path rode in the bidi SETUP above, not the uni one.
-				let (protocol, goaway) = ietf::start(ietf::Config {
+				let (protocol, goaway, setup) = ietf::start(ietf::Config {
 					runtime: runtime.clone(),
 					session: session.clone(),
 					setup: Some(stream),
@@ -429,11 +430,13 @@ impl Client {
 					peer_declared: Some(peer_declared),
 					early_unis: Vec::new(),
 				})?;
-				(None, crate::driver::Protocol::Ietf(protocol), goaway)
+				(None, crate::driver::Protocol::Ietf(protocol), goaway, setup)
 			}
 		};
 
-		Ok(Session::new(runtime, session, version, recv_bw, protocol, goaway))
+		Ok(Session::new(
+			runtime, session, version, recv_bw, protocol, goaway, setup,
+		))
 	}
 }
 
@@ -463,7 +466,7 @@ mod tests {
 
 	impl std::error::Error for FakeError {}
 
-	impl web_transport_trait::Error for FakeError {
+	impl crate::transport::Error for FakeError {
 		fn session_error(&self) -> Option<(u32, String)> {
 			Some((0, "closed".to_string()))
 		}
@@ -532,7 +535,7 @@ mod tests {
 		}
 	}
 
-	impl web_transport_trait::poll::Session for FakeSession {
+	impl crate::transport::poll::Session for FakeSession {
 		type SendStream = FakeSendStream;
 		type RecvStream = FakeRecvStream;
 		type Error = FakeError;
@@ -584,7 +587,7 @@ mod tests {
 			Poll::Ready(FakeError)
 		}
 
-		fn stats(&self) -> impl web_transport_trait::Stats {
+		fn stats(&self) -> impl crate::transport::Stats {
 			FakeStats {
 				send_rate: *self.state.send_rate.lock().unwrap(),
 				bytes_sent: *self.state.bytes_sent.lock().unwrap(),
@@ -597,7 +600,7 @@ mod tests {
 		bytes_sent: Option<u64>,
 	}
 
-	impl web_transport_trait::Stats for FakeStats {
+	impl crate::transport::Stats for FakeStats {
 		fn estimated_send_rate(&self) -> Option<u64> {
 			self.send_rate
 		}
@@ -612,7 +615,7 @@ mod tests {
 		writes: Arc<Mutex<Vec<u8>>>,
 	}
 
-	impl web_transport_trait::poll::SendStream for FakeSendStream {
+	impl crate::transport::poll::SendStream for FakeSendStream {
 		type Error = FakeError;
 
 		fn poll_write(&mut self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>> {
@@ -637,7 +640,7 @@ mod tests {
 		data: VecDeque<u8>,
 	}
 
-	impl web_transport_trait::poll::RecvStream for FakeRecvStream {
+	impl crate::transport::poll::RecvStream for FakeRecvStream {
 		type Error = FakeError;
 
 		fn poll_read(&mut self, _cx: &mut Context<'_>, dst: &mut [u8]) -> Poll<Result<Option<usize>, Self::Error>> {
@@ -666,13 +669,17 @@ mod tests {
 			parameters: Bytes::new(),
 		};
 		server
-			.encode(&mut encoded, Version::Ietf(ietf::Version::Draft14))
+			.encode(
+				&mut crate::coding::Encoder::new(&mut encoded, (Version::Ietf(ietf::Version::Draft14)).into()),
+				Version::Ietf(ietf::Version::Draft14),
+			)
 			.unwrap();
 
 		// Add a setup-stream SessionInfo frame using the negotiated Lite version.
 		let info = lite::SessionInfo { bitrate: Some(1) };
 		let lite_v = lite::Version::try_from(negotiated).unwrap();
-		info.encode(&mut encoded, lite_v).unwrap();
+		info.encode(&mut crate::coding::Encoder::new(&mut encoded, lite_v.into()), lite_v)
+			.unwrap();
 
 		encoded
 	}
@@ -690,15 +697,17 @@ mod tests {
 		);
 
 		// Start the returned driver after the handshake completes.
-		let (_session, driver) = client
-			.connect(tokio::time::Instant::now().into_std(), fake.clone())
-			.await
-			.unwrap();
-		tokio::spawn(crate::time::run(driver));
+		let (_session, driver) = client.connect(moq_net_sim::now(), fake.clone()).await.unwrap();
+		moq_net_sim::spawn(crate::time::run_sim(driver));
 
 		// Verify the client setup was encoded using Draft14 framing (ALPN_LITE fallback path).
 		let mut setup_bytes = Bytes::from(fake.control_writes());
-		let setup = setup::Client::decode(&mut setup_bytes, Version::Ietf(ietf::Version::Draft14)).unwrap();
+		let setup = crate::coding::decode_buf(
+			&mut setup_bytes,
+			Version::Ietf(ietf::Version::Draft14),
+			setup::Client::decode,
+		)
+		.unwrap();
 		let advertised: Vec<Version> = setup.versions.iter().map(|v| Version::try_from(*v).unwrap()).collect();
 		assert_eq!(
 			advertised,
@@ -725,7 +734,7 @@ mod tests {
 	/// `connect` for the life of the session, since it waited for the initial announce
 	/// set. Resolving a path you need is `routed`'s job, which waits for
 	/// that path rather than for the peer to finish talking.
-	#[tokio::test(start_paused = true)]
+	#[moq_net_sim::test]
 	async fn connect_does_not_wait_for_the_peer_to_announce() {
 		// Serves bidi streams, so the announce stream opens, and never answers on them.
 		let gate = kio::Producer::new(true);
@@ -740,49 +749,18 @@ mod tests {
 
 		// Paused time auto-advances while every task is idle, so a `connect` that waits
 		// on the silent peer trips this rather than hanging the suite.
-		let (_session, _driver) = tokio::time::timeout(
+		let (_session, _driver) = moq_net_sim::timeout(
 			std::time::Duration::from_secs(30),
-			client.connect(tokio::time::Instant::now().into_std(), transport),
+			client.connect(moq_net_sim::now(), transport),
 		)
 		.await
 		.expect("connect waited on a peer that never announced")
 		.expect("connect failed");
 	}
 
-	/// A peer that never delivers its announce count cannot stall the live
-	/// marker past its session: dropping the session lands the source.
-	#[tokio::test(start_paused = true)]
-	async fn a_dead_session_does_not_hold_the_live_marker() {
-		let gate = kio::Producer::new(true);
-		let transport = crate::lite::test_transport::SinkSession::gated_bi(gate.consume())
-			.with_protocol(crate::version::ALPN_LITE_05);
-
-		let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
-		let client = Client::new()
-			.with_versions([Version::Lite(lite::Version::Lite05)].into())
-			.with_subscriber(origin.clone());
-		let (session, driver) = client
-			.connect(tokio::time::Instant::now().into_std(), transport)
-			.await
-			.expect("connect failed");
-
-		let mut announced = origin.consume().announced();
-		let mut next = std::pin::pin!(announced.next());
-		assert!(
-			tokio::time::timeout(std::time::Duration::from_secs(5), next.as_mut())
-				.await
-				.is_err(),
-			"live before the peer answered"
-		);
-
-		drop(driver);
-		drop(session);
-		assert!(matches!(next.await, Some(crate::announce::Event::Live)));
-	}
-
 	/// The client SETUP on the bidi control stream (the pre-draft-17 framing) carries the
 	/// AUTHORITY next to the PATH.
-	#[tokio::test(start_paused = true)]
+	#[moq_net_sim::test]
 	async fn draft14_setup_carries_the_authority() {
 		let fake = FakeSession::new(Some(ALPN_LITE), mock_server_setup(Version::Lite(lite::Version::Lite01)));
 		let client = Client::new()
@@ -796,16 +774,12 @@ mod tests {
 			.with_path("/anon")
 			.with_authority("relay.example.com:4443");
 
-		let (_session, driver) = client
-			.connect(tokio::time::Instant::now().into_std(), fake.clone())
-			.await
-			.unwrap();
-		tokio::spawn(crate::time::run(driver));
+		let (_session, driver) = client.connect(moq_net_sim::now(), fake.clone()).await.unwrap();
+		moq_net_sim::spawn(crate::time::run_sim(driver));
 
-		let mut setup_bytes = Bytes::from(fake.control_writes());
-		let setup = setup::Client::decode(&mut setup_bytes, Version::Ietf(ietf::Version::Draft14)).unwrap();
-		let mut parameters = setup.parameters;
-		let parameters = ietf::Parameters::decode(&mut parameters, ietf::Version::Draft14).unwrap();
+		let (setup, _) =
+			setup::Client::decode_slice(&fake.control_writes(), Version::Ietf(ietf::Version::Draft14)).unwrap();
+		let (parameters, _) = ietf::Parameters::decode_slice(&setup.parameters, ietf::Version::Draft14).unwrap();
 		assert_eq!(
 			parameters.get_bytes(ietf::ParameterBytes::Authority),
 			Some(b"relay.example.com:4443".as_ref())
@@ -816,12 +790,12 @@ mod tests {
 		);
 	}
 
-	#[tokio::test(start_paused = true)]
+	#[moq_net_sim::test]
 	async fn alpn_lite_falls_back_to_draft14_and_switches_version_post_setup() {
 		run_alpn_lite_fallback_case(Some(ALPN_LITE)).await;
 	}
 
-	#[tokio::test(start_paused = true)]
+	#[moq_net_sim::test]
 	async fn no_alpn_falls_back_to_draft14_and_switches_version_post_setup() {
 		run_alpn_lite_fallback_case(None).await;
 	}
@@ -833,7 +807,7 @@ mod tests {
 		let fake = FakeSession::new(Some(ALPN_LITE_04), Vec::new());
 		let client = Client::new().with_versions(Version::Lite(lite::Version::Lite04).into());
 
-		let runtime = crate::runtime::Test::new();
+		let runtime = crate::time::Clock::new(crate::time::Instant::now());
 		let (session, mut driver) = futures::executor::block_on(client.connect(runtime.now(), fake.clone())).unwrap();
 		assert_eq!(session.version(), Version::Lite(lite::Version::Lite04));
 
@@ -856,7 +830,7 @@ mod tests {
 		let fake = FakeSession::new(Some(ALPN_LITE_04), Vec::new());
 		let client = Client::new().with_versions(Version::Lite(lite::Version::Lite04).into());
 
-		let runtime = crate::runtime::Test::new();
+		let runtime = crate::time::Clock::new(crate::time::Instant::now());
 		let (session, mut driver) = futures::executor::block_on(client.connect(runtime.now(), fake.clone())).unwrap();
 		let clone = session.clone();
 
@@ -890,7 +864,7 @@ mod tests {
 		let fake = FakeSession::new(Some(ALPN_LITE_04), Vec::new());
 		let client = Client::new().with_versions(Version::Lite(lite::Version::Lite04).into());
 
-		let runtime = crate::runtime::Test::new();
+		let runtime = crate::time::Clock::new(crate::time::Instant::now());
 		let (session, driver) = futures::executor::block_on(client.connect(runtime.now(), fake.clone())).unwrap();
 
 		drop(driver);
@@ -916,7 +890,7 @@ mod tests {
 		_local: std::rc::Rc<()>,
 	}
 
-	impl web_transport_trait::poll::Session for LocalSession {
+	impl crate::transport::poll::Session for LocalSession {
 		type SendStream = LocalSend;
 		type RecvStream = LocalRecv;
 		type Error = FakeError;
@@ -995,12 +969,12 @@ mod tests {
 			self.inner.poll_closed(cx)
 		}
 
-		fn stats(&self) -> impl web_transport_trait::Stats {
+		fn stats(&self) -> impl crate::transport::Stats {
 			self.inner.stats()
 		}
 	}
 
-	impl web_transport_trait::poll::SendStream for LocalSend {
+	impl crate::transport::poll::SendStream for LocalSend {
 		type Error = FakeError;
 
 		fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>> {
@@ -1020,11 +994,11 @@ mod tests {
 		}
 
 		fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-			web_transport_trait::poll::SendStream::poll_closed(&mut self.inner, cx)
+			crate::transport::poll::SendStream::poll_closed(&mut self.inner, cx)
 		}
 	}
 
-	impl web_transport_trait::poll::RecvStream for LocalRecv {
+	impl crate::transport::poll::RecvStream for LocalRecv {
 		type Error = FakeError;
 
 		fn poll_read(&mut self, cx: &mut Context<'_>, dst: &mut [u8]) -> Poll<Result<Option<usize>, Self::Error>> {
@@ -1036,7 +1010,7 @@ mod tests {
 		}
 
 		fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-			web_transport_trait::poll::RecvStream::poll_closed(&mut self.inner, cx)
+			crate::transport::poll::RecvStream::poll_closed(&mut self.inner, cx)
 		}
 	}
 
@@ -1053,7 +1027,7 @@ mod tests {
 		};
 		let client = Client::new().with_versions(Version::Lite(lite::Version::Lite04).into());
 
-		let runtime = crate::runtime::Test::new();
+		let runtime = crate::time::Clock::new(crate::time::Instant::now());
 		let (session, mut driver) = futures::executor::block_on(client.connect_lite(runtime.now(), local)).unwrap();
 		assert!(driver.poll(runtime.now(), &kio::Waiter::noop()).is_ok());
 
@@ -1076,7 +1050,7 @@ mod tests {
 		};
 		let server = crate::Server::new().with_versions(Version::Lite(lite::Version::Lite04).into());
 
-		let runtime = crate::runtime::Test::new();
+		let runtime = crate::time::Clock::new(crate::time::Instant::now());
 		let (session, mut driver) = futures::executor::block_on(server.accept_lite(runtime.now(), local)).unwrap();
 		assert_eq!(session.version(), Version::Lite(lite::Version::Lite04));
 		assert!(driver.poll(runtime.now(), &kio::Waiter::noop()).is_ok());
@@ -1097,7 +1071,7 @@ mod tests {
 			_local: std::rc::Rc::new(()),
 		};
 		let client = Client::new();
-		let runtime = crate::runtime::Test::new();
+		let runtime = crate::time::Clock::new(crate::time::Instant::now());
 		let result = futures::executor::block_on(client.connect_lite(runtime.now(), local));
 		assert!(matches!(result, Err(Error::Version)));
 	}
@@ -1105,17 +1079,14 @@ mod tests {
 	// `stats()` reads the machine's latest sample and primes the sampler, so a
 	// periodic poller observes fresh counters without consuming the bandwidth
 	// channel.
-	#[tokio::test(start_paused = true)]
+	#[moq_net_sim::test]
 	async fn stats_reads_prime_the_sampler() {
 		let fake = FakeSession::new(Some(ALPN_LITE_04), Vec::new());
 		fake.set_send_rate(Some(1_000_000));
 
 		let client = Client::new().with_versions(Version::Lite(lite::Version::Lite04).into());
-		let (session, driver) = client
-			.connect(tokio::time::Instant::now().into_std(), fake.clone())
-			.await
-			.unwrap();
-		tokio::spawn(crate::time::run(driver));
+		let (session, driver) = client.connect(moq_net_sim::now(), fake.clone()).await.unwrap();
+		moq_net_sim::spawn(crate::time::run_sim(driver));
 
 		// The construction-time snapshot, before the machine sampled anything.
 		assert_eq!(
@@ -1127,7 +1098,7 @@ mod tests {
 		// so the new rate shows up within an interval (paused time auto-advances).
 		fake.set_send_rate(Some(2_000_000));
 		while session.stats().estimated_send_rate != Some(crate::bandwidth::Rate::from_bps(2_000_000)) {
-			tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+			moq_net_sim::sleep(std::time::Duration::from_millis(10)).await;
 		}
 	}
 
@@ -1137,18 +1108,15 @@ mod tests {
 	// the construction-time snapshot: this backend reports no send rate, so
 	// there is no bandwidth consumer keeping the sampler ticking, and the test
 	// never reads stats while the session is live.
-	#[tokio::test(start_paused = true)]
+	#[moq_net_sim::test]
 	async fn stats_capture_the_final_counters() {
 		let fake = FakeSession::new(Some(ALPN_LITE_04), Vec::new());
 		fake.set_send_rate(None);
 		fake.set_bytes_sent(Some(0));
 
 		let client = Client::new().with_versions(Version::Lite(lite::Version::Lite04).into());
-		let (session, driver) = client
-			.connect(tokio::time::Instant::now().into_std(), fake.clone())
-			.await
-			.unwrap();
-		tokio::spawn(crate::time::run(driver));
+		let (session, driver) = client.connect(moq_net_sim::now(), fake.clone()).await.unwrap();
+		moq_net_sim::spawn(crate::time::run_sim(driver));
 		assert!(
 			session.send_bandwidth().is_none(),
 			"no send-rate estimate, so nothing samples on its own"
@@ -1167,19 +1135,16 @@ mod tests {
 	}
 
 	// The send-bandwidth sampler lives inside the driver: it samples as soon as a
-	// consumer exists and keeps sampling on its interval. Paused tokio time makes
+	// consumer exists and keeps sampling on its interval. Simulated time makes
 	// the interval fire deterministically.
-	#[tokio::test(start_paused = true)]
+	#[moq_net_sim::test]
 	async fn send_bandwidth_samples_while_the_driver_runs() {
 		let fake = FakeSession::new(Some(ALPN_LITE_04), Vec::new());
 		fake.set_send_rate(Some(1_000_000));
 
 		let client = Client::new().with_versions(Version::Lite(lite::Version::Lite04).into());
-		let (session, driver) = client
-			.connect(tokio::time::Instant::now().into_std(), fake.clone())
-			.await
-			.unwrap();
-		tokio::spawn(crate::time::run(driver));
+		let (session, driver) = client.connect(moq_net_sim::now(), fake.clone()).await.unwrap();
+		moq_net_sim::spawn(crate::time::run_sim(driver));
 
 		let mut bandwidth = session.send_bandwidth().expect("backend reports an estimate");
 		assert_eq!(

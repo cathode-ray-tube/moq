@@ -185,24 +185,32 @@ pub enum Error {
 		composition_time_ms: i32,
 	},
 
-	/// A segment ran past the advertised maximum duration.
-	#[error(
-		"timeline segment {segment} lasted {duration:?}, \
-         over the declared maximum {duration_max:?}"
-	)]
-	TimelineOverrun {
-		segment: u64,
-		duration: std::time::Duration,
-		duration_max: std::time::Duration,
+	/// [`timeline::Producer::resume`](crate::timeline::Producer::resume) received a checkpoint
+	/// whose record at this window index has a different sequence.
+	#[error("timeline checkpoint record at index {0} has a different sequence")]
+	TimelineCheckpoint(u64),
+
+	/// [`timeline::Producer::push`](crate::timeline::Producer::push) received a record out of order.
+	#[error("timeline record {actual} pushed where {expected} was next")]
+	TimelineSequence {
+		/// The window's next index.
+		expected: u64,
+		/// The pushed record's sequence.
+		actual: u64,
 	},
 
-	/// `Producer::finish` was called while deferred records remained pending.
-	#[error("finish and commit every deferred timeline record before closing the Producer")]
-	TimelineDeferredPending,
+	/// A timeline frame report did not advance past the previous one.
+	#[error("timeline report at {position:?} does not advance past {last:?}")]
+	TimelinePosition {
+		/// The rejected report's position.
+		position: hang::timeline::Position,
+		/// The previous report's position.
+		last: hang::timeline::Position,
+	},
 
-	/// A pending record was not yielded by its deferred publisher.
-	#[error("timeline segment {0} was not yielded for deferred publication")]
-	TimelineDeferredRecord(u64),
+	/// The catalog's `archive` entry indexes no timeline for this track.
+	#[error("no timeline for track {0}")]
+	TimelineMissing(String),
 
 	/// Error from a muxer/demuxer that reports via `anyhow`.
 	#[error("{0}")]

@@ -35,9 +35,9 @@ pub struct Import<E: crate::catalog::hang::CatalogExt = ()> {
 	/// The catalog being produced
 	catalog: crate::catalog::Producer<E>,
 
-	/// Held until the moov's track set is declared, so the catalog is withheld from the broadcast
-	/// until every rendition is in (and, when composed with other importers, until they finish too).
-	/// Dropped in [`init`](Self::init).
+	/// Held until the first fragment anchors the clock, so the catalog is withheld from the broadcast
+	/// until every rendition is in and its root `clock` is final (and, when composed with other
+	/// importers, until they release theirs too).
 	initial_reservation: Option<crate::catalog::Reserved<E>>,
 
 	// Which track roles to publish. `None` imports every supported track.
@@ -94,6 +94,10 @@ pub struct Import<E: crate::catalog::hang::CatalogExt = ()> {
 
 
 	encrypter: Option<Box<dyn FrameEncrypter + Send>>,
+
+	// The current segment's boundary was declared by the source (rather than inferred from a
+	// keyframe), so each track cuts its timeline where it opens its group for the segment.
+	declared: bool,
 }
 
 /// The catalog entry for one imported track, whichever section it lives in.
@@ -123,9 +127,8 @@ struct Fmp4Track<E: crate::catalog::hang::CatalogExt> {
 	track: moq_net::track::Producer,
 	group: Option<moq_net::group::Producer>,
 
-	// Reports this track's group opens into the broadcast's timeline. Passthrough writes
-	// groups by hand (no `container::Producer`), so the recorder is fed directly at each
-	// keyframe fragment rather than through `with_recorder`.
+	// Reports this track's fragments into its timeline. Passthrough writes groups by hand (no
+	// `container::Producer`), so the recorder is fed directly rather than through `with_recorder`.
 	recorder: Option<crate::timeline::Recorder>,
 
 	// The decode time of the last fragment, which the next one has to advance past.
@@ -180,6 +183,7 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			pending_timeline_cut: false,
 			segment_start: None,
 			encrypter: None,
+			declared: false,
 		}
 	}
 
@@ -197,9 +201,9 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	/// segmentation out of band (e.g. an HLS import following its playlist).
 	///
 	/// A `styp` atom (a CMAF segment on disk) does this on its own, so an importer reading a
-	/// segmented file needs no help. Boundaries are broadcast-wide, but redundant ones cost
-	/// nothing: the timeline ignores a cut that would land inside its minimum segment duration,
-	/// so several renditions of one source may all declare the same boundaries.
+	/// segmented file needs no help. Each track's timeline then closes a record where that track
+	/// opens its group for the new segment, following the source's segmentation instead of the
+	/// minimum-duration pacing.
 	///
 	/// This is where groups are drawn too: every track rolls its group at a segment boundary, so
 	/// a group is a segment and each fragment inside it is a frame.
@@ -291,19 +295,12 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	}
 
 	fn init(&mut self, moov: Moov) -> Result<()> {
-		// Held from construction until the track set is declared, so a second moov would be
-		// re-declaring a track set the catalog already published.
-		let reserved = self.initial_reservation.clone().ok_or(Error::DuplicateMoov)?;
-		let timeline = self.catalog.timeline();
-
-		// The tracks below enroll in the timeline, so advertise it in the same catalog update
-		// rather than publishing a second snapshot for it.
-		{
-			let mut catalog = self.catalog.modify()?;
-			if catalog.archive.is_none() && !moov.trak.is_empty() {
-				catalog.archive = Some(timeline.section());
-			}
+		// A second moov would re-declare a track set the catalog already advertises.
+		if self.moov.is_some() {
+			return Err(Error::DuplicateMoov.into());
 		}
+		// Only `finish()` releases the reservation before a moov, since a fragment needs one.
+		let reserved = self.initial_reservation.clone().ok_or(Error::MoovAfterFinish)?;
 
 		for trak in &moov.trak {
 			let track_id = trak.tkhd.track_id;
@@ -338,11 +335,10 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			        .with_timescale(timescale),
 			)?;
 
-
-			// Enroll every track in the broadcast's timeline: passthrough writes groups by hand
-			// (no `container::Producer`), so the recorder is fed directly at each group open.
-			// The root archive entry is advertised before any rendition releases its reservation.
-			let recorder = timeline.pacing_track(track.name())?;
+			// Enroll every track in the broadcast's timelines: passthrough writes groups by hand
+			// (no `container::Producer`), so the recorder is fed directly at each fragment. The
+			// reservation holds the archive entry back until the whole track set is declared.
+			let recorder = self.catalog.enroll(track.name())?;
 
 			// Whatever the descriptor declared (a bitrate) is authoritative; the rest is filled by
 			// `estimate` as fragments arrive.
@@ -379,9 +375,11 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			);
 		}
 
-		// The moov's full track set is declared now; release the reservation so the catalog publishes.
-		drop(reserved);
-		self.initial_reservation = None;
+		// The reservation stays held until the first fragment anchors the clock, unless no track
+		// was declared: then no fragment ever will.
+		if self.tracks.is_empty() {
+			self.initial_reservation = None;
+		}
 
 		self.moov = Some(moov);
 
@@ -698,9 +696,8 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			self.segment += 1;
 			// A boundary the source declared is also a timeline boundary; one merely inferred
 			// from a keyframe is not, since the default pacing already sees that group open.
-			self.pending_timeline_cut |= self.pending_cut;
+			self.declared = self.pending_cut;
 			self.pending_cut = false;
-			self.segment_start = None;
 		}
 
 		let moov = self.moov.as_ref().ok_or(Error::NoMoov)?;
@@ -935,8 +932,11 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			// in the track's native timescale. The relay reads it off the wire; the
 			// consumer still drives playback from the fragment's internal timing.
 			let timestamp = min_timestamp.ok_or(Error::MissingTrun)?;
-			// The first fragment of the import is live on arrival.
+			// The first fragment of the import is live on arrival. Anchor before releasing the
+			// reservation, so the first snapshot carries the final clock; the moov declared every
+			// track, so any track's fragment releases it.
 			self.catalog.anchor(timestamp)?;
+			self.initial_reservation = None;
 
 			// Write the per-track fragment as a single MoQ frame (passthrough). The group rolls
 			// once per segment, so a group is a segment and the fragments inside it are frames.
@@ -947,6 +947,9 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			let mut g = if start_group {
 				if let Some(prev) = track.group.take() {
 					prev.finish()?;
+					if let Some(recorder) = track.recorder.as_mut() {
+						recorder.finish_group(prev.sequence);
+					}
 				}
 				track.segment = Some(self.segment);
 				match track.pending_sequence.take() {
@@ -957,28 +960,16 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 				track.group.take().ok_or(Error::NoKeyframe)?
 			};
 
+			let position = hang::timeline::Position::new(g.sequence, g.frame_count() as u64);
+
 			if start_group {
-				// A group just opened; report it so the broadcast's timeline can index the segment
-				// (the timeline absorbs publish failures). Audio is always independently decodable;
-				// video says whether this segment really begins on an IDR, which is what an HLS
-				// export reads to bootstrap an init segment. A group reopened mid-segment (after a
-				// `seek`) reports its own timestamp: it does not start a segment.
-				let reported = match new_segment {
-					false => timestamp,
-					true => match self.segment_start {
-						Some(start) => start,
-						None => {
-							self.segment_start = Some(timestamp);
-							if self.pending_timeline_cut {
-								self.pending_timeline_cut = false;
-								self.catalog.timeline().cut(timestamp)?;
-							}
-							timestamp
-						}
-					},
-				};
-				if let Some(recorder) = track.recorder.as_mut() {
-					recorder.record(g.sequence, reported, contains_keyframe);
+				// A group opening for a declared segment is a boundary on this track's timeline. A
+				// group reopened mid-segment (after a `seek`) is not.
+				if new_segment
+					&& self.declared
+					&& let Some(recorder) = track.recorder.as_mut()
+				{
+					recorder.cut(timestamp);
 				}
 
 				// Close the previous group for the bitrate estimator (used only when the
@@ -986,6 +977,7 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 				track.estimator.cut(Some(timestamp));
 			}
 			let fragment_len = fragment_bytes.len();
+<<<<<<< HEAD
 
 			{
 				let output = MoqFrameWriter { group: &mut g };
@@ -1011,6 +1003,21 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 					}
 				}
 			}
+=======
+			let mut frame = g.create_frame(moq_net::frame::Info {
+				size: fragment_bytes.len() as u64,
+				timestamp,
+			})?;
+			frame.write(fragment_bytes)?;
+			frame.finish()?;
+>>>>>>> upstream/main
+
+			// Only once published, so a rejected fragment is never indexed. Audio is always
+			// independently decodable; video says whether this fragment really begins on an IDR,
+			// which is what an HLS export reads to bootstrap an init segment.
+			if let Some(recorder) = track.recorder.as_mut() {
+				recorder.frame(position, timestamp, contains_keyframe);
+			}
 
 			track.group = Some(g);
 			track.estimator.write(timestamp, fragment_len);
@@ -1030,11 +1037,16 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	/// Finish all tracks, flushing current groups.
 	pub fn finish(&mut self) -> Result<()> {
+		// No frame follows to anchor the clock, so publish the declared track set now.
+		self.initial_reservation = None;
 		for track in self.tracks.values_mut() {
 			track.estimator.cut(None);
 			track.publish_estimate()?;
 			if let Some(g) = track.group.take() {
 				g.finish()?;
+				if let Some(recorder) = track.recorder.as_mut() {
+					recorder.finish_group(g.sequence);
+				}
 			}
 			track.track.finish()?;
 		}
@@ -1065,6 +1077,9 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			track.publish_estimate()?;
 			if let Some(g) = track.group.take() {
 				g.finish()?;
+				if let Some(recorder) = track.recorder.as_mut() {
+					recorder.finish_group(g.sequence);
+				}
 			}
 			track.pending_sequence = Some(sequence);
 		}

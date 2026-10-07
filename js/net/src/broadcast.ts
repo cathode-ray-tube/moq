@@ -19,6 +19,8 @@ export interface Announcer {
 	announce(route: Route): void;
 	/** Retract the advertisement from local consumers and peers alike. */
 	unannounce(): void;
+	/** The route this broadcast's path is advertised with, if it is. */
+	route(): Route | undefined;
 }
 
 let attachAnnouncer: (producer: Producer, announcer: Announcer) => void;
@@ -36,18 +38,21 @@ class BroadcastState {
 	consumers = 0;
 	used = new Signal(false);
 	active = 0;
-	watched = new WeakSet<track.Producer>();
-	demandCleanup = new Set<Dispose>();
+	// The demand watcher of each open track, disposed when it closes or leaves the broadcast.
+	demands = new Map<track.Producer, Dispose>();
 }
 
 // Each track updates the aggregate on an edge, so a demand change touches only its track.
-function watchDemand(state: BroadcastState, producer: track.Producer): void {
-	if (state.watched.has(producer)) return;
-	state.watched.add(producer);
+// A `pinned` track counts as demand until it closes, subscribed or not.
+function watchDemand(state: BroadcastState, producer: track.Producer, pinned = false): void {
+	if (state.demands.has(producer)) return;
 	const demand = producer.demand();
+	// A closed track is never demand, and its close already fired, so nothing would dispose a watcher.
+	if (demand.closed.peek() !== undefined) return;
 	let active = false;
 	const update = () => {
-		const used = state.closed.peek() === undefined && demand.closed.peek() === undefined && demand.used.peek();
+		const used =
+			state.closed.peek() === undefined && demand.closed.peek() === undefined && (pinned || demand.used.peek());
 		if (active === used) return;
 		state.active += used ? 1 : -1;
 		active = used;
@@ -66,9 +71,9 @@ function watchDemand(state: BroadcastState, producer: track.Producer): void {
 			active = false;
 			state.used.set(state.active > 0);
 		}
-		state.demandCleanup.delete(cleanup);
+		state.demands.delete(producer);
 	};
-	state.demandCleanup.add(cleanup);
+	state.demands.set(producer, cleanup);
 	update();
 }
 
@@ -87,7 +92,7 @@ function dequeueRequest(state: BroadcastState): track.Request | undefined {
 function closeState(state: BroadcastState) {
 	if (state.closed.peek() !== undefined) return;
 	state.closed.set(null);
-	for (const cleanup of state.demandCleanup) cleanup();
+	for (const cleanup of state.demands.values()) cleanup();
 	for (const request of state.pending) request.reject();
 	state.requested.mutate((requests) => {
 		requests.length = 0;
@@ -147,8 +152,9 @@ async function resolveTrackInfo(state: BroadcastState, name: string): Promise<tr
 		return Promise.reject(new Error("broadcast is closed"));
 	}
 
+	// A pending query is demand, as a pending track request is in Rust, though nobody subscribes.
 	const producer = new track.Producer(name);
-	watchDemand(state, producer);
+	watchDemand(state, producer, true);
 	state.requested.mutate((requested) => {
 		requested.push(hooks.makeRequest({ name, producer, sequences: state.sequences, pending: state.pending }));
 	});
@@ -205,7 +211,7 @@ export class Demand {
 		makeDemand = (state) => new Demand(state);
 	}
 
-	/** Whether any track currently has subscribers. */
+	/** Whether any track currently has subscribers, or a track info query is pending. */
 	get used(): Getter<boolean> {
 		return this.#state.used;
 	}
@@ -305,9 +311,12 @@ export class Producer {
 		return producer;
 	}
 
-	/** Remove a statically inserted track by name. */
+	/** Remove a statically inserted track by name. It stops counting toward {@link demand} at once. */
 	removeTrack(name: string): void {
+		const track = this.#state.tracks.get(name);
+		if (!track) return;
 		this.#state.tracks.delete(name);
+		this.#state.demands.get(track)?.();
 	}
 
 	/** A lazy read handle for a track on this broadcast. */
@@ -324,15 +333,26 @@ export class Producer {
 		};
 	}
 
+	/** The route this broadcast is announced with, or undefined while it is not announced. */
+	get route(): Route | undefined {
+		return this.#announcer?.route();
+	}
+
 	/**
-	 * Advertise this broadcast's exact path, or re-price a standing advertisement in place.
+	 * Advertise this broadcast's exact path, or replace the standing advertisement's route.
+	 *
+	 * The route is taken as given, epoch included: a route with another epoch (or none)
+	 * announces a new broadcast, so re-price from the current one,
+	 * `announce({ ...broadcast.route, cost })`, to keep the instance.
 	 *
 	 * Call it once the tracks a subscriber needs first (a catalog) exist. Until then the
 	 * broadcast exists for nobody, on its own origin or at a peer. Retracts on
 	 * {@link unannounce} or {@link close}. Throws if this producer was not created through an
 	 * origin, or if the broadcast is already closed.
 	 */
-	announce(route: Route | { hops?: Route["hops"]; cost?: Route["cost"] | bigint } = Route.default): void {
+	announce(
+		route: Route | { epoch?: Route["epoch"]; hops?: Route["hops"]; cost?: Route["cost"] | bigint } = Route.default,
+	): void {
 		if (this.#state.closed.peek() !== undefined) {
 			throw new Error("broadcast is closed");
 		}

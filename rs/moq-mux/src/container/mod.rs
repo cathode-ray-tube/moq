@@ -77,18 +77,16 @@ pub struct Frame {
     /// per-frame timescale carried on the wire.
     pub timestamp: moq_net::Timestamp,
 
-    /// Sample duration, normalized to microseconds, when the container reports
-    /// one.
-    ///
-    /// CMAF carries a per-sample duration. Legacy and LOC can fill this from
-    /// a duration marker when reading a fetched group. Streaming muxers
-    /// receive the later endpoint separately, so media remains immediately
-    /// available.
-    ///
-    /// The [`Consumer`] adds this duration to `timestamp` to learn how far a
-    /// group has been presented. It can then advance to a newer group as soon
-    /// as the gap is covered instead of waiting out the maximum-age budget.
-    pub duration: Option<moq_net::Timestamp>,
+	/// Sample duration in the frame's own scale, when the container reports it.
+	///
+	/// CMAF carries a per-sample duration (trun sample-duration). Legacy and LOC
+	/// can fill it from a duration marker when reading a fetched group. Streaming
+	/// muxers receive the later endpoint separately, so media stays immediately available.
+	/// The [`Consumer`] adds it to `timestamp` to learn how far a group has
+	/// presented, so it can advance to a newer group as soon as the gap is
+	/// covered instead of waiting out the max delay budget.
+	pub duration: Option<moq_net::Timestamp>,
+>>>>>>> upstream/main
 
     /// Encoded codec payload.
     pub payload: Bytes,

@@ -197,7 +197,6 @@ impl StreamError {
 			Self::GoingAway => 0x4,
 			Self::TooFarBehind => 0x5,
 			Self::MalformedTrack => 0x12,
-			// 0x30 NO_CAPACITY is assigned by other work in this range. Do not reuse it.
 			Self::ControlTimeout => 0x31,
 			Self::GroupTooLarge => 0x32,
 			Self::NotFound => 0x33,
@@ -484,7 +483,7 @@ impl Error {
 	/// [`StreamError::from_code`]. Reading a stream reset with the session table (or the
 	/// reverse) silently mistranslates, since e.g. 0 is "no error" for a session but an
 	/// internal error for a stream.
-	pub fn from_transport(err: impl web_transport_trait::Error) -> Self {
+	pub fn from_transport(err: impl crate::transport::Error) -> Self {
 		if let Some((code, _reason)) = err.session_error() {
 			return SessionError::from_code(code).into();
 		}
@@ -599,7 +598,7 @@ impl From<&Error> for StreamError {
 	}
 }
 
-impl web_transport_trait::Error for Error {
+impl crate::transport::Error for Error {
 	fn session_error(&self) -> Option<(u32, String)> {
 		None
 	}
@@ -682,8 +681,7 @@ mod tests {
 			assert_eq!(StreamError::from_code(err.to_code()), err, "{err:?} did not round trip");
 		}
 
-		// moq-lite's own 48-63 range, pinned to the draft's table. They stay off 0x30
-		// (NO_CAPACITY), which other work assigns.
+		// moq-lite's own 48-63 range, pinned to the draft's table.
 		for (err, code) in [
 			(StreamError::ControlTimeout, 0x31),
 			(StreamError::GroupTooLarge, 0x32),
@@ -770,7 +768,7 @@ mod tests {
 			stream: Option<u32>,
 		}
 
-		impl web_transport_trait::Error for Failed {
+		impl crate::transport::Error for Failed {
 			fn session_error(&self) -> Option<(u32, String)> {
 				self.session.map(|code| (code, "closed".to_string()))
 			}

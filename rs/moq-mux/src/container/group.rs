@@ -35,8 +35,16 @@ impl FrameReader for GroupReader<'_> {
     }
 }
 
-/// Decode a single [`moq_net::group::Consumer`] into a finite stream of media
-/// [`Frame`]s.
+/// Decode a single [`moq_net::group::Consumer`] into a finite stream of media [`Frame`]s.
+///
+/// This is the group-scoped counterpart to [`Consumer`](super::Consumer). Where that one
+/// subscribes to a track and juggles group ordering, age skipping, and rewinds, this one
+/// reads exactly the group it was handed, in arrival order, and ends. That is what a caller
+/// wants after a FETCH: a group already chosen by sequence, with no live subscription and no
+/// max delay budget that could skip the very group being asked for.
+///
+/// A batch of frames decoded from one wire frame (a CMAF fragment carrying several samples) is
+/// handed back one frame at a time.
 pub struct GroupConsumer<F: Container> {
     group: moq_net::group::Consumer,
     format: F,

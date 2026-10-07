@@ -8,7 +8,7 @@ use crate::container::{Container as ContainerTrait, Frame, FrameWriter, FrameRea
 ///
 /// Built from a track's audio or video configuration, including its container.
 pub enum Container {
-	/// VarInt timestamp + raw codec bitstream. The original hang wire format.
+	/// varint timestamp + raw codec bitstream. The original hang wire format.
 	Legacy(Kind),
 
 	/// ISO-BMFF moof+mdat fragments. The wrapped [`fmp4::Wire`] holds

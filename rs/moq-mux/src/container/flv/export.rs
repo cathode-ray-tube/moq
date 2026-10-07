@@ -106,7 +106,7 @@ impl Flavor {
 pub struct Export {
 	source: crate::Source,
 	catalog: Option<crate::catalog::Consumer>,
-	max_age: std::time::Duration,
+	max_delay: std::time::Duration,
 	/// Emit every rendition as an enhanced-RTMP multitrack track, rather than only
 	/// the best video + first audio rendition.
 	multitrack: bool,
@@ -185,7 +185,7 @@ impl Export {
 		Ok(Self {
 			source,
 			catalog: Some(catalog),
-			max_age: std::time::Duration::ZERO,
+			max_delay: std::time::Duration::ZERO,
 			multitrack: false,
 			select: None,
 			video: Vec::new(),
@@ -222,13 +222,14 @@ impl Export {
         factory()
     }
 
-	/// Set the max age for each per-track source.
+
+	/// Set the max delay for each per-track source.
 	///
 	/// See [`Consumer`](crate::container::Consumer) for the per-track skip behavior.
 	/// Defaults to
 	/// [`std::time::Duration::ZERO`](std::time::Duration::ZERO) (skip aggressively).
-	pub fn with_max_age(mut self, max_age: std::time::Duration) -> Self {
-		self.max_age = max_age;
+	pub fn with_max_delay(mut self, max_delay: std::time::Duration) -> Self {
+		self.max_delay = max_delay;
 		self
 	}
 
@@ -423,13 +424,7 @@ impl Export {
 
 			let decrypter = self.new_decrypter();
 
-			let Some(source) = ExportSource::for_video(
-				&self.source,
-				name,
-				config,
-				self.max_age,
-				decrypter,
-			)? else {
+			let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_delay, decrypter,)? else {
 				continue;
 			};
 
@@ -469,8 +464,7 @@ impl Export {
 			let flavor = audio_flavor(config)?;
 			ensure_legacy(&config.container, "audio", name)?;
 			let decrypter = self.new_decrypter();
-			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age, decrypter)?
-			else {
+			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_delay, decrypter)? else {
 				continue;
 			};
 			let track_id = u8::try_from(self.audio.len()).context("too many FLV audio tracks")?;

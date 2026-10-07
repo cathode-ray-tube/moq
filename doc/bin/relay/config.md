@@ -25,10 +25,11 @@ timeout = "10s"                      # Handshake deadline. "0" waits forever.
 cert = "cert.pem"                    # Certificate chain and key. Reloaded on change.
 key = "key.pem"
 generate = ["localhost"]             # Or: a self-signed cert for development.
-root = ["peer-ca.pem"]               # Optional: CAs for client certs (mTLS), reported to the auth server.
+root = ["peer-ca.pem"]               # Optional: CAs for client certs (mTLS), reported to the auth server. Needs QUIC.
 
 [listen.tcp]                         # Plaintext qmux over TCP for trusted local workers.
 bind = "127.0.0.1:4444"
+# tls = true                         # Or: qmux over TLS (tls://) with the listen certificate, no client certs.
 
 [listen.unix]                        # Plaintext qmux over a Unix socket, gated by peer credentials.
 bind = "/run/moq/internal.sock"
@@ -151,7 +152,7 @@ See [Authentication](/bin/relay/auth).
 
 ```toml
 [cluster]
-connect = ["https://us-east.example.com/?cost=10"]   # Peers to dial. ?cost prices the link, or use {url, cost, egress, token} objects.
+connect = ["https://us-east.example.com/?cost=10"]   # Peers to dial. ?cost prices the link, or use {url, cost, egress, token, upstream} objects.
 node = "https://us-west.example.com/"                 # This relay's own URL.
 connect_api = "https://api.example.com/peers"        # Or fetch the peer list (JSON array of URLs and/or objects) live.
 token = "cluster.jwt"                                 # JWT for dials without an inline ?jwt=.
@@ -224,6 +225,7 @@ prefix = ".stats"                    # Broadcasts appear under <prefix>/node/<no
 interval = 1                         # Seconds between snapshots.
 node = "sjc/1"                       # Disambiguates relays sharing a cluster.
 depth = 1                            # Also bucket by the first N path segments (per tenant).
+linger = "5m"                        # Keep an empty group's broadcast announced this long. Default.
 ```
 
 Each node publishes `publisher.json`, `subscriber.json`, and `sessions.json`

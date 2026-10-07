@@ -2,10 +2,10 @@
 
 ## Goal
 
-Each stats group broadcast publishes under its own epoch,
-`<prefix>[/<group>]/node/<node>/@<epoch>`, minted each time the group is
-announced, so neither a restarted node nor a group returning from idle reuses
-a broadcast name or the group numbers a relay cached under it.
+Each stats group broadcast at `<prefix>[/<group>]/node/<node>` announces under
+its own epoch, minted each time the group is announced, so neither a restarted
+node nor a group returning from idle reuses a broadcast identity or the group
+numbers a relay cached under it.
 
 ## Plan
 
@@ -16,20 +16,18 @@ a broadcast name or the group numbers a relay cached under it.
   linger and drops its totals; when it returns it announces under a new epoch
   counted from zero. Why: a producer never holds an idle group's state, so its
   memory is bounded by active and lingering groups, and readers see every
-  reset as a new path rather than detecting one. The cost: a reader that
+  reset as a new broadcast rather than detecting one. The cost: a reader that
   misses every frame across the linger loses that epoch's tail; billing
   under-bills by that tail, consistent with the 0-bill baseline.
   At depth 0 the single broadcast never unannounces, so its epoch still lasts
   the producer's life.
 - [#4739](https://github.com/moq-dev/moq/pull/4739)'s original commits are
-  prior art: path syntax, `parse_node_path`, the
-  aggregator's restarted-epoch handling, and the tests. The PR landed only the
+  prior art for the aggregator's restarted-epoch handling and the tests; its
+  path syntax is superseded, since the epoch is on the route. The PR landed only the
   producer-wide group allocator.
-- Decide what an unset node becomes once the epoch follows it (#4739 used
-  `local`).
 - The aggregator treats a new epoch as a new node: its counters add to the
-  retired total from the [bounded aggregate](/quest/m0/broadcast-epoch/stats-aggregate-bound.md)
-  instead of regressing the merged total.
+  merged total instead of regressing it, and the old epoch folds into the
+  retired total once `aggregate::Config::grace` elapses. Test it.
 - Expose each group broadcast's epoch (a per-group accessor replacing
   #4739's `Producer::epoch()`) so a consumer can tell epochs apart.
   MoQ Pro's VOD `storage.json` mints its own epoch rather than sharing a
@@ -45,9 +43,5 @@ a broadcast name or the group numbers a relay cached under it.
 - demo/web stats keys include the epoch. Update `doc/concept/stats.md`,
   `doc/bin/relay/config.md`, and the relay stats config docs.
 
-Public API: path shape change for every stats consumer. Wire: stats broadcast
-names gain a trailing epoch segment.
-
-## Required
-
-- [Bounded stats aggregate](/quest/m0/broadcast-epoch/stats-aggregate-bound.md) - retired nodes fold into a bounded total, which epochs churn
+Public API: stats consumers read the epoch from the route. Wire: none beyond
+the route epoch.

@@ -150,7 +150,7 @@ export class Producer {
 	/**
 	 * When the group was created or last written, in `performance.now()` milliseconds.
 	 *
-	 * @internal Track retention only.
+	 * @internal Idle cache eviction only.
 	 */
 	get activity(): number {
 		return this.#activity;
@@ -430,7 +430,7 @@ export class Consumer {
 		if (!this.#expiry?.expired()) return false;
 
 		if (unread) {
-			this.#terminal = new Error("group exceeded the subscription max age budget");
+			this.#terminal = new Error("group exceeded the subscription max delay budget");
 		} else {
 			this.#ended = true;
 		}

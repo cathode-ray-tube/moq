@@ -34,8 +34,8 @@ Decided (2026-10-04):
   black keyframe, so a viewer released before this field shows black rather
   than a frozen picture. Older viewers otherwise keep selecting a disabled
   rendition; that degradation is accepted and noted in the changelog.
-- Viewer: `@moq/watch` deselects a disabled rendition and keeps its audio
-  graph ([audio graph lifetime](/quest/m1/watch-audio-graph.md)).
+- Viewer: `@moq/watch` deselects a disabled rendition, and its audio graph
+  outlives the absence as it does for a removed one.
 - Bandwidth: a rendition is enabled only once its reservation is granted, and
   disabled, with encoding stopped, when the grant falls below its floor,
   until the grant recovers. A disabled rendition loses its subscribers, and
@@ -50,20 +50,24 @@ Decided (2026-10-04):
   Selection in `js/watch/src/video/source.ts` filters on it, as
   [rendition preference](/quest/m1/rendition-preference.md) expects.
 
-Tests: disabling an audio rendition publishes a catalog with the same
+- Nothing edits a rendition before its config is published (decided
+  2026-10-06, #4945). Today demand on a video track before its first
+  keyframe lets `publish_stalled` (`rs/moq-mux/src/codec/video.rs`) call
+  `track.modify()` on an unpublished rendition, and `moq import ts` exits
+  with `NotPublished`. Deleting the detector removes that path; whatever
+  writes `enabled` must not bring it back.
+
+Tests: demand on a video track before its first keyframe does not end
+the import. Disabling an audio rendition publishes a catalog with the same
 rendition and `enabled: false`, and a viewer deselects it and keeps one
 AudioContext across disable and enable; a legacy `stalled: true` changes
 nothing; nothing in the tree writes `stalled`.
-
-## Required
-
-- [Audio graph lifetime](/quest/m1/watch-audio-graph.md) - the viewer keeps its graph across an absence, which a disable reuses
-- [Audio publish hygiene](/quest/m1/audio-publish-hygiene.md) - lands first, so the publisher pause builds on the shared container producer's disable path
 
 ## Closes
 
 - [#4772](https://github.com/moq-dev/moq/issues/4772) - close this issue when the quest finishes
 - [#4776](https://github.com/moq-dev/moq/issues/4776) - close this issue when the quest finishes
+- [#4945](https://github.com/moq-dev/moq/issues/4945) - a replacement `moq import ts` exits with "rendition is not published"; the relay half is fixed by #4942's epochs
 
 ## Related
 
