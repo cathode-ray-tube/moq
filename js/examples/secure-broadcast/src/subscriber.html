@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MoQ subscriber debug</title>
+  </head>
+  <body>
+    <h1>MoQ subscriber</h1>
+    <label>
+      Relay URL
+      <input id="url" value="https://relay.example.com/anon" size="45" />
+    </label>
+    <label>
+      Broadcast name
+      <input id="name" value="room/alice.hang" />
+    </label>
+    <label>
+      Track
+      <input id="track" value="video/hd" />
+    </label>
+    <button id="subscribe">Subscribe and log frames</button>
+    <pre id="status">Not subscribed</pre>
+    <script type="module" src="/subscriber.js"></script>
+  </body>
+</html>

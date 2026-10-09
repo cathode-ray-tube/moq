@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MoQ publisher debug</title>
+  </head>
+  <body>
+    <h1>MoQ publisher</h1>
+    <label>
+      Relay URL
+      <input id="url" value="https://relay.example.com/anon" size="45" />
+    </label>
+    <label>
+      Broadcast name
+      <input id="name" value="room/alice.hang" />
+    </label>
+    <button id="start">Start camera and publish</button>
+    <button id="stop" disabled>Stop</button>
+    <pre id="status">Not started</pre>
+    <script type="module" src="/src/publisher.ts"></script>
+  </body>
+</html>
