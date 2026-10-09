@@ -17,6 +17,7 @@ import { type Baseline, Estimator } from "../jitter";
 import { hardwareReliable } from "../support/video";
 import type { Capture } from "./capture";
 import { normalizeSource, type Source } from "./types";
+import type { FrameEncrypter } from "moq-secure";
 
 /** Cumulative encoder output totals, measured from the chunks the encoder produces. */
 export interface Stats {
@@ -81,8 +82,8 @@ export type EncoderInput = {
 
 /** Constructor options: the wired inputs plus the live-editable {@link Config} tuning knobs. */
 export type EncoderProps = Inputs<EncoderInput> & {
-	// User tuning knobs. Seed a value or wire a Signal; also live-editable via `encoder.config`.
 	config?: Config | Signal<Config | undefined>;
+	encrypter?: FrameEncrypter;
 };
 
 type EncoderOutput = {
@@ -109,6 +110,8 @@ export class Encoder {
 	readonly name: string;
 
 	readonly in: Readonlys<EncoderInput>;
+
+	readonly #encrypter?: FrameEncrypter;
 
 	/** The live-editable encoder tuning knobs (codec, dimensions, bitrate, frame rate). */
 	config: Signal<Config | undefined>;
@@ -175,6 +178,7 @@ export class Encoder {
 
 	constructor(name: string, props?: EncoderProps) {
 		this.name = name;
+		this.#encrypter = props?.encrypter;
 		this.in = {
 			enabled: getter(props?.enabled ?? true),
 			broadcast: getter(props?.broadcast),
@@ -292,8 +296,16 @@ export class Encoder {
 		// current group, marking the break so a later subscriber resumes on the same track without
 		// the pre-gap group reading as live. A fatal encoder error still aborts the track through
 		// producer.close(err) below.
+        if (this.#encrypter) producer.withEncrypter(this.#encrypter);
+		let writes = Promise.resolve();
 		effect.cleanup(() => {
-			if (track.closed.peek() === undefined) producer.discontinuity();
+		if (track.closed.peek() === undefined) {
+		void writes
+			.then(() => producer.discontinuity())
+			.catch((err: unknown) => {
+				producer.close(err instanceof Error ? err : new Error(String(err)));
+			});
+			}
 		});
 
 		let lastKeyframe: Time.Micro | undefined;
@@ -313,7 +325,11 @@ export class Encoder {
 						keyframes: key ? stats.keyframes + 1 : stats.keyframes,
 					}));
 
-					producer.encode(frame, frame.timestamp as Time.Micro, key);
+					writes = writes
+					.then(() => producer.encode(frame, frame.timestamp as Time.Micro, key))
+					.catch((err: unknown) => {
+					producer.close(err instanceof Error ? err : new Error(String(err)));
+					});
 					if (this.#estimator.flush(frame.timestamp, baseline)) {
 						const catalog = this.#out.catalog.peek();
 						if (catalog) this.#out.catalog.set({ ...catalog, ...this.#estimator.estimate });
