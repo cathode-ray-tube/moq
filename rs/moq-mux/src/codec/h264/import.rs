@@ -50,7 +50,14 @@ impl Import {
 		// cannot disagree with what the rendition advertises.
 		let wire = crate::catalog::hang::Container::try_from(&hint)?;
 		let catalog = crate::codec::video::Catalog::new(hint);
+
+
+
+		//TODO: call track.with_encrypter() to return container Producer that performs encryption (after initalization)
 		let track = reserved.video(track, wire, None)?;
+
+
+
 		let mut import = Self {
 			avc1: false,
 			track,

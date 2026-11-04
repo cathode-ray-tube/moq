@@ -1,67 +1,71 @@
-import * as Moq from "@moq/net";
+import * as Watch from "@moq/watch";
+import { Signal } from "@moq/signals";
+import { InMemoryKeyStore, MoqSecureDecrypter } from "moq-secure";
 
-const status = document.querySelector("#status");
-const subscribeButton = document.querySelector("#subscribe");
+const status = document.querySelector("#status")!;
+const subscribeButton =
+  document.querySelector<HTMLButtonElement>("#subscribe")!;
 
-let connection;
-let request;
-let consumer;
-let stopped = false;
+let connection: Watch.Net.Connection | undefined;
+let player: Watch.Player | undefined;
 
-subscribeButton.addEventListener("click", async () => {
+const canvas = document.createElement("canvas");
+canvas.style.display = "block";
+canvas.style.width = "100%";
+canvas.style.maxWidth = "960px";
+canvas.style.background = "black";
+document.body.insertBefore(canvas, status);
+
+subscribeButton.addEventListener("click", () => {
   subscribeButton.disabled = true;
-  stopped = false;
 
   try {
-    const url = new URL(document.querySelector("#url").value);
-    const name = document.querySelector("#name").value.trim();
-    const trackName = document.querySelector("#track").value.trim();
+    const url = new URL(
+      document.querySelector<HTMLInputElement>("#url")!.value,
+    );
+    const name = document
+      .querySelector<HTMLInputElement>("#name")!
+      .value.trim();
 
-    connection = new Moq.Connection({ url });
+    if (!name) throw new Error("Enter a broadcast name.");
 
-    // Ask the connected origin for the named broadcast.
-    request = connection.origin.request(Moq.Path.from(name));
+    // Must match the publisher's key ID and key bytes.
+    const keyStore = new InMemoryKeyStore();
+    keyStore.setKeyEncoded(
+      1,
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    );
 
-    // Wait until the broadcast is available.
-    let active = request.active.peek();
-    while (!active && !stopped) {
-      await request.active.changed();
-      active = request.active.peek();
-    }
+    // The publisher uses nSigned: 0, so this stream is unsigned.
+    const decrypter = new MoqSecureDecrypter({
+      keyStore,
+      broadcasterPublicKey: new Uint8Array(),
+    });
 
-    if (stopped || !active) return;
+    connection = new Watch.Net.Connection({
+      url,
+      enabled: true,
+    });
 
-    consumer = active.track(trackName).subscribe({ priority: 0 });
-    status.textContent = `Subscribed to ${name} / ${trackName}. Check the console.`;
+    player = new Watch.Player({
+      origin: connection.origin,
+      probe: connection.probe,
+      name: Watch.Net.Path.from(name),
+      video: { canvas },
+      audio: { muted: new Signal(false) },
+      decrypter,
+    });
 
-    for (;;) {
-      const group = await consumer.recvGroup();
-      if (!group || stopped) break;
-
-      for (;;) {
-        const frame = await group.readFrame();
-        if (!frame || stopped) break;
-
-        // Log metadata and a short byte prefix, not the entire video payload.
-        console.log("Received frame", {
-          bytes: frame.payload.byteLength,
-          timestamp: frame.timestamp,
-          firstBytes: Array.from(frame.payload.slice(0, 12)),
-        });
-      }
-    }
-
-    status.textContent = "Track ended.";
+    status.textContent = `Watching ${name}`;
   } catch (error) {
     console.error(error);
-    status.textContent = `${error?.name ?? "Error"}: ${error?.message ?? error}`;
+    status.textContent =
+      `${(error as Error)?.name ?? "Error"}: ${(error as Error)?.message ?? error}`;
+
+    player?.close();
+    player = undefined;
+    connection?.close();
+    connection = undefined;
     subscribeButton.disabled = false;
   }
-});
-
-window.addEventListener("beforeunload", () => {
-  stopped = true;
-  consumer?.close?.();
-  request?.close?.();
-  connection?.close?.();
 });

@@ -4,54 +4,59 @@ import {
   MoqSecureEncrypter,
 } from "moq-secure";
 
-const status = document.querySelector("#status");
-const startButton = document.querySelector("#start");
-const stopButton = document.querySelector("#stop");
+const status = document.querySelector("#status")!;
+const startButton = document.querySelector<HTMLButtonElement>("#start")!;
+const stopButton = document.querySelector<HTMLButtonElement>("#stop")!;
 
-let connection;
-let broadcast;
-let camera;
-let encoder;
+let connection: Publish.Net.Connection | undefined;
+let origin: Publish.Net.Origin.Producer | undefined;
+let broadcast: Publish.Broadcast | undefined;
+let camera: InstanceType<typeof Publish.Source.Camera> | undefined;
+let encoder: Publish.Video.Encoder | undefined;
 
 startButton.addEventListener("click", async () => {
   startButton.disabled = true;
 
   try {
-    const url = new URL(document.querySelector("#url").value);
-    const name = document.querySelector("#name").value.trim();
+    const url = new URL(
+      document.querySelector<HTMLInputElement>("#url")!.value,
+    );
+    const name = document
+      .querySelector<HTMLInputElement>("#name")!
+      .value.trim();
 
     if (!name) throw new Error("Enter a broadcast name.");
 
-    // Construct the camera source in this click handler so its permission
-    // request happens as a result of the user gesture.
+    // Create the camera in the click handler so permission is requested
+    // from a user gesture.
     camera = new Publish.Source.Camera({ enabled: true });
 
-    connection = new Publish.Net.Connection({
+    origin = new Publish.Net.Origin.Producer();
+
+    connection = await Publish.Net.Connection.connect({
       url,
-      enabled: true,
+      publish: origin.consume(),
+      consume: origin,
     });
 
     broadcast = new Publish.Broadcast({
-      origin: connection.origin,
+      origin,
       enabled: true,
       name: Publish.Net.Path.from(name),
     });
 
     const video = new Publish.Signals.Computed(
-      (effect) => effect.get(camera.out.source)?.video,
+      (effect) => effect.get(camera!.out.source)?.video,
     );
     const capture = new Publish.Video.Capture({ source: video });
 
-    // TEST KEY ONLY. Replace it with a securely generated 32-byte key.
-    // The receiver must use the same key and keyId to decrypt later.
+    // TEST KEY ONLY. Replace with a securely generated 32-byte key.
     const keyStore = new InMemoryKeyStore();
     keyStore.setKeyEncoded(
       1,
       "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     );
 
-    // Signing is disabled here. Check encryptFrame to confirm whether it
-    // accepts an empty signingPrivateKey when nSigned is 0.
     const encrypter = new MoqSecureEncrypter({
       keyStore,
       signingPrivateKey: new Uint8Array(),
@@ -72,22 +77,22 @@ startButton.addEventListener("click", async () => {
       `Publishing ${name}\nTrack: video/hd\nWaiting for a subscriber…`;
   } catch (error) {
     console.error(error);
-    status.textContent = `${error?.name ?? "Error"}: ${error?.message ?? error}`;
+    status.textContent =
+      `${(error as Error)?.name ?? "Error"}: ${(error as Error)?.message ?? error}`;
     startButton.disabled = false;
   }
 });
 
 stopButton.addEventListener("click", () => {
-  // Disabling components lets their effects clean up.
-  encoder?.enabled?.set?.(false);
-  camera?.enabled?.set?.(false);
-
-  connection?.close?.();
+  encoder?.enabled.set(false);
+  camera?.enabled.set(false);
+  connection?.close();
 
   encoder = undefined;
-  camera = undefined;
   broadcast = undefined;
+  camera = undefined;
   connection = undefined;
+  origin = undefined;
 
   stopButton.disabled = true;
   startButton.disabled = false;

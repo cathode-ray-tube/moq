@@ -1,7 +1,16 @@
 import type * as Catalog from "@moq/hang/catalog";
 import type * as Moq from "@moq/net";
 import { Path, Time } from "@moq/net";
-import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
+import {
+	Effect,
+	type Getter,
+	getter,
+	type Inputs,
+	type Readonlys,
+	readonlys,
+	Signal,
+} from "@moq/signals";
+import type { FrameDecrypter } from "moq-secure";
 import * as Audio from "./audio";
 import { Broadcast, type CatalogFormat } from "./broadcast";
 import { type Delay, Sync } from "./sync";
@@ -47,7 +56,10 @@ export type PlayerInput = {
 };
 
 /** Constructor options for {@link Player}; omitted controls use the element defaults. */
-export type PlayerProps = Inputs<PlayerInput>;
+export type PlayerProps = Inputs<PlayerInput> & {
+	/** Optional decrypter for encrypted legacy-container video. */
+	decrypter?: FrameDecrypter;
+};
 
 /** Owns the broadcast, synchronized media pipelines, and their download policy. */
 export class Player {
@@ -114,14 +126,29 @@ export class Player {
 			audioSource.close();
 		});
 
-		this.text = new Text.Source({ broadcast: this.broadcast, target: this.in.captions });
+		this.text = new Text.Source({
+			broadcast: this.broadcast,
+			target: this.in.captions,
+		});
 		this.#signals.cleanup(() => this.text.close());
 
-		this.sync = new Sync({ delay: this.in.delay, buffer: this.in.buffer });
+		this.sync = new Sync({
+			delay: this.in.delay,
+			buffer: this.in.buffer,
+		});
 		this.#signals.cleanup(() => this.sync.close());
 
-		this.video = new Video.Decoder({ source: videoSource, sync: this.sync, enabled: this.#videoEnabled });
-		this.audio = new Audio.Decoder({ source: audioSource, sync: this.sync, enabled: this.#audioEnabled });
+		this.video = new Video.Decoder({
+			source: videoSource,
+			sync: this.sync,
+			enabled: this.#videoEnabled,
+			decrypter: props.decrypter,
+		});
+		this.audio = new Audio.Decoder({
+			source: audioSource,
+			sync: this.sync,
+			enabled: this.#audioEnabled,
+		});
 		this.#signals.cleanup(() => {
 			this.video.close();
 			this.audio.close();
@@ -152,10 +179,14 @@ export class Player {
 		this.#signals.cleanup(() => this.textRenderer.close());
 
 		this.#signals.run((effect) => {
-			this.#captionsEnabled.set(effect.get(this.in.enabled) && !effect.get(this.in.paused));
+			this.#captionsEnabled.set(
+				effect.get(this.in.enabled) && !effect.get(this.in.paused),
+			);
 		});
 		this.#signals.run((effect) => {
-			this.#audioEnabled.set(effect.get(this.in.enabled) && effect.get(this.emitter.out.enabled));
+			this.#audioEnabled.set(
+				effect.get(this.in.enabled) && effect.get(this.emitter.out.enabled),
+			);
 		});
 		this.#signals.run((effect) => {
 			const visible = effect.get(this.renderer.out.visible);
@@ -165,7 +196,9 @@ export class Player {
 				this.#videoEnabled.set(visible);
 			} else {
 				// Keep downloading a paused poster until a frame is painted, then stop.
-				this.#videoEnabled.set(visible && !effect.get(this.renderer.out.frame));
+				this.#videoEnabled.set(
+					visible && !effect.get(this.renderer.out.frame),
+				);
 			}
 		});
 	}

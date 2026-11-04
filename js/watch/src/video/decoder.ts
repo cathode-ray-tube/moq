@@ -13,6 +13,7 @@ import {
 	readonlys,
 	Signal,
 } from "@moq/signals";
+import type { FrameDecrypter } from "/home/user/moq-secure/js/src/decrypter.js";
 import { base64ToBytes } from "../base64";
 import { nextMedia, subscribeMedia } from "../media";
 
@@ -42,6 +43,8 @@ export type DecoderProps = Inputs<DecoderInput> & {
 	source: Source;
 	/** Shared playback clock. */
 	sync: Sync;
+	/** Optional decrypter for encrypted legacy-container payloads. */
+	decrypter?: FrameDecrypter;
 };
 
 /** Cumulative video statistics since the decoder started. */
@@ -78,6 +81,7 @@ export class Decoder {
 	readonly in: Readonlys<DecoderInput>;
 	readonly source: Source;
 	readonly sync: Sync;
+	readonly #decrypter?: FrameDecrypter;
 
 	readonly #out: DecoderOutput = {
 		frame: new Signal<VideoFrame | undefined>(undefined),
@@ -95,7 +99,9 @@ export class Decoder {
 	// The rendition preparing to replace the active one, with the catalog of the broadcast it
 	// subscribed to. One value so a later source that reuses the track name still notifies:
 	// the name alone would compare equal, and the jitter effect would keep the previous catalog.
-	#pending = new Signal<{ track: string; catalog: Getter<Catalog.Root | undefined> } | undefined>(undefined);
+	#pending = new Signal<
+		{ track: string; catalog: Getter<Catalog.Root | undefined> } | undefined
+	>(undefined);
 	// The active track's arrival estimate from its container consumer.
 	#spread = new Signal<Time.Milli | undefined>(undefined);
 	readonly #identity: Computed<PlaybackIdentity | undefined>;
@@ -117,6 +123,8 @@ export class Decoder {
 
 		this.source = props.source;
 		this.sync = props.sync;
+		this.#decrypter = props.decrypter;
+
 		// "auto" holds the arrival estimate plus the active rendition's catalog `delay`, floored at the
 		// catalog requirement. The estimate cancels any offset between tracks, so the delay is added
 		// back. The audio frame term has no video counterpart: the rendition jitter already covers a
@@ -126,8 +134,13 @@ export class Decoder {
 			const spread = effect.get(this.#spread);
 			if (spread === undefined) return jitter;
 			const active = effect.get(this.#active);
-			const delay = active && effect.get(active.catalog)?.video?.renditions?.[active.track]?.delay;
-			return Time.Milli.max(Time.Milli.add(spread, Time.Milli(delay ?? 0)), jitter ?? Time.Milli.zero);
+			const delay =
+				active &&
+				effect.get(active.catalog)?.video?.renditions?.[active.track]?.delay;
+			return Time.Milli.max(
+				Time.Milli.add(spread, Time.Milli(delay ?? 0)),
+				jitter ?? Time.Milli.zero,
+			);
 		});
 		this.#signals.cleanup(this.sync.register(target));
 		this.#identity = this.#signals.computed((effect) => {
@@ -147,7 +160,10 @@ export class Decoder {
 	// shared catalog already describes the next broadcast, and the same track name there is a
 	// different rendition.
 	#runJitter(effect: Effect): void {
-		const floor = (track: string | undefined, catalog: Getter<Catalog.Root | undefined> | undefined) => {
+		const floor = (
+			track: string | undefined,
+			catalog: Getter<Catalog.Root | undefined> | undefined,
+		) => {
 			if (track === undefined || catalog === undefined) return undefined;
 			const config = effect.get(catalog)?.video?.renditions?.[track];
 			return config && renditionJitter(config);
@@ -176,7 +192,8 @@ export class Decoder {
 
 		// Honor a per-rendition `broadcast` override: subscribe on the resolved source
 		// broadcast instead of the catalog's own broadcast.
-		const active: Moq.Broadcast.Consumer | undefined = broadcast.relativeBroadcast(effect, identity.broadcast);
+		const active: Moq.Broadcast.Consumer | undefined =
+			broadcast.relativeBroadcast(effect, identity.broadcast);
 		if (!active) {
 			// Going offline should clear the last rendered frame.
 			this.#active.set(undefined);
@@ -193,6 +210,7 @@ export class Decoder {
 			config: identity.decoder,
 			stats: this.#out.stats,
 			catalog: broadcast.out.catalog,
+			decrypter: this.#decrypter,
 		});
 		effect.set(this.#pending, { track, catalog: broadcast.out.catalog });
 
@@ -208,7 +226,14 @@ export class Decoder {
 				if (pendingTimestamp === undefined) return;
 
 				// Hold off until the new rendition has caught up to the picture it's replacing.
-				if (!caughtUp({ playhead: pendingTimestamp, active: effect.get(current.timestamp) })) return;
+				if (
+					!caughtUp({
+						playhead: pendingTimestamp,
+						active: effect.get(current.timestamp),
+					})
+				) {
+					return;
+				}
 			}
 
 			// Upgrade the pending track to active.
@@ -238,7 +263,9 @@ export class Decoder {
 		effect.run((inner) => {
 			const frame = inner.get(active.frame);
 			if (!frame) return; // A promoted track holds the previous picture until its first frame.
-			this.#out.timestamp.set(Time.Milli.fromMicro(frame.timestamp as Time.Micro));
+			this.#out.timestamp.set(
+				Time.Milli.fromMicro(frame.timestamp as Time.Micro),
+			);
 			this.#out.frame.update((prev) => {
 				prev?.close();
 				return frame.clone();
@@ -254,7 +281,10 @@ export class Decoder {
 
 		const display = catalog.display;
 		if (display) {
-			effect.set(this.#out.display, { width: display.width, height: display.height });
+			effect.set(this.#out.display, {
+				width: display.width,
+				height: display.height,
+			});
 			return;
 		}
 
@@ -263,7 +293,10 @@ export class Decoder {
 
 		effect.set(
 			this.#out.display,
-			rotateVideoDimensions({ width: frame.displayWidth, height: frame.displayHeight }, catalog.rotation),
+			rotateVideoDimensions(
+				{ width: frame.displayWidth, height: frame.displayHeight },
+				catalog.rotation,
+			),
 		);
 	}
 
@@ -286,7 +319,6 @@ export class Decoder {
 
 	close() {
 		this.#clearCurrentFrame();
-
 		this.#signals.close();
 	}
 
@@ -302,6 +334,8 @@ interface DecoderTrackProps {
 	// The broadcast catalog this subscription started from. Updates on that broadcast still apply;
 	// a later source does not.
 	catalog: Getter<Catalog.Root | undefined>;
+	/** Optional decrypter for encrypted legacy-container payloads. */
+	decrypter?: FrameDecrypter;
 
 	stats: Signal<Stats | undefined>;
 }
@@ -312,6 +346,7 @@ class DecoderTrack {
 	track: string;
 	config: DecoderConfig;
 	catalog: Getter<Catalog.Root | undefined>;
+	decrypter?: FrameDecrypter;
 	stats: Signal<Stats | undefined>;
 
 	timestamp = new Signal<Time.Milli | undefined>(undefined);
@@ -338,6 +373,7 @@ class DecoderTrack {
 		this.track = props.track;
 		this.config = props.config;
 		this.catalog = props.catalog;
+		this.decrypter = props.decrypter;
 		this.stats = props.stats;
 
 		this.#signals.run(this.#run.bind(this));
@@ -359,7 +395,9 @@ class DecoderTrack {
 					// below, this frame belongs to the reneged timeline and must be dropped.
 					const generation = this.#discontinuity;
 
-					const timestamp = Time.Milli.fromMicro(frame.timestamp as Time.Micro);
+					const timestamp = Time.Milli.fromMicro(
+						frame.timestamp as Time.Micro,
+					);
 					if (timestamp < (this.timestamp.peek() ?? 0)) {
 						// Late frame, don't render it.
 						return;
@@ -367,7 +405,7 @@ class DecoderTrack {
 
 					// `received()` runs at submit, so a frame is anchored by the time it decodes.
 					// Reaching here unanchored means a rewind reset the clock after this frame's
-					// received(), so it predates the current timeline. Drop it: painting it would
+					// `received()`, so it predates the current timeline. Drop it: painting it would
 					// set `timestamp` from the old timeline and late-reject the whole rewind.
 					if (this.sync.out.reference.peek() === undefined) return;
 
@@ -377,7 +415,9 @@ class DecoderTrack {
 					}
 
 					// Returns immediately when the latency is "instant".
-					const ok = await effect.race(this.sync.wait(timestamp).then(() => true));
+					const ok = await effect.race(
+						this.sync.wait(timestamp).then(() => true),
+					);
 					if (!ok) return;
 					if (generation !== this.#discontinuity) return; // a rewind happened while waiting
 
@@ -418,12 +458,25 @@ class DecoderTrack {
 		}
 	}
 
-	#runLegacy(effect: Effect, sub: Moq.Track.Subscriber, decoder: VideoDecoder): void {
+	#runLegacy(
+		effect: Effect,
+		sub: Moq.Track.Subscriber,
+		decoder: VideoDecoder,
+	): void {
 		const format =
 			this.config.container.kind === "loc"
 				? new Container.Loc.Format("video")
 				: new Container.Legacy.Format(this.config);
-		// Create consumer that reorders groups/frames up to the provided latency.
+
+		// Decryption is opt-in, matching the producer's optional encrypter.
+		// LOC and CMAF formats are left unchanged.
+		if (
+			this.config.container.kind !== "loc" &&
+			this.decrypter !== undefined
+		) {
+			format.withDecrypter(this.decrypter);
+		}
+
 		const consumer = new Container.Consumer(sub, {
 			format,
 			maxDelay: this.sync.out.maxDelay,
@@ -434,7 +487,9 @@ class DecoderTrack {
 		effect.run((inner) => {
 			const network = inner.get(consumer.buffered);
 			const decode = inner.get(this.#buffered);
-			this.buffered.update(() => Container.mergeBufferedRanges(network, decode));
+			this.buffered.update(() =>
+				Container.mergeBufferedRanges(network, decode),
+			);
 		});
 
 		// Publish the arrival estimate for the "auto" target.
@@ -442,7 +497,9 @@ class DecoderTrack {
 
 		decoder.configure({
 			codec: this.config.codec,
-			description: this.config.description ? Util.Hex.toBytes(this.config.description) : undefined,
+			description: this.config.description
+				? Util.Hex.toBytes(this.config.description)
+				: undefined,
 			displayAspectWidth: this.config.displayAspectWidth,
 			displayAspectHeight: this.config.displayAspectHeight,
 			optimizeForLatency: this.config.optimizeForLatency,
@@ -470,12 +527,15 @@ class DecoderTrack {
 				const stale = latest !== undefined && next.group < latest;
 				this.stats.update((current) => ({
 					frameCount: (current?.frameCount ?? 0) + (stale ? 0 : 1),
-					bytesReceived: (current?.bytesReceived ?? 0) + frame.payload.byteLength,
+					bytesReceived:
+						(current?.bytesReceived ?? 0) + frame.payload.byteLength,
 				}));
 				if (stale) continue;
 
 				// Mark that we received this frame right now.
-				const timestamp = Time.Milli.fromMicro(frame.timestamp as Time.Micro);
+				const timestamp = Time.Milli.fromMicro(
+					frame.timestamp as Time.Micro,
+				);
 				this.sync.received(timestamp, "video");
 
 				const chunk = new EncodedVideoChunk({
@@ -490,24 +550,32 @@ class DecoderTrack {
 				// from DTS), so adjacency neither proves continuity nor rules out a gap the consumer
 				// skipped, and reporting a skipped span as decoded overstates the buffer.
 				if (previous !== undefined && next.continuous) {
-					this.#addBuffered(Time.Milli.fromMicro(previous), Time.Milli.fromMicro(frame.timestamp));
+					this.#addBuffered(
+						Time.Milli.fromMicro(previous),
+						Time.Milli.fromMicro(frame.timestamp),
+					);
 				}
 
 				previous = frame.timestamp;
-
 				latest = next.group;
 				decoder.decode(chunk);
 			}
 		});
 	}
 
-	#runCmaf(effect: Effect, sub: Moq.Track.Subscriber, decoder: VideoDecoder): void {
+	#runCmaf(
+		effect: Effect,
+		sub: Moq.Track.Subscriber,
+		decoder: VideoDecoder,
+	): void {
 		const container = this.config.container;
 		if (container.kind !== "cmaf") return;
 
 		const initSegment = base64ToBytes(container.init);
 		const init = Container.Cmaf.decodeInitSegment(initSegment);
-		const description = this.config.description ? Util.Hex.toBytes(this.config.description) : init.description;
+		const description = this.config.description
+			? Util.Hex.toBytes(this.config.description)
+			: init.description;
 
 		const consumer = new Container.Consumer(sub, {
 			format: new Container.Cmaf.Format(init),
@@ -519,7 +587,9 @@ class DecoderTrack {
 		effect.run((inner) => {
 			const network = inner.get(consumer.buffered);
 			const decode = inner.get(this.#buffered);
-			this.buffered.update(() => Container.mergeBufferedRanges(network, decode));
+			this.buffered.update(() =>
+				Container.mergeBufferedRanges(network, decode),
+			);
 		});
 
 		// Publish the arrival estimate for the "auto" target.
@@ -556,7 +626,8 @@ class DecoderTrack {
 				const stale = latest !== undefined && next.group < latest;
 				this.stats.update((current) => ({
 					frameCount: (current?.frameCount ?? 0) + (stale ? 0 : 1),
-					bytesReceived: (current?.bytesReceived ?? 0) + frame.payload.byteLength,
+					bytesReceived:
+						(current?.bytesReceived ?? 0) + frame.payload.byteLength,
 				}));
 				if (stale) continue;
 
@@ -567,7 +638,10 @@ class DecoderTrack {
 				// Track decode buffer (see #runLegacy: bridge on the consumer's continuity signal,
 				// never on group adjacency, which proves nothing about the timeline).
 				if (previous !== undefined && next.continuous) {
-					this.#addBuffered(Time.Milli.fromMicro(previous), Time.Milli.fromMicro(frame.timestamp));
+					this.#addBuffered(
+						Time.Milli.fromMicro(previous),
+						Time.Milli.fromMicro(frame.timestamp),
+					);
 				}
 
 				previous = frame.timestamp;
@@ -646,7 +720,10 @@ class DecoderTrack {
 async function supported(config: Catalog.VideoConfig): Promise<boolean> {
 	if (!Catalog.containerSupported(config.container)) {
 		// `kind` is the literal "unknown" tag; the container the publisher actually named is in `raw`.
-		const kind = config.container.kind === "unknown" ? config.container.raw.kind : config.container.kind;
+		const kind =
+			config.container.kind === "unknown"
+				? config.container.raw.kind
+				: config.container.kind;
 		console.warn(`video: ignoring rendition with unknown container: ${kind}`);
 		return false;
 	}
@@ -656,13 +733,18 @@ async function supported(config: Catalog.VideoConfig): Promise<boolean> {
 		description = Util.Hex.toBytes(config.description);
 	} else if (config.container.kind === "cmaf") {
 		try {
-			description = Container.Cmaf.decodeInitSegment(base64ToBytes(config.container.init)).description;
+			description = Container.Cmaf.decodeInitSegment(
+				base64ToBytes(config.container.init),
+			).description;
 		} catch (err) {
 			// A malformed init segment means we can't extract the codec
 			// description, so we can't probe support reliably. Reject the
 			// track rather than letting isConfigSupported pass on a
 			// description-less config and then having runCmaf fail later.
-			console.warn(`video: malformed CMAF init segment for codec ${config.codec}`, err);
+			console.warn(
+				`video: malformed CMAF init segment for codec ${config.codec}`,
+				err,
+			);
 			return false;
 		}
 	}

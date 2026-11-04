@@ -42,6 +42,7 @@
 		"js/room",
 		"js/signals",
 		"js/wasm",
+		"js/examples/secure-broadcast",
 		"demo/boy",
 		"demo/web",
 		"js/moq-boy",

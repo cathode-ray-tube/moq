@@ -12,10 +12,10 @@
     "vite": "^8.3.0"
   },
   "dependencies": {
-    "@moq/net": "^0.4.2",
-    "@moq/publish": "^0.5.2",
+    "@moq/net": "workspace:^",
+    "@moq/publish": "file:../../publish",
     "@noble/ciphers": "^2.4.0",
     "@noble/hashes": "^2.4.0",
-    "moq-secure": "file:../../../../moq-secure/js/moq-secure-0.1.0.tgz"
+    "moq-secure": "0.1.10"
   }
 }
