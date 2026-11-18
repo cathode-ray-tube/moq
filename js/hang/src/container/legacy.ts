@@ -6,8 +6,8 @@ export type { BufferedRange, BufferedRanges, Frame } from "./types";
 import type { AudioConfig, VideoConfig } from "../catalog";
 import type { Format as ContainerFormat } from "./format";
 import type { Frame } from "./types";
-import type { FrameDecrypter } from "/home/user/moq-secure/js/src/decrypter.js";
-import type { FrameEncrypter } from "/home/user/moq-secure/js/encrypter.js";
+import type { FrameDecrypter } from "@cathode-ray-tube/moq-secure";
+import type { FrameEncrypter } from "@cathode-ray-tube/moq-secure";
 
 /** The legacy hang container: a microsecond timestamp varint followed by the raw codec payload. */
 export class Format implements ContainerFormat {

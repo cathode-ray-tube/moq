@@ -18,7 +18,11 @@ export default defineConfig({
 		rollupOptions: {
 			// Keep every @moq workspace dep (and its subpaths, e.g. @moq/signals/dom)
 			// external so consumers dedupe against their own copy instead of bundling ours.
-			external: (id) => id.startsWith("@moq/"),
+			external: (id) =>
+  id === "@moq/net" ||
+  id.startsWith("@moq/net/") ||
+  id === "@cathode-ray-tube/moq-secure" ||
+  id.startsWith("@cathode-ray-tube/moq-secure/"),
 		},
 		sourcemap: true,
 		target: "esnext",

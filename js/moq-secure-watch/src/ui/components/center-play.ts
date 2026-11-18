@@ -1,0 +1,26 @@
+import type { Effect } from "@moq/signals";
+import type MoqWatch from "../../element";
+import { icon, play } from "../icons";
+
+/** A large centered play button shown while paused. */
+export function centerPlay(parent: Effect, watch: MoqWatch): HTMLElement {
+	const button = document.createElement("button");
+	button.type = "button";
+	button.className = "center-play flex-center";
+	button.title = "Play";
+	button.setAttribute("aria-label", "Play");
+	button.replaceChildren(icon(play));
+
+	parent.run((effect) => {
+		const paused = effect.get(watch.controls.paused);
+		const sourceError = effect.get(watch.video.source.out.error);
+		const refused = effect.get(watch.broadcast.out.error);
+		button.style.display = paused && !sourceError && !refused ? "" : "none";
+	});
+
+	parent.event(button, "click", () => {
+		watch.paused = false;
+	});
+
+	return button;
+}

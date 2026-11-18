@@ -12,10 +12,10 @@
     "vite": "^8.3.0"
   },
   "dependencies": {
-    "@moq/net": "workspace:^",
-    "@moq/publish": "file:../../publish",
+    "@moq/net": "0.4.2",
+    "@cathode-ray-tube/moq-secure-publish": "workspace:^",
     "@noble/ciphers": "^2.4.0",
     "@noble/hashes": "^2.4.0",
-    "moq-secure": "0.1.10"
+    "@cathode-ray-tube/moq-secure": "0.1.10"
   }
 }

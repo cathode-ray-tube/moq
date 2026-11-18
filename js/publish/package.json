@@ -1,7 +1,7 @@
 {
 	"name": "@moq/publish",
 	"type": "module",
-	"version": "0.5.2",
+	"version": "0.1.0",
 	"jsr": false,
 	"description": "Publish Media over QUIC broadcasts",
 	"license": "(MIT OR Apache-2.0)",
@@ -29,6 +29,7 @@
 		"release": "bun ../common/release.ts"
 	},
 	"dependencies": {
+		"@cathode-ray-tube/moq-secure": "0.1.10",
 		"@moq/hang": "workspace:^",
 		"@moq/json": "workspace:^",
 		"@moq/net": "workspace:^",
@@ -36,6 +37,7 @@
 		"mediabunny": "^1.60.0"
 	},
 	"devDependencies": {
+		"@cathode-ray-tube/moq-secure": "0.1.10",
 		"@types/audioworklet": "^0.0.100",
 		"@types/bun": "^1.4.2",
 		"@typescript/lib-dom": "npm:@types/web@^0.0.350",

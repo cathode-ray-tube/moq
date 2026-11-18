@@ -17,7 +17,7 @@ import { type Baseline, Estimator } from "../jitter";
 import { hardwareReliable } from "../support/video";
 import type { Capture } from "./capture";
 import { normalizeSource, type Source } from "./types";
-import type { FrameEncrypter } from "moq-secure";
+import type { FrameEncrypter } from "@cathode-ray-tube/moq-secure";
 
 /** Cumulative encoder output totals, measured from the chunks the encoder produces. */
 export interface Stats {

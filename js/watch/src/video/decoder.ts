@@ -13,7 +13,7 @@ import {
 	readonlys,
 	Signal,
 } from "@moq/signals";
-import type { FrameDecrypter } from "/home/user/moq-secure/js/src/decrypter.js";
+import type { FrameDecrypter } from "@cathode-ray-tube/moq-secure";
 import { base64ToBytes } from "../base64";
 import { nextMedia, subscribeMedia } from "../media";
 

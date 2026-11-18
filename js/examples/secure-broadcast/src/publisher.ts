@@ -1,8 +1,8 @@
-import * as Publish from "@moq/publish";
+import * as Publish from "@cathode-ray-tube/moq-secure-publish";
 import {
   InMemoryKeyStore,
   MoqSecureEncrypter,
-} from "moq-secure";
+} from "@cathode-ray-tube/moq-secure";
 
 const status = document.querySelector("#status")!;
 const startButton = document.querySelector<HTMLButtonElement>("#start")!;
@@ -29,7 +29,7 @@ startButton.addEventListener("click", async () => {
 
     // Create the camera in the click handler so permission is requested
     // from a user gesture.
-    camera = new Publish.Source.Camera({ enabled: true });
+    camera = new Publish.Source.Screen({ enabled: true });
 
     origin = new Publish.Net.Origin.Producer();
 

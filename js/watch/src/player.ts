@@ -10,7 +10,7 @@ import {
 	readonlys,
 	Signal,
 } from "@moq/signals";
-import type { FrameDecrypter } from "moq-secure";
+import type { FrameDecrypter } from "@cathode-ray-tube/moq-secure";
 import * as Audio from "./audio";
 import { Broadcast, type CatalogFormat } from "./broadcast";
 import { type Delay, Sync } from "./sync";

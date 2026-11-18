@@ -1,7 +1,7 @@
 import type { Time } from "@moq/net";
 import type { Format as ContainerFormat } from "../format";
 import type { Frame } from "../types";
-import type { FrameDecrypter } from "../secure/decrypter.js";
+import type { FrameDecrypter } from "@cathode-ray-tube/moq-secure";
 import { decodeDataSegment, type InitSegment } from "./decode";
 
 /** CMAF container format: decodes each MoQ frame as a moof+mdat fragment using the parsed init segment. */

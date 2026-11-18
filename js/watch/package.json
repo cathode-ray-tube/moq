@@ -29,6 +29,7 @@
 		"release": "bun ../common/release.ts"
 	},
 	"dependencies": {
+		"@cathode-ray-tube/moq-secure": "0.1.10",
 		"@moq/hang": "workspace:^",
 		"@moq/json": "workspace:^",
 		"@moq/net": "workspace:^",
@@ -37,6 +38,7 @@
 		"media-captions": "0.0.18"
 	},
 	"devDependencies": {
+		"@cathode-ray-tube/moq-secure": "0.1.10",
 		"@types/audioworklet": "^0.0.100",
 		"@types/bun": "^1.4.2",
 		"@typescript/lib-dom": "npm:@types/web@^0.0.350",

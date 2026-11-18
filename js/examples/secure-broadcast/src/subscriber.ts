@@ -1,6 +1,6 @@
 import * as Watch from "@moq/watch";
 import { Signal } from "@moq/signals";
-import { InMemoryKeyStore, MoqSecureDecrypter } from "moq-secure";
+import { InMemoryKeyStore, MoqSecureDecrypter } from "@cathode-ray-tube/moq-secure";
 
 const status = document.querySelector("#status")!;
 const subscribeButton =
@@ -16,8 +16,17 @@ canvas.style.maxWidth = "960px";
 canvas.style.background = "black";
 document.body.insertBefore(canvas, status);
 
+function closePlayer() {
+  player?.close();
+  player = undefined;
+
+  connection?.close();
+  connection = undefined;
+}
+
 subscribeButton.addEventListener("click", () => {
   subscribeButton.disabled = true;
+  closePlayer();
 
   try {
     const url = new URL(
@@ -27,7 +36,16 @@ subscribeButton.addEventListener("click", () => {
       .querySelector<HTMLInputElement>("#name")!
       .value.trim();
 
-    if (!name) throw new Error("Enter a broadcast name.");
+    if (!name) {
+      throw new Error("Enter a broadcast name.");
+    }
+
+    // Avoid logging the full URL because its query string might contain credentials.
+    console.info("[moq:watch] connecting", {
+      url: `${url.origin}${url.pathname}`,
+      name,
+      at: new Date().toISOString(),
+    });
 
     // Must match the publisher's key ID and key bytes.
     const keyStore = new InMemoryKeyStore();
@@ -47,25 +65,28 @@ subscribeButton.addEventListener("click", () => {
       enabled: true,
     });
 
-    player = new Watch.Player({
-      origin: connection.origin,
-      probe: connection.probe,
-      name: Watch.Net.Path.from(name),
-      video: { canvas },
-      audio: { muted: new Signal(false) },
-      decrypter,
+   player = new Watch.Player({
+  origin: connection.origin,
+  probe: connection.probe,
+  name: Watch.Net.Path.from(name),
+  canvas,
+  muted: new Signal(false),
+  decrypter,
+});
+
+    status.textContent = `Player created for ${name}; waiting for media.`;
+    console.info("[moq:watch] player created", {
+      name,
+      at: new Date().toISOString(),
     });
-
-    status.textContent = `Watching ${name}`;
   } catch (error) {
-    console.error(error);
-    status.textContent =
-      `${(error as Error)?.name ?? "Error"}: ${(error as Error)?.message ?? error}`;
+    console.error("[moq:watch] setup failed", error);
 
-    player?.close();
-    player = undefined;
-    connection?.close();
-    connection = undefined;
+    status.textContent =
+      `${(error as Error)?.name ?? "Error"}: ` +
+      `${(error as Error)?.message ?? error}`;
+
+    closePlayer();
     subscribeButton.disabled = false;
   }
 });

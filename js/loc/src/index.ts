@@ -8,9 +8,8 @@
 import * as Moq from "@moq/net";
 import { Time } from "@moq/net";
 
-import type { ContainerFormat } from "./format";
-import type { FrameDecrypter } from "../secure/decrypter.js";
-import type { FrameEncrypter } from "../secure/encrypter.js";
+import type { FrameDecrypter } from "@cathode-ray-tube/moq-secure";
+import type { FrameEncrypter } from "@cathode-ray-tube/moq-secure";
 
 /** A decoded LOC frame: the codec bitstream plus its timing metadata. */
 export interface Frame {
@@ -43,7 +42,7 @@ const DEFAULT_TIMESCALE = 1_000_000;
  * timescale) followed by the codec bitstream payload. Frames without a 0x08
  * timescale property are interpreted as microseconds.
  */
-export class Format implements ContainerFormat {
+export class Format {
 	/** The kind of content carried by the track. */
 	readonly kind: "audio" | "video" | "data";
 
