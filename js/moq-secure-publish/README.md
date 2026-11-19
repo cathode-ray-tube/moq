@@ -1,4 +1,4 @@
-# `@cathode-ray-tube/moq-secure-publish`
+# @cathode-ray-tube/moq-secure-publish
 
 A modified fork of [`@moq/publish`](https://www.npmjs.com/package/@moq/publish) that adds encryption and signing through [`@cathode-ray-tube/moq-secure`](https://www.npmjs.com/package/@cathode-ray-tube/moq-secure).
 
